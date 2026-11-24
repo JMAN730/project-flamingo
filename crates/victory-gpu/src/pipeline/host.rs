@@ -373,6 +373,15 @@ pub(crate) struct HostPipeline {
     pub(crate) strip_cut: D3D12_INDEX_BUFFER_STRIP_CUT_VALUE,
     /// Its shaders, for reports of slow submissions.
     pub(crate) name: String,
+    /// Multi-argument host command signatures bound to `root`, by argument
+    /// layout and record stride.
+    pub(crate) signatures: std::sync::Mutex<
+        Vec<(
+            Vec<crate::indirect_plan::HostIndirectArg>,
+            u32,
+            ID3D12CommandSignature,
+        )>,
+    >,
 }
 
 /// Logs a pipeline that gets no host pipeline, once per reason.
@@ -592,6 +601,7 @@ impl HostPipeline {
                 root,
                 stages: bound,
                 name: format!("{shaders:?}"),
+                signatures: std::sync::Mutex::new(Vec::new()),
                 slots: 0,
                 inputs: Vec::new(),
                 strip_cut: D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED,
@@ -629,6 +639,7 @@ impl HostPipeline {
                 root,
                 stages: bound,
                 name: format!("{shaders:?}"),
+                signatures: std::sync::Mutex::new(Vec::new()),
                 slots: 0,
                 inputs: Vec::new(),
                 strip_cut: D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED,
@@ -709,6 +720,7 @@ impl HostPipeline {
             root,
             stages: bound,
             name: format!("{shaders:?}"),
+            signatures: std::sync::Mutex::new(Vec::new()),
             slots: g.slots(),
             inputs: g.elements(),
             strip_cut: g.strip_cut,

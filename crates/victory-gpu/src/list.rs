@@ -1709,7 +1709,7 @@ mod state {
         }
         let mut ran = false;
         with_state(this, |list, s| {
-            ran = s.execute_indirect(list, (MESH, STRIDE, 1), indirect, None);
+            ran = s.execute_indirect(list, STRIDE, &[[MESH, 0, 0, 0]], 1, indirect, None);
         });
         if !ran {
             super::INDIRECT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1796,18 +1796,11 @@ extern "system" fn execute_indirect(
     let counter = crate::resource::buffer_bytes(count).map(|(p, _)| p as u64 + count_offset);
     let mut ran = false;
     #[cfg(windows)]
-    if let ([[kind, ..]], Some(address)) = (args, address)
+    if let (false, Some(address)) = (args.is_empty(), address)
         && (count.is_null() || counter.is_some())
     {
-        const DISPATCH: u32 = 2;
-        const DISPATCH_SINGLE: u32 = 105;
-        let kind = if *kind == DISPATCH_SINGLE {
-            DISPATCH
-        } else {
-            *kind
-        };
         with_state(this, |list, s| {
-            ran = s.execute_indirect(list, (kind, stride, max), address, counter);
+            ran = s.execute_indirect(list, stride, args, max, address, counter);
         });
     } else {
         #[cfg(all(windows, feature = "diagnostics"))]

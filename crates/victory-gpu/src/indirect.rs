@@ -386,6 +386,35 @@ pub(crate) fn bound(
     true
 }
 
+/// The D3D12 argument descriptions of a planned host signature.
+pub(crate) fn to_d3d12_descs(
+    args: &[crate::indirect_plan::HostIndirectArg],
+) -> Vec<D3D12_INDIRECT_ARGUMENT_DESC> {
+    use crate::indirect_plan::HostIndirectArg;
+    args.iter()
+        .map(|&arg| match arg {
+            HostIndirectArg::Constant {
+                param,
+                offset,
+                count,
+            } => D3D12_INDIRECT_ARGUMENT_DESC {
+                Type: D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT,
+                Anonymous: D3D12_INDIRECT_ARGUMENT_DESC_0 {
+                    Constant: D3D12_INDIRECT_ARGUMENT_DESC_0_1 {
+                        RootParameterIndex: param,
+                        DestOffsetIn32BitValues: offset,
+                        Num32BitValuesToSet: count,
+                    },
+                },
+            },
+            HostIndirectArg::Execute(kind) => D3D12_INDIRECT_ARGUMENT_DESC {
+                Type: D3D12_INDIRECT_ARGUMENT_TYPE(kind as i32),
+                ..Default::default()
+            },
+        })
+        .collect()
+}
+
 /// After the execution: the buffer back to unordered access, where the
 /// title's passes keep using it.
 pub(crate) fn done(list: &HostList, buffer: &ID3D12Resource) {
