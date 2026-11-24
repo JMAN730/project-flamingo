@@ -213,18 +213,27 @@ fn dump_on() -> bool {
     *ON.get_or_init(|| folder().is_some() && std::env::var_os("VICTORY_DUMP_TARGETS").is_some())
 }
 
-/// `VICTORY_SHOW_TARGET=<w>x<h>-f<format>` (e.g. `2560x1440-f28`): the size and format of
-/// the render target to show in place of the title's frame.
-fn show_spec() -> Option<(u64, u32, i32)> {
-    static SPEC: std::sync::OnceLock<Option<(u64, u32, i32)>> = std::sync::OnceLock::new();
+/// `VICTORY_SHOW_TARGET=<w>x<h>-f<format>[-<n>]` (e.g. `2560x1440-f28-3`):
+/// the size and format of the render target to show in place of the
+/// title's frame, and which of the frame's distinct targets of that kind
+/// (1-based, in first-use order; default 1). A G-buffer is several targets
+/// of one size and format: the third showed the world's geometry while the
+/// final image was dark (upstream #994).
+fn show_spec() -> Option<(u64, u32, i32, usize)> {
+    static SPEC: std::sync::OnceLock<Option<(u64, u32, i32, usize)>> = std::sync::OnceLock::new();
     *SPEC.get_or_init(|| parse_show_spec(&std::env::var("VICTORY_SHOW_TARGET").ok()?))
 }
 
-/// `<w>x<h>-f<format>` as (width, height, DXGI format); `None` if malformed.
-fn parse_show_spec(v: &str) -> Option<(u64, u32, i32)> {
-    let (size, format) = v.trim().split_once("-f")?;
+/// `<w>x<h>-f<format>[-<n>]` as (width, height, DXGI format, n); `None` if
+/// malformed.
+fn parse_show_spec(v: &str) -> Option<(u64, u32, i32, usize)> {
+    let (size, rest) = v.trim().split_once("-f")?;
     let (w, h) = size.split_once('x')?;
-    Some((w.parse().ok()?, h.parse().ok()?, format.parse().ok()?))
+    let (format, n) = match rest.split_once('-') {
+        Some((f, n)) => (f, n.parse::<usize>().ok()?),
+        None => (rest, 1),
+    };
+    Some((w.parse().ok()?, h.parse().ok()?, format.parse().ok()?, n.max(1)))
 }
 
 #[cfg(test)]
@@ -233,13 +242,23 @@ mod show_tests {
     fn show_spec_reads_size_and_format() {
         assert_eq!(
             super::parse_show_spec(" 2560x1440-f28 "),
-            Some((2560, 1440, 28))
+            Some((2560, 1440, 28, 1))
         );
+        assert_eq!(
+            super::parse_show_spec("2560x1440-f28-3"),
+            Some((2560, 1440, 28, 3))
+        );
+        assert_eq!(super::parse_show_spec("2560x1440-f28-x"), None);
         assert_eq!(super::parse_show_spec("2560x1440"), None);
         assert_eq!(super::parse_show_spec("2560-f28"), None);
         assert_eq!(super::parse_show_spec("ax1440-f28"), None);
     }
 }
+
+/// The frame's distinct targets matching [`show_spec`]'s size and format so
+/// far: the frame (presents before it) and the resources, in first-use
+/// order.
+static MATCHED: std::sync::Mutex<(u64, Vec<usize>)> = std::sync::Mutex::new((0, Vec::new()));
 
 /// The last render target bound that matches [`show_spec`].
 static SHOWN: std::sync::Mutex<Option<std::sync::Arc<crate::resource::HostTexture>>> =
@@ -299,13 +318,28 @@ pub(crate) fn show(list: &ID3D12GraphicsCommandList, back: &ID3D12Resource) -> b
 
 /// Notes a title texture the frame being built renders to or writes.
 pub(crate) fn note_target(resource: crate::object::This) {
-    if let Some((w, h, f)) = show_spec()
+    if let Some((w, h, f, n)) = show_spec()
         && let Some(copy) = crate::resource::host_copy(resource)
     {
         // SAFETY: a live resource.
         let d = unsafe { copy.texture.GetDesc() };
         if (d.Width, d.Height, d.Format.0) == (w, h, f) {
-            *SHOWN.lock().unwrap_or_else(|e| e.into_inner()) = Some(copy);
+            let mut matched = MATCHED.lock().unwrap_or_else(|e| e.into_inner());
+            let frame = crate::queue::presented();
+            if matched.0 != frame {
+                *matched = (frame, Vec::new());
+            }
+            let r = resource as usize;
+            let at = match matched.1.iter().position(|&m| m == r) {
+                Some(at) => at,
+                None => {
+                    matched.1.push(r);
+                    matched.1.len() - 1
+                }
+            };
+            if at + 1 == n {
+                *SHOWN.lock().unwrap_or_else(|e| e.into_inner()) = Some(copy);
+            }
         }
     }
     if resource.is_null() || !dump_on() || !listed(crate::queue::presented() + 1) {
