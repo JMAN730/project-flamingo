@@ -2776,6 +2776,13 @@ fn depth_range(min: f32, max: f32) -> (f32, f32) {
     (min.min(max), max)
 }
 
+pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
+    #[cfg(feature = "diagnostics")]
+    crate::capture::op(std::ptr::from_ref(list) as usize, || format!("STENCIL REF {reference:#x}"));
+    // SAFETY: an open list.
+    unsafe { list.list.OMSetStencilRef(reference) };
+}
+
 #[cfg(test)]
 mod depth_bounds_tests {
     use super::depth_range;
@@ -2788,11 +2795,4 @@ mod depth_bounds_tests {
         assert_eq!(depth_range(f32::NAN, f32::NAN), (0.0, 1.0));
         assert_eq!(depth_range(0.9, 0.1), (0.1, 0.1));
     }
-}
-
-pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
-    #[cfg(feature = "diagnostics")]
-    crate::capture::op(std::ptr::from_ref(list) as usize, || format!("STENCIL REF {reference:#x}"));
-    // SAFETY: an open list.
-    unsafe { list.list.OMSetStencilRef(reference) };
 }
