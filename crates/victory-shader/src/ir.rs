@@ -138,9 +138,17 @@ const SPILL_FIRST: u8 = 16;
 /// 40-bit address, usually through copies in `s2`/`s3`) into `s_mov_b32` from
 /// the user SGPRs the table's dwords stand for. Only loads with a constant
 /// offset, in code no branch joins after the pointer is set up, are rewritten.
+///
+/// The table holds the arguments as they were on entry, but the program may
+/// have written the SGPRs those dwords stand for by the time it loads them
+/// (a load into `s[8:23]` overwrites what stands for table dwords 0..7). So
+/// the program first copies the user SGPRs it reads into a block of SGPRs it
+/// never uses, and the loads read that block. Without such a block, or when a
+/// branch can return to the entry, nothing is rewritten.
 fn spill_loads(
     list: Vec<Instruction>,
     wave64: bool,
+    vgprs: u16,
     code_len: usize,
 ) -> Result<Vec<Instruction>, ShaderError> {
     use gfx10::Fields::{Smem, Sop, Valu};
@@ -153,6 +161,39 @@ fn spill_loads(
             targets.insert(t);
         }
     }
+    let Some(entry) = list.first().map(|i| i.offset) else {
+        return Ok(list);
+    };
+    if targets.contains(&entry) {
+        return Ok(list);
+    }
+    // Every SGPR the program reads or writes, to find a block it never uses.
+    let mut used = [false; 128];
+    for inst in list.iter() {
+        let Some(name) = inst.name() else {
+            return Ok(list);
+        };
+        let Ok(effects) = effects(
+            inst,
+            &inst.fields(wave64),
+            name,
+            1 + u8::from(wave64),
+            vgprs,
+        ) else {
+            return Ok(list);
+        };
+        for reg in effects
+            .into_iter()
+            .flat_map(|(r, w)| r.into_iter().chain(w))
+        {
+            if let Reg::S(c) = reg {
+                used[usize::from(c).min(127)] = true;
+            }
+        }
+    }
+    let original = list.clone();
+    // Where each rewritten copy is in `out`, and the user SGPR it stands for.
+    let mut copies: Vec<(usize, u8)> = Vec::new();
     // 1: a copy of s0, 2: a copy of s1 (masked to the address's high bits).
     let mut tag = [0u8; 128];
     tag[0] = 1;
@@ -188,13 +229,9 @@ fn spill_loads(
             let first = u32::from(SPILL_FIRST) + (offset as u32) / 4;
             if first + u32::from(n) <= 105 {
                 for k in 0..n {
-                    let mov =
-                        0xBE80_0000 | u32::from(dst + k) << 16 | 3 << 8 | (first + u32::from(k));
-                    let mut bytes = mov.to_le_bytes().to_vec();
-                    bytes.extend(0xBF81_0000u32.to_le_bytes()); // s_endpgm
-                    let mut one = gfx10::decode(&bytes)?.remove(0);
-                    one.offset = inst.offset;
-                    out.push(one);
+                    let src = (first + u32::from(k)) as u8;
+                    copies.push((out.len(), src));
+                    out.push(s_mov(dst + k, src, inst.offset)?);
                 }
                 for k in 0..n {
                     tag[(dst + k) as usize] = 0;
@@ -216,12 +253,13 @@ fn spill_loads(
                         },
                         ("s_and_b32", [x, y]) => {
                             // `s1 & mask` with a small mask, either way round.
+                            // The high dword's eight low bits are address bits
+                            // (40-bit addresses): a mask clearing any of them
+                            // can point elsewhere, so it drops the tag. No
+                            // inline constant (1..=64) keeps them all.
                             let masked = |reg: &Operand, mask: &Operand| match (scalar(reg), mask) {
                                 (Some((c, _)), Operand::Literal(m)) => {
-                                    tag[c as usize] == 2 && *m <= 0xFFFF
-                                }
-                                (Some((c, _)), Operand::Const(k)) => {
-                                    tag[c as usize] == 2 && (129..=192).contains(k)
+                                    tag[c as usize] == 2 && *m <= 0xFFFF && *m & 0xFF == 0xFF
                                 }
                                 _ => false,
                             };
@@ -250,7 +288,47 @@ fn spill_loads(
         }
         out.push(inst);
     }
-    Ok(out)
+    let Some(last) = copies.iter().map(|c| c.1).max() else {
+        return Ok(out);
+    };
+    // A block of SGPRs past the user SGPRs the table stands for that the
+    // program never touches, below VCC.
+    let size = usize::from(last - SPILL_FIRST) + 1;
+    let Some(block) = (usize::from(last) + 1..=usize::from(VCC) - size)
+        .find(|&b| used[b..b + size].iter().all(|u| !u))
+    else {
+        return Ok(original);
+    };
+    let moved = |src: u8| (block + usize::from(src - SPILL_FIRST)) as u8;
+    let mut read: Vec<u8> = copies.iter().map(|c| c.1).collect();
+    read.sort_unstable();
+    read.dedup();
+    for &(at, src) in &copies {
+        let Fields::Sop {
+            dst: Some(Operand::Scalar { code, .. }),
+            ..
+        } = out[at].fields(wave64)
+        else {
+            unreachable!("a copy is an s_mov_b32");
+        };
+        out[at] = s_mov(code, moved(src), out[at].offset)?;
+    }
+    let mut entries = Vec::with_capacity(read.len() + out.len());
+    for &src in &read {
+        entries.push(s_mov(moved(src), src, entry)?);
+    }
+    entries.extend(out);
+    Ok(entries)
+}
+
+/// `s_mov_b32 s<dst>, s<src>`, placed at `offset`.
+fn s_mov(dst: u8, src: u8, offset: usize) -> Result<Instruction, ShaderError> {
+    let word = 0xBE80_0000 | u32::from(dst) << 16 | 3 << 8 | u32::from(src);
+    let mut bytes = word.to_le_bytes().to_vec();
+    bytes.extend(0xBF81_0000u32.to_le_bytes()); // s_endpgm
+    let mut one = gfx10::decode(&bytes)?.remove(0);
+    one.offset = offset;
+    Ok(one)
 }
 
 /// Decodes `code` and builds its SSA form; `vgprs` is the program's VGPR
@@ -271,7 +349,7 @@ pub fn build_with(
 ) -> Result<Program, ShaderError> {
     let mut list = gfx10::decode(code)?;
     if spilled {
-        list = spill_loads(list, wave64, code.len())?;
+        list = spill_loads(list, wave64, vgprs, code.len())?;
     }
     let lanes = 1 + u8::from(wave64);
     let isa = |offset, reason| ShaderError::Isa { offset, reason };
@@ -1620,6 +1698,43 @@ mod tests {
         p.inputs.iter().find(|i| i.0 == reg).expect("input").1
     }
 
+    /// A mask on the table pointer's high dword that clears one of its
+    /// address bits points elsewhere: the load through it stays a load
+    /// (found by NexForever on #489).
+    #[test]
+    fn spill_table_masks_keep_every_address_bit() {
+        let loads_left = |mask: u32, inline: bool| {
+            let mut words = vec![0xBE82_0300u32]; // s_mov_b32 s2, s0
+            if inline {
+                words.push(0x8703_0001 | (128 + mask) << 8); // s_and_b32 s3, s1, mask
+            } else {
+                words.extend([0x8703_FF01, mask]); // s_and_b32 s3, s1, lit
+            }
+            words.extend([0xF408_0201, 0xFA00_0010, S_ENDPGM]); // s_load_dwordx4 s[8:11], s[2:3], 0x10
+            let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let p = build_with(&code, false, 256, true).unwrap();
+            p.blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .filter(|i| i.name() == "s_load_dwordx4")
+                .count()
+        };
+        for mask in 0..=0xFF {
+            assert_eq!(
+                loads_left(mask, false),
+                usize::from(mask != 0xFF),
+                "{mask:#x}"
+            );
+        }
+        for mask in 1..=64 {
+            assert_eq!(loads_left(mask, true), 1, "inline {mask}");
+        }
+        assert_eq!(loads_left(0x1FF, false), 0);
+        assert_eq!(loads_left(0xFFFF, false), 0);
+        assert_eq!(loads_left(0xFFFE, false), 1);
+        assert_eq!(loads_left(0x1_00FF, false), 1);
+    }
+
     /// A compute program whose root arguments are in the spill table `s[0:1]`
     /// points to: the loads become copies of the user SGPRs the dwords stand for.
     #[test]
@@ -1655,10 +1770,58 @@ mod tests {
                 20 + k
             );
         }
+        // s2, the four entry copies of s20..s23, the four loaded dwords, s6.
         assert_eq!(
             insts.iter().filter(|i| i.name() == "s_mov_b32").count(),
-            1 + 4 + 1
+            1 + 4 + 4 + 1
         );
+    }
+
+    /// A later table load still reads the arguments as they were on entry,
+    /// although an earlier load overwrote the SGPRs its dwords stand for.
+    #[test]
+    fn spill_table_loads_read_entry_values() {
+        let code: Vec<u8> = [
+            0xBE82_0300u32, // s_mov_b32 s2, s0
+            0x8703_FF01,    // s_and_b32 s3, s1, lit
+            0x0000_00FF,    //   0xff
+            0xF40C_0301,    // s_load_dwordx8 s[12:19], s[2:3], 0x10 (writes s16..s19)
+            0xFA00_0010,
+            0xF404_0101, // s_load_dwordx2 s[4:5], s[2:3], 0 (table dwords 0..1)
+            0xFA00_0000,
+            0xBE86_0304, // s_mov_b32 s6, s4
+            S_ENDPGM,
+        ]
+        .iter()
+        .flat_map(|w| w.to_le_bytes())
+        .collect();
+        let p = build_with(&code, false, 256, true).unwrap();
+        let insts: Vec<_> = p.blocks.iter().flat_map(|b| &b.insts).collect();
+        assert!(!insts.iter().any(|i| i.name().starts_with("s_load")));
+        // Table dwords 0..1 and 4..11 are user SGPRs 16..17 and 20..27, all
+        // read on entry.
+        for reg in (16..18).chain(20..28) {
+            assert!(
+                p.inputs.iter().any(|i| i.0 == Reg::S(reg)),
+                "s{reg} read on entry"
+            );
+        }
+        // s6 holds what s16 held on entry, not what the first load put there.
+        let entry = input(&p, Reg::S(16));
+        let copied = |v: Value| {
+            insts
+                .iter()
+                .find(|i| i.name() == "s_mov_b32" && i.writes.iter().any(|w| w.1 == v))
+                .and_then(|i| i.reads.first().map(|r| r.1))
+        };
+        let mut value = insts
+            .iter()
+            .rev()
+            .find_map(|i| i.write(Reg::S(6)))
+            .expect("s6 written");
+        while value != entry {
+            value = copied(value).expect("a chain of copies back to the entry value");
+        }
     }
 
     /// Loads from a pointer that is not the spill table stay loads.
