@@ -1164,8 +1164,14 @@ mod host {
         fn keys(&mut self) -> Vec<KeyState> {
             #[cfg(feature = "diagnostics")]
             let mut down = scripted();
+            // Buttons the debug tool's control folder asks for (see
+            // `victory_core::ctl`), with or without focus.
+            #[cfg(feature = "diagnostics")]
+            down.extend(victory_core::ctl::held());
             #[cfg(not(feature = "diagnostics"))]
             let mut down = Vec::new();
+            down.sort_unstable();
+            down.dedup();
             if focused() {
                 // Left/right modifier keys only, as devices report them; no
                 // mouse buttons (below 0x08).

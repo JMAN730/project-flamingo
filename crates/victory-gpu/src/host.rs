@@ -5805,6 +5805,15 @@ impl Meter {
         });
         let dropped = crate::draw::take_dropped() as f64 / frames;
         let indirect = crate::list::take_indirect() as f64 / frames;
+        // What a shot's stats file says about this second of frames.
+        #[cfg(feature = "diagnostics")]
+        crate::capture::note_stats(format!(
+            "{fps:.1} fps {ms:.1} ms/frame (preparing {cpu:.1} ms: copies {copy_ms:.1} ms \
+             {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} ms on \
+             the GPU; copying back {back_ms:.1} ms {back_mb:.1} MB), {draws:.0} draws/frame, \
+             dropped {dropped:.0} without a host pipeline ({} being made), {indirect:.0} indirect",
+            crate::pipeline::making()
+        ));
         let mesh_largest = MESH_GROUPS[0].swap(0, Ordering::Relaxed);
         let mesh_groups = MESH_GROUPS[1].swap(0, Ordering::Relaxed) as f64 / frames;
         tracing::info!(
@@ -6078,7 +6087,9 @@ impl Host {
             ]);
             list.CopyResource(&back, texture);
             #[cfg(feature = "diagnostics")]
-            let capture = crate::capture::wanted(frame)
+            let shot = crate::capture::take_request();
+            #[cfg(feature = "diagnostics")]
+            let capture = (crate::capture::wanted(frame) || shot.is_some())
                 .then(|| crate::capture::read_back(&self.device, list, texture))
                 .flatten();
             #[cfg(feature = "diagnostics")]
@@ -6102,8 +6113,16 @@ impl Host {
                 None => self.execute(&[copy]),
             }
             #[cfg(feature = "diagnostics")]
-            if let Some((buffer, footprint)) = capture {
-                crate::capture::save_read_back(frame, &buffer, &footprint);
+            match (capture, shot) {
+                (Some((buffer, footprint)), Some(label)) => {
+                    crate::capture::save_shot(frame, label, &buffer, &footprint);
+                }
+                (Some((buffer, footprint)), None) => {
+                    crate::capture::save_read_back(frame, &buffer, &footprint);
+                }
+                // Not this frame: the next one reads the same request.
+                (None, Some(label)) => crate::capture::put_back(label),
+                (None, None) => {}
             }
             let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
             p.meter.frame(p.hwnd);
