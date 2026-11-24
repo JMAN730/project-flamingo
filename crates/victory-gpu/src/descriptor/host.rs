@@ -90,32 +90,23 @@ fn max_view_heap(host: &Host) -> u32 {
 
 /// The view heaps to try for `count` title slots on a device that takes
 /// `limit` views, in order: (heap size, title slots, dynamic slots). The
-/// full dynamic range on top of every title slot where that fits. Where it
-/// does not (a capped heap), what is left over the title's slots, between
-/// [`CAPPED_DYNAMIC`] and [`DYNAMIC`] (shortcut: title slots past the
-/// limit are left out; a title that reaches them needs remapping). Then,
-/// if the host refuses that, the smallest range. None is over `limit`.
-///
-/// A capped heap with 2^16 dynamic slots ran dry in every world submission
-/// and dropped most indirect draws (upstream #747); with 2^18, Grand Theft
-/// Auto VI's 1,245,184-slot heap kept 737,856 title slots on an RTX 4060,
-/// and the title filled them before its first screen (its views from
-/// 737,856 up had no host descriptor: a black screen). 2^17 keeps 868,928.
+/// full dynamic range always: on top of every title slot where that fits,
+/// else the title's slots are cut to make room for it (shortcut:
+/// descriptors past the host's limit are left out; tables reaching them
+/// are made in dynamic slots). A capped heap with 2^16 dynamic slots ran dry in
+/// every world submission and dropped most indirect draws, where 2^18
+/// dropped none (upstream #747: RTX 4070 Ti, 5060 Ti, 5070 Ti). Then, if
+/// the host refuses that, the smaller range. None is over `limit`. 2^17
+/// (868,928 title slots of Grand Theft Auto VI's 1,245,184) ran dry 70 s
+/// into the world on an RTX 4060; the title writes every slot of its heap
+/// at start, so no cut keeps them all.
 fn view_heap_sizes(count: u32, limit: u32) -> Vec<(u32, u32, u32)> {
     let planned = |extra: u32| match count.checked_add(extra) {
         Some(size) if size <= limit => (size, count, extra),
         _ => (limit, limit.saturating_sub(extra), extra),
     };
-    let first = match count.checked_add(DYNAMIC) {
-        Some(size) if size <= limit => DYNAMIC,
-        _ => limit.saturating_sub(count).clamp(CAPPED_DYNAMIC, DYNAMIC),
-    };
-    vec![planned(first), planned(MIN_DYNAMIC)]
+    vec![planned(DYNAMIC), planned(MIN_DYNAMIC)]
 }
-
-/// The fewest dynamic slots of a capped view heap: the title's slots have
-/// the rest.
-const CAPPED_DYNAMIC: u32 = 1 << 17;
 
 /// Slots past the title's in a view heap, for tables a draw needs made
 /// afresh (constant buffers copied per draw). A list holds the slots it
@@ -350,8 +341,10 @@ impl HostHeap {
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
         let (next, taken) = &mut *guard;
         let n = n as usize;
-        // Search from `next` on, then from the start.
-        let starts = (*next as usize..spare).chain(0..*next as usize);
+        // Search from `next` on, then from the start up to past `next`, so
+        // a free run across `next` is found (Xvania7, upstream #887).
+        let cursor = *next as usize;
+        let starts = (cursor..spare).chain(0..cursor.saturating_add(n - 1).min(spare));
         let mut run = 0;
         let mut found = None;
         let mut last = usize::MAX;
@@ -1402,26 +1395,23 @@ mod tests {
     /// that takes 1,000,000 (upstream #735).
     #[test]
     fn view_heaps_stay_within_the_device_limit() {
-        // 2^20 title slots on a 1M device: the title's slots cut for
-        // 2^17 dynamic ones (upstream #735, #747).
+        // 2^20 title slots on a 1M device: the full dynamic range, the
+        // title's slots cut (upstream #735, #747).
         assert_eq!(
             view_heap_sizes(1 << 20, PORTABLE_VIEWS),
             [
-                (PORTABLE_VIEWS, PORTABLE_VIEWS - CAPPED_DYNAMIC, CAPPED_DYNAMIC),
+                (PORTABLE_VIEWS, PORTABLE_VIEWS - DYNAMIC, DYNAMIC),
                 (PORTABLE_VIEWS, PORTABLE_VIEWS - MIN_DYNAMIC, MIN_DYNAMIC),
             ]
         );
-        // Grand Theft Auto VI's heap on an RTX 4060.
-        assert_eq!(view_heap_sizes(1_245_184, PORTABLE_VIEWS)[0].1, 868_928);
         assert_eq!(
             view_heap_sizes(4, PORTABLE_VIEWS),
             [(4 + DYNAMIC, 4, DYNAMIC), (4 + MIN_DYNAMIC, 4, MIN_DYNAMIC)]
         );
-        // Every title slot, and the rest for dynamic ones.
         assert_eq!(
             view_heap_sizes(800_000, PORTABLE_VIEWS),
             [
-                (PORTABLE_VIEWS, 800_000, 200_000),
+                (PORTABLE_VIEWS, PORTABLE_VIEWS - DYNAMIC, DYNAMIC),
                 (800_000 + MIN_DYNAMIC, 800_000, MIN_DYNAMIC),
             ]
         );
@@ -1432,7 +1422,7 @@ mod tests {
         );
         for count in [0, 1, 999_999, 1_000_000, u32::MAX] {
             let sizes = view_heap_sizes(count, PORTABLE_VIEWS);
-            assert!((CAPPED_DYNAMIC..=DYNAMIC).contains(&sizes[0].2));
+            assert_eq!(sizes[0].2, DYNAMIC);
             for (size, titles, extra) in sizes {
                 assert!(size <= PORTABLE_VIEWS && titles + extra == size && titles <= count);
             }

@@ -100,6 +100,9 @@ pub(crate) struct State {
     /// The dynamic slots the list holds: title heap, first, count; given
     /// back when the list is reset or released.
     dynamic: Vec<(usize, u32, u32)>,
+    /// The draw or dispatch being bound would read descriptors the host
+    /// heap does not have (out of dynamic slots): it is dropped.
+    unbound: bool,
 }
 
 impl Drop for State {
@@ -432,7 +435,9 @@ impl State {
             );
             return false;
         }
-        self.bind(list, p, false);
+        if !self.bind(list, p, false) {
+            return false;
+        }
         let l = &list.list;
         // Vertex buffers the input layout reads.
         let mut views = [D3D12_VERTEX_BUFFER_VIEW::default(); 32];
@@ -584,9 +589,15 @@ impl State {
 
     /// What draws and dispatches share: heaps, our root signature, the
     /// pipeline, and per stage the user data, root views and the
-    /// descriptors its tables hold.
-    fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) {
+    /// descriptors its tables hold. False if the draw or dispatch must be
+    /// dropped: a table past the host heap or a root SRV found no dynamic
+    /// slots, and the shader would read past the heap's end or a stale
+    /// view (an RTX 4060 removed the device 40 s into the world after the
+    /// dynamic slots ran out).
+    #[must_use]
+    fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
         self.depth_sampled = false;
+        self.unbound = false;
         let l = &list.list;
         self.bind_heaps(list);
         let root = p.root.as_raw() as usize;
@@ -688,6 +699,10 @@ impl State {
                 }
             }
         }
+        if self.unbound {
+            once!("draws and dispatches dropped: their descriptors found no dynamic slots");
+        }
+        !self.unbound
     }
 
     /// Binds the title's root SRV `slot` as the one-view table `param` (see
@@ -726,7 +741,8 @@ impl State {
             return;
         }
         let Some(index) = host.dynamic(1) else {
-            once!("no free dynamic slot for a root SRV: left unset");
+            once!("no free dynamic slot for a root SRV: the draw is dropped");
+            self.unbound = true;
             return;
         };
         self.dynamic.push((heap, index, 1));
@@ -776,7 +792,10 @@ impl State {
             once!("a dispatch with a graphics pipeline");
             return;
         }
-        self.bind(list, p, true);
+        if !self.bind(list, p, true) {
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
         // SAFETY: an open list with everything set.
@@ -949,7 +968,12 @@ impl State {
                 .max()
                 .unwrap_or(1);
             let last = table + u64::from(n - 1) * 32;
+            // In place only where the host heap has all the title's slots.
+            let in_place = heap
+                .index(table)
+                .is_some_and(|i| u64::from(i) + u64::from(n) <= u64::from(host.count()));
             if heap.index(last).is_none() {
+                self.unbound |= !in_place;
                 for u in entries {
                     self.table_entry(list, u, compute);
                 }
@@ -978,6 +1002,7 @@ impl State {
             }
             let Some(first) = host.dynamic(n) else {
                 once!(n, "descriptor table did not fit in command-list slots");
+                self.unbound |= !in_place;
                 for u in entries {
                     self.table_entry(list, u, compute);
                 }
@@ -1588,10 +1613,7 @@ impl State {
             DRAW | INDEXED => self.prepare(list, kind == INDEXED),
             MESH => self.prepare_for(list, false, true),
             DISPATCH => match pipeline {
-                Some(p) if p.compute => {
-                    self.bind(list, p, true);
-                    true
-                }
+                Some(p) if p.compute => self.bind(list, p, true),
                 _ => false,
             },
             _ => false,

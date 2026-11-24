@@ -2397,6 +2397,11 @@ fn look_at(
 /// The brightest color channel and the mean of the pixels [`look_at`]
 /// copied (their submission has run).
 fn levels(buffer: &ID3D12Resource) -> Option<(u8, u8)> {
+    levels_alpha(buffer).map(|(max, mean, _)| (max, mean))
+}
+
+/// [`levels`] and the mean alpha.
+fn levels_alpha(buffer: &ID3D12Resource) -> Option<(u8, u8, u8)> {
     let mut data = std::ptr::null_mut();
     // SAFETY: the copies finished (every submission is waited for); the
     // buffer is mapped for the read only.
@@ -2410,10 +2415,15 @@ fn levels(buffer: &ID3D12Resource) -> Option<(u8, u8)> {
             .chunks(LOOK_SLOT as usize)
             .flat_map(|pixel| pixel[..3].iter().copied())
             .collect();
+        let alpha = bytes
+            .chunks(LOOK_SLOT as usize)
+            .map(|pixel| u32::from(pixel[3]))
+            .sum::<u32>()
+            / u32::from(LOOK_GRID * LOOK_GRID);
         buffer.Unmap(0, None);
         let max = channels.iter().copied().max().unwrap_or(0);
         let mean = channels.iter().map(|&c| u32::from(c)).sum::<u32>() / channels.len().max(1) as u32;
-        Some((max, mean as u8))
+        Some((max, mean as u8, alpha as u8))
     }
 }
 
@@ -2509,6 +2519,24 @@ impl Host {
             p.copy.reset();
             let list = &p.copy.list;
             if let Some(compositor) = compositor {
+                // Each plane's own pixels on the frames the log reports:
+                // tells a black scene plane from a UI plane covering it.
+                let mut plane_looks = Vec::new();
+                if frame.is_power_of_two() && frame >= 4 {
+                    for (i, &(plane, state)) in planes.iter().enumerate().take(4) {
+                        let state = D3D12_RESOURCE_STATES(state as i32);
+                        let copy = state != D3D12_RESOURCE_STATE_COPY_SOURCE;
+                        if copy {
+                            list.ResourceBarrier(&[transition(plane, state, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                        }
+                        if let Some(buffer) = look_at(&self.device, list, plane) {
+                            plane_looks.push((i, buffer));
+                        }
+                        if copy {
+                            list.ResourceBarrier(&[transition(plane, D3D12_RESOURCE_STATE_COPY_SOURCE, state)]);
+                        }
+                    }
+                }
                 compositor.record(&self.device, list, &back, (width, height), planes, |f| {
                     swap_format(f).or(matches!(f.0, 26 | 88).then_some(f))
                 });
@@ -2537,6 +2565,10 @@ impl Host {
                 #[cfg(feature = "diagnostics")]
                 if let Some((buffer, footprint)) = capture {
                     crate::capture::save_read_back(frame, &buffer, &footprint);
+                }
+                for (plane, buffer) in plane_looks {
+                    let (max, mean, alpha) = levels_alpha(&buffer).unwrap_or((0, 0, 0));
+                    tracing::info!(frame, plane, brightest = max, mean, alpha, "plane picture (16 pixels)");
                 }
                 self.show_frame(p, frame, looked, (width, height, format.0));
                 #[cfg(feature = "diagnostics")]
