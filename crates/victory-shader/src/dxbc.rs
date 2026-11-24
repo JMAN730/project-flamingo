@@ -109,6 +109,24 @@ impl<'a> Container<'a> {
     pub fn part(&self, fourcc: FourCC) -> Option<&Part<'a>> {
         self.parts.iter().find(|p| p.fourcc == fourcc)
     }
+
+    /// The part holding the program and its console code: `DXIL`, else
+    /// any part laid out as one (the console code's `XDAT` table at the
+    /// program header's end), as some compute containers keep it only in
+    /// another part (`ILDB` and the like).
+    pub fn program_part(&self) -> Option<&Part<'a>> {
+        self.part(FourCC::DXIL).or_else(|| {
+            self.parts
+                .iter()
+                .find(|p| p.data.get(0x18..0x1c) == Some(b"XDAT"))
+        })
+    }
+
+    /// The part tags, for a report of a container without a program part.
+    pub fn part_names(&self) -> String {
+        let names: Vec<String> = self.parts.iter().map(|p| p.fourcc.to_string()).collect();
+        names.join(",")
+    }
 }
 
 /// Every container stored as is in `data`, found by its magic, as its offset
@@ -196,6 +214,14 @@ mod tests {
         assert_eq!(c.part(FourCC::SFI0).unwrap().data, &[1, 2, 3, 4]);
         assert_eq!(c.part(FourCC::HASH).unwrap().data.len(), 20);
         assert!(c.part(FourCC::DXIL).is_none());
+        assert!(c.program_part().is_none());
+        assert_eq!(c.part_names(), "SFI0,HASH");
+        // A program laid out as one under another tag is the program part.
+        let mut program = vec![0u8; 0x20];
+        program[0x18..0x1c].copy_from_slice(b"XDAT");
+        let bytes = build(&[(FourCC::ILDB, &program), (FourCC::HASH, &[9; 20])]);
+        let c = Container::parse(&bytes).unwrap();
+        assert_eq!(c.program_part().map(|p| p.fourcc), Some(FourCC::ILDB));
     }
 
     #[test]

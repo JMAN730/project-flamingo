@@ -278,9 +278,23 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
 /// [`translate`] for a host that runs the wave sizes of `target`.
 pub fn translate_for(container: &[u8], target: Target) -> Result<HostShader, ShaderError> {
     let c = Container::parse(container)?;
-    let dxil = c
-        .part(FourCC::DXIL)
-        .ok_or(ShaderError::Malformed("no DXIL part"))?;
+    let Some(dxil) = c.program_part() else {
+        // Named with its parts, once per kind of container (a few kinds).
+        static SEEN: std::sync::Mutex<Vec<(String, &'static str)>> =
+            std::sync::Mutex::new(Vec::new());
+        let parts = c.part_names();
+        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        let what = match seen.iter().find(|(p, _)| *p == parts) {
+            Some(&(_, what)) => what,
+            None => {
+                let what: &'static str =
+                    Box::leak(format!("no DXIL part (parts: {parts})").into_boxed_str());
+                seen.push((parts, what));
+                what
+            }
+        };
+        return Err(ShaderError::Malformed(what));
+    };
     let native = crate::native_programs(dxil.data)?
         .into_iter()
         .find(|p| {

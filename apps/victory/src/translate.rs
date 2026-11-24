@@ -356,7 +356,7 @@ fn translate(
     let Ok(container) = Container::parse(&bytes) else {
         return t.fail("no DXIL part (SM5 or older)".into(), example);
     };
-    let Some(dxil) = container.part(FourCC::DXIL).map(|p| p.data) else {
+    let Some(dxil) = container.program_part().map(|p| p.data) else {
         return t.fail("no DXIL part (SM5 or older)".into(), example);
     };
     let key = translation_key(&container);
