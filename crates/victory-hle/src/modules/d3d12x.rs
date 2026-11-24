@@ -49,6 +49,14 @@ pub fn use_shader_cache(dir: std::path::PathBuf) {
     let _ = dir;
 }
 
+/// Makes the title pipelines of earlier runs that the pipeline library
+/// lacks, before the title runs (`victory_gpu::pipeline::warm_up`); `None`
+/// when there is nothing to do.
+#[cfg(windows)]
+pub fn warm_up() -> Option<victory_gpu::pipeline::WarmUpReport> {
+    victory_gpu::pipeline::warm_up()
+}
+
 pub(crate) fn module() -> HleModule {
     HleModule {
         name: "d3d12x",

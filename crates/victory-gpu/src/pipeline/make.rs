@@ -60,6 +60,22 @@ impl Pending {
         }
     }
 
+    pub(crate) fn key(&self) -> &str {
+        &self.key
+    }
+
+    /// What it is made from.
+    pub(crate) fn parts(&self) -> (&[Arc<Shader>], Option<&GraphicsState>) {
+        (&self.shaders, self.graphics.as_deref())
+    }
+
+    /// Makes it on this thread (the warm-up's workers); whether it has a
+    /// host pipeline.
+    pub(crate) fn make_here(&self) -> bool {
+        self.make();
+        self.made.get().is_some_and(|made| made.is_some())
+    }
+
     fn make(&self) {
         self.made
             .get_or_init(|| HostPipeline::new(&self.shaders, self.graphics.as_deref()));
@@ -120,6 +136,9 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     // pipeline waits on the frame's budget for nothing.
     if !p.used.swap(true, Ordering::Relaxed) {
         super::library::note_used(&p.key);
+        if made.is_some() {
+            super::warm::note(p);
+        }
     }
     made
 }
