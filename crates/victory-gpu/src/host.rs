@@ -235,7 +235,7 @@ fn create() -> windows::core::Result<Host> {
         // Diagnostics: the software adapter, on which a shader's wild access
         // is an access violation in this process (a crash report with the
         // address and instruction) instead of a GPU fault and driver reset.
-        if cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_WARP").is_some() {
+        if warp_on() {
             let adapter = warp_adapter()?;
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");
@@ -409,6 +409,21 @@ pub(crate) fn dred_on() -> bool {
     *ON.get_or_init(|| {
         cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_DRED").is_some()
     })
+}
+
+/// Whether the host device is the software adapter (`VICTORY_D3D12_WARP`,
+/// diagnostics builds). The variable is set to `1` to compare a run with
+/// WARP, so `0` has to turn it off again: a `0` left in the shell (or in a
+/// `.bat` that sets it for one command) used to pick WARP as well.
+fn warp_on() -> bool {
+    cfg!(feature = "diagnostics") && warp_switch(std::env::var_os("VICTORY_D3D12_WARP").as_deref())
+}
+
+/// The `VICTORY_D3D12_WARP` switch, by its value: on when the variable is
+/// set to anything but `0`. An empty value counts as on, like every other
+/// switch in the README's table.
+fn warp_switch(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_some_and(|value| value != "0")
 }
 
 /// Whether each list of a submission runs and is timed on its own, slow
@@ -2761,6 +2776,20 @@ mod tests {
         let raw = [b'R' as u16, b'T' as u16, b'X' as u16, 0, b'X' as u16];
         assert_eq!(adapter_name(&raw), "RTX");
         assert_eq!(adapter_name(&[b'X' as u16, b'e' as u16]), "Xe");
+    }
+
+    #[test]
+    fn warp_switch_takes_zero_as_off() {
+        use std::ffi::OsStr;
+        // Unset, `0`, `1`, empty, and a value the README does not name.
+        assert!(!warp_switch(None), "unset");
+        assert!(!warp_switch(Some(OsStr::new("0"))), "`0` turns it off");
+        assert!(warp_switch(Some(OsStr::new("1"))));
+        assert!(warp_switch(Some(OsStr::new(""))), "empty is set");
+        assert!(
+            warp_switch(Some(OsStr::new("yes"))),
+            "any other value is on"
+        );
     }
 
     #[test]
