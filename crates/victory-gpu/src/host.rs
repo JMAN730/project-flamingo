@@ -5867,9 +5867,19 @@ impl Meter {
 
 impl Host {
     /// Shows `texture`, which is in `state` (a host state) and stays in it,
-    /// as frame `frame` (saved if captures are on). `None` if nothing was
+    /// as frame `frame` (saved if captures are on). `resource` is the title
+    /// resource it is the host copy of, and `fill`: put up the title's
+    /// newest content of it in this present's own list first
+    /// ([`crate::texture::present_fill_pending`]). `None` if nothing was
     /// shown; else, in diagnostics builds, whether the frame was black.
-    pub(crate) fn present(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
+    pub(crate) fn present(
+        &self,
+        resource: crate::object::This,
+        texture: &ID3D12Resource,
+        state: u32,
+        frame: u64,
+        fill: bool,
+    ) -> Option<bool> {
         // SAFETY: a live resource.
         let desc = unsafe { texture.GetDesc() };
         let Some(format) = swap_format(desc.Format) else {
@@ -5935,8 +5945,31 @@ impl Host {
             };
             copy.reset();
             let list = &copy.list;
+            // The frame shown is the title's newest content of this texture:
+            // its staging buffer is refreshed and copied up in this present's
+            // own list, in order with the copy to the back buffer. Without
+            // it the present shows what the last list that sampled the
+            // texture uploaded -- one recorded before its refresh found the
+            // newest bytes holds a frame behind, and two textures taking
+            // turns then show their frames out of order (the intro's movie).
+            let filling = fill
+                && slot.is_none()
+                && crate::texture::title_written(texture)
+                && crate::texture::present_fill_pending(resource);
+            if filling {
+                list.ResourceBarrier(&[transition(texture, state, D3D12_RESOURCE_STATE_COPY_DEST)]);
+                crate::texture::present_fill(copy, resource, texture);
+            }
             list.ResourceBarrier(&[
-                transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE),
+                transition(
+                    texture,
+                    if filling {
+                        D3D12_RESOURCE_STATE_COPY_DEST
+                    } else {
+                        state
+                    },
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                ),
                 transition(
                     &back,
                     D3D12_RESOURCE_STATE_PRESENT,

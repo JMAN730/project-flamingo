@@ -837,7 +837,43 @@ extern "system" fn present(
                 crate::copystat::add(crate::copystat::C::PresentPending, 1);
             }
         }
-        let shown = host.present(texture, state, frame);
+        // The present puts up the title's newest content of a texture from
+        // title memory itself, in its own list and before its copy
+        // (`texture::present_fill_pending`): what a list that recorded
+        // before its refresh found the newest bytes uploaded is a frame
+        // behind, and two textures taking turns then show frames out of
+        // order.
+        let fill = crate::texture::present_fill_pending(resource);
+        let shown = host.present(resource, texture, state, frame, fill);
+        #[cfg(feature = "diagnostics")]
+        if let Some(o) = crate::texture::present_order(resource, fill) {
+            use crate::copystat::{C, add};
+            if o.content < o.staged {
+                add(C::PresentBehind, 1);
+            }
+            if o.overwritten > 0 {
+                add(C::PresentOverwritten, 1);
+            }
+            if o.back {
+                add(C::PresentReorder, 1);
+            }
+            if crate::texture::order_on() {
+                tracing::info!(
+                    frame,
+                    resource = format_args!("{resource:?}"),
+                    content = o.content,
+                    queued_in = o.queued_in,
+                    content_bytes = format_args!("{:#018x}", o.label),
+                    staged = o.staged,
+                    staged_in = o.staged_in,
+                    overwritten = o.overwritten,
+                    presents = o.presents,
+                    filled = fill,
+                    back = o.back,
+                    "presented content of a texture from title memory"
+                );
+            }
+        }
         crate::resource::host_transition(resource, state);
         #[cfg(feature = "diagnostics")]
         blinks(frame, resource, state, shown);
