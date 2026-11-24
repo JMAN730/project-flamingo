@@ -1813,6 +1813,15 @@ mod clear_state_tests {
 
 #[cfg(all(test, feature = "diagnostics"))]
 mod tests {
+
+    /// Depth bounds reach the host in 0..=1 and in order.
+    #[test]
+    fn depth_bounds_are_clamped_and_ordered() {
+        assert_eq!(depth_range(0.25, 0.75), (0.25, 0.75));
+        assert_eq!(depth_range(-1.0, 2.0), (0.0, 1.0));
+        assert_eq!(depth_range(f32::NAN, f32::NAN), (0.0, 1.0));
+        assert_eq!(depth_range(0.9, 0.1), (0.1, 0.1));
+    }
     use super::*;
 
     #[test]
@@ -2020,3 +2029,25 @@ mod tests {
         assert_eq!(pixels, [[0, 255, 0, 255]; (SIDE * SIDE) as usize]);
     }
 }
+
+/// `OMSetDepthBounds`, if the host has the test: bounds in 0..=1, the low
+/// one first, as the host requires (its debug layer refuses others).
+pub(crate) fn depth_bounds(list: &HostList, min: f32, max: f32) {
+    if !crate::pipeline::host::depth_bounds_supported() {
+        return;
+    }
+    let (min, max) = depth_range(min, max);
+    if let Ok(list1) = list.list.cast::<ID3D12GraphicsCommandList1>() {
+        // SAFETY: an open list.
+        unsafe { list1.OMSetDepthBounds(min, max) };
+    }
+}
+
+/// Depth bounds the host takes: NaN as the full range, each in 0..=1, in
+/// order.
+fn depth_range(min: f32, max: f32) -> (f32, f32) {
+    let unit = |x: f32, nan: f32| if x.is_nan() { nan } else { x.clamp(0.0, 1.0) };
+    let (min, max) = (unit(min, 0.0), unit(max, 1.0));
+    (min.min(max), max)
+}
+
