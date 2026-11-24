@@ -278,7 +278,7 @@ fn system_timestamp() -> u64 {
 /// Frames presented so far.
 static FRAMES: AtomicU64 = AtomicU64::new(0);
 
-#[cfg(feature = "diagnostics")]
+#[cfg(any(windows, feature = "diagnostics"))]
 pub(crate) fn presented() -> u64 {
     FRAMES.load(Ordering::Relaxed)
 }
@@ -399,7 +399,12 @@ fn show(resources: Vec<object::Held>) {
         if shown_planes.is_empty() {
             return;
         }
-        let sources: Vec<(&_, u32)> = shown_planes.iter().map(|&(_, t, s)| (t, s)).collect();
+        let mut sources: Vec<(&_, u32)> = shown_planes.iter().map(|&(_, t, s)| (t, s)).collect();
+        let world = crate::world::take_world(sources[0].0);
+        if let Some(copy) = &world {
+            let state = crate::host::legal_state(&copy.texture, copy.state.load(Ordering::Relaxed));
+            sources[0] = (&copy.texture, state);
+        }
         let shown = host.present(&sources, frame);
         if frame.is_power_of_two() && shown.is_none() {
             tracing::warn!(frame, "frame not shown (see the warning before)");

@@ -333,6 +333,7 @@ impl State {
                 continue;
             };
             self.targets.push(record.resource as usize);
+            crate::world::note_world(record.resource);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
             rtvs.push(host.rtv(Some(texture), record.desc().as_ref()));
