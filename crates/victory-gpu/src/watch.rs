@@ -218,12 +218,17 @@ struct Guards {
     /// shortcut: memory committed otherwise into such a block (a range
     /// reaching from a view into a plain reservation) is not seen.
     absent: BTreeSet<usize>,
+    /// Blocks found to be in a view when an asking began there, until the
+    /// runtime remaps them (upstream #490): asking the system each time
+    /// cost 100-230 ms per world frame, more than the rest of the guard.
+    views: BTreeSet<usize>,
 }
 
 static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     protected: BTreeSet::new(),
     clean: BTreeSet::new(),
     absent: BTreeSet::new(),
+    views: BTreeSet::new(),
 });
 
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
@@ -234,14 +239,18 @@ fn guards() -> std::sync::MutexGuard<'static, Guards> {
 /// they were last guarded (all of a block's pages), guarding them again
 /// before the caller copies them. `None` if the memory is not a view.
 fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
-    if !mapped(start) {
-        return None;
-    }
     install();
     let mut g = guards();
+    let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
+    // Asked under the lock: a remap in between would leave a stale view.
+    if !g.views.contains(&first) {
+        if !mapped(start) {
+            return None;
+        }
+        g.views.insert(first);
+    }
     let mut written = Vec::new();
     let mut run: Option<usize> = None;
-    let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
     for block in first..=last {
         let open = block < last && !g.clean.contains(&block) && !g.absent.contains(&block);
         if open {
@@ -386,6 +395,10 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     let absent: Vec<usize> = g.absent.range(range.clone()).copied().collect();
     for block in absent {
         g.absent.remove(&block);
+    }
+    let views: Vec<usize> = g.views.range(range.clone()).copied().collect();
+    for block in views {
+        g.views.remove(&block);
     }
     let blocks: Vec<usize> = g.protected.range(range).copied().collect();
     for block in blocks {
