@@ -112,8 +112,17 @@ fn event_after(
     let interval = interval.max(1);
     let extra = (offset / interval) as u64;
     let remainder = offset % interval;
-    let tick = (first + (elapsed / interval + 1) as u64 + extra).max(last + 1);
-    let at = u128::from(tick - first) * interval + remainder;
+    // The current tick's event may still lie ahead of `elapsed` when the
+    // offset is inside it. Only step to the next tick once that instant has
+    // passed (review note on #321).
+    let mut tick = first + (elapsed / interval) as u64 + extra;
+    let mut at = u128::from(tick - first) * interval + remainder;
+    if at <= elapsed {
+        tick += 1;
+        at += interval;
+    }
+    tick = tick.max(last + 1);
+    at = u128::from(tick - first) * interval + remainder;
     (tick, at.saturating_sub(elapsed))
 }
 
@@ -227,8 +236,12 @@ mod tests {
         // A quarter into the first millisecond after now.
         assert_eq!(event_after(250_000, MS, 0, 0, 0), (1, 750_000));
         assert_eq!(event_after(250_000, MS, 0, 0, 300_000), (1, 1_050_000));
-        // An offset past a tick moves the event into the next one.
-        assert_eq!(event_after(250_000, MS, 0, 0, MS + 200_000), (2, 1_950_000));
+        // An offset past a tick moves the event into the next one; that
+        // event is still ahead and must not be skipped.
+        assert_eq!(event_after(250_000, MS, 0, 0, MS + 200_000), (1, 950_000));
+        // Review note on #321: between a tick and its offset, that tick's
+        // event is still pending.
+        assert_eq!(event_after(1_100_000, MS, 0, 0, 300_000), (1, 200_000));
         // A kind already woken on a tick cannot wake on it again, offset or
         // no offset.
         assert_eq!(event_after(250_000, MS, 0, 1, 0), (2, 1_750_000));
