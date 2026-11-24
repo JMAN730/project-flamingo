@@ -10,7 +10,6 @@ publish.workspace = true
 [dependencies]
 thiserror.workspace = true
 miniz_oxide.workspace = true
-memchr.workspace = true
 
 [features]
 # Host D3D12 pipeline checks (`emit::host`).
@@ -29,7 +28,6 @@ windows = { workspace = true, optional = true, features = [
 ] }
 
 [target.'cfg(windows)'.dev-dependencies]
-tempfile.workspace = true
 windows = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_Graphics_Direct3D",

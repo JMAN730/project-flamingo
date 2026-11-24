@@ -21,7 +21,6 @@ use std::sync::{Mutex, MutexGuard};
 use windows_sys::Win32::Globalization::{CP_ACP, MultiByteToWideChar};
 use windows_sys::Win32::Storage::FileSystem::GetLogicalDrives;
 
-use crate::modules::paths;
 use crate::{HleExport, HleModule, hle_export};
 
 /// The host's own function: what the import would have been bound to.
@@ -84,60 +83,97 @@ pub fn mount_at(letter: char, root: &Path) {
 }
 
 /// `root` as UTF-16, absolute, without trailing separators (a drive root
-/// keeps its own). An empty root is the current directory, as it is to a
-/// path joined to it: it is the title's folder when the title is run by its
-/// file name alone (`victory run GTA6.exe`).
+/// keeps its own).
 fn root_wide(root: &Path) -> Vec<u16> {
-    let root = if root.as_os_str().is_empty() {
-        Path::new(".")
-    } else {
-        root
-    };
     let root = std::path::absolute(root).unwrap_or_else(|_| root.to_owned());
     let mut wide: Vec<u16> = root.as_os_str().encode_wide().collect();
-    while wide.len() > 3 && wide.last().is_some_and(|c| paths::SEPARATORS.contains(c)) {
+    while wide.len() > 3 && wide.last().is_some_and(|c| SEPARATORS.contains(c)) {
         wide.pop();
     }
     wide
 }
 
+const SEPARATORS: [u16; 2] = [b'\\' as u16, b'/' as u16];
+const VERBATIM: [u16; 4] = [b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16];
+
+/// Host paths from this length on take the `\\?\` form, which lifts the
+/// host's MAX_PATH limit (248 characters for a directory, 260 for a file).
+const LONG: usize = 248;
+
+/// `root` and the title's `tail` as a `\\?\` path. That form turns off the
+/// host's own clean-up, so `/` becomes `\` and `.` and `..` are resolved
+/// here (`..` stops at the root).
+fn verbatim(root: &[u16], tail: &[u16]) -> Vec<u16> {
+    let backslash = u16::from(b'\\');
+    let mut out = if root.starts_with(&VERBATIM) {
+        root.to_vec()
+    } else if let Some(unc) = root.strip_prefix(&[backslash; 2][..]) {
+        let mut out = VERBATIM.to_vec();
+        out.extend("UNC\\".encode_utf16());
+        out.extend_from_slice(unc);
+        out
+    } else {
+        [&VERBATIM[..], root].concat()
+    };
+    while out.last() == Some(&backslash) {
+        out.pop();
+    }
+    let dot = u16::from(b'.');
+    let mut parts: Vec<&[u16]> = Vec::new();
+    for part in tail.split(|c| SEPARATORS.contains(c)) {
+        match part {
+            [] => {}
+            [d] if *d == dot => {}
+            [d, e] if [*d, *e] == [dot; 2] => drop(parts.pop()),
+            _ => parts.push(part),
+        }
+    }
+    for part in parts {
+        out.push(backslash);
+        out.extend_from_slice(part);
+    }
+    out
+}
+
 /// The host path, NUL-terminated, for `path` (without its NUL) if it is on
-/// a virtual drive. The lexical rules are host-independent so CI tests
-/// them; only the mounted drives come from here.
+/// a virtual drive.
 pub(crate) fn translate(path: &[u16]) -> Option<Vec<u16>> {
-    let first = paths::translate(path, &drives())?;
-    // A drive with a second folder (the package split between the game
-    // files and the exe's folder): a path missing from the first is taken
-    // from the second when it is there.
-    let fallback = FALLBACKS.lock().unwrap_or_else(|e| e.into_inner());
-    if fallback.is_empty() || exists(&first) {
-        return Some(first);
+    let (prefix, rest) = match path.strip_prefix(&VERBATIM[..]) {
+        Some(rest) => (&VERBATIM[..], rest),
+        None => (&[][..], path),
+    };
+    let &[letter, colon, ..] = rest else {
+        return None;
+    };
+    if colon != u16::from(b':') {
+        return None;
     }
-    match paths::translate(path, &fallback) {
-        Some(second) if exists(&second) => Some(second),
-        _ => Some(first),
+    let letter = u8::try_from(letter).ok().filter(u8::is_ascii_alphabetic)?;
+    let letter = u16::from(letter.to_ascii_uppercase());
+    let drives = drives();
+    let (_, root) = drives.iter().find(|(l, _)| *l == letter)?;
+    let tail = &rest[2..];
+    if prefix.is_empty() && root.len() + tail.len() >= LONG {
+        let mut out = verbatim(root, tail);
+        out.push(0);
+        return Some(out);
     }
-}
-
-/// Second folders of drives (see [`mount_fallback`]).
-static FALLBACKS: Mutex<Vec<(u16, Vec<u16>)>> = Mutex::new(Vec::new());
-
-/// Whether the host path `path` (NUL-terminated) names a file or folder.
-fn exists(path: &[u16]) -> bool {
-    use windows_sys::Win32::Storage::FileSystem::{GetFileAttributesW, INVALID_FILE_ATTRIBUTES};
-    // SAFETY: a NUL-terminated wide string.
-    unsafe { GetFileAttributesW(path.as_ptr()) != INVALID_FILE_ATTRIBUTES }
-}
-
-/// Gives the drive `letter` a second host folder: paths missing from its
-/// own root are looked up there (the exe's folder when the game files lie
-/// elsewhere).
-pub fn mount_fallback(letter: char, root: &Path) {
-    let letter = letter.to_ascii_uppercase() as u16;
-    tracing::info!(drive = %char::from_u32(letter.into()).unwrap_or('?'), root = %root.display(), "virtual drive fallback");
-    let mut fallback = FALLBACKS.lock().unwrap_or_else(|e| e.into_inner());
-    fallback.retain(|(l, _)| *l != letter);
-    fallback.push((letter, root_wide(root)));
+    let mut out = prefix.to_vec();
+    out.extend_from_slice(root);
+    // `X:` and `X:name` are relative to the root.
+    if !tail.first().is_some_and(|c| SEPARATORS.contains(c)) {
+        out.push(b'\\'.into());
+    }
+    let verbatim = !prefix.is_empty();
+    out.extend(tail.iter().map(|&c| {
+        if verbatim && c == u16::from(b'/') {
+            b'\\'.into()
+        } else {
+            c
+        }
+    }));
+    out.push(0);
+    Some(out)
 }
 
 /// A title's wide path: the host path when it is on a virtual drive, else
@@ -182,9 +218,12 @@ fn narrow(path: *const c_char) -> Option<Vec<u16>> {
     // SAFETY: the title passes a NUL-terminated path.
     let bytes = unsafe { CStr::from_ptr(path) }.to_bytes();
     // The drive part is ASCII in every code page; decode only candidates.
-    if !paths::has_drive(bytes) {
-        tracing::debug!(path = %String::from_utf8_lossy(bytes), "title path");
-        return None;
+    match bytes.strip_prefix(br"\\?\").unwrap_or(bytes) {
+        [letter, b':', ..] if letter.is_ascii_alphabetic() => {}
+        _ => {
+            tracing::debug!(path = %String::from_utf8_lossy(bytes), "title path");
+            return None;
+        }
     }
     let len = i32::try_from(bytes.len()).ok()?;
     // SAFETY: sizing call, then a call with room for `n` units.
@@ -386,7 +425,7 @@ pub extern "system" fn GetDiskFreeSpaceW(
     if let Some(host) = &mut p.1
         && let [letter, colon, sep, ..] = host[..]
         && colon == u16::from(b':')
-        && paths::SEPARATORS.contains(&sep)
+        && SEPARATORS.contains(&sep)
     {
         *host = vec![letter, colon, sep, 0];
     }
@@ -708,10 +747,7 @@ mod tests {
         let file = std::fs::File::open(&path).unwrap();
         let (mut out, mut n) = ([0u8; 10], 0);
         let handle = file.as_raw_handle().cast();
-        assert_ne!(
-            ReadFile(handle, out.as_mut_ptr(), 10, &mut n, std::ptr::null_mut()),
-            0
-        );
+        assert_ne!(ReadFile(handle, out.as_mut_ptr(), 10, &mut n, std::ptr::null_mut()), 0);
         assert_eq!((&out, n), (b"0123456789", 10));
     }
 
@@ -763,20 +799,9 @@ mod tests {
             Some(format!(r"\\?\{}\a\{long}\f", package.path().display()))
         );
         assert_eq!(
-            paths::verbatim(&w(r"\\server\share\")[..15], &w("/x/../../y")[..10]),
+            verbatim(&w(r"\\server\share\")[..15], &w("/x/../../y")[..10]),
             w(r"\\?\UNC\server\share\y")[..22].to_vec()
         );
-    }
-
-    /// A title run by its file name alone has an empty folder: the drive
-    /// over it is the current directory, not the current drive's root.
-    #[test]
-    fn an_empty_root_is_the_current_directory() {
-        let letter = mount(Path::new("")).unwrap();
-        let path = format!(r"{letter}:\a.rpf");
-        let host = translate(&w(&path)[..path.len()]).map(|v| text(&v));
-        let cwd = std::env::current_dir().unwrap();
-        assert_eq!(host, Some(cwd.join("a.rpf").display().to_string()));
     }
 
     #[test]

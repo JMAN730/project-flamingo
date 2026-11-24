@@ -62,164 +62,43 @@ fn err(e: windows::core::Error) -> String {
     e.message().to_string()
 }
 
-fn pick_adapter(filter: Option<&str>) -> Result<IDXGIAdapter1, String> {
-    let needle = filter.map(|s| s.trim().to_ascii_lowercase());
-    // SAFETY: plain DXGI enumeration and D3D12 capability probe.
-    unsafe {
-        let factory: IDXGIFactory4 =
-            CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(err)?;
-        let factory6 = factory.cast::<IDXGIFactory6>().ok();
-        let mut i = 0u32;
-        loop {
-            let adapter: IDXGIAdapter1 = match &factory6 {
-                Some(f6) => {
-                    match f6.EnumAdapterByGpuPreference(i, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE) {
-                        Ok(a) => a,
-                        Err(e) if e.code() == DXGI_ERROR_NOT_FOUND => break,
-                        Err(e) => return Err(err(e)),
-                    }
-                }
-                None => match factory.EnumAdapters1(i) {
-                    Ok(a) => a,
-                    Err(e) if e.code() == DXGI_ERROR_NOT_FOUND => break,
-                    Err(e) => return Err(err(e)),
-                },
-            };
-            i += 1;
-            let desc = adapter.GetDesc1().map_err(err)?;
-            let is_sw = desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0;
-            if let Some(ref want) = needle {
-                let len = desc
-                    .Description
-                    .iter()
-                    .position(|&c| c == 0)
-                    .unwrap_or(desc.Description.len());
-                let name = String::from_utf16_lossy(&desc.Description[..len]).to_ascii_lowercase();
-                if !name.contains(want) {
-                    continue;
-                }
-            } else if is_sw {
-                continue;
-            }
-            if D3D12CreateDevice(
-                &adapter,
-                D3D_FEATURE_LEVEL_12_0,
-                std::ptr::null_mut::<Option<ID3D12Device>>(),
-            )
-            .is_ok()
-            {
-                return Ok(adapter);
-            }
-        }
-        Err(match filter {
-            Some(f) => format!("no D3D12 adapter matching VICTORY_ADAPTER={f:?}"),
-            None => "no hardware D3D12 adapter found".into(),
-        })
-    }
-}
-
-/// Whether an adapter is hardware. A machine without a GPU (a CI runner)
-/// can list the Microsoft Basic Render Driver, which is WARP, as an
-/// ordinary adapter without the software flag: its ids, or its name, tell.
-fn hardware(d: &DXGI_ADAPTER_DESC1) -> bool {
-    let basic_render_driver = d.VendorId == 0x1414 && d.DeviceId == 0x8c
-        || description(&d.Description) == "Microsoft Basic Render Driver";
-    d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0 && !basic_render_driver
-}
-
-/// The hardware adapters that run waves of 32 or 64 lanes, in DXGI's
-/// order: each one's description. An integrated GPU with narrower waves
-/// (some Intel ones report 16-16) runs none of the console's programs
-/// that depend on the wave size: the translator refuses them for it by
-/// name, and what walks this list expects a pipeline. An adapter no SM 6.6
-/// device can be made on stays listed, for its user to skip.
-pub fn adapters() -> Result<Vec<String>, String> {
-    // SAFETY: plain DXGI calls.
-    let mut out = unsafe {
-        let factory: IDXGIFactory1 = CreateDXGIFactory1().map_err(err)?;
-        let mut out = Vec::new();
-        let mut i = 0;
-        while let Ok(a) = factory.EnumAdapters1(i) {
-            let d = a.GetDesc1().map_err(err)?;
-            if hardware(&d) {
-                out.push(description(&d.Description));
-            }
-            i += 1;
-        }
-        out
-    };
-    out.retain(|name| {
-        Host::on(name).map_or(true, |host| {
-            let target = host.target();
-            target.runs(32) || target.runs(64)
-        })
-    });
-    Ok(out)
-}
-
-fn description(wide: &[u16]) -> String {
-    let n = wide.iter().position(|&c| c == 0).unwrap_or(wide.len());
-    String::from_utf16_lossy(&wide[..n])
-}
-
 impl Host {
-    /// The default adapter, or WARP with `warp` (or `VICTORY_WARP=1`), or
-    /// the first hardware adapter whose description holds
-    /// `VICTORY_ADAPTER` (ignoring case: `nvidia`, `radeon`...).
+    /// The default adapter, or WARP with `warp` (or `VICTORY_WARP=1`).
     pub fn new(warp: bool) -> Result<Self, String> {
         let warp = warp || std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
-        match std::env::var("VICTORY_ADAPTER") {
-            Ok(name) if !warp && !name.is_empty() => Self::on(&name),
-            _ => Self::create(warp, None),
-        }
-    }
-
-    /// The first hardware adapter whose description holds `name`,
-    /// ignoring case.
-    pub fn on(name: &str) -> Result<Self, String> {
-        let want = name.to_lowercase();
-        // SAFETY: plain DXGI calls.
-        let adapter = unsafe {
-            let factory: IDXGIFactory1 = CreateDXGIFactory1().map_err(err)?;
-            let mut i = 0;
-            loop {
-                let a = factory
-                    .EnumAdapters1(i)
-                    .map_err(|_| format!("no adapter named {name:?}"))?;
-                let d = a.GetDesc1().map_err(err)?;
-                if hardware(&d) && description(&d.Description).to_lowercase().contains(&want) {
-                    break a;
-                }
-                i += 1;
-            }
-        };
-        Self::create(false, Some(adapter.cast().map_err(err)?))
-    }
-
-    fn create(warp: bool, adapter: Option<IDXGIAdapter>) -> Result<Self, String> {
         // SAFETY: plain D3D12/DXGI calls with valid out pointers.
         unsafe {
+            // `VICTORY_D3D12_DEBUG`: the debug layer, whose messages a
+            // refused pipeline's error then carries.
+            if std::env::var_os("VICTORY_D3D12_DEBUG").is_some() {
+                let mut debug: Option<ID3D12Debug> = None;
+                if D3D12GetDebugInterface(&mut debug).is_ok()
+                    && let Some(debug) = debug
+                {
+                    debug.EnableDebugLayer();
+                }
+            }
             let mut device: Option<ID3D12Device> = None;
             if warp {
                 let factory: IDXGIFactory4 =
                     CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(err)?;
                 let adapter: IDXGIAdapter = factory.EnumWarpAdapter().map_err(err)?;
                 D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
-            } else if let Some(adapter) = &adapter {
-                D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
             } else {
-                let filter = std::env::var("VICTORY_ADAPTER")
-                    .ok()
-                    .filter(|s| !s.trim().is_empty());
-                match pick_adapter(filter.as_deref()) {
-                    Ok(adapter) => {
-                        D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)
-                            .map_err(err)?;
-                    }
-                    Err(e) if filter.is_some() => return Err(e),
-                    Err(_) => {
-                        D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)
-                            .map_err(err)?;
+                D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
+                // A machine without a graphics card gives the software
+                // adapter as its default device (a hosted test runner,
+                // whose first adapter is a display stub that cannot make a
+                // device): that is no hardware device, and the tests that
+                // ask for one skip it, as they do where there is none.
+                if let Some(made) = &device {
+                    let factory: IDXGIFactory4 =
+                        CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(err)?;
+                    if let Ok(adapter) = factory.EnumAdapterByLuid::<IDXGIAdapter1>(made.GetAdapterLuid())
+                        && let Ok(desc) = adapter.GetDesc1()
+                        && (desc.Flags & 2 != 0 || (desc.VendorId == 0x1414 && desc.DeviceId == 0x8c))
+                    {
+                        return Err("the default device is the software adapter".to_owned());
                     }
                 }
             }
@@ -241,30 +120,6 @@ impl Host {
                 ));
             }
             Ok(Host { device })
-        }
-    }
-
-    /// The wave sizes the device runs ([`super::Target::ANY`] if it does
-    /// not say).
-    pub fn target(&self) -> super::Target {
-        let mut o = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
-        // SAFETY: the query writes the structure of the given size.
-        let ok = unsafe {
-            self.device
-                .CheckFeatureSupport(
-                    D3D12_FEATURE_D3D12_OPTIONS1,
-                    (&raw mut o).cast(),
-                    size_of_val(&o) as u32,
-                )
-                .is_ok()
-        };
-        if ok && o.WaveOps.as_bool() && o.WaveLaneCountMin > 0 {
-            super::Target {
-                lanes_min: o.WaveLaneCountMin,
-                lanes_max: o.WaveLaneCountMax,
-            }
-        } else {
-            super::Target::ANY
         }
     }
 
@@ -302,21 +157,23 @@ impl Host {
                 ShaderVisibility: vis,
             })
             .collect();
-        let mut views: Vec<(u8, bool)> = stages
+        // By slot, then kind: 0 CBV, 1 SRV, 2 UAV.
+        let mut views: Vec<(u8, u8)> = stages
             .iter()
             .flat_map(|(s, _)| {
-                let cbvs = s.root_cbvs.iter().map(|&r| (r, false));
-                cbvs.chain(s.root_srvs.iter().map(|&r| (r, true)))
+                let cbvs = s.root_cbvs.iter().map(|&r| (r, 0));
+                let srvs = s.root_srvs.iter().map(|&r| (r, 1));
+                cbvs.chain(srvs).chain(s.root_uavs.iter().map(|&r| (r, 2)))
             })
             .collect();
         views.sort_unstable();
         views.dedup();
-        for (slot, srv) in views {
+        for (slot, kind) in views {
             params.push(D3D12_ROOT_PARAMETER1 {
-                ParameterType: if srv {
-                    D3D12_ROOT_PARAMETER_TYPE_SRV
-                } else {
-                    D3D12_ROOT_PARAMETER_TYPE_CBV
+                ParameterType: match kind {
+                    1 => D3D12_ROOT_PARAMETER_TYPE_SRV,
+                    2 => D3D12_ROOT_PARAMETER_TYPE_UAV,
+                    _ => D3D12_ROOT_PARAMETER_TYPE_CBV,
                 },
                 Anonymous: D3D12_ROOT_PARAMETER1_0 {
                     Descriptor: D3D12_ROOT_DESCRIPTOR1 {
@@ -403,7 +260,34 @@ impl Host {
             ..Default::default()
         };
         // SAFETY: the description points at live data.
-        unsafe { self.device.CreateComputePipelineState(&desc) }.map_err(err)
+        unsafe { self.device.CreateComputePipelineState(&desc) }.map_err(|e| self.explained(e))
+    }
+
+    /// The error with the debug layer's messages since the last call, if
+    /// the layer is on (`VICTORY_D3D12_DEBUG`).
+    fn explained(&self, e: windows::core::Error) -> String {
+        let mut text = err(e);
+        let Ok(queue) = self.device.cast::<ID3D12InfoQueue>() else {
+            return text;
+        };
+        // SAFETY: each message is read into a buffer of the size the queue
+        // asks for, aligned for the message header.
+        unsafe {
+            for i in 0..queue.GetNumStoredMessages() {
+                let mut len = 0usize;
+                let _ = queue.GetMessage(i, None, &mut len);
+                let mut buffer = vec![0u64; len.div_ceil(8)];
+                let message = buffer.as_mut_ptr().cast::<D3D12_MESSAGE>();
+                if queue.GetMessage(i, Some(message), &mut len).is_ok() {
+                    let m = &*message;
+                    let bytes = std::slice::from_raw_parts(m.pDescription, m.DescriptionByteLength.saturating_sub(1));
+                    text.push_str(" | ");
+                    text.push_str(&String::from_utf8_lossy(bytes));
+                }
+            }
+            queue.ClearStoredMessages();
+        }
+        text
     }
 
     /// A graphics pipeline from a vertex and a pixel shader, with float or
@@ -424,6 +308,18 @@ impl Host {
         &self,
         root: &ID3D12RootSignature,
         vs: &[u8],
+        ps: &[u8],
+    ) -> Result<ID3D12PipelineState, String> {
+        self.pipeline_with_gs(root, vs, None, ps)
+    }
+
+    /// As [`Host::pipeline_with`], with a geometry shader between the two
+    /// (the rectangle stage, `rect_list_gs`).
+    pub fn pipeline_with_gs(
+        &self,
+        root: &ID3D12RootSignature,
+        vs: &[u8],
+        gs: Option<&[u8]>,
         ps: &[u8],
     ) -> Result<ID3D12PipelineState, String> {
         let inputs = sig(vs, FourCC::ISG1)?;
@@ -457,6 +353,10 @@ impl Host {
                 pShaderBytecode: ps.as_ptr().cast(),
                 BytecodeLength: ps.len(),
             },
+            GS: gs.map_or(D3D12_SHADER_BYTECODE::default(), |gs| D3D12_SHADER_BYTECODE {
+                pShaderBytecode: gs.as_ptr().cast(),
+                BytecodeLength: gs.len(),
+            }),
             SampleMask: u32::MAX,
             RasterizerState: D3D12_RASTERIZER_DESC {
                 FillMode: D3D12_FILL_MODE_SOLID,
@@ -698,7 +598,8 @@ fn stub(pixel: bool, outputs: Vec<SigElement>) -> HostShader {
         static_samplers: Vec::new(),
         root_cbvs: Vec::new(),
         root_srvs: Vec::new(),
-        group_waves: 1,
+        root_uavs: Vec::new(),
+        root_indexed_views: Vec::new(),
     }
 }
 

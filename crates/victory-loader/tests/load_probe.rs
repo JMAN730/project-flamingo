@@ -24,10 +24,6 @@ fn workspace_root() -> PathBuf {
 /// for tests, so that it follows `CARGO_TARGET_DIR` like the rest of the
 /// build.
 fn build_probe() -> PathBuf {
-    // Under Proton the Windows test process cannot invoke the Linux Cargo.
-    if let Some(path) = std::env::var_os("VICTORY_HLE_PROBE") {
-        return PathBuf::from(path);
-    }
     let manifest = workspace_root().join("tests/fixtures/hle-probe/Cargo.toml");
     let target = Path::new(env!("CARGO_TARGET_TMPDIR")).join("hle-probe");
     let status = Command::new(env!("CARGO"))
@@ -140,7 +136,7 @@ fn loads_binds_and_calls_probe() {
     )
     .unwrap();
     let dlls =
-        victory_loader::load_title_dlls(image.info(), &[title_dir.path()], dir.path(), &|_| true)
+        victory_loader::load_title_dlls(image.info(), title_dir.path(), dir.path(), &|_| true)
             .unwrap();
     let names: Vec<_> = dlls.iter().map(|(n, _)| n.as_str()).collect();
     assert_eq!(names, ["victory-probe-title.dll"]);
@@ -261,7 +257,7 @@ fn maps_a_title_dll_the_title_loads_itself() {
     )
     .unwrap();
     let load = |name: &str, wanted: &dyn Fn(&str) -> bool| {
-        victory_loader::load_title_dll(name, &[title_dir.path()], cache.path(), wanted).unwrap()
+        victory_loader::load_title_dll(name, title_dir.path(), cache.path(), wanted).unwrap()
     };
     let dlls = load("LATE.DLL", &|_| true);
     let names: Vec<_> = dlls.iter().map(|(n, _)| n.as_str()).collect();

@@ -4,37 +4,6 @@ use anyhow::{Context, Result};
 
 use crate::{Console, Unimplemented};
 
-#[cfg(any(windows, test))]
-const SKIP_CPU_CHECK_ENV: &str = "VICTORY_SKIP_CPU_CHECK";
-
-#[cfg(any(windows, test))]
-fn skip_cpu_check(value: Option<&str>) -> bool {
-    value == Some("1")
-}
-
-#[cfg(any(windows, test))]
-fn check_cpu_features_with(has_avx2: bool, skip_env: Option<&str>) -> Result<()> {
-    if has_avx2 || skip_cpu_check(skip_env) {
-        return Ok(());
-    }
-    anyhow::bail!(
-        "this CPU does not support AVX2, which Xbox Series titles require; \
-         set {SKIP_CPU_CHECK_ENV}=1 to bypass this check (for example under CPU emulation such as Intel SDE)"
-    );
-}
-
-/// Pre-flight check before executing title code: Xbox Series binaries are
-/// compiled for Zen 2 and require AVX2.
-#[cfg(windows)]
-fn check_cpu_features() -> Result<()> {
-    #[cfg(target_arch = "x86_64")]
-    let has_avx2 = std::arch::is_x86_feature_detected!("avx2");
-    #[cfg(not(target_arch = "x86_64"))]
-    let has_avx2 = true;
-    let skip = std::env::var(SKIP_CPU_CHECK_ENV).ok();
-    check_cpu_features_with(has_avx2, skip.as_deref())
-}
-
 #[cfg(windows)]
 pub fn run(
     exe: &Path,
@@ -44,51 +13,29 @@ pub fn run(
     console: Console,
 ) -> Result<()> {
     use std::sync::Arc;
-    use victory_core::diagnostics::{self, IoOperation};
     use victory_hle::{HleResolver, HostPolicy};
     use victory_loader::{BindReport, UnimplementedPolicy, WithTitleDlls};
 
-    if execute {
-        check_cpu_features()?;
-    }
     // A title that relaunched itself: the old process must be gone first.
     victory_hle::modules::lifecycle::wait_for_previous();
     let cfg = victory_core::Config::load()?;
-    let started = diagnostics::operation_started();
-    let original = std::fs::read(exe)
-        .inspect_err(|error| IoOperation::ReadImage.failed(error, started))
-        .with_context(|| format!("reading {}", exe.display()))?;
+    let original = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
     let prepared = victory_loader::prepare(&original)?;
     let hash = prepared.original_hash.to_hex();
-    let title_dir = exe.parent().unwrap_or(Path::new("."));
-    // The package (the console's `G:`): the exe's folder, unless the game
-    // files lie in the configured game folder and the exe elsewhere.
-    let mut dirs = vec![title_dir];
-    dirs.extend(cfg.game_dir.as_deref());
-    let package = match victory_game::identify(&hash) {
-        Some(build) => {
-            println!("build          {} ({hash})", build.label);
-            let found = find_in(&dirs, build.startup_archive);
-            #[cfg(windows)]
-            if execute {
-                check_startup_archive(&dirs, build.startup_archive, found.as_deref());
-            }
-            found
-                .and_then(|f| f.parent().map(Path::to_path_buf))
-                .unwrap_or_else(|| package_dir(&dirs))
-        }
-        None => {
-            println!("build          unknown ({hash})");
-            package_dir(&dirs)
-        }
-    };
-    if package != title_dir {
-        println!("game files     {}", package.display());
+    match victory_game::identify(&hash) {
+        Some(build) => println!("build          {} ({hash})", build.label),
+        None => println!("build          unknown ({hash})"),
     }
 
     let images = cfg.cache_subdir("images")?;
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
     let image = victory_loader::load(&prepared, &images)?;
+    // The program is mapped from the copy `load` wrote: the file's bytes
+    // and their patched copy are not read again, and were held for the
+    // whole run (two blocks of 114.7 MB each for Grand Theft Auto VI, in
+    // physical memory: run 65's memory map).
+    drop(prepared);
+    drop(original);
     victory_hle::runtime::set_main_image(image.base());
     victory_hle::runtime::set_image_path(image.base(), exe);
     println!(
@@ -102,10 +49,10 @@ pub fn run(
         HostPolicy::default()
     });
     let wanted = |dll: &str| title_dll(&resolver.host, dll);
+    let title_dir = exe.parent().unwrap_or(Path::new("."));
     // A missing manifest leaves id 0 and no storage quota.
-    let manifest = std::fs::read_to_string(title_dir.join("MicrosoftGame.config"))
-        .or_else(|_| std::fs::read_to_string(package.join("MicrosoftGame.config")))
-        .unwrap_or_default();
+    let manifest =
+        std::fs::read_to_string(title_dir.join("MicrosoftGame.config")).unwrap_or_default();
     let title = victory_hle::runtime::Title::from_manifest(&manifest);
     let storage = cfg.data_subdir(&format!("{:08X}/storage", title.id))?;
     println!(
@@ -115,11 +62,7 @@ pub fn run(
         title.storage_bytes >> 20
     );
     // The console's fixed drives: the package as `G:`, temporary files `T:`.
-    victory_hle::modules::files::mount_at('G', &package);
-    if package.as_path() != title_dir {
-        // What the title reads from its package and keeps beside the exe.
-        victory_hle::modules::files::mount_fallback('G', title_dir);
-    }
+    victory_hle::modules::files::mount_at('G', title_dir);
     let temp = cfg.data_subdir(&format!("{:08X}/temp", title.id))?;
     victory_hle::modules::files::mount_at('T', &temp);
     victory_hle::runtime::set_title(victory_hle::runtime::Title { storage, ..title });
@@ -128,17 +71,10 @@ pub fn run(
         Console::SeriesS => victory_hle::console::Console::SeriesS,
     });
     println!("console        {}", victory_hle::console::current().name());
-    // Title DLLs: next to the exe, else with the game files.
-    let dll_dirs: Vec<&Path> = if package.as_path() == title_dir {
-        vec![title_dir]
-    } else {
-        vec![title_dir, package.as_path()]
-    };
-    let dlls = victory_loader::load_title_dlls(image.info(), &dll_dirs, &images, &wanted)?;
+    let dlls = victory_loader::load_title_dlls(image.info(), title_dir, &images, &wanted)?;
     for (name, dll) in &dlls {
         println!("title dll      {name} at {:#x}", dll.base());
-        let path = find_in(&dll_dirs, name).unwrap_or_else(|| title_dir.join(name));
-        victory_hle::runtime::set_image_path(dll.base(), &path);
+        victory_hle::runtime::set_image_path(dll.base(), &title_dir.join(name));
     }
 
     let policy = match unimplemented {
@@ -177,7 +113,7 @@ pub fn run(
     diagnostics(&image, &cfg);
     let late = LateDlls {
         host: resolver.host.clone(),
-        title_dirs: dll_dirs.iter().map(|d| d.to_path_buf()).collect(),
+        title_dir: title_dir.to_owned(),
         cache_dir: images,
         policy,
         mapped: std::sync::Mutex::new(dlls.clone()),
@@ -193,92 +129,6 @@ pub fn run(
         .map_err(|_| anyhow::anyhow!("title main thread panicked"))??;
     println!("title exited with {code}");
     Ok(())
-}
-
-/// The file `name` in the first of `dirs` that holds it, in any letter case.
-#[cfg(any(windows, test))]
-fn find_in(dirs: &[&Path], name: &str) -> Option<std::path::PathBuf> {
-    dirs.iter().find_map(|dir| {
-        let exact = dir.join(name);
-        if exact.is_file() {
-            return Some(exact);
-        }
-        std::fs::read_dir(dir).ok()?.flatten().map(|e| e.path()).find(|p| {
-            p.is_file()
-                && p.file_name()
-                    .is_some_and(|f| f.to_string_lossy().eq_ignore_ascii_case(name))
-        })
-    })
-}
-
-/// The `.rpf` archives directly in `dir`, by name.
-#[cfg(any(windows, test))]
-fn archives(dir: &Path) -> Vec<String> {
-    std::fs::read_dir(dir)
-        .into_iter()
-        .flat_map(|r| r.flatten())
-        .map(|e| e.file_name().to_string_lossy().into_owned())
-        .filter(|f| f.to_ascii_lowercase().ends_with(".rpf"))
-        .collect()
-}
-
-/// The package folder of a build whose startup archive was not found: the
-/// first of `dirs` holding archives, else the exe's folder (`dirs[0]`).
-#[cfg(any(windows, test))]
-fn package_dir(dirs: &[&Path]) -> std::path::PathBuf {
-    dirs.iter()
-        .find(|d| !archives(d).is_empty())
-        .unwrap_or(&dirs[0])
-        .to_path_buf()
-}
-
-/// Warns when the build's startup archive is missing or damaged. Only a
-/// warning: a stop here kept titles from starting whose packages lay the
-/// archive out differently, and the title reports a missing archive itself.
-#[cfg(windows)]
-fn check_startup_archive(dirs: &[&Path], name: &str, found: Option<&Path>) {
-    use std::io::Read;
-
-    let Some(path) = found else {
-        let looked: Vec<String> = dirs.iter().map(|d| d.display().to_string()).collect();
-        let rpfs: Vec<String> = dirs.iter().flat_map(|d| archives(d)).take(12).collect();
-        eprintln!(
-            "warning: startup archive {name} not found in {}; archives there: {}. \
-             Starting anyway; if the title stops, give the folder that holds {name} as the game folder.",
-            looked.join(" or "),
-            if rpfs.is_empty() { "none".to_owned() } else { rpfs.join(", ") }
-        );
-        return;
-    };
-    let mut magic = [0; 4];
-    let read = std::fs::File::open(path).and_then(|mut file| file.read_exact(&mut magic));
-    match read {
-        Err(e) => eprintln!("warning: cannot read startup archive {}: {e}", path.display()),
-        Ok(()) if magic != *b"9FPR" => eprintln!(
-            "warning: {} has no RPF9 header: restore it from your package if the title stops",
-            path.display()
-        ),
-        Ok(()) => {}
-    }
-}
-
-#[cfg(test)]
-mod package_tests {
-    use super::*;
-
-    #[test]
-    fn the_package_is_the_folder_holding_the_archives() {
-        let exe = tempfile::tempdir().unwrap();
-        let game = tempfile::tempdir().unwrap();
-        std::fs::write(game.path().join("AppData0.RPF"), b"9FPR").unwrap();
-        let dirs = [exe.path(), game.path()];
-        let found = find_in(&dirs, "appdata0.rpf").unwrap();
-        assert_eq!(found.parent().unwrap(), game.path());
-        assert_eq!(package_dir(&dirs), game.path());
-        assert_eq!(package_dir(&[exe.path()]), exe.path());
-        std::fs::write(exe.path().join("x.rpf"), b"").unwrap();
-        assert_eq!(package_dir(&dirs), exe.path());
-    }
 }
 
 /// The debugging aids (README): scheduled stack dumps, watched values and
@@ -314,7 +164,11 @@ fn watch(base: usize, size: usize) {
     let Ok(list) = std::env::var("VICTORY_WATCH") else {
         return;
     };
-    let rvas = watch_rvas(&list, size);
+    let rvas: Vec<usize> = list
+        .split(',')
+        .filter_map(|r| usize::from_str_radix(r.trim().trim_start_matches("0x"), 16).ok())
+        .filter(|&rva| rva + 4 <= size)
+        .collect();
     std::thread::spawn(move || {
         let mut seen = vec![None; rvas.len()];
         loop {
@@ -331,17 +185,6 @@ fn watch(base: usize, size: usize) {
     });
 }
 
-/// The RVAs `VICTORY_WATCH` asks for, kept only when four bytes fit in the
-/// image. `rva + 4` would wrap for a large value and pass the check, making
-/// the polling thread read in front of the image base instead.
-#[cfg(all(windows, feature = "diagnostics"))]
-fn watch_rvas(list: &str, size: usize) -> Vec<usize> {
-    list.split(',')
-        .filter_map(|r| usize::from_str_radix(r.trim().trim_start_matches("0x"), 16).ok())
-        .filter(|&rva| rva.checked_add(4).is_some_and(|end| end <= size))
-        .collect()
-}
-
 /// DLLs the host or our runtime provide are never taken from the title.
 #[cfg(windows)]
 fn title_dll(host: &victory_hle::HostPolicy, dll: &str) -> bool {
@@ -353,8 +196,7 @@ fn title_dll(host: &victory_hle::HostPolicy, dll: &str) -> bool {
 #[cfg(windows)]
 struct LateDlls {
     host: victory_hle::HostPolicy,
-    /// Where title DLLs are looked for, in order.
-    title_dirs: Vec<std::path::PathBuf>,
+    title_dir: std::path::PathBuf,
     cache_dir: std::path::PathBuf,
     policy: victory_loader::UnimplementedPolicy,
     /// Every title DLL mapped so far, to bind new ones against.
@@ -383,10 +225,9 @@ impl LateDlls {
             let new = {
                 let mut mapped = self.mapped.lock().unwrap_or_else(|e| e.into_inner());
                 let wanted = |dll: &str| title_dll(&self.host, dll) && image_named(dll).is_none();
-                let dirs: Vec<&Path> = self.title_dirs.iter().map(|d| d.as_path()).collect();
                 let new = victory_loader::load_title_dll(
                     file,
-                    &dirs,
+                    &self.title_dir,
                     &self.cache_dir,
                     &wanted,
                 )?;
@@ -405,8 +246,7 @@ impl LateDlls {
                         dll.base()
                     );
                     show(name, dll.bind_imports(&resolver, self.policy)?);
-                    let path = find_in(&dirs, name).unwrap_or_else(|| self.title_dirs[0].join(name));
-                    set_image_path(dll.base(), &path);
+                    set_image_path(dll.base(), &self.title_dir.join(name));
                 }
                 // Visible before their `DllMain`s run, which may load more.
                 mapped.extend(new.iter().cloned());
@@ -479,14 +319,6 @@ impl LoaderLock {
 mod tests {
     use std::sync::{Arc, Mutex};
 
-    #[cfg(feature = "diagnostics")]
-    #[test]
-    fn watch_rejects_rvas_that_wrap() {
-        let list = format!("0,{:x}", usize::MAX);
-        assert_eq!(super::watch_rvas(&list, 4), vec![0]);
-        assert_eq!(super::watch_rvas("0x10,1c,20", 0x20), vec![0x10, 0x1c]);
-    }
-
     #[test]
     fn loader_lock_is_reentrant_and_exclusive() {
         let lock = Arc::new(super::LoaderLock::default());
@@ -503,45 +335,6 @@ mod tests {
         });
         other.join().unwrap();
         assert_eq!(*order.lock().unwrap(), [1, 2]);
-    }
-
-    #[test]
-    fn cpu_feature_check_matches_host() {
-        let skip = std::env::var(super::SKIP_CPU_CHECK_ENV).ok();
-        #[cfg(target_arch = "x86_64")]
-        let expected_ok =
-            std::arch::is_x86_feature_detected!("avx2") || skip.as_deref() == Some("1");
-        #[cfg(not(target_arch = "x86_64"))]
-        let expected_ok = true;
-        assert_eq!(super::check_cpu_features().is_ok(), expected_ok);
-    }
-}
-
-#[cfg(test)]
-mod cpu_check_tests {
-    use super::{SKIP_CPU_CHECK_ENV, check_cpu_features_with};
-
-    #[test]
-    fn avx2_present_passes() {
-        assert!(check_cpu_features_with(true, None).is_ok());
-        assert!(check_cpu_features_with(true, Some("0")).is_ok());
-        assert!(check_cpu_features_with(true, Some("1")).is_ok());
-    }
-
-    #[test]
-    fn avx2_missing_fails_with_clear_error() {
-        for skip in [None, Some(""), Some("0"), Some("true")] {
-            let err = check_cpu_features_with(false, skip).unwrap_err();
-            let msg = err.to_string();
-            assert!(msg.contains("AVX2"), "unexpected error: {msg}");
-            assert!(msg.contains("Xbox Series"), "unexpected error: {msg}");
-            assert!(msg.contains(SKIP_CPU_CHECK_ENV), "unexpected error: {msg}");
-        }
-    }
-
-    #[test]
-    fn skip_env_var_bypasses_missing_avx2() {
-        assert!(check_cpu_features_with(false, Some("1")).is_ok());
     }
 }
 

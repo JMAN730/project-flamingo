@@ -3,9 +3,8 @@
 //! dispatched) on the host GPU with the same inputs.
 //!
 //! Needs `VICTORY_CONSOLE_DXC` (the console SDK's `dxc.exe`) and a PC
-//! `dxc.exe` (`VICTORY_PC_DXC`, then the newest Windows SDK's, then the
-//! sibling of `VICTORY_DXIL` for standalone DXC). Skipped without both
-//! compilers. Set `VICTORY_WARP=1` to draw on WARP.
+//! `dxc.exe` (`VICTORY_PC_DXC`, else the newest Windows SDK's); skipped
+//! without them. Set `VICTORY_WARP=1` to draw on WARP.
 
 use std::path::{Path, PathBuf};
 
@@ -653,48 +652,12 @@ const MS_CASES: &[(&str, u32, &str)] = &[
 ];
 
 fn tools() -> Option<(PathBuf, PathBuf)> {
-    tools_in(Path::new(super::validator::SDK_BIN), |key| {
-        std::env::var_os(key).map(PathBuf::from)
-    })
-}
-
-fn tools_in(kits: &Path, env_path: impl Fn(&str) -> Option<PathBuf>) -> Option<(PathBuf, PathBuf)> {
-    let console = env_path("VICTORY_CONSOLE_DXC")?;
-    let pc = env_path("VICTORY_PC_DXC")
-        .or_else(|| super::validator::sdk_tool(kits, "dxc.exe"))
-        .or_else(|| env_path("VICTORY_DXIL").map(|dll| dll.with_file_name("dxc.exe")))?;
-    (console.exists() && pc.exists()).then_some((console, pc))
-}
-
-#[test]
-fn pc_compiler_prefers_sdk_and_supports_standalone_dxc() {
-    let dir = tempfile::tempdir().unwrap();
-    let kits = dir.path().join("bin");
-    let sdk = kits.join("10.0.26100.0").join("x64");
-    std::fs::create_dir_all(&sdk).unwrap();
-    let console = dir.path().join("console.exe");
-    let validator = dir.path().join("dxil.dll");
-    let explicit_pc = dir.path().join("dxc.exe");
-    let sdk_pc = sdk.join("dxc.exe");
-    for path in [&console, &validator, &explicit_pc, &sdk_pc] {
-        std::fs::write(path, []).unwrap();
-    }
-    let locate = |pc: Option<&PathBuf>| {
-        tools_in(&kits, |key| match key {
-            "VICTORY_CONSOLE_DXC" => Some(console.clone()),
-            "VICTORY_DXIL" => Some(validator.clone()),
-            "VICTORY_PC_DXC" => pc.cloned(),
-            _ => None,
-        })
+    let console = PathBuf::from(std::env::var_os("VICTORY_CONSOLE_DXC")?);
+    let pc = match std::env::var_os("VICTORY_PC_DXC") {
+        Some(p) => PathBuf::from(p),
+        None => super::validator::Validator::default_path()?.with_file_name("dxc.exe"),
     };
-    assert_eq!(locate(None), Some((console.clone(), sdk_pc.clone())));
-    assert_eq!(locate(Some(&dir.path().join("missing.exe"))), None);
-    assert_eq!(
-        locate(Some(&explicit_pc)),
-        Some((console.clone(), explicit_pc.clone()))
-    );
-    std::fs::remove_file(sdk_pc).unwrap();
-    assert_eq!(locate(None), Some((console, explicit_pc)));
+    (console.exists() && pc.exists()).then_some((console, pc))
 }
 
 fn compile(dxc: &Path, dir: &Path, src: &str, entry: &str, profile: &str) -> Vec<u8> {
@@ -743,9 +706,6 @@ fn user_data(s: &HostShader, k: &[u32; 4]) -> Vec<u32> {
             (RootType::Table, 3) => 5 * 32,
             // The typed views of `raw` (compute) from 9.
             (RootType::Table, 6) => 9 * 32,
-            // The bytes of the root CBV (slot 4) and SRV (slot 5) bound.
-            (RootType::Descriptor, 4) => 64 * 4,
-            (RootType::Descriptor, 5) => 32 * 4,
             other => panic!("unexpected user data {other:?}"),
         };
     }

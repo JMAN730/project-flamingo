@@ -2,7 +2,7 @@
 //! (or `s_nand_saveexec 0`) and the restore of the saved mask runs in every lane of the console's
 //! wave, the inactive ones included, which is how the compiler expands
 //! HLSL wave reductions and prefix sums (an identity put into the inactive
-//! lanes with `v_cndmask`, then DPP, `v_permlane16`, `v_permlanex16` and `v_readlane`
+//! lanes with `v_cndmask`, then DPP, `v_permlanex16` and `v_readlane`
 //! steps). A host lane that is elsewhere cannot run that code, so each
 //! section is simulated on the console's lanes with symbolic values, and a
 //! value it leaves is lowered by what it turned out to be: the reduction or
@@ -14,7 +14,6 @@
 use std::collections::HashMap;
 
 use crate::gfx10::{Dpp, Fields, NULL, Operand};
-use crate::hash::Map;
 use crate::ir::{EXEC, Inst, Program, Reg, Value};
 
 /// An associative operation and its identity.
@@ -22,6 +21,10 @@ use crate::ir::{EXEC, Inst, Program, Reg, Value};
 pub(crate) enum Op {
     AddU,
     AddF,
+    /// A sum of 16-bit floats in the low halves (`v_add_f16`), each addition rounded to 16
+    /// bits: not associative, so only the balanced tree over the lanes in their order is
+    /// followed (see [`buddies`]), which is how the compiler sums a wave.
+    AddH,
     MinU,
     MaxU,
     MinI,
@@ -36,8 +39,11 @@ pub(crate) enum Op {
 impl Op {
     fn of(name: &str) -> Option<Op> {
         Some(match name {
-            "v_add_nc_u32" => Op::AddU,
+            // the low dword of a 64-bit sum (`v_add_co_ci_u32` carries into
+            // the high one) is the 32-bit sum of the low dwords
+            "v_add_nc_u32" | "v_add_co_u32" => Op::AddU,
             "v_add_f32" => Op::AddF,
+            "v_add_f16" => Op::AddH,
             "v_min_u32" => Op::MinU,
             "v_max_u32" => Op::MaxU,
             "v_min_i32" => Op::MinI,
@@ -54,7 +60,7 @@ impl Op {
     /// Whether `k` leaves the other operand unchanged.
     fn identity(self, k: u32) -> bool {
         match self {
-            Op::AddU | Op::Or | Op::Xor | Op::MaxU => k == 0,
+            Op::AddU | Op::AddH | Op::Or | Op::Xor | Op::MaxU => k == 0,
             Op::AddF => k == 0 || k == 0x8000_0000,
             Op::MinU | Op::And => k == u32::MAX,
             Op::MinI => k == 0x7FFF_FFFF,
@@ -66,7 +72,26 @@ impl Op {
 
     /// Counting a lane twice changes the result.
     fn counts(self) -> bool {
-        matches!(self, Op::AddU | Op::AddF | Op::Xor)
+        matches!(self, Op::AddU | Op::AddF | Op::AddH | Op::Xor)
+    }
+}
+
+/// Whether the lane sets `a` and `b` are the two halves of one aligned run of lanes: lanes
+/// 2k and 2k+1, then two such pairs side by side, and so on up to the two halves of the
+/// wave. Sums joined only that way form the balanced tree over the lanes in their order,
+/// whichever of the two a lane adds to the other (the addition is commutative).
+fn buddies(a: u64, b: u64) -> bool {
+    let n = a.count_ones();
+    if n != b.count_ones() || !n.is_power_of_two() || n == 64 {
+        return false;
+    }
+    let run = |s: u64| {
+        let first = s.trailing_zeros();
+        (first.is_multiple_of(n) && s >> first == (1u64 << n) - 1).then_some(first)
+    };
+    match (run(a), run(b)) {
+        (Some(x), Some(y)) => x.min(y) % (2 * n) == 0 && x.abs_diff(y) == n,
+        _ => false,
     }
 }
 
@@ -110,10 +135,10 @@ pub(crate) struct Section {
 }
 
 /// Every whole-wave section of `block`, by start index.
-pub(crate) fn sections(p: &Program, block: usize) -> Map<usize, Section> {
+pub(crate) fn sections(p: &Program, block: usize) -> HashMap<usize, Section> {
     let insts = &p.blocks[block].insts;
     let wave: u32 = if p.wave64 { 64 } else { 32 };
-    let mut out = Map::default();
+    let mut out = HashMap::new();
     let mut i = 0;
     while i < insts.len() {
         let inst = &insts[i];
@@ -217,7 +242,8 @@ fn combine(op: Op, a: Sym, b: Sym) -> Sym {
             && op.identity(ident)
             && oa.is_none_or(|o| o == op)
             && ob.is_none_or(|o| o == op)
-            && (!op.counts() || la & lb == 0) =>
+            && (!op.counts() || la & lb == 0)
+            && (op != Op::AddH || buddies(la, lb)) =>
         {
             Sym::Red {
                 op: Some(op),
@@ -409,29 +435,22 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
                     })
                     .collect()
             }
-            (n @ ("v_permlane16_b32" | "v_permlanex16_b32"), Some(a)) => {
-                // Lane i of a row picks nibble i of {src2, src1}: from its
-                // own row (permlane16) or from the other row of its half of
-                // 32 lanes (permlanex16). Only with every lane active: the
-                // opsel bits (fi, bound_ctrl) decide what an inactive lane
-                // reads.
+            ("v_permlanex16_b32", Some(a)) => {
+                // Lanes of each row read the other row of their half; lane
+                // i's pick is nibble i of {src2, src1}.
                 let sel = |k: usize| match v.src.get(k) {
                     Some(&Operand::Const(c)) => crate::resource::inline(c),
                     Some(&Operand::Literal(x)) => Some(x),
                     _ => None,
                 };
                 match (sel(1), sel(2)) {
-                    (Some(s1), Some(s2)) if exec == all || v.opsel & 1 != 0 => {
+                    (Some(s1), Some(s2)) => {
                         let s = u64::from(s1) | u64::from(s2) << 32;
                         (0..wave)
                             .map(|l| {
-                                let row = if n == "v_permlane16_b32" {
-                                    l & !15
-                                } else {
-                                    (l & !31) | ((l & 16) ^ 16)
-                                };
+                                let other = (l & !31) | ((l & 16) ^ 16);
                                 let pick = (s >> (4 * (l & 15)) & 15) as u32;
-                                a[(row | pick) as usize]
+                                a[(other | pick) as usize]
                             })
                             .collect()
                     }
@@ -641,6 +660,32 @@ fn per_lane(lanes: &[Sym], all: u64) -> Option<Shape> {
     Some(Shape::Prefix(op, src, mask, ident, inclusive))
 }
 
+/// `WaveActiveBitOr(v7)` into s7 as the console compiler expands it: every lane takes part,
+/// those outside the saved EXEC (s[4:5]) with 0.
+#[cfg(test)]
+pub(super) const WAVE_OR_V7_TO_S7: [u32; 20] = [
+    0xBE84_25C1, // s_or_saveexec_b64 s[4:5], -1
+    0xD501_0001,
+    0x0012_0E80, // v_cndmask_b32 v1, 0, v7, s[4:5]
+    0x3802_02E9,
+    0xDE54_C101, // v_or_b32 v1, v1, v1 dpp8:[1,0,3,2,5,4,7,6]
+    0x3802_02E9,
+    0x9360_1201, // v_or_b32 v1, v1, v1 dpp8:[2,2,0,0,6,6,4,4]
+    0x3802_02E9,
+    0x0009_2401, // v_or_b32 v1, v1, v1 dpp8:[4,4,4,4,0,0,0,0]
+    0x3802_02FA,
+    0xFF09_4001, // v_or_b32 v1, v1, v1 row_mirror bound_ctrl:1
+    0xD778_0002,
+    0x0201_0101, // v_permlanex16_b32 v2, v1, 0, 0
+    0x3802_0302, // v_or_b32 v1, v2, v1
+    0xD760_0007,
+    0x0001_4101, // v_readlane_b32 s7, v1, 32
+    0x3802_0207, // v_or_b32 v1, s7, v1
+    0xD760_0007,
+    0x0001_0101, // v_readlane_b32 s7, v1, 0
+    0xBEFE_0404, // s_mov_b64 exec, s[4:5]
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -737,50 +782,6 @@ mod tests {
         assert_eq!(
             per_lane(&vec![red(u64::MAX); 64], u64::MAX),
             Some(Shape::Active(Op::AddU, x, m, 0))
-        );
-    }
-
-    /// Assembled with llvm-mc (gfx1030, wave32): a sum over all 32 lanes as
-    /// the console expands it, a DPP reduction of each row of 16, then each
-    /// row total read from lane 15 of its own row and of the other row.
-    const ROW_SUM_WORDS: [u32; 15] = [
-        0xBE80_3DC1, // s_or_saveexec_b32 s0, -1
-        0xD501_0001,
-        0x0002_0080, // v_cndmask_b32_e64 v1, 0, v0, s0
-        0x4A02_02FA,
-        0xFF01_6101, // v_add_nc_u32_dpp v1, v1, v1 row_xmask:1
-        0x4A02_02FA,
-        0xFF01_6201, // v_add_nc_u32_dpp v1, v1, v1 row_xmask:2
-        0x4A02_02FA,
-        0xFF01_6401, // v_add_nc_u32_dpp v1, v1, v1 row_xmask:4
-        0x4A02_02FA,
-        0xFF01_6801, // v_add_nc_u32_dpp v1, v1, v1 row_xmask:8
-        0xD777_0002,
-        0x0305_8301, // v_permlane16_b32 v2, v1, -1, -1
-        0xD778_0003,
-        0x0305_8302, // v_permlanex16_b32 v3, v2, -1, -1
-    ];
-
-    #[test]
-    fn permlane16_reads_the_lanes_own_row() {
-        let mut words = ROW_SUM_WORDS.to_vec();
-        words.extend([
-            0x4A08_0702, // v_add_nc_u32_e32 v4, v2, v3
-            0xBEFE_0300, // s_mov_b32 exec_lo, s0
-            0xBF81_0000, // s_endpgm
-        ]);
-        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
-        let p = crate::ir::build(&code, false, 8).unwrap();
-        let insts = &p.blocks[0].insts;
-        let (saved, x) = (
-            insts[0].write(Reg::S(0)).unwrap(),
-            insts[1].read(Reg::V(0)).unwrap(),
-        );
-        let total = insts[8].write(Reg::V(4)).unwrap();
-        let found = sections(&p, 0);
-        assert_eq!(
-            found[&0].shapes.get(&total),
-            Some(&Shape::Active(Op::AddU, x, saved, 0))
         );
     }
 
@@ -907,6 +908,67 @@ mod tests {
             );
             assert_eq!(sec.shapes.get(&v4_val), None);
         }
+    }
+
+    /// `WaveActiveSum` of 16-bit floats, as compiled in
+    /// `compute_graph_ops:CS_TransposeVecMatMulAlignedOperation` (0x19c on): the tree the
+    /// lowering reproduces. A tree in another order is not followed.
+    #[test]
+    fn a_sum_of_halves_over_the_wave_is_followed_in_the_order_of_its_tree() {
+        let words = |first: [u32; 2], second: [u32; 2]| {
+            [
+                0xBE84_25C1, // s_or_saveexec_b64 s[4:5], -1
+                0xD501_0001,
+                0x0012_0E80, // v_cndmask_b32 v1, 0, v7, s[4:5]
+                first[0],
+                first[1],
+                second[0],
+                second[1],
+                0x6402_02E9,
+                0x0009_2401, // v_add_f16 v1, v1, v1 dpp8:[4,4,4,4,0,0,0,0]
+                0x6402_02FA,
+                0xFF09_4001, // v_add_f16 v1, v1, v1 row_mirror bound_ctrl:1
+                0xD778_0002,
+                0x0201_0101, // v_permlanex16_b32 v2, v1, 0, 0
+                0x6402_0302, // v_add_f16 v1, v2, v1
+                0xD760_0007,
+                0x0001_4101, // v_readlane_b32 s7, v1, 32
+                0x6402_0207, // v_add_f16 v1, s7, v1
+                0xD760_0007,
+                0x0001_0101, // v_readlane_b32 s7, v1, 0
+                0xBEFE_0404, // s_mov_b64 exec, s[4:5]
+            ]
+        };
+        let pairs = [0x6402_02E9, 0xDE54_C101]; // v_add_f16 v1, v1, v1 dpp8:[1,0,3,2,5,4,7,6]
+        let quads = [0x6402_02E9, 0x9360_1201]; // v_add_f16 v1, v1, v1 dpp8:[2,2,0,0,6,6,4,4]
+        let shape = |w: &[u32]| {
+            let p = build(w, true);
+            let insts = &p.blocks[0].insts;
+            let saved = insts[0].write(Reg::S(4)).unwrap();
+            let v7 = p.inputs.iter().find_map(|&(r, v)| (r == Reg::V(7)).then_some(v)).unwrap();
+            // ..., v_readlane_b32 s7, v1, 0; s_mov_b64 exec, s[4:5]; s_endpgm
+            let total = insts[insts.len() - 3].write(Reg::S(7)).unwrap();
+            (sections(&p, 0)[&0].shapes.get(&total).copied(), Shape::Active(Op::AddH, v7, saved, 0))
+        };
+        let (found, want) = shape(&words(pairs, quads));
+        assert_eq!(found, Some(want));
+        // lanes two apart first, neighbours second: every lane counted once, but
+        // (x0 + x2) + (x1 + x3) rounds differently from (x0 + x1) + (x2 + x3)
+        let (found, _) = shape(&words(quads, pairs));
+        assert_eq!(found, None);
+    }
+
+    #[test]
+    fn buddies_are_the_two_halves_of_an_aligned_run() {
+        assert!(buddies(0b01, 0b10));
+        assert!(buddies(0b1100, 0b0011));
+        assert!(buddies(0xF0, 0x0F));
+        assert!(buddies(u64::from(u32::MAX), u64::from(u32::MAX) << 32));
+        assert!(!buddies(0b010, 0b100)); // lanes 1 and 2: not one pair
+        assert!(!buddies(0b0011, 0b110000)); // pairs 0 and 2
+        assert!(!buddies(0b0101, 0b1010)); // not runs
+        assert!(!buddies(0b01, 0b1100)); // unequal
+        assert!(!buddies(0b11, 0b11));
     }
 
     #[test]

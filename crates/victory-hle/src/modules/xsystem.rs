@@ -3,7 +3,6 @@
 //! chose ([`victory_gpu::console`]).
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
-use super::xasync::E_NOT_SUFFICIENT_BUFFER;
 use super::xgameruntime::{
     Guid, HRESULT, Interface, Methods, Object, add_ref, missing, put_string,
 };
@@ -36,9 +35,6 @@ pub const ANALYTICS: Guid = Guid::new(
 const CONSOLE_ID: &str = "00000000000000000000000000000000000001";
 /// The retail sandbox.
 const SANDBOX: &str = "RETAIL";
-/// `XSystemXboxLiveSandboxIdMaxBytes`: the least the runtime accepts for the
-/// sandbox id, whatever the sandbox's own length.
-const SANDBOX_ID_MAX_BYTES: usize = 16;
 /// Base64 of 32 bytes: 44 characters (45 bytes with the NUL).
 const DEVICE_ID: &str = "VkljdG9yeSBvZmZsaW5lIGRldmljZSBpZGVudGl0eSE=";
 
@@ -66,9 +62,6 @@ extern "system" fn console_id(_: This, size: usize, buffer: *mut u8, used: *mut 
     put_string(CONSOLE_ID, size, buffer, used)
 }
 extern "system" fn sandbox_id(_: This, size: usize, buffer: *mut u8, used: *mut usize) -> HRESULT {
-    if size < SANDBOX_ID_MAX_BYTES {
-        return E_NOT_SUFFICIENT_BUFFER;
-    }
     put_string(SANDBOX, size, buffer, used)
 }
 /// The device id this title sees (titles see different ones).
@@ -110,9 +103,6 @@ fn text(s: &str) -> [u8; 64] {
 /// A struct this large comes back through the caller's buffer, whose
 /// address is also the return value.
 extern "system" fn analytics_info(_: This, out: *mut AnalyticsInfo) -> *mut AnalyticsInfo {
-    if out.is_null() {
-        return std::ptr::null_mut();
-    }
     let info = AnalyticsInfo {
         os: OS,
         hosting_os: OS,
@@ -190,20 +180,11 @@ mod device_type {
         text.eq_ignore_ascii_case(expected)
     }
 
-    /// Opens our key for its path; the key has no subkeys, and a null or
-    /// empty path below it opens the key itself, as the host's do. `None`:
-    /// not ours, ask the host.
+    /// Opens our key for its path; the key has no subkeys. `None`: not
+    /// ours, ask the host.
     fn open(root: Key, sub: *const u16, out: *mut Key) -> Option<u32> {
         if root == oem() {
-            if !(sub.is_null() || is(sub, "")) {
-                return Some(FILE_NOT_FOUND);
-            }
-            if out.is_null() {
-                return Some(INVALID_PARAMETER);
-            }
-            // SAFETY: checked non-null; the title passes room for a key.
-            unsafe { out.write(oem()) };
-            return Some(SUCCESS);
+            return Some(FILE_NOT_FOUND);
         }
         if root == LOCAL_MACHINE && is(sub, KEY) && !out.is_null() {
             // SAFETY: checked non-null; the title passes room for a key.
@@ -359,34 +340,6 @@ mod device_type {
         }
 
         #[test]
-        fn a_null_or_empty_path_opens_the_key_itself() {
-            const KEY_READ: u32 = 0x2_0019;
-            let empty = w("");
-            let host_key = w(r"Software\Microsoft\Windows NT\CurrentVersion");
-            for (root, path) in [(oem(), w(KEY)), (std::ptr::null_mut(), host_key)] {
-                // Ours, then the host's for comparison.
-                let mut key = std::ptr::null_mut();
-                assert_eq!(RegOpenKeyW(LOCAL_MACHINE, path.as_ptr(), &mut key), SUCCESS);
-                assert!(root.is_null() || key == root);
-                for sub in [std::ptr::null(), empty.as_ptr()] {
-                    // `RegOpenKeyW` gives back the key it was passed.
-                    let mut same = std::ptr::null_mut();
-                    assert_eq!(RegOpenKeyW(key, sub, &mut same), SUCCESS, "{sub:?}");
-                    assert_eq!(same, key);
-                    // `RegOpenKeyExW` a handle to the same key.
-                    let mut again = std::ptr::null_mut();
-                    assert_eq!(
-                        RegOpenKeyExW(key, sub, 0, KEY_READ, &mut again),
-                        SUCCESS,
-                        "{sub:?}"
-                    );
-                    assert_eq!(RegCloseKey(again), SUCCESS);
-                }
-                assert_eq!(RegCloseKey(key), SUCCESS);
-            }
-        }
-
-        #[test]
         fn other_keys_reach_the_host() {
             let mut key = std::ptr::null_mut();
             let path = w(r"Software\Microsoft\Windows NT\CurrentVersion");
@@ -432,24 +385,6 @@ mod tests {
     }
 
     #[test]
-    fn a_sandbox_id_buffer_under_the_documented_minimum_is_refused() {
-        type Get = extern "system" fn(This, usize, *mut u8, *mut usize) -> HRESULT;
-        let get = method::<Get>(&OBJECT, 0x20);
-        let mut buffer = [0xAAu8; 16];
-        let mut used = 0;
-        for size in [7, 15] {
-            assert_eq!(
-                get(&OBJECT, size, buffer.as_mut_ptr(), &mut used),
-                E_NOT_SUFFICIENT_BUFFER,
-                "size {size}"
-            );
-            assert_eq!((used, buffer), (0, [0xAA; 16]));
-        }
-        assert_eq!(get(&OBJECT, 16, buffer.as_mut_ptr(), &mut used), S_OK);
-        assert_eq!((used, &buffer[..7]), (7, &b"RETAIL\0"[..]));
-    }
-
-    #[test]
     fn analytics_info_comes_back_through_the_buffer() {
         type Get = extern "system" fn(This, *mut AnalyticsInfo) -> *mut AnalyticsInfo;
         let mut info = std::mem::MaybeUninit::<AnalyticsInfo>::uninit();
@@ -461,8 +396,5 @@ mod tests {
         assert_eq!(size_of::<AnalyticsInfo>(), 0x90);
         assert_eq!(info.os.build, 22000);
         assert_eq!(&info.form[..14], b"Xbox Series X\0");
-
-        // A null output is refused rather than written through.
-        assert!(get(&ANALYTICS_OBJECT, std::ptr::null_mut()).is_null());
     }
 }

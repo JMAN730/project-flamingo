@@ -8,7 +8,6 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 
 use anyhow::{Context, Result, bail};
-use victory_core::diagnostics::{self, IoOperation};
 use victory_pe::{ImageInfo, ImportSymbol};
 use windows_sys::Win32::Foundation::{FreeLibrary, HMODULE};
 use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryExW};
@@ -55,25 +54,26 @@ pub struct BindReport {
 /// `dir` receives derived game data, so it must be outside the repository.
 pub fn load(prepared: &PreparedImage, dir: &Path) -> Result<LoadedImage> {
     victory_core::ensure_outside_repo(dir)?;
-    let started = diagnostics::operation_started();
-    std::fs::create_dir_all(dir)
-        .inspect_err(|error| IoOperation::CreateImageDirectory.failed(error, started))
-        .with_context(|| format!("creating {}", dir.display()))?;
+    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     let path = dir.join(prepared.file_name());
     write_if_changed(&path, &prepared.bytes)?;
 
-    // SAFETY: the prepared image has no entry point or imports.
-    let module = unsafe { map_image(&path) }.with_context(|| {
-        format!(
-            "LoadLibraryExW({}) failed{}",
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    // SAFETY: `wide` is a NUL-terminated path. The image has no entry point
+    // and no imports, so loading it runs no title code.
+    let module = unsafe { LoadLibraryExW(wide.as_ptr(), std::ptr::null_mut(), 0) };
+    if module.is_null() {
+        bail!(
+            "LoadLibraryExW({}) failed: {}{}",
             path.display(),
+            std::io::Error::last_os_error(),
             if prepared.info.has_relocations {
                 ""
             } else {
                 " (image has no relocations; its preferred base may be taken)"
             }
-        )
-    })?;
+        );
+    }
     let loaded = LoadedImage {
         module,
         path,
@@ -83,16 +83,6 @@ pub fn load(prepared: &PreparedImage, dir: &Path) -> Result<LoadedImage> {
     if !loaded.info.is_dll() {
         // SAFETY: just mapped, and no title code has run.
         unsafe { crate::tls::redirect(loaded.base(), &loaded.info) }?;
-    }
-    if std::env::var_os(crate::hooks::NO_WATCHDOG_ENV).is_some() {
-        // SAFETY: just mapped, and no title code has run.
-        let applied =
-            unsafe { crate::hooks::disarm_watchdog(loaded.base(), &prepared.original_hash) };
-        tracing::info!(
-            applied,
-            "title watchdog hooks ({})",
-            crate::hooks::NO_WATCHDOG_ENV
-        );
     }
     tracing::info!(
         base = format_args!("{:#x}", loaded.base()),
@@ -110,12 +100,12 @@ pub fn load(prepared: &PreparedImage, dir: &Path) -> Result<LoadedImage> {
 /// or our runtime provide stay with them. Imports are not bound.
 pub fn load_title_dlls(
     main: &ImageInfo,
-    title_dirs: &[&Path],
+    title_dir: &Path,
     cache_dir: &Path,
     wanted: &dyn Fn(&str) -> bool,
 ) -> Result<Vec<(String, LoadedImage)>> {
     let mut loaded = Vec::new();
-    let dirs = (title_dirs, cache_dir);
+    let dirs = (title_dir, cache_dir);
     map_imports(main, dirs, wanted, &mut HashSet::new(), &mut loaded)?;
     Ok(loaded)
 }
@@ -126,19 +116,19 @@ pub fn load_title_dlls(
 /// loads itself; `wanted` must refuse those already mapped.
 pub fn load_title_dll(
     name: &str,
-    title_dirs: &[&Path],
+    title_dir: &Path,
     cache_dir: &Path,
     wanted: &dyn Fn(&str) -> bool,
 ) -> Result<Vec<(String, LoadedImage)>> {
     let mut loaded = Vec::new();
-    let dirs = (title_dirs, cache_dir);
+    let dirs = (title_dir, cache_dir);
     map_dll(name, dirs, wanted, &mut HashSet::new(), &mut loaded)?;
     Ok(loaded)
 }
 
 fn map_imports(
     info: &ImageInfo,
-    dirs: (&[&Path], &Path),
+    dirs: (&Path, &Path),
     wanted: &dyn Fn(&str) -> bool,
     seen: &mut HashSet<String>,
     loaded: &mut Vec<(String, LoadedImage)>,
@@ -151,46 +141,22 @@ fn map_imports(
 
 fn map_dll(
     name: &str,
-    dirs: (&[&Path], &Path),
+    dirs: (&Path, &Path),
     wanted: &dyn Fn(&str) -> bool,
     seen: &mut HashSet<String>,
     loaded: &mut Vec<(String, LoadedImage)>,
 ) -> Result<()> {
-    let key = name.to_ascii_lowercase();
-    if !seen.insert(key.clone()) || !wanted(&key) {
+    let name = name.to_ascii_lowercase();
+    let path = dirs.0.join(&name);
+    if !seen.insert(name.clone()) || !wanted(&name) || !path.is_file() {
         return Ok(());
     }
-    // The exe's folder first, then the game files folder when the exe
-    // sits apart from them (the DLLs ship with the game files).
-    let Some(path) = dirs.0.iter().find_map(|dir| file_in(dir, name)) else {
-        return Ok(());
-    };
     let original = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
     let prepared = prepare(&original).with_context(|| format!("preparing {}", path.display()))?;
     let image = load(&prepared, dirs.1).with_context(|| format!("loading {}", path.display()))?;
     map_imports(&image.info, dirs, wanted, seen, loaded)?;
-    loaded.push((key, image));
+    loaded.push((name, image));
     Ok(())
-}
-
-/// The file `name` in `dir`, its case ignored as the Windows loader ignores
-/// it. A folder can be case-sensitive (WSL makes the folders it creates
-/// so), where joining the name finds only that exact spelling.
-fn file_in(dir: &Path, name: &str) -> Option<PathBuf> {
-    let exact = dir.join(name);
-    if exact.is_file() {
-        return Some(exact);
-    }
-    std::fs::read_dir(dir)
-        .ok()?
-        .filter_map(Result::ok)
-        .find(|e| {
-            e.file_name()
-                .to_str()
-                .is_some_and(|n| n.eq_ignore_ascii_case(name))
-        })
-        .map(|e| e.path())
-        .filter(|p| p.is_file())
 }
 
 /// Resolves through `inner`, then through the exports of the title's DLLs.
@@ -214,37 +180,6 @@ impl ImportResolver for WithTitleDlls<'_> {
                 provenance: Provenance::Title,
             })
     }
-}
-
-/// The caller supplies an image safe to map with the default loader flags.
-unsafe fn map_image(path: &Path) -> std::io::Result<HMODULE> {
-    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
-    let started = diagnostics::operation_started();
-    // SAFETY: `wide` is terminated and the caller checked the image.
-    let module = unsafe { LoadLibraryExW(wide.as_ptr(), std::ptr::null_mut(), 0) };
-    if module.is_null() {
-        let error = std::io::Error::last_os_error();
-        IoOperation::MapImage.failed(&error, started);
-        return Err(error);
-    }
-    Ok(module)
-}
-
-#[cfg(test)]
-#[test]
-fn maps_missing_dll_to_its_original_win32_error() {
-    let directory = tempfile::tempdir().unwrap();
-    let output = directory.path().join("diagnostics.jsonl");
-    diagnostics::start(&output).unwrap();
-    // SAFETY: the path points into a fresh directory and has no DLL to load.
-    let error =
-        unsafe { map_image(&directory.path().join("absent-victory-test.dll")) }.unwrap_err();
-    diagnostics::finish(false);
-    assert_eq!(error.raw_os_error(), Some(126));
-    let output = std::fs::read_to_string(output).unwrap();
-    assert!(output.contains("ERROR_MOD_NOT_FOUND"));
-    assert!(output.contains("\"value\":126"));
-    assert!(!output.contains("absent-victory-test.dll"));
 }
 
 fn write_if_changed(path: &Path, bytes: &[u8]) -> Result<()> {

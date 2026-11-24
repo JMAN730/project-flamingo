@@ -7,15 +7,29 @@
 
 use std::collections::HashMap;
 
+pub mod census;
+pub mod opt;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct Ty(u32);
+
+/// What the lowering made an instruction for, where it says so (counted by
+/// [`census`], nothing else reads it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Tag {
+    /// The select that keeps a register's old value in lanes a guard masks.
+    Guard,
+    /// An index clamp the translation adds (the console has none).
+    Clamp,
+    /// The iteration counter and limit test the translation adds to a loop.
+    Counter,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum TypeDef {
     Void,
     Int(u32),
     Float,
-    Double,
     /// Pointee and address space.
     Ptr(Ty, u32),
     Struct(Option<String>, Vec<Ty>),
@@ -93,15 +107,11 @@ pub(crate) enum Cast {
     FpToSi = 4,
     UiToFp = 5,
     SiToFp = 6,
-    FpTrunc = 7,
     Bitcast = 11,
 }
 
 /// Compare predicates: floats 0-15, integers 32-41.
 pub(crate) mod pred {
-    // FALSE and TRUE are not emitted: WARP removes its device on them (and
-    // DXC folds them away), so constant compares lower as constants.
-    #[allow(dead_code)]
     pub const FALSE: u8 = 0;
     pub const OEQ: u8 = 1;
     pub const OGT: u8 = 2;
@@ -120,7 +130,6 @@ pub(crate) mod pred {
     pub const ULT: u8 = 12;
     pub const ULE: u8 = 13;
     pub const UNE: u8 = 14;
-    #[allow(dead_code)]
     pub const TRUE: u8 = 15;
     pub const EQ: u8 = 32;
     pub const NE: u8 = 33;
@@ -214,15 +223,11 @@ pub(crate) struct Module {
     blocks: Vec<Block>,
     mds: Vec<MdDef>,
     named: Vec<(String, Vec<Md>)>,
+    /// See [`Tag`]: by instruction.
+    tags: HashMap<u32, Tag>,
 }
 
 impl Module {
-    /// The names of the declared and defined functions.
-    #[cfg(test)]
-    pub fn func_names(&self) -> Vec<String> {
-        self.funcs.iter().map(|f| f.name.clone()).collect()
-    }
-
     fn ty(&mut self, def: TypeDef) -> Ty {
         if let Some(&t) = self.type_ids.get(&def) {
             return Ty(t);
@@ -241,9 +246,6 @@ impl Module {
     }
     pub fn float(&mut self) -> Ty {
         self.ty(TypeDef::Float)
-    }
-    pub fn double(&mut self) -> Ty {
-        self.ty(TypeDef::Double)
     }
     pub fn ptr(&mut self, to: Ty) -> Ty {
         self.ty(TypeDef::Ptr(to, 0))
@@ -368,6 +370,16 @@ impl Module {
             self.globals[n as usize].init = Some(i);
         }
         g
+    }
+
+    /// Notes what instruction `v` is for (see [`Tag`]); only when modules
+    /// are counted.
+    pub fn tag(&mut self, v: V, tag: Tag) {
+        if let V::Inst(i) = v
+            && census::enabled()
+        {
+            self.tags.insert(i, tag);
+        }
     }
 
     pub fn new_block(&mut self) -> usize {
@@ -501,27 +513,6 @@ impl Module {
         self.named.push((name.into(), nodes));
     }
 
-    #[cfg(test)]
-    pub(crate) fn has_dx_op(&self, name: &str, opcode: i64) -> bool {
-        self.insts.iter().any(|inst| match &inst.op {
-            Op::Call(fid, args) => {
-                self.funcs[*fid as usize].name == name
-                    && matches!(
-                        args.first(),
-                        Some(V::Const(cid)) if matches!(self.consts[*cid as usize].1, Const::Int(n) if n == opcode)
-                    )
-            }
-            _ => false,
-        })
-    }
-
-    #[cfg(test)]
-    pub(crate) fn has_cmp(&self, predicate: u8) -> bool {
-        self.insts
-            .iter()
-            .any(|inst| matches!(inst.op, Op::Cmp(p, _, _) if p == predicate))
-    }
-
     /// The module as bitcode.
     /// Which instructions are written: every body instruction, the branch
     /// conditions, and whatever they read, transitively (a phi nothing reads
@@ -587,7 +578,6 @@ impl Module {
             match t {
                 TypeDef::Void => w.record(2, &[]),
                 TypeDef::Float => w.record(3, &[]),
-                TypeDef::Double => w.record(4, &[]),
                 TypeDef::Int(b) => w.record(7, &[u64::from(*b)]),
                 TypeDef::Ptr(p, space) => w.record(8, &[u64::from(p.0), u64::from(*space)]),
                 TypeDef::Array(n, e) => w.record(11, &[u64::from(*n), u64::from(e.0)]),

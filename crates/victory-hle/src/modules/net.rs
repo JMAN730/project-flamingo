@@ -11,9 +11,8 @@
 //!   numeric, or fail if a name is required, as with no network.
 //! * `WinHttpConnect` to a host that is not loopback fails with
 //!   `ERROR_WINHTTP_CANNOT_CONNECT`, so no request (or WebSocket) handle can
-//!   exist for one. Automatic redirects are disabled, including redirects
-//!   returned by a loopback server. Proxies are off and proxy auto-detection
-//!   (WPAD, PAC downloads) fails with `ERROR_WINHTTP_AUTODETECTION_FAILED`.
+//!   exist for one. Proxies are off and proxy auto-detection (WPAD, PAC
+//!   downloads) fails with `ERROR_WINHTTP_AUTODETECTION_FAILED`.
 //! * A bind to all interfaces is narrowed to loopback, so nothing on the
 //!   network can connect in.
 #![allow(non_snake_case)]
@@ -24,7 +23,7 @@ use std::ffi::{CStr, c_char, c_void};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Mutex;
 
-use windows_sys::Win32::Foundation::{GetLastError, SetLastError};
+use windows_sys::Win32::Foundation::SetLastError;
 
 use crate::modules::files::host;
 use crate::{HleExport, HleModule, hle_export};
@@ -46,8 +45,6 @@ const SIO_GET_EXTENSION_FUNCTION_POINTER: u32 = 0xC800_0006;
 const SIO_GET_MULTIPLE_EXTENSION_FUNCTION_POINTER: u32 = 0xC800_0024;
 const WINHTTP_ACCESS_TYPE_NO_PROXY: u32 = 1;
 const WINHTTP_OPTION_PROXY: u32 = 38;
-const WINHTTP_OPTION_REDIRECT_POLICY: u32 = 88;
-const WINHTTP_OPTION_REDIRECT_POLICY_NEVER: u32 = 0;
 
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -323,18 +320,9 @@ pub extern "system" fn WSAConnectByList(
             return 0;
         }
     }
-    type ConnectByList = extern "system" fn(Socket, *const u8, *mut u32, *mut c_void, *mut u32, *mut c_void, *const c_void, *mut c_void) -> i32;
-    static ADDRESS: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
-    // Wine's ws2_32 has no WSAConnectByList: fail the call as unsupported.
-    let Some(address) = *ADDRESS.get_or_init(|| crate::host::function("ws2_32.dll", "WSAConnectByList"))
-    else {
-        const WSAEOPNOTSUPP: i32 = 10045;
-        host!("ws2_32.dll", "WSASetLastError": extern "system" fn(i32))(WSAEOPNOTSUPP);
-        return 0;
-    };
-    // SAFETY: the host exports this function with this signature.
-    let connect = unsafe { std::mem::transmute::<usize, ConnectByList>(address) };
-    connect(s, list, local_len, local, remote_len, remote, timeout, reserved)
+    host!("ws2_32.dll", "WSAConnectByList": extern "system" fn(Socket, *const u8, *mut u32, *mut c_void, *mut u32, *mut c_void, *const c_void, *mut c_void) -> i32)(
+        s, list, local_len, local, remote_len, remote, timeout, reserved,
+    )
 }
 
 pub extern "system" fn WSAJoinLeaf(
@@ -592,16 +580,9 @@ pub extern "system" fn GetAddrInfoExA(
     if !resolvable(narrow(name)) {
         return WSAHOST_NOT_FOUND;
     }
-    type Resolve = extern "system" fn(*const c_char, *const c_char, u32, *const c_void, *const c_void, *mut *mut c_void, *const c_void, *mut c_void, *const c_void, *mut Handle) -> i32;
-    static ADDRESS: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
-    // Wine's ws2_32 has no GetAddrInfoExA: the name is not found.
-    let Some(address) = *ADDRESS.get_or_init(|| crate::host::function("ws2_32.dll", "GetAddrInfoExA"))
-    else {
-        return WSAHOST_NOT_FOUND;
-    };
-    // SAFETY: the host exports this function with this signature.
-    let resolve = unsafe { std::mem::transmute::<usize, Resolve>(address) };
-    resolve(name, service, namespace, provider, hints, result, timeout, overlapped, completion, handle)
+    host!("ws2_32.dll", "GetAddrInfoExA": extern "system" fn(*const c_char, *const c_char, u32, *const c_void, *const c_void, *mut *mut c_void, *const c_void, *mut c_void, *const c_void, *mut Handle) -> i32)(
+        name, service, namespace, provider, hints, result, timeout, overlapped, completion, handle,
+    )
 }
 
 pub extern "system" fn GetAddrInfoExW(
@@ -756,8 +737,8 @@ pub extern "system" fn WinHttpConnect(
     )
 }
 
-/// Sessions never use a proxy or follow redirects: either could carry a
-/// loopback request off the machine inside the host's own WinHTTP calls.
+/// Sessions never use a proxy: only loopback is reachable, and a proxy
+/// (named, or found by auto-detection) would carry it off the machine.
 pub extern "system" fn WinHttpOpen(
     agent: *const u16,
     access: u32,
@@ -768,44 +749,16 @@ pub extern "system" fn WinHttpOpen(
     if access != WINHTTP_ACCESS_TYPE_NO_PROXY {
         once("HTTP proxy ignored", format!("access type {access}"));
     }
-    let session = host!("winhttp.dll", "WinHttpOpen": extern "system" fn(*const u16, u32, *const u16, *const u16, u32) -> Handle)(
+    host!("winhttp.dll", "WinHttpOpen": extern "system" fn(*const u16, u32, *const u16, *const u16, u32) -> Handle)(
         agent,
         WINHTTP_ACCESS_TYPE_NO_PROXY,
         std::ptr::null(),
         std::ptr::null(),
         flags,
-    );
-    if session.is_null() || no_http_redirects(session) == 0 {
-        return std::ptr::null_mut();
-    }
-    session
+    )
 }
 
-/// Applies the documented DWORD policy to a session or request. If the
-/// host cannot enforce it, the handle is closed and the original error
-/// is preserved; an unguarded handle must not remain usable.
-fn no_http_redirects(handle: Handle) -> i32 {
-    let policy = WINHTTP_OPTION_REDIRECT_POLICY_NEVER;
-    let result = host!("winhttp.dll", "WinHttpSetOption": extern "system" fn(Handle, u32, *const c_void, u32) -> i32)(
-        handle,
-        WINHTTP_OPTION_REDIRECT_POLICY,
-        (&raw const policy).cast(),
-        std::mem::size_of_val(&policy) as u32,
-    );
-    if result == 0 {
-        // SAFETY: reads only the calling thread's last error.
-        let error = unsafe { GetLastError() };
-        if !handle.is_null() {
-            host!("winhttp.dll", "WinHttpCloseHandle": extern "system" fn(Handle) -> i32)(handle);
-        }
-        // SAFETY: restore the option failure after closing the unsafe handle.
-        unsafe { SetLastError(error) };
-    }
-    result
-}
-
-/// See [`WinHttpOpen`]: later proxy settings are ignored and every redirect
-/// policy change still enforces NEVER, on both sessions and requests.
+/// See [`WinHttpOpen`]: a proxy set later is accepted and not used.
 pub extern "system" fn WinHttpSetOption(
     handle: Handle,
     option: u32,
@@ -815,13 +768,6 @@ pub extern "system" fn WinHttpSetOption(
     if option == WINHTTP_OPTION_PROXY {
         once("HTTP proxy ignored", "WINHTTP_OPTION_PROXY".into());
         return 1;
-    }
-    if option == WINHTTP_OPTION_REDIRECT_POLICY {
-        once(
-            "HTTP redirects disabled",
-            "WINHTTP_OPTION_REDIRECT_POLICY".into(),
-        );
-        return no_http_redirects(handle);
     }
     host!("winhttp.dll", "WinHttpSetOption": extern "system" fn(Handle, u32, *const c_void, u32) -> i32)(
         handle, option, buffer, len,
@@ -931,10 +877,6 @@ pub(crate) fn module() -> HleModule {
         ],
     }
 }
-
-#[cfg(test)]
-#[path = "net_redirect_tests.rs"]
-mod redirect_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1111,9 +1053,6 @@ mod tests {
         // Windows 10's winhttp.dll); the HLE supplies those itself, so skip
         // them only when the host really lacks them.
         const NEWER_WINDOWS_ONLY: &[&str] = &["WinHttpGetProxySettingsEx"];
-        // Wine's ws2_32 lacks these; their overrides fail the call instead
-        // of forwarding it.
-        const MISSING_ON_WINE: &[&str] = &["WSAConnectByList", "GetAddrInfoExA"];
         for e in m.exports.iter().filter(|e| !e.name.starts_with('#')) {
             let dll = if e.name.starts_with("WinHttp") {
                 "winhttp.dll"
@@ -1121,7 +1060,7 @@ mod tests {
                 "ws2_32.dll"
             };
             let present = crate::host::function(dll, e.name).is_some();
-            if !present && (NEWER_WINDOWS_ONLY.contains(&e.name) || MISSING_ON_WINE.contains(&e.name)) {
+            if !present && NEWER_WINDOWS_ONLY.contains(&e.name) {
                 continue;
             }
             assert!(present, "{dll} lacks {}", e.name);

@@ -15,7 +15,7 @@ use victory_shader::{
 };
 use victory_shader::{io, resource};
 
-use crate::shader::{MAX_FILE, Source, scan_entries, sources};
+use crate::shader::{MAX_FILE, Source, sources};
 
 #[derive(Default)]
 struct Tally {
@@ -71,7 +71,7 @@ struct Tally {
     ms_pipelines: usize,
     /// Reason → programs stopped by it, and the first one.
     failed: BTreeMap<String, (usize, String)>,
-    /// With `--list`: per-program result rows, including runtime hashes.
+    /// With `--list`: one line per program and outcome.
     list: bool,
     lines: Vec<String>,
 }
@@ -145,8 +145,6 @@ type Kept = std::sync::Arc<Mutex<Vec<(String, emit::HostShader)>>>;
 
 /// The optional checks after emission, one set per thread.
 struct Checks {
-    /// The wave sizes to translate for.
-    target: emit::Target,
     /// Shaders named in `VICTORY_PAIRS` (`vs+ps,...`, label substrings),
     /// kept to build those pipelines after the walk.
     keep: Option<Kept>,
@@ -160,7 +158,6 @@ pub fn run(
     pipelines: bool,
     list: bool,
     jobs: Option<usize>,
-    host_lanes: Option<(u32, u32)>,
 ) -> Result<()> {
     let paths = crate::default_paths(paths)?;
     let dll = validate.then(Validator::default_path).flatten();
@@ -172,21 +169,8 @@ pub fn run(
                 .map_or("dxil.dll".into(), |p| p.display().to_string())
         );
     }
-    let mut target = emit::Target::ANY;
     if pipelines {
-        target = Host::new(false).map_err(anyhow::Error::msg)?.target();
-    }
-    if let Some((lanes_min, lanes_max)) = host_lanes {
-        target = emit::Target {
-            lanes_min,
-            lanes_max,
-        };
-    }
-    if target != emit::Target::ANY {
-        println!(
-            "host waves   {}-{} lanes",
-            target.lanes_min, target.lanes_max
-        );
+        Host::new(false).map_err(anyhow::Error::msg)?;
     }
     let pairs: Vec<(String, String)> = std::env::var("VICTORY_PAIRS")
         .unwrap_or_default()
@@ -199,9 +183,11 @@ pub fn run(
         jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
     let seen = Mutex::new(HashSet::new());
     let total = Mutex::new(Tally::default());
-    let mut walk_errors = 0;
     for root in &paths {
-        for entry in scan_entries(root, &mut walk_errors) {
+        for entry in walkdir::WalkDir::new(root)
+            .into_iter()
+            .filter_map(Result::ok)
+        {
             if !entry.file_type().is_file() || entry.metadata().map_or(0, |m| m.len()) > MAX_FILE {
                 continue;
             }
@@ -218,7 +204,6 @@ pub fn run(
                             ..Tally::default()
                         };
                         let mut checks = Checks {
-                            target,
                             keep: (!pairs.is_empty()).then(|| kept.clone()),
                             validator: validate
                                 .then(|| Validator::load(dll.as_deref()).ok())
@@ -288,11 +273,10 @@ pub fn run(
     if !pairs.is_empty() {
         let host = Host::new(false).map_err(anyhow::Error::msg)?;
         let kept = lock(&kept);
+        let find = |name: &str| kept.iter().find(|(l, _)| l.contains(name));
         for (v, p) in &pairs {
-            let graphics = find_shader(&kept, v, &[HwStage::Vs, HwStage::Ms]);
-            let pixel = find_shader(&kept, p, &[HwStage::Ps]);
-            let made = match (graphics, pixel) {
-                (Some(vs), Some(ps)) => if vs.stage == HwStage::Ms {
+            let made = match (find(v), find(p)) {
+                (Some((_, vs)), Some((_, ps))) => if vs.stage == HwStage::Ms {
                     host.mesh_pipeline(vs, ps)
                 } else {
                     host.pipeline(vs, ps)
@@ -314,22 +298,7 @@ pub fn run(
     for (reason, (n, example)) in failed {
         println!("  {n:>7}  {reason}  (e.g. {example})");
     }
-    anyhow::ensure!(
-        walk_errors == 0,
-        "scan incomplete (traversal errors: {walk_errors})"
-    );
     Ok(())
-}
-
-fn find_shader<'a>(
-    shaders: &'a [(String, emit::HostShader)],
-    name: &str,
-    stages: &[HwStage],
-) -> Option<&'a emit::HostShader> {
-    shaders
-        .iter()
-        .find(|(label, shader)| stages.contains(&shader.stage) && label.contains(name))
-        .map(|(_, shader)| shader)
 }
 
 fn translate(
@@ -339,38 +308,76 @@ fn translate(
     t: &mut Tally,
     checks: &mut Checks,
 ) {
-    let location = || format!("{}{}", path.display(), source.label());
+    let example = || format!("{}{}", path.display(), source.label());
     let Some(bytes) = source.bytes() else {
-        return t.fail("corrupt record".into(), location);
+        return t.fail("corrupt record".into(), example);
     };
-    let list = t.list;
-    let hash = list.then(|| blake3::hash(&bytes).to_hex().to_string());
-    let example = || {
-        let location = location();
-        match &hash {
-            Some(hash) => format!("{location} hash={}", &hash[..16]),
-            None => location,
-        }
-    };
+    // The hash a run's log names the shader by (`hash=` in "first bind",
+    // "shader does not translate", "host pipeline refused").
+    let hash = blake3::hash(&bytes).to_hex()[..16].to_owned();
+    let example = || format!("{}{} #{hash}", path.display(), source.label());
     t.containers += 1;
     let Ok(container) = Container::parse(&bytes) else {
         return t.fail("no DXIL part (SM5 or older)".into(), example);
     };
-    let Some(dxil) = container.program_part().map(|p| p.data) else {
+    let Some(dxil) = container.part(FourCC::DXIL).map(|p| p.data) else {
         return t.fail("no DXIL part (SM5 or older)".into(), example);
     };
-    let key = translation_key(&container);
-    if !lock(seen).insert(key) && !list {
+    // `~`: the hash of the code alone; containers that differ only around
+    // it are translated once, the others listed as duplicates of it.
+    let code = blake3::hash(dxil);
+    let code8 = code.to_hex()[..8].to_owned();
+    let example = || format!("{} ~{code8}", example());
+    // `VICTORY_DUMP_MATCH=<dir>;<text>|<text>...`: the containers whose
+    // line holds one of the texts (a name, `#hash`), as the title has them.
+    if let Ok(spec) = std::env::var("VICTORY_DUMP_MATCH")
+        && let Some((dir, texts)) = spec.split_once(';')
+    {
+        let line = example();
+        if texts.split('|').any(|text| !text.is_empty() && line.contains(text)) {
+            let name: String = source
+                .label()
+                .chars()
+                .skip_while(|c| *c != ' ')
+                .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .take(70)
+                .collect();
+            let _ = std::fs::create_dir_all(dir);
+            let _ = std::fs::write(std::path::Path::new(dir).join(format!("{name}.{hash}.cdxil")), &bytes[..]);
+        }
+    }
+    if !lock(seen).insert(code) {
         t.duplicates += 1;
+        if t.list {
+            t.lines.push(format!("{}  duplicate", example()));
+        }
         return;
     }
     let programs = match native_programs(dxil) {
         Ok(p) => p,
         Err(e) => return t.fail(e.to_string(), example),
     };
+    // `VICTORY_FAIL_DUMP=<dir>`: the first 3 containers of each failure reason, as the title
+    // has them (`.cdxil`), to work on a translator gap offline
+    let dump = std::env::var_os("VICTORY_FAIL_DUMP");
+    let before: Option<BTreeMap<String, usize>> = dump.as_ref().map(|_| t.failed.iter().map(|(k, v)| (k.clone(), v.0)).collect());
+    translate_programs(&container, programs, &example, t, checks);
+    if let (Some(dir), Some(before)) = (dump, before) {
+        for (reason, (n, _)) in &t.failed {
+            let was = before.get(reason).copied().unwrap_or(0);
+            if *n > was && was < 3 {
+                let stem: String = reason.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).take(60).collect();
+                let _ = std::fs::create_dir_all(&dir);
+                let _ = std::fs::write(std::path::Path::new(&dir).join(format!("{stem}_{was}.cdxil")), &bytes[..]);
+            }
+        }
+    }
+}
+
+fn translate_programs(container: &Container, programs: Vec<NativeProgram>, example: &dyn Fn() -> String, t: &mut Tally, checks: &mut Checks) {
     for p in programs {
         t.programs += 1;
-        match ir::build_with(&p.patched_code(), p.wave64, p.vgprs, p.spills_root_args()) {
+        match victory_shader::spill::build(&p) {
             Ok(program) => {
                 t.translated += 1;
                 t.instructions += program.blocks.iter().map(|b| b.insts.len()).sum::<usize>();
@@ -431,8 +438,9 @@ fn translate(
                 if let (Some(r), Some(i), Some(s)) = (res, raised, structured) {
                     let label = || format!("{} {:?}", example(), p.stage);
                     *counter(t, p.stage, 0) += 1;
-                    match emit::emit(&container, &p, &program, &s, &i, &r, checks.target) {
+                    match emit::emit(container, &p, &program, &s, &i, &r) {
                         Ok(shader) => {
+                            census_line(&label(), &p, &program, &shader);
                             *counter(t, p.stage, 1) += 1;
                             check(shader, t, checks, label);
                         }
@@ -455,16 +463,49 @@ fn translate(
     }
 }
 
-fn translation_key(container: &Container<'_>) -> blake3::Hash {
-    // Emission reads signatures and pipeline metadata alongside the DXIL.
-    // Parsed parts exclude bytes after a container embedded in another file.
-    let mut hash = blake3::Hasher::new();
-    for part in &container.parts {
-        hash.update(&part.fourcc.0);
-        hash.update(&(part.data.len() as u64).to_le_bytes());
-        hash.update(part.data);
+/// `VICTORY_SHADER_CENSUS=<file>`: one line per emitted program, appended:
+/// its label, the console program's instructions by encoding class (a
+/// static count of the whole program, not of one thread's path), and the
+/// host module's instructions by kind (`emit::census::KINDS`).
+fn census_line(label: &str, native: &NativeProgram, p: &ir::Program, shader: &emit::HostShader) {
+    use std::io::Write;
+    use victory_shader::gfx10::Fields;
+    static OUT: std::sync::OnceLock<Option<Mutex<std::fs::File>>> = std::sync::OnceLock::new();
+    let Some(out) = OUT.get_or_init(|| {
+        let path = std::env::var_os("VICTORY_SHADER_CENSUS")?;
+        let file = std::fs::OpenOptions::new().create(true).append(true).open(path).ok()?;
+        Some(Mutex::new(file))
+    }) else {
+        return;
+    };
+    let Some(census) = emit::census::take(&shader.dxil) else {
+        return;
+    };
+    // total, vector, scalar, descriptor loads, buffer and memory, image, LDS, control, other
+    let mut console = [0u32; 9];
+    for inst in p.blocks.iter().flat_map(|b| &b.insts) {
+        console[0] += 1;
+        let k = match &inst.fields {
+            Fields::Valu(_) => 1,
+            Fields::Sop { .. } => 2,
+            Fields::Smem { .. } => 3,
+            Fields::Buffer { .. } | Fields::Flat { .. } => 4,
+            Fields::Image { .. } => 5,
+            Fields::Ds { .. } => 6,
+            Fields::Sopp { .. } => 7,
+            _ => 8,
+        };
+        console[k] += 1;
     }
-    hash.finalize()
+    let mut line = format!("{label}\twave64={}", u8::from(native.wave64));
+    for (name, n) in ["c_total", "c_valu", "c_sop", "c_smem", "c_buffer", "c_image", "c_ds", "c_sopp", "c_other"].iter().zip(console) {
+        line.push_str(&format!("\t{name}={n}"));
+    }
+    for (name, n) in emit::census::KINDS.iter().zip(census.counts) {
+        line.push_str(&format!("\t{name}={n}"));
+    }
+    line.push('\n');
+    let _ = lock(out).write_all(line.as_bytes());
 }
 
 /// Validates an emitted shader if asked to.
@@ -541,13 +582,7 @@ fn check(
                     let _ = std::fs::write(format!("{name}.txt"), format!("{}\n{text}", label()));
                 }
             }
-            // With what the module declares and calls: the validator's
-            // message for an operation the stage or the entry's properties
-            // do not allow names neither.
-            t.fail(
-                format!("validator: {first} [{}]", emit::last_module_summary()),
-                label,
-            );
+            t.fail(format!("validator: {first}"), label);
         }
     }
 }
@@ -584,6 +619,7 @@ fn tally_io(r: &io::Io, t: &mut Tally) {
         match i {
             io::Interp::Interpolated { .. } => t.interpolated += 1,
             io::Interp::Vertex { .. } => t.vertex_values += 1,
+            io::Interp::Weighted { .. } => t.interpolated += 1,
         }
     }
     for e in &r.exports {
@@ -727,69 +763,4 @@ fn tally_structured(program: &ir::Program, s: &structure::Structured, t: &mut Ta
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn pipeline_pair_selects_each_shader_by_stage() {
-        let ps = host::stub_ps();
-        let vs = host::stub_vs(&ps).unwrap();
-        let shaders = [("shared Ps".to_owned(), ps), ("shared Vs".to_owned(), vs)];
-
-        let graphics = find_shader(&shaders, "shared", &[HwStage::Vs, HwStage::Ms]);
-        let pixel = find_shader(&shaders, "shared", &[HwStage::Ps]);
-        assert_eq!(graphics.map(|shader| shader.stage), Some(HwStage::Vs));
-        assert_eq!(pixel.map(|shader| shader.stage), Some(HwStage::Ps));
-        assert!(find_shader(&shaders, "Vs", &[HwStage::Ps]).is_none());
-    }
-
-    fn shader_with_signature(signature: &[u8]) -> Vec<u8> {
-        let mut bytes = vec![0; 40]; // Header and two part offsets.
-        bytes[..4].copy_from_slice(b"DXBC");
-        bytes[20..22].copy_from_slice(&1u16.to_le_bytes());
-        bytes[28..32].copy_from_slice(&2u32.to_le_bytes());
-        let parts = [(b"DXIL", b"synthetic program".as_slice()), (b"ISG1", signature)];
-        for (index, (tag, part)) in parts.into_iter().enumerate() {
-            let offset = bytes.len() as u32;
-            let table = 32 + index * 4;
-            bytes[table..table + 4].copy_from_slice(&offset.to_le_bytes());
-            bytes.extend_from_slice(tag);
-            bytes.extend_from_slice(&(part.len() as u32).to_le_bytes());
-            bytes.extend_from_slice(part);
-        }
-        let size = bytes.len() as u32;
-        bytes[24..28].copy_from_slice(&size.to_le_bytes());
-        bytes
-    }
-
-    #[test]
-    fn translates_distinct_signatures_and_skips_duplicate_parts() {
-        let first = shader_with_signature(b"first signature");
-        let second = shader_with_signature(b"second signature");
-        let mut embedded = first.clone();
-        embedded.extend_from_slice(b"unrelated bytes after the container");
-        let seen = Mutex::new(HashSet::new());
-        let mut tally = Tally::default();
-        let mut checks = Checks {
-            target: emit::Target::ANY,
-            keep: None,
-            validator: None,
-            host: None,
-        };
-        for data in [&first, &second, &embedded] {
-            translate(
-                &Source::Raw { offset: 0, data },
-                Path::new("synthetic"),
-                &seen,
-                &mut tally,
-                &mut checks,
-            );
-        }
-
-        assert_eq!(tally.containers, 3);
-        assert_eq!(tally.duplicates, 1);
-    }
 }

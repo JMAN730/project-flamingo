@@ -15,7 +15,7 @@
 
 $ErrorActionPreference = 'Continue'
 $ProgressPreference = 'SilentlyContinue'
-$TryVersion = '2.2'
+$TryVersion = '3.0'
 $ForkUrl = 'https://github.com/MfDev0/victory.git'
 $Branch = 'arena/59fabb00-victory'
 # Other places the fork may live (renamed to CAtez, or a backup copy), tried
@@ -38,15 +38,17 @@ function Step([string]$msg) { Write-Host ''; Write-Host ('== ' + $msg) -Foregrou
 function Bad([string]$msg) { Write-Host ('  ' + $msg) -ForegroundColor Red }
 
 function Load-Config {
-    # console: series-s shows the menus (two planes, composited), where
-    # series-x has stayed black for everyone so far (upstream #841, #211).
-    $c = @{ game_dir = ''; game_exe = ''; built_key = ''; added = ''; console = 'series-s' }
+    # console: series-x, the profile the fork's base (fxceless/victory-gta6)
+    # renders the world with on NVIDIA (RTX 3080, 3070 Ti, 4070).
+    $c = @{ game_dir = ''; game_exe = ''; built_key = ''; added = ''; console = 'series-x'; base = '' }
     if (Test-Path $ConfigPath) {
         try {
             $j = Get-Content -Path $ConfigPath -Raw | ConvertFrom-Json
-            foreach ($k in @('game_dir', 'game_exe', 'built_key', 'added', 'console')) { if ($j.$k) { $c[$k] = [string]$j.$k } }
+            foreach ($k in @('game_dir', 'game_exe', 'built_key', 'added', 'console', 'base')) { if ($j.$k) { $c[$k] = [string]$j.$k } }
         } catch {}
     }
+    # Try 3.0 moved to the victory-gta6 base: start once on Series X.
+    if ($c.base -ne 'gta6') { $c.console = 'series-x'; $c.base = 'gta6' }
     return $c
 }
 function Save-Config { try { ($script:Config | ConvertTo-Json) | Set-Content -Path $ConfigPath -Encoding ASCII } catch {} }
@@ -446,17 +448,16 @@ function Run-Game {
     # Long shader loops hang the GPU (device hung about 40 s into the world):
     # leave a loop after 64 turns unless set already (held 30 fps longest).
     if (-not $env:VICTORY_SHADER_LOOP_LIMIT) { $env:VICTORY_SHADER_LOOP_LIMIT = '64' }
-    # Series X draws the world at 2560x1440 and its 4K upscale stays black:
-    # show the 1440p picture instead (set VICTORY_PRESENT_1440P=0 to turn off).
-    # Series S: the world's own target, picked in frames of the world (menus
-    # keep the title's picture).
-    if (-not $env:VICTORY_PRESENT_1440P) {
-        if ($c.console -eq 'series-x') { $env:VICTORY_PRESENT_1440P = '1' } else { $env:VICTORY_PRESENT_1440P = 'auto' }
-    }
+    # The hit-detection program that page-faults the card (upstream #981),
+    # skipped as the NVIDIA world runs on victory-gta6 did.
+    if (-not $env:VICTORY_SKIP_PIPELINES) { $env:VICTORY_SKIP_PIPELINES = 'eeed82b877b44b5f' }
+    # Its own cache: the old base's pipeline library and shaders do not mix.
+    if (-not $env:VICTORY_CACHE_DIR) { $env:VICTORY_CACHE_DIR = Join-Path $TryHome 'cache-gta6' }
     # Shaders that do not translate are saved here (zip and send this folder).
     if (-not $env:VICTORY_DUMP_FAILED) { $env:VICTORY_DUMP_FAILED = Join-Path $TryHome 'failed-shaders' }
     Say "failed shaders saved to: $($env:VICTORY_DUMP_FAILED)"
-    Say "shader loop limit: $($env:VICTORY_SHADER_LOOP_LIMIT)$(if ($env:VICTORY_PRESENT_1440P) { "   world view: $($env:VICTORY_PRESENT_1440P)" })"
+    Say "shader loop limit: $($env:VICTORY_SHADER_LOOP_LIMIT)   skipped programs: $($env:VICTORY_SKIP_PIPELINES)"
+    Say 'The first world visit compiles ~700 pipelines (slow, the picture may be white: auto-exposure); the next launch loads them.'
     $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
     $log = Join-Path $LogDir "game-$stamp.log"
     Push-Location $TryHome
