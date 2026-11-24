@@ -542,14 +542,29 @@ fn attr_input_ids(
     ids
 }
 
-/// Whether a phi, or an instruction other than an interpolation's second
-/// half (`v_interp_p2*`), reads `v`.
+/// Whether a phi, or an instruction other than an interpolation's second-half
+/// (`v_interp_p2*`) accumulator operand, reads `v`.
 fn read_past_interpolation(p: &Program, v: Value) -> bool {
     p.blocks.iter().any(|b| {
         b.phis.iter().any(|p| p.args.contains(&v))
-            || b.insts
-                .iter()
-                .any(|i| !i.name().starts_with("v_interp_p2") && i.reads.iter().any(|r| r.1 == v))
+            || b.insts.iter().any(|i| {
+                if i.name().starts_with("v_interp_p2") {
+                    let j_val = match &i.fields {
+                        Fields::Vintrp {
+                            src: Operand::Vector { reg, .. },
+                            ..
+                        } => i.read(Reg::V(*reg)),
+                        Fields::Valu(val) => match val.src.get(1) {
+                            Some(&Operand::Vector { reg, .. }) => i.read(Reg::V(reg)),
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    j_val == Some(v)
+                } else {
+                    i.reads.iter().any(|r| r.1 == v)
+                }
+            })
     })
 }
 
@@ -6920,8 +6935,12 @@ impl<'a> Lower<'a> {
                 let h = 2 * attribute.channel;
                 let c = self.cur;
                 if f16 {
-                    let lo = half(self, h + u8::from(attribute.high))?;
-                    self.low_half(inst, reg, lo)
+                    let half = half(self, h + u8::from(attribute.high))?;
+                    if matches!(&inst.fields, Fields::Valu(v) if v.opsel >> 3 & 1 != 0) {
+                        self.high_half(inst, reg, half)
+                    } else {
+                        self.low_half(inst, reg, half)
+                    }
                 } else if mode == 1 {
                     // The whole dword of a flat input: both halves.
                     let lo = half(self, h)?;
@@ -7073,7 +7092,20 @@ impl<'a> Lower<'a> {
                 let p1 = vertex_f32(self, 1)?;
                 let p10 = self.s.m.bin(c, Bin::Sub, p1, p0);
                 let prod = self.s.m.bin(c, Bin::Mul, p10, i_val);
-                let res = self.s.m.bin(c, Bin::Add, prod, p0);
+                let mut res = self.s.m.bin(c, Bin::Add, prod, p0);
+                if let Fields::Valu(v) = &inst.fields {
+                    if v.abs != 0 || v.neg != 0 {
+                        return Err("a modified f16 interpolation");
+                    }
+                    if v.omod != 0 {
+                        let factor = [1.0f32, 2.0, 4.0, 0.5][usize::from(v.omod)];
+                        let k = self.s.m.f32(factor.to_bits());
+                        res = self.s.m.bin(c, Bin::Mul, res, k);
+                    }
+                    if v.clamp {
+                        res = self.unary(7, res);
+                    }
+                }
                 self.as_int(res)
             }
             "v_interp_p2_f32" | "v_interp_p2_f16" => {
@@ -7102,10 +7134,27 @@ impl<'a> Lower<'a> {
                 let p2 = vertex_f32(self, 2)?;
                 let p20 = self.s.m.bin(c, Bin::Sub, p2, p0);
                 let prod = self.s.m.bin(c, Bin::Mul, p20, j_val);
-                let res = self.s.m.bin(c, Bin::Add, prod, acc);
+                let mut res = self.s.m.bin(c, Bin::Add, prod, acc);
+                if let Fields::Valu(v) = &inst.fields {
+                    if v.abs != 0 || v.neg != 0 {
+                        return Err("a modified f16 interpolation");
+                    }
+                    if v.omod != 0 {
+                        let factor = [1.0f32, 2.0, 4.0, 0.5][usize::from(v.omod)];
+                        let k = self.s.m.f32(factor.to_bits());
+                        res = self.s.m.bin(c, Bin::Mul, res, k);
+                    }
+                    if v.clamp {
+                        res = self.unary(7, res);
+                    }
+                }
                 if f16 {
-                    let lo = self.f16_nearest(res);
-                    self.low_half(inst, reg, lo)
+                    let half = self.f16_nearest(res);
+                    if matches!(&inst.fields, Fields::Valu(v) if v.opsel >> 3 & 1 != 0) {
+                        self.high_half(inst, reg, half)
+                    } else {
+                        self.low_half(inst, reg, half)
+                    }
                 } else {
                     self.as_int(res)
                 }
@@ -8861,6 +8910,17 @@ impl<'a> Lower<'a> {
                 let Some(qb) = self.tail[q] else { continue };
                 let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
                 let arg = phi.args[n];
+                if !bit
+                    && self.read_phis.contains(&phi.value)
+                    && !self.vals.contains_key(&arg)
+                    && let Some(&(kind, index)) = self.barycentric_inputs.get(&arg)
+                {
+                    let val = match self.load_barycentric(kind, index) {
+                        Ok(val) => val,
+                        Err(why) => Val::Missing(why),
+                    };
+                    self.vals.insert(arg, val);
+                }
                 let x = match (self.vals.get(&arg).copied(), bit) {
                     (Some(Val::I32(x)), false) | (Some(Val::Bit(x)), true) => x,
                     (Some(Val::Bit(_)), false) if self.read_phis.contains(&phi.value) => {

@@ -234,6 +234,8 @@ fn render_pair(vs: &HostShader, ps: &HostShader, label: &str, warp: bool) -> Opt
 /// linear, perspective-centroid, and linear-centroid modes on hardware GPU
 /// and WARP.
 #[test]
+// The bindings need `mut` only for the Windows-only DXIL validation loop.
+#[cfg_attr(not(windows), allow(unused_mut))]
 fn hand_interpolation_matches_host_for_perspective_linear_and_centroid() {
     // (name, SPI_PS_INPUT_ADDR bit, host DXIL interp mode)
     let modes = [
@@ -284,7 +286,13 @@ fn hand_interpolation_matches_host_for_perspective_linear_and_centroid() {
                     .iter()
                     .flatten()
                     .zip(hand_out.iter().flatten())
-                    .map(|(a, b)| (a - b).abs())
+                    .map(|(&a, &b)| {
+                        assert!(
+                            a.is_finite() && b.is_finite(),
+                            "{label}/{name}: non-finite output (host={a}, hand={b})"
+                        );
+                        (a - b).abs()
+                    })
                     .fold(0.0f32, f32::max);
                 assert!(
                     max_diff < 1e-4,
@@ -306,7 +314,13 @@ fn hand_interpolation_matches_host_for_perspective_linear_and_centroid() {
                 .iter()
                 .flatten()
                 .zip(linear.iter().flatten())
-                .map(|(a, b)| (a - b).abs())
+                .map(|(&a, &b)| {
+                    assert!(
+                        a.is_finite() && b.is_finite(),
+                        "{label}: non-finite perspective/linear output (persp={a}, linear={b})"
+                    );
+                    (a - b).abs()
+                })
                 .fold(0.0f32, f32::max);
             assert!(
                 mode_diff > 0.1,
@@ -360,11 +374,27 @@ fn direct_barycentrics_and_first_half_on_hardware() {
                     continue;
                 }
                 covered += 1;
+                // Independently derive perspective-correct (i, j) for this pixel
+                // center from triangle vertices (-1,-1,w=1), (1,-1,w=2), (-1,1,w=4).
+                let (px, py) = (idx % 8, idx / 8);
+                let ndc_x = ((px as f32 + 0.5) / 8.0) * 2.0 - 1.0;
+                let ndc_y = 1.0 - ((py as f32 + 0.5) / 8.0) * 2.0;
+                let l1 = (ndc_x + 1.0) * 0.5;
+                let l2 = (ndc_y + 1.0) * 0.5;
+                let l0 = 1.0 - l1 - l2;
+                let (q0, q1, q2) = (l0, l1 / 2.0, l2 / 4.0);
+                let sum = q0 + q1 + q2;
+                let expected_i = q1 / sum;
+                let expected_j = q2 / sum;
                 assert!(
                     (0.0..=1.0).contains(&i) && (0.0..=1.0).contains(&j) && i + j <= 1.001,
                     "{label}: pixel {idx} out-of-range barycentrics ({i}, {j})"
                 );
-                let expected_p1 = 1.0 + i * (2.0 - 1.0);
+                assert!(
+                    (i - expected_i).abs() < 1e-4 && (j - expected_j).abs() < 1e-4,
+                    "{label}: pixel {idx} barycentrics mismatch: got ({i}, {j}), expected ({expected_i}, {expected_j})"
+                );
+                let expected_p1 = 1.0 + expected_i * (2.0 - 1.0);
                 assert!(
                     (p1_x - expected_p1).abs() < 1e-4,
                     "{label}: pixel {idx} p1 mismatch: got {p1_x}, expected {expected_p1}"
