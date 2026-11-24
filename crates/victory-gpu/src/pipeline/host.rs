@@ -555,6 +555,12 @@ impl HostPipeline {
             )
         };
         if compute.is_some() {
+            // D3D12 rejects empty mandatory stages with E_INVALIDARG; on
+            // hardware that arrives as a GPU device removal instead of a
+            // clean refusal, so bail before CreateComputePipelineState.
+            if code(0).BytecodeLength == 0 {
+                return refuse("compute shader did not translate", shaders);
+            }
             let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
                 // SAFETY: a borrowed pointer the description never releases.
                 pRootSignature: unsafe { std::mem::transmute_copy(&root) },
@@ -629,6 +635,11 @@ impl HostPipeline {
             });
         }
 
+        // VS is mandatory; an empty bytecode causes GPU device removal on
+        // hardware (E_INVALIDARG on WARP).  PS may be absent (depth-only).
+        if code(0).BytecodeLength == 0 {
+            return refuse("vertex shader did not translate", shaders);
+        }
         let desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
             // SAFETY: a borrowed pointer the description never releases.
             pRootSignature: unsafe { std::mem::transmute_copy(&root) },
