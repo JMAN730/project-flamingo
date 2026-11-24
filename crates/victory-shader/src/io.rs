@@ -382,7 +382,15 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                             io.interps
                                 .push((site, Interp::Vertex { attribute, vertex }));
                         }
-                        ("v_interp_p1_f32", _) => {}
+                        // A first half stands on its own when no second half
+                        // consumes it (its result read as data): register it
+                        // as a weighted interpolation, exactly what
+                        // `push_pair` records for a consumed one (`push_pair`
+                        // then finds it already there and adds nothing).
+                        ("v_interp_p1_f32", _) => {
+                            io.interps
+                                .push((site, Interp::Weighted { attribute }));
+                        }
                         ("v_interp_p2_f32", Operand::Vector { reg, .. }) => {
                             let Operand::Vector { reg: d, .. } = *dst else {
                                 return Err(unsupported(at, "an interpolation operand"));
@@ -460,6 +468,23 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
             }
         }
     }
+    // A first half registered for its own sake that a second half later
+    // paired with goes back to being the pair's business alone: the pair's
+    // `first` sites name it, and a standalone weighted entry here would make
+    // the lower emit the interpolation twice.
+    let paired: Vec<Site> = io
+        .interps
+        .iter()
+        .filter_map(|(_, interp)| match interp {
+            Interp::Interpolated { first, .. } => Some(first.iter().copied()),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    io.interps.retain(|(site, interp)| match interp {
+        Interp::Weighted { .. } => !paired.contains(site),
+        _ => true,
+    });
     Ok(io)
 }
 
