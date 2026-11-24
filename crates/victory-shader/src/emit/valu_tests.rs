@@ -137,6 +137,7 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        host_wave64: true,
     })
     .expect("lower");
 
@@ -1294,4 +1295,80 @@ fn v_ldexp_f32_scales_by_any_exponent() {
     run_cases(&shader, &[[0x7fc0_0000, 10, 0, 0]], |backend, _, _, got| {
         assert!(f32::from_bits(got).is_nan(), "{backend}: {got:#010x}");
     });
+}
+
+/// Translates a 64-thread wave64 program from `wave64_fixtures` for a host
+/// without 64-lane waves (lane exchanges through group-shared memory) and
+/// checks what its group stores on every available SM 6.6 host. The
+/// translation declares no wave size, so it runs on any GPU: on NVIDIA's
+/// 32-lane waves this is the only way these programs run at all.
+fn run_wave64_group(body: &[u32], lds_bytes: u32, expected: &[u32]) {
+    use super::wave64_fixtures::{lower_for, program};
+    let lowered = lower_for(&program(body, 64, lds_bytes), false).expect("lower");
+    let shader = HostShader {
+        stage: HwStage::Cs,
+        dxil: lowered.dxil,
+        user_data: lowered.user_data,
+        samplers: lowered.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: lowered.root_cbvs,
+        root_srvs: lowered.root_srvs,
+    };
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host
+            .compute_pipeline(&shader)
+            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            ud[u.index as usize] = match (u.root, u.slot) {
+                (RootType::Constants, 0) | (RootType::Table, 1) => 0,
+                other => panic!("unexpected user data {other:?}"),
+            };
+        }
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &[View::RawUav(256)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+        for (n, (&got, &want)) in out[0].iter().zip(expected).enumerate() {
+            assert_eq!(
+                got,
+                want,
+                "{label}: dword {n} (lane {}, result {}) = {got:#x}, want {want:#x}",
+                n % 64,
+                n / 64,
+            );
+        }
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
+#[test]
+fn wave64_lane_reads_ballots_and_lds_run_without_64_lane_waves() {
+    use super::wave64_fixtures::{CROSS_LANE, cross_lane_expected};
+    run_wave64_group(CROSS_LANE, 512, &cross_lane_expected());
+}
+
+#[test]
+fn wave64_dpp_first_lane_and_swizzle_run_without_64_lane_waves() {
+    use super::wave64_fixtures::{DPP_FIRST_SWIZZLE, dpp_first_swizzle_expected};
+    run_wave64_group(DPP_FIRST_SWIZZLE, 0, &dpp_first_swizzle_expected());
 }
