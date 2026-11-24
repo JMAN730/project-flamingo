@@ -154,13 +154,17 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
     }
 }
 
-/// The start of a present plane: frame token, then the plane's resources.
+/// A present plane (`D3D12XBOX_PRESENT_PLANE_PARAMETERS`, 0x48 bytes, after
+/// upstream #211): frame token, the plane's resources, then source
+/// rectangles, placement, color space, extended descriptions and flags.
 #[repr(C)]
 pub(crate) struct Plane {
     token: u64,
     count: u32,
     resources: *const This,
+    _rest: [u64; 6],
 }
+const _: () = assert!(std::mem::size_of::<Plane>() == 0x48);
 /// Submission tagged with the frame it belongs to `(count, lists, frame
 /// token, flags)`; frames are paced elsewhere, so it runs as a plain one.
 extern "system" fn execute_x(this: This, count: u32, lists: *const This, _token: u64, _flags: u32) {
@@ -279,9 +283,10 @@ pub(crate) fn presented() -> u64 {
     FRAMES.load(Ordering::Relaxed)
 }
 
-/// Shows the first plane's first resource in our window.
+/// Shows each plane's first resource in our window, planes 1.. over plane 0
+/// (`Host::present`).
 ///
-/// shortcut: one plane, no scaling or placement, the source expected in
+/// shortcut: no source rectangles or placement, the sources expected in
 /// the common state.
 extern "system" fn present(
     this: This,
@@ -291,36 +296,44 @@ extern "system" fn present(
 ) -> HRESULT {
     // Read now: the parameters are the title's, maybe on its stack. The
     // frame is shown in the queue's order, after the work before it.
-    if planes > 1 {
-        // A console can put a UI plane over a scene plane (Series S: a
-        // 1080p scene under a 4K UI); only the first is shown here. Once,
-        // so a run shows whether a title needs the planes composited.
-        static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| {
-            tracing::warn!(planes, "a present with several planes: only the first is shown");
-        });
-    }
-    let plane = if planes > 0 {
+    let all: &[Plane] = if planes > 0 && !plane_parameters.is_null() {
         // SAFETY: the title passes `planes` plane descriptions.
-        unsafe { plane_parameters.as_ref() }
+        unsafe {
+            std::slice::from_raw_parts(
+                plane_parameters,
+                (planes as usize).min(8),
+            )
+        }
     } else {
-        None
+        &[]
     };
-    let resource = plane
+    // A console puts a UI plane over a scene plane (Series S: a 1080p
+    // scene under a 4K UI); upstream #841's title shows its start screens
+    // on the UI plane alone.
+    let resources: Vec<object::Held> = all
+        .iter()
         .filter(|plane| plane.count > 0 && !plane.resources.is_null())
         // SAFETY: the plane lists `count` resources.
         .map(|plane| unsafe { *plane.resources })
         .filter(|resource| !resource.is_null())
-        .map(object::Held::new);
+        .map(object::Held::new)
+        .collect();
+    if planes > 1 {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            tracing::info!(planes, shown = resources.len(), "a present with several planes: composited");
+        });
+    }
     queue(this)
         .timeline
-        .submit(Op::Run(Box::new(move || show(resource))));
+        .submit(Op::Run(Box::new(move || show(resources))));
     S_OK
 }
 
 /// A present, once the queue's work before it has run: counts the frame
 /// and shows the plane's first resource.
-fn show(resource: Option<object::Held>) {
+fn show(resources: Vec<object::Held>) {
+    let resource = resources.first();
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
     if frame.is_power_of_two() {
         let (draws, dispatches) = crate::list::take_counts();
@@ -356,7 +369,7 @@ fn show(resource: Option<object::Held>) {
     }
     #[cfg(windows)]
     if frame.is_power_of_two() {
-        let held = resource.as_ref().map(object::Held::get);
+        let held = resource.map(object::Held::get);
         match held {
             None => tracing::warn!(frame, "a present with no resource: nothing shown"),
             Some(r) if !crate::resource::host_made(r) => tracing::warn!(
@@ -367,22 +380,38 @@ fn show(resource: Option<object::Held>) {
         }
     }
     #[cfg(windows)]
-    if let Some(resource) = resource.as_ref().map(object::Held::get)
-        && let Some(texture) = crate::resource::host_resource(resource)
-        && let Some(host) = crate::host::host()
-    {
+    if let Some(host) = crate::host::host() {
         const COPY_SOURCE: u32 = 0x800;
-        let state = crate::resource::host_transition(resource, COPY_SOURCE)
-            .map_or(COPY_SOURCE, |(_, before)| before);
-        let shown = host.present(texture, state, frame);
+        // Plane 0 first; planes with no host copy (never written) are left
+        // out, as is a texture on two planes.
+        let mut shown_planes = Vec::with_capacity(resources.len());
+        for r in resources.iter().map(object::Held::get) {
+            if shown_planes.iter().any(|&(o, _, _)| o == r) {
+                continue;
+            }
+            let Some(texture) = crate::resource::host_resource(r) else {
+                continue;
+            };
+            let state = crate::resource::host_transition(r, COPY_SOURCE)
+                .map_or(COPY_SOURCE, |(_, before)| before);
+            shown_planes.push((r, texture, state));
+        }
+        if shown_planes.is_empty() {
+            return;
+        }
+        let sources: Vec<(&_, u32)> = shown_planes.iter().map(|&(_, t, s)| (t, s)).collect();
+        let shown = host.present(&sources, frame);
         if frame.is_power_of_two() && shown.is_none() {
             tracing::warn!(frame, "frame not shown (see the warning before)");
         }
-        crate::resource::host_transition(resource, state);
+        for &(r, _, state) in shown_planes.iter().rev() {
+            crate::resource::host_transition(r, state);
+        }
+        let (resource, _, state) = shown_planes[0];
         #[cfg(feature = "diagnostics")]
         blinks(frame, resource, state, shown);
         #[cfg(not(feature = "diagnostics"))]
-        let _ = shown;
+        let _ = (shown, resource, state);
     }
     #[cfg(not(windows))]
     let _ = resource;
@@ -750,6 +779,7 @@ mod tests {
                 token: 1,
                 count: 1,
                 resources: resources.as_ptr(),
+                _rest: [0; 6],
             });
             assert_eq!(present(waits)(waits, 1, &*plane, std::ptr::null()), S_OK);
         }

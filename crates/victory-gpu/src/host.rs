@@ -2146,7 +2146,12 @@ struct Presenter {
     copy: HostList,
     hwnd: HWND,
     meter: Meter,
+    /// Draws presents of several planes (made on the first).
+    compositor: Option<crate::compose::Compositor>,
 }
+
+/// Set once making the compositor failed: presents show plane 0 alone.
+static NO_COMPOSITOR: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 impl Presenter {
     fn sync_color_space(&mut self, hdr_active: bool) {
@@ -2413,17 +2418,41 @@ fn levels(buffer: &ID3D12Resource) -> Option<(u8, u8)> {
 }
 
 impl Host {
-    /// Shows `texture`, which is in `state` (a host state) and stays in it,
-    /// as frame `frame` (saved if captures are on). `None` if nothing was
-    /// shown; else, in diagnostics builds, whether the frame was black.
-    pub(crate) fn present(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
+    /// Shows `planes` (host textures, each in a host state it stays in) as
+    /// frame `frame` (saved if captures are on): plane 0 alone is copied,
+    /// several are composited, planes 1.. over plane 0 ([`crate::compose`]).
+    /// `None` if nothing was shown; else, in diagnostics builds, whether
+    /// the frame was black.
+    pub(crate) fn present(&self, planes: &[(&ID3D12Resource, u32)], frame: u64) -> Option<bool> {
+        let &(texture, state) = planes.first()?;
         // SAFETY: a live resource.
         let desc = unsafe { texture.GetDesc() };
         let Some(format) = swap_format(desc.Format) else {
             tracing::warn!(format = desc.Format.0, "cannot present this format");
             return None;
         };
-        let (width, height) = (desc.Width as u32, desc.Height);
+        let compose = planes.len() > 1 && !NO_COMPOSITOR.load(Ordering::Relaxed);
+        let (mut width, mut height) = (desc.Width as u32, desc.Height);
+        if compose {
+            for &(plane, _) in &planes[1..] {
+                // SAFETY: a live resource.
+                let d = unsafe { plane.GetDesc() };
+                width = width.max(d.Width as u32);
+                height = height.max(d.Height);
+            }
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                let sizes: Vec<String> = planes
+                    .iter()
+                    .map(|&(plane, _)| {
+                        // SAFETY: a live resource.
+                        let d = unsafe { plane.GetDesc() };
+                        format!("{}x{} format {}", d.Width, d.Height, d.Format.0)
+                    })
+                    .collect();
+                tracing::info!(planes = ?sizes, width, height, "compositing present planes");
+            });
+        }
         let mut presenter = self.presenter.lock().unwrap_or_else(|e| e.into_inner());
         if presenter.is_none() {
             *presenter = match self.presenter(width, height, format) {
@@ -2457,6 +2486,19 @@ impl Host {
         } else {
             p.sync_color_space(false);
         }
+        if compose && p.compositor.as_ref().is_none_or(|c| c.format != format) {
+            match crate::compose::Compositor::new(&self.device, format) {
+                Ok(c) => p.compositor = Some(c),
+                Err(e) => {
+                    // The swap chain may be sized for the planes: plane 0
+                    // alone from the next frame.
+                    tracing::warn!(error = %e, "no present compositor: only plane 0 is shown");
+                    NO_COMPOSITOR.store(true, Ordering::Relaxed);
+                    return None;
+                }
+            }
+        }
+        let compositor = if compose { p.compositor.as_ref() } else { None };
         let state = D3D12_RESOURCE_STATES(state as i32);
         // SAFETY: our swap chain, list and a live source texture.
         unsafe {
@@ -2466,6 +2508,42 @@ impl Host {
             };
             p.copy.reset();
             let list = &p.copy.list;
+            if let Some(compositor) = compositor {
+                compositor.record(&self.device, list, &back, (width, height), planes, |f| {
+                    swap_format(f).or(matches!(f.0, 26 | 88).then_some(f))
+                });
+                // The composited picture is what is captured and looked at.
+                list.ResourceBarrier(&[transition(
+                    &back,
+                    D3D12_RESOURCE_STATE_PRESENT,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                )]);
+                #[cfg(feature = "diagnostics")]
+                let capture = crate::capture::wanted(frame)
+                    .then(|| crate::capture::read_back(&self.device, list, &back))
+                    .flatten();
+                #[cfg(feature = "diagnostics")]
+                let probe = crate::capture::probe(&self.device, list, &back);
+                let looked = (frame.is_power_of_two() && frame >= 4)
+                    .then(|| look_at(&self.device, list, &back))
+                    .flatten();
+                list.ResourceBarrier(&[transition(
+                    &back,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    D3D12_RESOURCE_STATE_PRESENT,
+                )]);
+                p.copy.close();
+                self.execute(&[&p.copy]);
+                #[cfg(feature = "diagnostics")]
+                if let Some((buffer, footprint)) = capture {
+                    crate::capture::save_read_back(frame, &buffer, &footprint);
+                }
+                self.show_frame(p, frame, looked, (width, height, format.0));
+                #[cfg(feature = "diagnostics")]
+                return Some(probe.is_some_and(|b| crate::capture::black(&b)));
+                #[cfg(not(feature = "diagnostics"))]
+                return Some(false);
+            }
             list.ResourceBarrier(&[
                 transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE),
                 transition(
@@ -2509,31 +2587,44 @@ impl Host {
             if let Some((buffer, footprint)) = capture {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
             }
-            let presented = p.swap_chain.Present(0, DXGI_PRESENT(0));
-            if presented.is_err() {
-                static LAST: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
-                if LAST.swap(presented.0, std::sync::atomic::Ordering::Relaxed) != presented.0 {
-                    tracing::warn!(hr = %format!("{:#010x}", presented.0 as u32), frame, "Present failed");
-                }
-            }
-            if let Some(buffer) = looked {
-                let (max, mean) = levels(&buffer).unwrap_or((0, 0));
-                tracing::info!(
-                    frame,
-                    width,
-                    height,
-                    format = desc.Format.0,
-                    brightest = max,
-                    mean,
-                    "presented picture (16 pixels; 0 = black)"
-                );
-            }
-            p.meter.frame(p.hwnd);
+            self.show_frame(p, frame, looked, (width, height, desc.Format.0));
             #[cfg(feature = "diagnostics")]
             return Some(probe.is_some_and(|b| crate::capture::black(&b)));
             #[cfg(not(feature = "diagnostics"))]
             Some(false)
         }
+    }
+
+    /// Presents the back buffer the copy list filled (it has run), logs
+    /// the pixels `looked` read, and counts the frame.
+    fn show_frame(
+        &self,
+        p: &mut Presenter,
+        frame: u64,
+        looked: Option<ID3D12Resource>,
+        (width, height, format): (u32, u32, i32),
+    ) {
+        // SAFETY: our swap chain; the copies into `looked` finished.
+        let presented = unsafe { p.swap_chain.Present(0, DXGI_PRESENT(0)) };
+        if presented.is_err() {
+            static LAST: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+            if LAST.swap(presented.0, Ordering::Relaxed) != presented.0 {
+                tracing::warn!(hr = %format!("{:#010x}", presented.0 as u32), frame, "Present failed");
+            }
+        }
+        if let Some(buffer) = looked {
+            let (max, mean) = levels(&buffer).unwrap_or((0, 0));
+            tracing::info!(
+                frame,
+                width,
+                height,
+                format,
+                brightest = max,
+                mean,
+                "presented picture (16 pixels; 0 = black)"
+            );
+        }
+        p.meter.frame(p.hwnd);
     }
 
     fn presenter(
@@ -2577,6 +2668,7 @@ impl Host {
                 copy,
                 hwnd,
                 meter: Meter::new(),
+                compositor: None,
             };
             p.sync_color_space(display_hdr_info().is_some());
             Ok(p)
