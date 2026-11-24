@@ -1958,7 +1958,20 @@ mod tests {
     fn bounded_root_slots_belong_to_the_recording_that_allocated_them() {
         let mut state = super::State::default();
         let heap = 1;
-        state.fresh_tables.insert((10, 11), 4);
+        state.fresh_tables.insert(
+            super::FreshTableKey {
+                heap,
+                copy_gen: 0,
+                slots: 1,
+                records_hash: 10,
+            },
+            super::FreshTableEntry {
+                table: 11,
+                start_slot: 10,
+                first: 4,
+                dead_slots: Vec::new(),
+            },
+        );
         state.root_srv_slots.insert((heap, None), 5);
         state.dynamic.extend([(heap, 4, 1), (heap, 5, 1)]);
 
