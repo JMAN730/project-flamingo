@@ -479,6 +479,13 @@ pub fn emit(
         }
         other => other,
     };
+    if matches!(&original, Ok((_, Some(64))))
+        && native.stage == HwStage::Cs
+        && lower::host_max_wave() == 32
+        && std::env::var_os("VICTORY_WAVE_WHY").is_some()
+    {
+        doubled_probe(native, p);
+    }
     let original = original.map(|(shader, _)| shader);
     // Retry unsupported programs only. Threading can separate an unknown
     // register value from its apparent use on a mutually exclusive path.
@@ -557,6 +564,78 @@ fn widen(
         }
         wide.extend(more);
     }
+}
+
+/// `p` structured with every per-lane branch taken by the whole wave
+/// ([`structure::structure_wide`]): control flow is then the console's own (the wave goes
+/// one way, EXEC guards each vector instruction), the form a console wave run as one host
+/// wave of doubled lanes needs. Fails where a lane branch's wave-wide meaning is not known
+/// ([`structure::Structured::wave_any`]).
+pub(crate) fn all_wide(p: &ir::Program) -> Result<structure::Structured, &'static str> {
+    let mut wide = std::collections::HashSet::new();
+    loop {
+        let st = structure::structure_wide(p, &wide).map_err(|_| "no structure with every lane branch wave-wide")?;
+        let lane: Vec<usize> = st
+            .exits
+            .iter()
+            .enumerate()
+            .filter(|&(b, e)| {
+                matches!(*e, structure::LaneExit::Branch { when, .. }
+                    if !st.wide.contains(&b)
+                        && !st.bools.support(when).iter().all(|a| matches!(a, structure::Atom::Uniform(_))))
+            })
+            .map(|(b, _)| b)
+            .collect();
+        if lane.is_empty() {
+            return Ok(st);
+        }
+        if lane.iter().any(|&b| st.wave_any.get(b).copied().flatten().is_none()) {
+            return Err("a lane branch whose wave-wide meaning is not known");
+        }
+        wide.extend(lane);
+    }
+}
+
+/// `VICTORY_WAVE_WHY`: for a program that keeps 64-lane waves, whether the doubled form
+/// could take it ([`all_wide`]) and the cross-lane code it holds.
+fn doubled_probe(native: &NativeProgram, p: &ir::Program) {
+    let group = match native.io {
+        crate::native::StageIo::Cs(cs) => cs.threads.iter().product::<u32>(),
+        _ => return,
+    };
+    let mut kinds: Vec<&str> = Vec::new();
+    for i in p.blocks.iter().flat_map(|b| &b.insts) {
+        let n = i.name();
+        let k = if n.starts_with("v_mbcnt") {
+            "v_mbcnt"
+        } else if matches!(n, "v_readlane_b32" | "v_writelane_b32" | "v_readfirstlane_b32") {
+            n
+        } else if n.starts_with("ds_permute") || n.starts_with("ds_bpermute") {
+            "ds_(b)permute"
+        } else if n.starts_with("ds_swizzle") || n.contains("permlane") {
+            "swizzle/permlane"
+        } else if matches!(&i.fields, crate::gfx10::Fields::Valu(v) if v.dpp.is_some()) {
+            "dpp"
+        } else if n == "s_barrier" {
+            "s_barrier"
+        } else {
+            continue;
+        };
+        if !kinds.contains(&k) {
+            kinds.push(k);
+        }
+    }
+    let sections: usize = (0..p.blocks.len()).map(|b| wave::sections(p, b).len()).sum();
+    kinds.sort_unstable();
+    let wide = match all_wide(p) {
+        Ok(st) => format!("all-wide ok ({} wave-wide branches)", st.wide.len()),
+        Err(e) => format!("all-wide NO: {e}"),
+    };
+    eprintln!(
+        "WAVE64-DOUBLE probe group={group} blocks={} {wide}; sections={sections}; cross-lane [{}]",
+        p.blocks.len(),
+        kinds.join(", ")
+    );
 }
 
 /// The translated program, and the wave size it requires of the host.
