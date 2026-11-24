@@ -2289,6 +2289,8 @@ impl<'a> Lower<'a> {
     /// shader fast-math (observed on Intel Iris Xe and NVIDIA, upstream
     /// #726, #745), returning the median where the hardware gives the
     /// least operand. An integer compare leaves them nothing to assume.
+    /// The final selection runs in integer space so NVIDIA's DXIL compiler
+    /// cannot fold the select back into `FMNMX`.
     fn med3(&mut self, a: V, b: V, third: V) -> V {
         let c = self.cur;
         let lo = self.binary(36, a, b);
@@ -2301,7 +2303,9 @@ impl<'a> Lower<'a> {
         let n3 = self.is_nan_bits(third);
         let ab = self.s.m.bin(c, Bin::Or, na, nb);
         let nan = self.s.m.bin(c, Bin::Or, ab, n3);
-        self.s.m.select(c, nan, least, median)
+        let (ileast, imedian) = (self.as_int(least), self.as_int(median));
+        let picked = self.s.m.select(c, nan, ileast, imedian);
+        self.as_float(picked)
     }
 
     /// Whether `f` is a NaN, tested on its bits (`|f| > +inf` as integers).
