@@ -265,6 +265,10 @@ struct Lower<'a> {
     wave64_refused: bool,
     /// Guarded code being lowered ([`Lower::begin_guarded`] depth).
     guard_depth: u32,
+    /// The one block that returns: every end of the program branches to it,
+    /// so the function has a single exit as DXC emits it (dxil-spirv, under
+    /// Proton, cannot structure a loop left by both a break and a return).
+    ret: Option<usize>,
 }
 
 /// The console's 64-lane wave as one thread group on a host whose waves
@@ -714,6 +718,7 @@ impl<'a> Lower<'a> {
             emulated,
             wave64_refused,
             guard_depth: 0,
+            ret: None,
         }
     }
 
@@ -8091,7 +8096,7 @@ impl<'a> Lower<'a> {
                     self.s
                         .op(self.cur, "discard", Attr::NoUnwind, self.s.t.void, 82, &[t]);
                 }
-                Term::Ret
+                Term::Br(self.ret_block())
             }
             LaneExit::Indirect => return Err(unsupported(offset, "an indirect jump")),
         };
@@ -8137,9 +8142,21 @@ impl<'a> Lower<'a> {
             self.s
                 .op(a, "discard", Attr::NoUnwind, self.s.t.void, 82, &[t]);
         }
-        self.s.m.terminate(a, Term::Ret);
+        let r = self.ret_block();
+        self.s.m.terminate(a, Term::Br(r));
         self.abort = Some(a);
         a
+    }
+
+    /// The function's single returning block (see `ret`).
+    fn ret_block(&mut self) -> usize {
+        if let Some(r) = self.ret {
+            return r;
+        }
+        let r = self.s.m.new_block();
+        self.s.m.terminate(r, Term::Ret);
+        self.ret = Some(r);
+        r
     }
 
     /// The DXIL block a branch from IR block `from` to `to` goes to.
