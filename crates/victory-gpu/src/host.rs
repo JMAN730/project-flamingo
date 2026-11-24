@@ -8,7 +8,9 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{
+    DXGI_STATUS_OCCLUDED, HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM,
+};
 use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -16,7 +18,7 @@ use windows::Win32::Graphics::Dxgi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
 use windows::Win32::UI::WindowsAndMessaging::*;
-use windows::core::{Interface, PCWSTR, w};
+use windows::core::{HRESULT, Interface, PCWSTR, w};
 
 /// Resource states without the console's own bits (compression hints from
 /// bit 25 up), which the host rejects.
@@ -647,6 +649,18 @@ fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn present_result_distinguishes_occlusion_from_success_and_failure() {
+        assert!(present_result(HRESULT(0)).unwrap());
+        assert!(!present_result(DXGI_STATUS_OCCLUDED).unwrap());
+        assert_eq!(
+            present_result(DXGI_ERROR_DEVICE_REMOVED)
+                .unwrap_err()
+                .code(),
+            DXGI_ERROR_DEVICE_REMOVED
+        );
+    }
+
     #[test]
     fn sparse_copies_preserve_islands_and_observe_remaps() {
         use windows_sys::Win32::System::Memory::*;
@@ -5769,6 +5783,13 @@ struct Presenter {
     ahead: Vec<(HostList, u64)>,
     hwnd: HWND,
     meter: Meter,
+    last_present_error: Option<HRESULT>,
+}
+
+/// A successful DXGI status may still mean nothing was presented.
+fn present_result(status: HRESULT) -> windows::core::Result<bool> {
+    status.ok()?;
+    Ok(status != DXGI_STATUS_OCCLUDED)
 }
 
 /// The frame rate, shown in the window's caption every second and logged
@@ -6152,7 +6173,28 @@ impl Host {
                 (None, Some(label)) => crate::capture::put_back(label),
                 (None, None) => {}
             }
-            let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            let status = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            match present_result(status) {
+                Ok(shown) => {
+                    p.last_present_error = None;
+                    if !shown {
+                        return None;
+                    }
+                }
+                Err(error) => {
+                    if self.device.GetDeviceRemovedReason().is_err() {
+                        fail(format_args!(
+                            "host GPU device removed during Present: {error}{}{}",
+                            self.removal_data(&[&p.copy]),
+                            last_notes(&[&p.copy])
+                        ));
+                    }
+                    if p.last_present_error.replace(status) != Some(status) {
+                        tracing::warn!(%error, frame, "swap chain present failed");
+                    }
+                    return None;
+                }
+            }
             p.meter.frame(p.hwnd);
             #[cfg(feature = "diagnostics")]
             return Some(probe.is_some_and(|b| crate::capture::black(&b)));
@@ -6202,6 +6244,7 @@ impl Host {
                 ahead: Vec::new(),
                 hwnd,
                 meter: Meter::new(),
+                last_present_error: None,
             })
         }
     }

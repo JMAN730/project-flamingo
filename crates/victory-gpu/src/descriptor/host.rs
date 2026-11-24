@@ -1087,6 +1087,24 @@ impl HostHeap {
         self.keep(index, kept.flatten());
     }
 
+    /// Makes slot `index` (a dynamic one) a structured buffer alias with
+    /// element width `stride`, for a shader that declares a structured SRV
+    /// where the title binds a raw buffer SRV (`draw::fullscreen_structured_alias`
+    /// names the verified passes). The title's own slot keeps its raw view.
+    pub(crate) fn make_structured_at(&self, index: u32, view: &View, stride: u32) -> bool {
+        let Some((address, len, desc)) = buffer_srv_parts(view) else {
+            return false;
+        };
+        let Some(alias) = structured_alias(desc, stride) else {
+            return false;
+        };
+        let Some(kept) = buffer_srv_alias(address, len, alias, self.cpu(index)) else {
+            return false;
+        };
+        self.keep(index, kept);
+        true
+    }
+
     /// Makes slot `index` read nothing: a null view, or a plain sampler.
     pub(crate) fn make_null(&self, index: u32) {
         if self.sampler {
@@ -1610,6 +1628,116 @@ fn buffer_srv(
             raw,
             width,
             "buffer view the host would refuse left null"
+        );
+        return None;
+    }
+    // The console has no component mapping; one the host does not know is the default's.
+    if desc.Shader4ComponentMapping != D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING {
+        desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    }
+    let host = host()?;
+    // SAFETY: a live buffer and a slot of our heap.
+    unsafe {
+        host.device
+            .CreateShaderResourceView(&shadow.buffer, Some(&desc), at)
+    };
+    Some(Some(shadow.buffer.clone()))
+}
+
+/// The buffer a view is of: its memory address, its length in bytes, and
+/// the view's description (`None` for views that are not buffer views).
+fn buffer_srv_parts(view: &View) -> Option<(u64, u64, D3D12_SHADER_RESOURCE_VIEW_DESC)> {
+    const BUFFER: u32 = 1;
+    match view {
+        View::Shader(resource, Some(desc)) => {
+            let (data, len) = crate::resource::buffer_bytes(*resource as crate::object::This)?;
+            Some((data as u64, len, srv_desc(desc)))
+        }
+        View::Placed(false, resource, desc) if resource[0] == BUFFER => {
+            let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+            let len = u64::from(resource[4]) | u64::from(resource[5]) << 32;
+            Some((address, len, srv_desc(desc[..10].try_into().ok()?)))
+        }
+        _ => None,
+    }
+}
+
+/// Re-expresses the exact byte start and length of a raw buffer SRV as
+/// structured elements of width `stride`, rejecting typed or already
+/// structured views and fractional bounds.
+fn structured_alias(
+    mut desc: D3D12_SHADER_RESOURCE_VIEW_DESC,
+    stride: u32,
+) -> Option<D3D12_SHADER_RESOURCE_VIEW_DESC> {
+    if desc.ViewDimension != D3D12_SRV_DIMENSION_BUFFER
+        || !(4..=2048).contains(&stride)
+        || !stride.is_multiple_of(4)
+    {
+        return None;
+    }
+    let old_bytes = element_size(&desc);
+    // SAFETY: `ViewDimension == D3D12_SRV_DIMENSION_BUFFER` verified above.
+    let old = unsafe { desc.Anonymous.Buffer };
+    if old.StructureByteStride != 0
+        || old.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 == 0
+        || old_bytes == 0
+        || old.NumElements == 0
+    {
+        return None;
+    }
+    let width = u64::from(stride);
+    let start = old.FirstElement.checked_mul(old_bytes)?;
+    let size = u64::from(old.NumElements).checked_mul(old_bytes)?;
+    if start % width != 0 || size % width != 0 {
+        return None;
+    }
+    desc.Format = DXGI_FORMAT_UNKNOWN;
+    desc.Anonymous.Buffer = D3D12_BUFFER_SRV {
+        FirstElement: start / width,
+        NumElements: u32::try_from(size / width).ok()?,
+        StructureByteStride: stride,
+        Flags: D3D12_BUFFER_SRV_FLAG_NONE,
+    };
+    Some(desc)
+}
+
+/// [`buffer_srv`] that keeps the structured shape it is given instead of
+/// turning it into a raw window ([`raw_window`]): for a shader whose
+/// translated reads are structured while the title binds a raw view.
+fn buffer_srv_alias(
+    address: u64,
+    len: u64,
+    mut desc: D3D12_SHADER_RESOURCE_VIEW_DESC,
+    at: D3D12_CPU_DESCRIPTOR_HANDLE,
+) -> Option<Kept> {
+    let shadow = crate::shadow::find(address, len)?;
+    let offset = shadow.offset(address);
+    let element = element_size(&desc);
+    // SAFETY: a buffer view's union member.
+    let buffer = unsafe { &mut desc.Anonymous.Buffer };
+    if element == 0 || buffer.StructureByteStride == 0 || buffer.NumElements == 0 {
+        return None;
+    }
+    if offset % element != 0 {
+        once!(
+            offset,
+            element,
+            "structured alias not on an element of its host copy"
+        );
+        return None;
+    }
+    buffer.FirstElement += offset / element;
+    let (first, count, stride) = (buffer.FirstElement, buffer.NumElements, buffer.StructureByteStride);
+    // SAFETY: a live buffer.
+    let width = unsafe { shadow.buffer.GetDesc() }.Width;
+    if !buffer_view_ok(desc.Format, first, count, stride, false, width) {
+        REFUSED_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        once!(
+            first,
+            count,
+            stride,
+            width,
+            "structured alias the host would refuse left raw"
         );
         return None;
     }
