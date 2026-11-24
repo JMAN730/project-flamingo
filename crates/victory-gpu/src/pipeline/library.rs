@@ -431,8 +431,80 @@ const LIBRARY_FILE: &str = "host-pipelines.bin";
 /// start renames it over the library first ([`Blob::of`]).
 const NEXT_FILE: &str = "host-pipelines.next";
 const EARLY_FILE: &str = "early-pipelines.txt";
+/// Pipelines the host's compiler failed on with `E_OUTOFMEMORY`, and in how
+/// many launches (see [`crashes`]).
+const CRASHED_FILE: &str = "crashed-pipelines.txt";
 /// Title pipelines listed for an early start, at most.
 const EARLY_MAX: usize = 8192;
+
+/// Whether the library came from this cache's file (not rejected: the same
+/// adapter and driver as when it was saved).
+static KEPT: AtomicBool = AtomicBool::new(false);
+
+/// The pipelines NVIDIA's compiler crashed on, by name, and in how many
+/// launches. In a world run on an RTX 4060, 25 compute pipelines took the
+/// driver's compiler down (an access violation in `nvgpucomp64.dll`, four
+/// times each, reported as `E_OUTOFMEMORY`), each holding a worker for
+/// 10-40 s, again at every launch, while 1,675 other pipelines waited.
+/// One that failed in two launches is no longer tried (its draws are
+/// dropped, as when it fails); a real shortage of memory passes the second
+/// time and is forgotten. A driver or adapter change (the library file is
+/// rejected) forgets them all. `VICTORY_RETRY_CRASHED=1` tries them anyway.
+fn crashes() -> &'static Mutex<std::collections::HashMap<String, u32>> {
+    static CRASHES: OnceLock<Mutex<std::collections::HashMap<String, u32>>> = OnceLock::new();
+    CRASHES.get_or_init(|| {
+        let mut map = std::collections::HashMap::new();
+        if let Some(dir) = DIR.get() {
+            let path = dir.join(CRASHED_FILE);
+            if library().is_some() && KEPT.load(Ordering::Relaxed) {
+                map = parse_crashes(&std::fs::read_to_string(&path).unwrap_or_default());
+            } else {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+        Mutex::new(map)
+    })
+}
+
+/// `name launches` lines.
+fn parse_crashes(text: &str) -> std::collections::HashMap<String, u32> {
+    text.lines()
+        .filter_map(|l| {
+            let (name, n) = l.trim().split_once(' ')?;
+            Some((name.to_owned(), n.parse().ok()?))
+        })
+        .collect()
+}
+
+/// Whether the pipeline `name` crashed the compiler in two launches before.
+fn crashed_before(name: &str) -> bool {
+    if std::env::var_os("VICTORY_RETRY_CRASHED").is_some_and(|v| v == "1") {
+        return false;
+    }
+    crashes().lock().unwrap_or_else(|e| e.into_inner()).get(name).is_some_and(|&n| n >= 2)
+}
+
+/// Records how making the pipeline `name` went: a compiler failure counts
+/// a launch more (once per launch), a success forgets it.
+fn note_made(name: &str, crashed: bool) {
+    static THIS_LAUNCH: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    let mut map = crashes().lock().unwrap_or_else(|e| e.into_inner());
+    if crashed {
+        let mut seen = THIS_LAUNCH.lock().unwrap_or_else(|e| e.into_inner());
+        if seen.iter().any(|n| n == name) {
+            return;
+        }
+        seen.push(name.to_owned());
+        *map.entry(name.to_owned()).or_insert(0) += 1;
+    } else if map.remove(name).is_none() {
+        return;
+    }
+    let mut lines: Vec<String> = map.iter().map(|(n, c)| format!("{n} {c}")).collect();
+    lines.sort();
+    if let Some(dir) = DIR.get() {
+        let _ = write_atomically(&dir.join(CRASHED_FILE), lines.join("\n").as_bytes());
+    }
+}
 
 fn library() -> Option<&'static Library> {
     static LIBRARY: OnceLock<Option<Library>> = OnceLock::new();
@@ -469,6 +541,7 @@ fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
                     VIEW[0].store(file.at.Value as usize, Ordering::Relaxed);
                     LOADED_AT.store(crate::host::now_ms(), Ordering::Relaxed);
                 }
+                KEPT.store(true, Ordering::Relaxed);
                 return Some(Library {
                     library,
                     _blob: blob,
@@ -537,10 +610,23 @@ pub(crate) fn pipeline(
         }
         Err(e) => e,
     };
+    if crashed_before(name) {
+        static SAID: AtomicBool = AtomicBool::new(false);
+        if !SAID.swap(true, Ordering::Relaxed) {
+            tracing::info!("pipelines that crashed the host's compiler in two launches are not tried again (VICTORY_RETRY_CRASHED=1 tries them)");
+        }
+        return Err(windows::core::Error::from_hresult(windows::Win32::Foundation::E_OUTOFMEMORY));
+    }
     // Compiled outside any lock: compiles take up to seconds.
     let pso = {
         let _call = call("make", name);
-        create()?
+        let made = create();
+        match &made {
+            Err(e) if e.code() == windows::Win32::Foundation::E_OUTOFMEMORY => note_made(name, true),
+            Ok(_) => note_made(name, false),
+            Err(_) => {}
+        }
+        made?
     };
     MADE.fetch_add(1, Ordering::Relaxed);
     crate::host::trail(|| {
@@ -709,6 +795,13 @@ pub(crate) fn note_used(key: &str) {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn crashed_pipelines_read_back() {
+        let map = super::parse_crashes("abc 1\ndef 2\nbroken\n");
+        assert_eq!(map.len(), 2);
+        assert_eq!(map["def"], 2);
+    }
     use super::*;
 
     #[test]
