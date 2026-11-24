@@ -68,6 +68,31 @@ thread_local! {
     static STORES: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct StructuredBinding {
+    slot: u8,
+    entry: u32,
+    stride: u32,
+}
+
+/// `HostShader` does not expose per-slot DXIL binding kinds and
+/// `UsedResource::stride` is console metadata that can be nonzero for raw
+/// views, so structured aliasing is scoped to verified fullscreen pairs whose
+/// vertex shader declares a 64-byte structured SRV at root table 0, entry 0
+/// while the title binds a raw buffer SRV.
+fn fullscreen_structured_alias(vertex_hash: &str, pixel_hash: &str) -> Option<StructuredBinding> {
+    match (vertex_hash, pixel_hash) {
+        ("f7f331c8c5b3a0d8", "3bfe730f7e24ee1a") // Bink video
+        | ("80cb958cde505e15", "f9bf13c6c099ccec") // Final sRGB write
+        => Some(StructuredBinding {
+            slot: 0,
+            entry: 0,
+            stride: 64,
+        }),
+        _ => None,
+    }
+}
+
 /// Whether a buffer range a shader names through an unordered access view
 /// is given to shaders as written (snapshot before the submission, compare
 /// and write back after) only if that shader's code can store to buffers.
@@ -896,10 +921,29 @@ impl State {
             list.keep(&p.pso);
             list.keep(&p.root);
         }
+        let pixel_hash = (!compute)
+            .then(|| {
+                p.stages
+                    .iter()
+                    .find(|s| s.shader.stage == "pixel")
+                    .map(|s| s.shader.hash.as_str())
+            })
+            .flatten();
         for stage in &p.stages {
             let t = stage.translated();
             STORES.set(t.stores);
-            let made = self.tables(list, &t.used, &t.host.root_indexed_views, compute);
+            let alias = (stage.shader.stage == "vertex")
+                .then(|| {
+                    pixel_hash.and_then(|ps| fullscreen_structured_alias(&stage.shader.hash, ps))
+                })
+                .flatten();
+            let made = self.tables(
+                list,
+                &t.used,
+                &t.host.root_indexed_views,
+                compute,
+                alias.as_slice(),
+            );
             STORES.set(true);
             if made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
@@ -1870,6 +1914,7 @@ impl State {
         used: &[UsedResource],
         indexed: &[RootIndexedView],
         compute: bool,
+        aliases: &[StructuredBinding],
     ) -> Vec<(u8, u32)> {
         let tables = |u: &&UsedResource| u.root == RootType::Table;
         let mut fresh: Vec<u8> = used
@@ -1877,6 +1922,7 @@ impl State {
             .filter(tables)
             .filter(|u| u.kind == ResourceType::Cbv)
             .map(|u| u.slot)
+            .chain(aliases.iter().map(|a| a.slot))
             .collect();
         // Tables reaching past a host heap smaller than the title's (the
         // host's limit, 1,000,000 views on NVIDIA) are made afresh too: the
@@ -1916,6 +1962,8 @@ impl State {
                 .filter(tables)
                 .filter(|u| u.slot == slot)
                 .collect();
+            let table_aliases: Vec<StructuredBinding> =
+                aliases.iter().copied().filter(|a| a.slot == slot).collect();
             let Some(heap) = self.heap_of(table) else {
                 continue;
             };
@@ -1945,6 +1993,7 @@ impl State {
                 .iter()
                 .map(|u| u.table_offset_dwords / 8)
                 .chain(selected.last().copied())
+                .chain(table_aliases.iter().map(|a| a.entry))
                 .max()
                 .unwrap_or(0)
                 + 1;
@@ -1955,7 +2004,8 @@ impl State {
                 once!(slot, n, "fresh descriptor table exceeds the available span");
                 continue;
             }
-            // The table and what its entries hold (record words).
+            // The table and what its entries hold (record words and alias
+            // shapes).
             let key = {
                 use std::hash::{Hash, Hasher};
                 let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -1964,9 +2014,22 @@ impl State {
                     // SAFETY: a descriptor slot in title memory.
                     unsafe { (at as *const [u32; 3]).read_unaligned() }.hash(&mut h);
                 }
+                table_aliases.hash(&mut h);
                 (table, n, h.finish())
             };
             if let Some(&first) = self.fresh_tables.get(&key) {
+                for alias in &table_aliases {
+                    if !entries.iter().any(|u| {
+                        u.kind != ResourceType::Cbv && u.table_offset_dwords / 8 == alias.entry
+                    }) {
+                        let handle = table + u64::from(alias.entry) * 32;
+                        if let Some(view) = crate::descriptor::view(handle)
+                            && let Some(kind) = view_kind(&view)
+                        {
+                            readable(list, kind, &view);
+                        }
+                    }
+                }
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     if let Some(view) = crate::descriptor::view(handle) {
@@ -2014,7 +2077,12 @@ impl State {
                         host.constant_at(index, gpu, size);
                     }
                     Some(view) => {
-                        host.make_at(index, &view);
+                        let aliased = table_aliases
+                            .iter()
+                            .any(|a| a.entry == k && host.make_structured_at(index, &view, a.stride));
+                        if !aliased {
+                            host.make_at(index, &view);
+                        }
                         let kind = used.map(|u| u.kind).or_else(|| {
                             selected.binary_search(&k).ok().and_then(|_| view_kind(&view))
                         });
