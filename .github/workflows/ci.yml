@@ -30,4 +30,11 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       # Includes xtask's repository_passes_policy, the asset-policy check.
       - name: Tests
-        run: cargo test --workspace --locked
+        shell: pwsh
+        run: |
+          cargo test --workspace --locked --no-fail-fast 2>&1 | Tee-Object -FilePath test-output.txt
+          $code = $LASTEXITCODE
+          # Failing tests and panics as annotations (readable through the API).
+          Select-String -Path test-output.txt -Pattern 'FAILED|panicked|^error|could not compile|STATUS_|exit code' |
+            Select-Object -First 40 | ForEach-Object { Write-Output "::error::$($_.Line)" }
+          exit $code
