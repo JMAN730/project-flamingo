@@ -1827,22 +1827,69 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     }
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::Fallbacks, 1);
-    // Something is unmapped: page by page (64 KiB, then 4 KiB in a piece
-    // that fails), zeros for what cannot be read.
-    for_pieces(src as usize, len, 64 << 10, |at, n| {
+    // Something is unmapped: one `VirtualQuery` per memory region, each
+    // committed readable region in one kernel copy, zeros for the rest
+    // (upstream #783, rocobalt1's region scan: 64 KiB pieces cost one
+    // kernel call each, 2 784 for a 174 MB range with one hole, and the
+    // world meets 2 300-2 500 such ranges a frame; copies 275 ms -> 120 ms).
+    let zero = |to: *mut u8, n: usize| {
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
+        // SAFETY: inside the destination, which is mapped.
+        unsafe { to.write_bytes(0, n) };
+    };
+    for_regions(src as usize, len, false, |at, n, readable| {
         let to = dst.wrapping_add(at - src as usize);
-        if !read(at as *const u8, to, n) {
+        if !readable {
+            zero(to, n);
+        } else if !read(at as *const u8, to, n) {
+            // Unmapped since the query: page by page.
             for_pieces(at, n, 4 << 10, |at, n| {
                 let to = dst.wrapping_add(at - src as usize);
                 if !read(at as *const u8, to, n) {
-                    #[cfg(feature = "diagnostics")]
-                    crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
-                    // SAFETY: inside the destination, which is mapped.
-                    unsafe { to.write_bytes(0, n) };
+                    zero(to, n);
                 }
             });
         }
     });
+}
+
+/// Calls `f` with the pieces of `[start, start + len)` cut at memory region
+/// boundaries (`VirtualQuery`), and whether each is committed and readable
+/// (writable, if `write`). Past what the query answers, one unreadable
+/// piece.
+fn for_regions(start: usize, len: usize, write: bool, mut f: impl FnMut(usize, usize, bool)) {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY,
+        PAGE_GUARD, PAGE_NOACCESS, PAGE_READWRITE, PAGE_WRITECOPY, VirtualQuery,
+    };
+    const WRITABLE: u32 =
+        PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+    let end = start + len;
+    let mut at = start;
+    while at < end {
+        // SAFETY: plain data the query fills in.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        let got = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+        let next = if got == 0 {
+            end
+        } else {
+            (info.BaseAddress as usize + info.RegionSize).min(end)
+        };
+        if next <= at {
+            f(at, end - at, false);
+            return;
+        }
+        let p = info.Protect;
+        let ok = got != 0
+            && info.State == MEM_COMMIT
+            && p & (PAGE_GUARD | PAGE_NOACCESS) == 0
+            && p & 0xff != 0
+            && (!write || p & WRITABLE != 0);
+        f(at, next - at, ok);
+        at = next;
+    }
 }
 
 /// Reads title memory at `src` into `dst`; false if a page of it is not
@@ -1877,8 +1924,10 @@ pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
     if len == 0 || write(dst as usize, len) {
         return;
     }
-    for_pieces(dst as usize, len, 64 << 10, |at, n| {
-        if !write(at, n) {
+    // The writable regions, one query each (as in `copy_mapped`); a region
+    // unmapped since the query page by page.
+    for_regions(dst as usize, len, true, |at, n, writable| {
+        if writable && !write(at, n) {
             for_pieces(at, n, 4 << 10, |at, n| {
                 write(at, n);
             });
