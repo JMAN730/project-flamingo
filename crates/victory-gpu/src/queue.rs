@@ -355,6 +355,18 @@ fn show(resource: Option<object::Held>) {
         crate::capture::dump_targets(frame);
     }
     #[cfg(windows)]
+    if frame.is_power_of_two() {
+        let held = resource.as_ref().map(object::Held::get);
+        match held {
+            None => tracing::warn!(frame, "a present with no resource: nothing shown"),
+            Some(r) if !crate::resource::host_made(r) => tracing::warn!(
+                frame,
+                "the presented texture has no host copy yet: no draw or copy wrote it"
+            ),
+            Some(_) => {}
+        }
+    }
+    #[cfg(windows)]
     if let Some(resource) = resource.as_ref().map(object::Held::get)
         && let Some(texture) = crate::resource::host_resource(resource)
         && let Some(host) = crate::host::host()
@@ -363,6 +375,9 @@ fn show(resource: Option<object::Held>) {
         let state = crate::resource::host_transition(resource, COPY_SOURCE)
             .map_or(COPY_SOURCE, |(_, before)| before);
         let shown = host.present(texture, state, frame);
+        if frame.is_power_of_two() && shown.is_none() {
+            tracing::warn!(frame, "frame not shown (see the warning before)");
+        }
         crate::resource::host_transition(resource, state);
         #[cfg(feature = "diagnostics")]
         blinks(frame, resource, state, shown);

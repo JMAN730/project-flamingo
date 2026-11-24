@@ -2299,6 +2299,119 @@ impl Meter {
     }
 }
 
+/// Pixels of a 4x4 grid [`look_at`] copies, each at a placement-aligned
+/// slot of its readback buffer.
+const LOOK_GRID: u32 = 4;
+const LOOK_SLOT: u64 = 512;
+
+/// Records copies of a 4x4 grid of `texture`'s pixels (8-bit color, in the
+/// copy-source state) into a new readback buffer.
+fn look_at(
+    device: &ID3D12Device,
+    list: &ID3D12GraphicsCommandList,
+    texture: &ID3D12Resource,
+) -> Option<ID3D12Resource> {
+    // SAFETY: a live resource.
+    let d = unsafe { texture.GetDesc() };
+    if !matches!(d.Format.0, 27..=29 | 87 | 90 | 91) {
+        return None;
+    }
+    let desc = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+        Width: LOOK_SLOT * u64::from(LOOK_GRID * LOOK_GRID),
+        Height: 1,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
+        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+        ..Default::default()
+    };
+    let heap = D3D12_HEAP_PROPERTIES {
+        Type: D3D12_HEAP_TYPE_READBACK,
+        ..Default::default()
+    };
+    let mut buffer: Option<ID3D12Resource> = None;
+    // SAFETY: plain creation; an open list; locations naming live resources.
+    unsafe {
+        device
+            .CreateCommittedResource(
+                &heap,
+                D3D12_HEAP_FLAG_NONE,
+                &desc,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                None,
+                &mut buffer,
+            )
+            .ok()?;
+        let buffer = buffer?;
+        for i in 0..LOOK_GRID * LOOK_GRID {
+            let (x, y) = (
+                (2 * (i % LOOK_GRID) + 1) * d.Width as u32 / (2 * LOOK_GRID),
+                (2 * (i / LOOK_GRID) + 1) * d.Height / (2 * LOOK_GRID),
+            );
+            let to = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(&buffer),
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                        Offset: LOOK_SLOT * u64::from(i),
+                        Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                            Format: d.Format,
+                            Width: 1,
+                            Height: 1,
+                            Depth: 1,
+                            RowPitch: 256,
+                        },
+                    },
+                },
+            };
+            let from = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(texture),
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    SubresourceIndex: 0,
+                },
+            };
+            let pixel = D3D12_BOX {
+                left: x,
+                top: y,
+                front: 0,
+                right: x + 1,
+                bottom: y + 1,
+                back: 1,
+            };
+            list.CopyTextureRegion(&to, 0, 0, 0, &from, Some(&pixel));
+        }
+        Some(buffer)
+    }
+}
+
+/// The brightest color channel and the mean of the pixels [`look_at`]
+/// copied (their submission has run).
+fn levels(buffer: &ID3D12Resource) -> Option<(u8, u8)> {
+    let mut data = std::ptr::null_mut();
+    // SAFETY: the copies finished (every submission is waited for); the
+    // buffer is mapped for the read only.
+    unsafe {
+        buffer.Map(0, None, Some(&mut data)).ok()?;
+        let bytes = std::slice::from_raw_parts(
+            data.cast::<u8>(),
+            (LOOK_SLOT * u64::from(LOOK_GRID * LOOK_GRID)) as usize,
+        );
+        let channels: Vec<u8> = bytes
+            .chunks(LOOK_SLOT as usize)
+            .flat_map(|pixel| pixel[..3].iter().copied())
+            .collect();
+        buffer.Unmap(0, None);
+        let max = channels.iter().copied().max().unwrap_or(0);
+        let mean = channels.iter().map(|&c| u32::from(c)).sum::<u32>() / channels.len().max(1) as u32;
+        Some((max, mean as u8))
+    }
+}
+
 impl Host {
     /// Shows `texture`, which is in `state` (a host state) and stays in it,
     /// as frame `frame` (saved if captures are on). `None` if nothing was
@@ -2377,6 +2490,11 @@ impl Host {
             let probe = crate::capture::probe(&self.device, list, texture);
             #[cfg(not(feature = "diagnostics"))]
             let _ = frame;
+            // A few pixels of the frames the log reports, in every build: tells
+            // a black picture from the title from one the window loses.
+            let looked = (frame.is_power_of_two() && frame >= 4)
+                .then(|| look_at(&self.device, list, texture))
+                .flatten();
             list.ResourceBarrier(&[
                 transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state),
                 transition(
@@ -2391,7 +2509,25 @@ impl Host {
             if let Some((buffer, footprint)) = capture {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
             }
-            let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            let presented = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            if presented.is_err() {
+                static LAST: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+                if LAST.swap(presented.0, std::sync::atomic::Ordering::Relaxed) != presented.0 {
+                    tracing::warn!(hr = %format!("{:#010x}", presented.0 as u32), frame, "Present failed");
+                }
+            }
+            if let Some(buffer) = looked {
+                let (max, mean) = levels(&buffer).unwrap_or((0, 0));
+                tracing::info!(
+                    frame,
+                    width,
+                    height,
+                    format = desc.Format.0,
+                    brightest = max,
+                    mean,
+                    "presented picture (16 pixels; 0 = black)"
+                );
+            }
             p.meter.frame(p.hwnd);
             #[cfg(feature = "diagnostics")]
             return Some(probe.is_some_and(|b| crate::capture::black(&b)));

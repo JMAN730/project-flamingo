@@ -870,6 +870,13 @@ pub(crate) fn host_transition(this: This, wanted: u32) -> Option<(*mut c_void, u
     (before != wanted).then(|| (host.texture.as_raw(), before))
 }
 
+/// Whether `this` has its host copy already (a draw, copy or upload made
+/// it); `host_resource` makes it on first use.
+#[cfg(windows)]
+pub(crate) fn host_made(this: This) -> bool {
+    !this.is_null() && resource(this).host.get().is_some_and(Option::is_some)
+}
+
 /// The host GPU's copy of a title resource, if it has one.
 #[cfg(windows)]
 pub(crate) fn host_resource<'a>(
