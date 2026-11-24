@@ -281,7 +281,11 @@ const LANE_MASK: Why = "a lane mask read as data";
 fn implicit_derivatives(name: &str) -> bool {
     matches!(
         name,
-        "image_sample" | "image_sample_cl" | "image_sample_b" | "image_sample_b_cl"
+        "image_sample"
+            | "image_sample_cl"
+            | "image_sample_o"
+            | "image_sample_b"
+            | "image_sample_b_cl"
     )
 }
 
@@ -6311,7 +6315,7 @@ impl<'a> Lower<'a> {
             return Ok(());
         }
         let (op, sample) = match name {
-            "image_sample" | "image_sample_cl" => (60, true),
+            "image_sample" | "image_sample_cl" | "image_sample_o" => (60, true),
             "image_sample_lz" | "image_sample_l" => (62, true),
             "image_sample_b" | "image_sample_b_cl" => (61, true),
             "image_sample_c_lz" => (65, true),
@@ -6477,6 +6481,24 @@ impl<'a> Lower<'a> {
             let mut os = vec![iu; 3];
             for o in os.iter_mut().take(offsets) {
                 *o = zero;
+            }
+            if offset_word && op != 73 {
+                // DXIL takes immediate offsets in -8..=7; the console's are
+                // 6-bit fields (x, y, z a byte apart) and may be computed.
+                let w = addr_val(self, 0)?;
+                let w = self
+                    .s
+                    .m
+                    .int_value(w)
+                    .ok_or("a sample offset that is not constant")? as u32;
+                for (k, o) in os.iter_mut().enumerate().take(offsets) {
+                    let x = (w >> (8 * k) & 0x3F) as i32;
+                    let x = if x >= 32 { x - 64 } else { x };
+                    if !(-8..=7).contains(&x) {
+                        return Err("a sample offset past -8..7");
+                    }
+                    *o = self.s.m.i32(x as u32);
+                }
             }
             let mut args = vec![h, sh];
             args.extend(&cs);
@@ -7781,7 +7803,7 @@ mod tests {
     #[test]
     fn compute_samples_with_implicit_levels_keep_console_lanes() {
         // Outside pixel shaders these take their level from each quad of
-        // console lanes (`quad_gradients`), whatever the clamp.
+        // console lanes (`quad_gradients`), whatever the clamp or offset.
         let head: [u32; 11] = [
             0xBE85_0380, // s_mov_b32 s5, 0
             0xF40C_0202,
@@ -7804,6 +7826,7 @@ mod tests {
             ("image_sample_cl", 0xF084_0108),
             ("image_sample_b", 0xF094_0108),
             ("image_sample_b_cl", 0xF098_0108),
+            ("image_sample_o", 0xF0C0_0108),
         ] {
             let tail: [u32; 5] = [
                 word,
@@ -7817,6 +7840,59 @@ mod tests {
                 panic!("{name}: {e}");
             }
         }
+    }
+
+    #[test]
+    fn a_sample_with_constant_offsets_takes_them_as_immediates() {
+        // An image (heap view 0), a buffer (view 1), an immediate sampler,
+        // s = t = 1.5; then the offsets in v1, an image_sample_o of them and
+        // a store of the result (upstream #634).
+        let head: [u32; 13] = [
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF40C_0202,
+            0xFA00_0000, // s_load_dwordx8 s[8:15], s[4:5], 0
+            0xF408_0502,
+            0xFA00_0020, // s_load_dwordx4 s[20:23], s[4:5], 32
+            0xBE90_0380, // s_mov_b32 s16, 0
+            0xBE91_0380, // s_mov_b32 s17, 0
+            0xBE92_0380, // s_mov_b32 s18, 0
+            0xBE93_0380, // s_mov_b32 s19, 0
+            0x7E04_02FF,
+            0x3FC0_0000, // v_mov_b32 v2, 1.5
+            0x7E06_02FF,
+            0x3FC0_0000, // v_mov_b32 v3, 1.5
+        ];
+        let tail: [u32; 5] = [
+            0xF0C0_0108,
+            0x0082_0401, // image_sample_o v4, v[1:3], s[8:15], s[16:19] dmask:1 dim:2D
+            0xE070_0000,
+            0x8005_0400, // buffer_store_dword v4, off, s[20:23]
+            S_ENDPGM,
+        ];
+        let sample = |offsets: &[u32]| heap_lower(&[&head[..], offsets, &tail[..]].concat());
+        let refused = |offsets: &[u32]| match sample(offsets) {
+            Err(crate::ShaderError::Unsupported { what, .. }) => what,
+            other => panic!("{:?}", other.map(|_| ())),
+        };
+        // x = 1, y = -1 (6-bit fields a byte apart; the rest ignored).
+        sample(&[0x7E02_02FF, 0xC0C0_3F01]).unwrap();
+        // x = -8, y = 7: the ends of DXIL's range.
+        sample(&[0x7E02_02FF, 0x0000_0738]).unwrap();
+        // x = 8 is past it.
+        assert_eq!(
+            refused(&[0x7E02_02FF, 0x0000_0008]),
+            "a sample offset past -8..7"
+        );
+        // y = -9 too.
+        assert_eq!(
+            refused(&[0x7E02_02FF, 0x0000_3700]),
+            "a sample offset past -8..7"
+        );
+        // Offsets computed per lane (v0, the thread id) cannot be immediates.
+        assert_eq!(
+            refused(&[0x7E02_0300]), // v_mov_b32 v1, v0
+            "a sample offset that is not constant"
+        );
     }
 
     #[test]
