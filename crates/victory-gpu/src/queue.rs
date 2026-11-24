@@ -69,7 +69,10 @@ fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 #[cfg(windows)]
 fn waits() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_QUEUE_WAIT").is_none_or(|v| v != "0"))
+    crate::switches::b(
+        "VICTORY_QUEUE_WAIT",
+        *ON.get_or_init(|| std::env::var_os("VICTORY_QUEUE_WAIT").is_none_or(|v| v != "0")),
+    )
 }
 
 /// Whether a submission is held list by list: the lists before the first
@@ -88,7 +91,10 @@ fn waits() -> bool {
 #[cfg(windows)]
 fn split() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_SPLIT_WAITS").is_none_or(|v| v != "0"))
+    crate::switches::b(
+        "VICTORY_SPLIT_WAITS",
+        *ON.get_or_init(|| std::env::var_os("VICTORY_SPLIT_WAITS").is_none_or(|v| v != "0")),
+    )
 }
 
 /// Whether a list is cut into host lists at its waits for memory values
@@ -778,6 +784,10 @@ extern "system" fn present(
     // its fence: a wait is not kept across frames.
     #[cfg(windows)]
     release_held(forces());
+    // The frame boundary: switches changed in `<ctl>/switches` are taken here
+    // (at most once a second, and only with nothing in the air for those that
+    // change how flights land), logged as `switches changed: K=V ...`.
+    crate::switches::poll(FRAMES.load(Ordering::Relaxed));
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
     if frame.is_power_of_two() {
         let (draws, dispatches) = crate::list::take_counts();

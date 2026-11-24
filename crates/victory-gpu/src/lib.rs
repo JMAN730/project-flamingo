@@ -46,6 +46,7 @@ pub mod root;
 mod sampler;
 #[cfg(windows)]
 pub mod shader_cache;
+mod switches;
 #[cfg(windows)]
 mod memory;
 #[cfg(windows)]

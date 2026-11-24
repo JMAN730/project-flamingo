@@ -1503,7 +1503,10 @@ void main(uint3 id : SV_DispatchThreadID) {
 /// a fetch that finds nothing and loses no shader write.
 fn rehash_runs() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_REHASH_RUNS").is_some_and(|v| v == "1"))
+    crate::switches::b(
+        "VICTORY_CARD_REHASH_RUNS",
+        *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_REHASH_RUNS").is_some_and(|v| v == "1")),
+    )
 }
 
 /// Since the last frame-rate line, of our own passes over copies in the
@@ -1674,19 +1677,27 @@ pub(crate) fn late() -> bool {
 /// `VICTORY_LATE_WAIT`: 0 (off), 1, or 2 ([`late_exact`]).
 fn late_stage() -> u8 {
     static STAGE: OnceLock<u8> = OnceLock::new();
-    *STAGE.get_or_init(|| {
-        if std::env::var_os("VICTORY_GPU_TIMING").is_some() {
-            return 0;
-        }
-        match std::env::var("VICTORY_LATE_WAIT").as_deref() {
-            Ok("1") => 1,
-            Ok("2") => 2,
-            Ok("3") => 3,
-            // The relay alone: on top of stage 3.
-            Err(_) if crate::shadow::relay() => 3,
-            _ => 0,
-        }
-    })
+    if std::env::var_os("VICTORY_GPU_TIMING").is_some() {
+        return 0;
+    }
+    let start = *STAGE.get_or_init(|| match std::env::var("VICTORY_LATE_WAIT").as_deref() {
+        Ok("1") => 1,
+        Ok("2") => 2,
+        Ok("3") => 3,
+        // The relay alone: on top of stage 3.
+        Err(_) if crate::shadow::relay() => 3,
+        _ => 0,
+    });
+    // Live (crate::switches); a change waits for nothing in the air.
+    crate::switches::u8v("VICTORY_LATE_WAIT", start)
+}
+
+/// Whether nothing is in the air: no flight to land and no write or signal
+/// behind one. The point at which a switch that changes how flights are
+/// held and landed may be changed (`crate::switches`).
+pub(crate) fn flights_quiet() -> bool {
+    let line = line();
+    line.line.is_empty() && line.written.is_empty() && line.landed.is_empty()
 }
 
 /// Stage 2 of [`late`] (`VICTORY_LATE_WAIT=2`): point 3 of its list is no
@@ -1775,7 +1786,9 @@ pub(crate) fn relay() -> bool {
 /// both wait for everything.
 fn relay_exact() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| relay() && std::env::var_os("VICTORY_RELAY").is_some_and(|v| v == "2"))
+    let start = *ON.get_or_init(|| relay() && std::env::var_os("VICTORY_RELAY").is_some_and(|v| v == "2"));
+    // Live: `VICTORY_RELAY=2` (crate::switches).
+    relay() && crate::switches::live_is("VICTORY_RELAY", 2).unwrap_or(start)
 }
 
 /// Told when something joins [`LINE`], for the thread that lands flights
@@ -1873,9 +1886,10 @@ mod relay_tests {
 /// all at once ran the slots out before (run 45).
 fn late_most() -> usize {
     static MOST: OnceLock<usize> = OnceLock::new();
-    *MOST.get_or_init(|| {
-        std::env::var("VICTORY_LATE_WAIT_LISTS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(128).max(1)
-    })
+    let start = *MOST
+        .get_or_init(|| std::env::var("VICTORY_LATE_WAIT_LISTS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(128));
+    // Live (crate::switches).
+    crate::switches::u64v("VICTORY_LATE_WAIT_LISTS", start as u64).max(1) as usize
 }
 
 /// Whether a submission with bottom-of-pipe writes may fly
@@ -1884,7 +1898,10 @@ fn late_most() -> usize {
 /// such a value from one that does not).
 fn late_writes() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_LATE_WAIT_WRITES").is_none_or(|v| v != "0"))
+    crate::switches::b(
+        "VICTORY_LATE_WAIT_WRITES",
+        *ON.get_or_init(|| std::env::var_os("VICTORY_LATE_WAIT_WRITES").is_none_or(|v| v != "0")),
+    )
 }
 
 /// Per host copy, the ranges a submission's shaders may write, as declared

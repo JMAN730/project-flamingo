@@ -345,12 +345,12 @@ pub(crate) static REFRESH_WAITS: [std::sync::atomic::AtomicU64; 4] = [const { st
 /// before; any large value is `VICTORY_TEXTURE_NO_WAIT`'s behaviour.
 fn wait_us() -> u64 {
     static US: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *US.get_or_init(|| {
-        std::env::var("VICTORY_TEXTURE_WAIT_US")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(8_000)
-    })
+    crate::switches::u64v(
+        "VICTORY_TEXTURE_WAIT_US",
+        *US.get_or_init(|| {
+            std::env::var("VICTORY_TEXTURE_WAIT_US").ok().and_then(|v| v.parse().ok()).unwrap_or(8_000)
+        }),
+    )
 }
 
 thread_local! {

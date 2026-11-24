@@ -42,7 +42,7 @@ pub(crate) fn this_is_worker() -> bool {
 /// (`VICTORY_ASYNC_WRITEBACK=1`; off by default).
 pub(crate) fn enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| {
+    let start = *ON.get_or_init(|| {
         let on = std::env::var("VICTORY_ASYNC_WRITEBACK").as_deref() == Ok("1");
         if on {
             tracing::info!(
@@ -51,7 +51,9 @@ pub(crate) fn enabled() -> bool {
             );
         }
         on
-    })
+    });
+    // Live, taken at a frame boundary with nothing in the air (crate::switches).
+    crate::switches::b("VICTORY_ASYNC_WRITEBACK", start)
 }
 
 /// Whether a submission's shader-written ranges go back on [`worker`].

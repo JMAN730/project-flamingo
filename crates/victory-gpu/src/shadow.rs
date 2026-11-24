@@ -147,7 +147,10 @@ struct Card {
 /// range holds its piece (before: never).
 pub(crate) fn cards() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_BUFFERS").is_none_or(|v| v != "0"))
+    crate::switches::b(
+        "VICTORY_CARD_BUFFERS",
+        *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_BUFFERS").is_none_or(|v| v != "0")),
+    )
 }
 
 /// The smallest title buffer whose copy goes to the card's memory, and the
@@ -160,7 +163,8 @@ fn card_limits() -> (u64, u64) {
     static LIMITS: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
     *LIMITS.get_or_init(|| {
         let mb = |name: &str, default: u64| {
-            std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(default) << 20
+            crate::switches::u64v(name, std::env::var(name).ok().and_then(|v| v.trim().parse().ok()).unwrap_or(default))
+                << 20
         };
         (mb("VICTORY_CARD_BUFFERS_MIN_MB", 16).max(1 << 20), mb("VICTORY_CARD_BUFFERS_MB", 512))
     })
@@ -255,9 +259,12 @@ fn card_for(size: u64) -> Option<ID3D12Resource> {
 /// alone; what moves is what shaders read.
 fn window_card_most() -> u64 {
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *MOST.get_or_init(|| {
-        std::env::var("VICTORY_CARD_WINDOWS_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0) << 20
-    })
+    crate::switches::u64v(
+        "VICTORY_CARD_WINDOWS_MB",
+        *MOST.get_or_init(|| {
+            std::env::var("VICTORY_CARD_WINDOWS_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0)
+        }),
+    ) << 20
 }
 
 /// Bytes alive of windows' card sides ([`window_card_most`]).
@@ -481,7 +488,9 @@ mod card_tests {
 ///   had not received from bytes the card wrote.
 pub(crate) fn relay() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("VICTORY_RELAY").is_ok_and(|v| v == "1" || v == "2") && !keeps())
+    let start = *ON.get_or_init(|| std::env::var("VICTORY_RELAY").is_ok_and(|v| v == "1" || v == "2") && !keeps());
+    // Live: `VICTORY_RELAY` 1 or 2 is on, 0 off (crate::switches).
+    crate::switches::b("VICTORY_RELAY", start) && !keeps()
 }
 
 /// The submission being prepared (its number among those started): what
