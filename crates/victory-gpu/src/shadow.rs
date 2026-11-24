@@ -153,29 +153,79 @@ pub(crate) fn cards() -> bool {
     )
 }
 
+/// Default `(min_mb, max_mb)` for [`card_limits`] chosen from the adapter's
+/// local VRAM budget (`DXGI_QUERY_VIDEO_MEMORY_INFO.Budget`), in bytes.
+///
+/// - Unknown (`None`, e.g. WARP) or `<= 12 GiB` (8–12 GB cards, whose WDDM
+///   budget is below 12 GiB): `(16, 512)` MiB, matching the 12 GB baseline.
+/// - `> 12 GiB` and `< 20 GiB` (16 GB cards, whose WDDM budget is typically
+///   ~13.5–15.2 GiB): `(4, 2048)` MiB.
+/// - `>= 20 GiB` (24–32+ GB cards): `(1, (budget_mb / 4).min(8192))` MiB,
+///   capping at 25% of local budget (at most 8 GiB) so "before" twins (up to 2x)
+///   still leave headroom for textures and render targets.
+fn default_card_limits_mb(local_vram_budget: Option<u64>) -> (u64, u64) {
+    let Some(budget_bytes) = local_vram_budget else {
+        return (16, 512);
+    };
+    let budget_mb = budget_bytes >> 20;
+    const TWELVE_GIB_MB: u64 = 12 * 1024;
+    const TWENTY_GIB_MB: u64 = 20 * 1024;
+    if budget_mb <= TWELVE_GIB_MB {
+        (16, 512)
+    } else if budget_mb < TWENTY_GIB_MB {
+        (4, 2048)
+    } else {
+        (1, (budget_mb / 4).min(8192))
+    }
+}
+
+/// Resolve `(min_bytes, max_bytes)` from the adapter's local VRAM budget and
+/// optional explicit MiB overrides from `VICTORY_CARD_BUFFERS_MIN_MB` /
+/// `VICTORY_CARD_BUFFERS_MB`.
+fn resolve_card_limits(
+    local_vram_budget: Option<u64>,
+    min_mb_override: Option<u64>,
+    max_mb_override: Option<u64>,
+) -> (u64, u64) {
+    const MIB: u64 = 1 << 20;
+    let (default_min_mb, default_max_mb) = default_card_limits_mb(local_vram_budget);
+    let min_bytes = min_mb_override.unwrap_or(default_min_mb).saturating_mul(MIB).max(MIB);
+    let max_bytes = max_mb_override.unwrap_or(default_max_mb).saturating_mul(MIB);
+    (min_bytes, max_bytes)
+}
+
 /// The smallest title buffer whose copy goes to the card's memory, and the
 /// most bytes of such copies (their "before" twins not counted: a copy
 /// shaders write takes its size twice), both in bytes:
-/// `VICTORY_CARD_BUFFERS_MIN_MB` (1) and `VICTORY_CARD_BUFFERS_MB` (512).
-///
-/// The first was 16 MiB, for run 69's ten title buffers of 16 MiB or more
-/// (494 MB, with 1,650 MB of the card's budget free). Run `fx-d3dc-1` (RX
-/// 9070 XT, native `d3dcompiler_47`, so the card's compare compiles) showed
-/// what the rest cost on the CPU: 430 MB a frame snapshotted and compared
-/// in 467 ranges of title buffers' copies, 399.8 MB of it in copies of
-/// 1 MiB or more (`58.5 ms` of snapshots, `20.8 + 27.9 ms` of finding and
-/// putting back, all on one thread, against a 172 ms frame). A copy of
-/// 1 MiB or more goes to the card's memory now, while the copies there stay
-/// under the second number: at most 512 MB of the card's budget, which the
-/// textures' queue (`resource::room`) counts like its own.
+/// `VICTORY_CARD_BUFFERS_MIN_MB` and `VICTORY_CARD_BUFFERS_MB`.
+/// Defaults scale with the adapter's local VRAM budget (16 MiB / 512 MiB on
+/// `<= 12 GiB` budgets, 4 MiB / 2048 MiB on 16 GB cards, 1 MiB / up to 8192 MiB
+/// on `>= 20 GiB` budgets), and explicit env vars always override. Both are
+/// live switches (`crate::switches`): a value set in `<ctl>/switches` wins
+/// over the environment and is taken at the next allocation.
 fn card_limits() -> (u64, u64) {
     static LIMITS: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
     *LIMITS.get_or_init(|| {
-        let mb = |name: &str, default: u64| {
-            crate::switches::u64v(name, std::env::var(name).ok().and_then(|v| v.trim().parse().ok()).unwrap_or(default))
-                << 20
+        let env_mb = |name: &str| -> Option<u64> {
+            let env = std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok());
+            match env {
+                Some(v) => Some(crate::switches::u64v(name, v)),
+                None => crate::switches::live_value(name),
+            }
         };
-        (mb("VICTORY_CARD_BUFFERS_MIN_MB", 1).max(1 << 20), mb("VICTORY_CARD_BUFFERS_MB", 512))
+        let vram_budget = crate::host::host().and_then(|h| h.video_memory()).map(|[budget, ..]| budget);
+        let (min_bytes, max_bytes) = resolve_card_limits(
+            vram_budget,
+            env_mb("VICTORY_CARD_BUFFERS_MIN_MB"),
+            env_mb("VICTORY_CARD_BUFFERS_MB"),
+        );
+        tracing::info!(
+            vram_budget_mb = vram_budget.map(|b| b >> 20),
+            card_buffers_min_mb = min_bytes >> 20,
+            card_buffers_max_mb = max_bytes >> 20,
+            "card buffer limits"
+        );
+        (min_bytes, max_bytes)
     })
 }
 
@@ -925,26 +975,32 @@ fn pooled(n: usize) -> Vec<u8> {
     v
 }
 
-/// Snapshot buffers the pool keeps: as many as copies a frame can hold at
-/// once (27 copies a frame in the steady state, one buffer each), so a copy
-/// takes a touched buffer back instead of allocating a fresh one whose
-/// pages fault as the snapshot is written.
-const POOL_MAX: usize = 32;
+/// Snapshot buffer pool byte cap scaled from total system RAM.
+fn snapshot_pool_cap(total_ram_bytes: Option<u64>) -> usize {
+    const FALLBACK: u64 = 512 << 20;
+    const MIN: u64 = 128 << 20;
+    const MAX: u64 = 1024 << 20;
+    let bytes = match total_ram_bytes {
+        Some(ram) => (ram / 32).clamp(MIN, MAX),
+        None => FALLBACK,
+    };
+    bytes as usize
+}
 
-/// Returns a snapshot buffer to the pool: at most [`POOL_MAX`] kept, the
-/// largest, and of those the largest one and the next ones up to `KEPT`
+/// Returns a snapshot buffer to the pool: at most 8 kept, the largest, and
+/// of those the largest one and the next ones up to [`snapshot_pool_cap`]
 /// bytes in all.
 fn give_back(v: Vec<u8>) {
-    const KEPT: usize = 512 << 20;
+    let kept = snapshot_pool_cap(crate::total_system_ram_bytes());
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
     pool.push(v);
     pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
-    pool.truncate(POOL_MAX);
+    pool.truncate(8);
     let (mut seen, mut total) = (0, 0usize);
     pool.retain(|v| {
         seen += 1;
         total = total.saturating_add(v.capacity());
-        seen == 1 || total <= KEPT
+        seen == 1 || total <= kept
     });
 }
 
@@ -1010,6 +1066,12 @@ mod difference_tests {
 /// The unit shader writes are looked for and put back in.
 const PIECE: usize = 64 << 10;
 
+/// Maximum number of threads [`copy_wide`] may fan out to for a machine with
+/// `cores` logical processors.
+fn copy_wide_max_jobs(cores: usize) -> usize {
+    (cores / 2).clamp(1, 8)
+}
+
 /// Copies `len` bytes, on several threads if they are many: a snapshot of
 /// the world's big heap is 100-170 MB per submission, 2-4 GB a frame, and
 /// one thread copies some 8 GB/s.
@@ -1018,7 +1080,11 @@ const PIECE: usize = 64 << 10;
 /// Both ranges are valid for `len` bytes and do not overlap.
 unsafe fn copy_wide(src: *const u8, dst: *mut u8, len: usize) {
     const PER_THREAD: usize = 16 << 20;
-    let threads = (len / PER_THREAD).clamp(1, 6);
+    static MAX_JOBS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let max_jobs = *MAX_JOBS.get_or_init(|| {
+        copy_wide_max_jobs(std::thread::available_parallelism().map_or(4, |n| n.get()))
+    });
+    let threads = (len / PER_THREAD).clamp(1, max_jobs);
     if threads == 1 {
         // SAFETY: the caller's.
         unsafe { std::ptr::copy_nonoverlapping(src, dst, len) };
@@ -1072,6 +1138,12 @@ struct Workers {
     more: std::sync::Condvar,
 }
 
+/// Number of kept worker threads for [`wide`] on a machine with `cores`
+/// logical processors.
+fn wide_worker_count(cores: usize) -> usize {
+    (cores / 4).clamp(1, 8)
+}
+
 fn workers() -> &'static Workers {
     static WORKERS: std::sync::OnceLock<Workers> = std::sync::OnceLock::new();
     static STARTED: std::sync::Once = std::sync::Once::new();
@@ -1080,7 +1152,7 @@ fn workers() -> &'static Workers {
         more: std::sync::Condvar::new(),
     });
     STARTED.call_once(|| {
-        let n = std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6);
+        let n = wide_worker_count(std::thread::available_parallelism().map_or(4, |n| n.get()));
         for i in 0..n {
             let _ = std::thread::Builder::new().name(format!("victory-wide-{i}")).spawn(move || {
                 let workers = WORKERS.get().expect("made above");
@@ -1669,17 +1741,20 @@ pub(crate) fn window_use() -> [u64; 8] {
 /// The next read of that memory makes a new copy and copies the window
 /// again. Called before a submission starts, by the thread that submits.
 pub(crate) fn let_go_idle() {
-    const IDLE_MS: u64 = 10_000;
     const IDLE_FRAMES: u64 = 4;
     let gone: Vec<Arc<Shadow>> = {
         // Held from the look to the removal: `loose` hands a copy out
         // under the same lock, so none is handed out in between.
         let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+        if map.is_empty() {
+            return;
+        }
+        let idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
         let idle: Vec<(u64, u64)> = map
             .iter()
             .filter(|(_, s)| {
                 Arc::strong_count(s) == 1
-                    && crate::host::long_ago(s.used.load(Ordering::Relaxed), IDLE_MS, IDLE_FRAMES)
+                    && crate::host::long_ago(s.used.load(Ordering::Relaxed), idle_ms, IDLE_FRAMES)
                     && crate::host::references(&s.buffer) == 1
             })
             .map(|(key, _)| *key)
@@ -3237,7 +3312,40 @@ mod pool_tests {
 
 #[cfg(test)]
 mod window_tests {
-    use super::{WINDOW, cover, grid, holder, longest_tail, tail_of, window_of};
+    use super::{
+        WINDOW, cover, default_card_limits_mb, grid, holder, longest_tail, resolve_card_limits,
+        tail_of, window_of,
+    };
+
+    #[test]
+    fn card_limits_scale_with_local_vram_budget() {
+        const GIB: u64 = 1 << 30;
+        const MIB: u64 = 1 << 20;
+
+        // Unknown (WARP / query failure) and <= 12 GiB keep the 12 GB baseline.
+        assert_eq!(default_card_limits_mb(None), (16, 512));
+        assert_eq!(default_card_limits_mb(Some(8 * GIB)), (16, 512));
+        assert_eq!(default_card_limits_mb(Some(11 * GIB)), (16, 512));
+        assert_eq!(default_card_limits_mb(Some(12 * GIB)), (16, 512));
+
+        // 16 GB tier (> 12 GiB, < 20 GiB), including WDDM budgets around 13.5–15 GiB.
+        assert_eq!(default_card_limits_mb(Some(13 * GIB)), (4, 2048));
+        assert_eq!(default_card_limits_mb(Some(14 * GIB)), (4, 2048));
+        assert_eq!(default_card_limits_mb(Some(15 * GIB)), (4, 2048));
+        assert_eq!(default_card_limits_mb(Some(16 * GIB)), (4, 2048));
+
+        // 24–32+ GB tier (>= 20 GiB): 1 MiB min, 25% of budget capped at 8192 MiB.
+        assert_eq!(default_card_limits_mb(Some(20 * GIB)), (1, 5120));
+        assert_eq!(default_card_limits_mb(Some(24 * GIB)), (1, 6144));
+        assert_eq!(default_card_limits_mb(Some(32 * GIB)), (1, 8192));
+        assert_eq!(default_card_limits_mb(Some(48 * GIB)), (1, 8192));
+
+        // Explicit env overrides always win, clamp min to >= 1 MiB, and saturate on overflow.
+        assert_eq!(resolve_card_limits(Some(32 * GIB), Some(8), Some(4096)), (8 * MIB, 4096 * MIB));
+        assert_eq!(resolve_card_limits(Some(12 * GIB), Some(0), Some(1024)), (MIB, 1024 * MIB));
+        assert_eq!(resolve_card_limits(None, Some(u64::MAX), Some(u64::MAX)), (u64::MAX, u64::MAX));
+        assert_eq!(resolve_card_limits(None, None, None), (16 * MIB, 512 * MIB));
+    }
 
     /// An ask that may take any window takes the longest that holds all of
     /// it, and none that holds only a part.
@@ -3338,6 +3446,43 @@ mod window_tests {
             assert!(start <= address && start + len >= end);
             assert!(start % g == 0 && len % g == 0);
         }
+    }
+
+    #[test]
+    fn snapshot_pool_cap_scales_with_ram() {
+        const GIB: u64 = 1 << 30;
+        const MIB: usize = 1 << 20;
+        assert_eq!(super::snapshot_pool_cap(None), 512 * MIB);
+        assert_eq!(super::snapshot_pool_cap(Some(2 * GIB)), 128 * MIB);
+        assert_eq!(super::snapshot_pool_cap(Some(8 * GIB)), 256 * MIB);
+        assert_eq!(super::snapshot_pool_cap(Some(16 * GIB)), 512 * MIB);
+        assert_eq!(super::snapshot_pool_cap(Some(32 * GIB)), 1024 * MIB);
+        assert_eq!(super::snapshot_pool_cap(Some(64 * GIB)), 1024 * MIB);
+    }
+}
+
+#[cfg(test)]
+mod worker_tests {
+    use super::{copy_wide_max_jobs, wide_worker_count};
+
+    #[test]
+    fn copy_wide_max_jobs_scales_with_cores() {
+        assert_eq!(copy_wide_max_jobs(2), 1);
+        assert_eq!(copy_wide_max_jobs(4), 2);
+        assert_eq!(copy_wide_max_jobs(8), 4);
+        assert_eq!(copy_wide_max_jobs(16), 8);
+        assert_eq!(copy_wide_max_jobs(28), 8);
+        assert_eq!(copy_wide_max_jobs(64), 8);
+    }
+
+    #[test]
+    fn wide_worker_count_scales_with_cores() {
+        assert_eq!(wide_worker_count(2), 1);
+        assert_eq!(wide_worker_count(4), 1);
+        assert_eq!(wide_worker_count(8), 2);
+        assert_eq!(wide_worker_count(16), 4);
+        assert_eq!(wide_worker_count(28), 7);
+        assert_eq!(wide_worker_count(64), 8);
     }
 }
 

@@ -107,6 +107,12 @@ pub(crate) fn live_is(name: &str, value: i64) -> Option<bool> {
     live(name).map(|v| v == value)
 }
 
+/// The live value of a number switch, `None` when it is not set (a caller
+/// with its own default to keep, such as `shadow::card_limits`).
+pub(crate) fn live_value(name: &str) -> Option<u64> {
+    live(name).map(|v| v.max(0) as u64)
+}
+
 /// A number switch: the live value if set, `base` otherwise.
 pub(crate) fn u64v(name: &str, base: u64) -> u64 {
     live(name).map_or(base, |v| v.max(0) as u64)
