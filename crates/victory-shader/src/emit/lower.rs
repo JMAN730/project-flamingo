@@ -1009,6 +1009,13 @@ thread_local! {
     pub(super) static TEST_F16_NEAREST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
+/// `VICTORY_F16_SUM_WIDE=0`: a wave sum of 16-bit floats where not every lane of the wave
+/// runs is refused, as before [`Lower::half_sum_wide`] gave it a widened f32 sum.
+fn f16_sum_wide_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_F16_SUM_WIDE").is_none_or(|v| v != "0"))
+}
+
 /// `VICTORY_WAVE_OWN_BITS=0`: a wave OR where not every lane runs is refused as before
 /// ([`super::own_bits`]).
 fn own_bits_on() -> bool {
@@ -1042,11 +1049,19 @@ pub(super) fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
             return false;
         }
         Fields::Sop { src, .. } => src.iter().collect(),
-        Fields::Valu(v)
-            if !matches!(i.name(), "v_cndmask_b32") && !i.name().contains("_co_ci_") =>
-        {
-            v.src.iter().collect()
+        // A select or a carry-in reads its mask operand: followed by the
+        // structure pass it is no data use, untracked it is read as a
+        // number (this lane's bit of the register), which needs the
+        // console's lane order (fixed by #84/#86).
+        Fields::Valu(v) if matches!(i.name(), "v_cndmask_b32") || i.name().contains("_co_ci_") => {
+            return match v.src.get(2) {
+                Some(&Operand::Scalar { code, .. }) if code != NULL => {
+                    i.read(Reg::S(code)).is_some_and(|m| !is_mask(m))
+                }
+                _ => false,
+            };
         }
+        Fields::Valu(v) => v.src.iter().collect(),
         _ => return false,
     };
     ops.into_iter().any(|op| match *op {
@@ -1071,6 +1086,8 @@ pub(super) fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
 /// parameter 3, after TEXCOORD5 and TEXCOORD7, while the high half of
 /// TEXCOORD4's second dword stays zero.
 type PackedLayout = Vec<(u8, Vec<(u8, u8, u8, u8)>)>;
+
+
 
 fn packed_layout(elements: &[SigElement], packs: &[(u8, Option<u8>)]) -> PackedLayout {
     let of_row = |r: u8| {
@@ -1994,8 +2011,22 @@ impl<'a> Lower<'a> {
             all_lane_blocks(self.x.st).is_some_and(|all| all.get(self.cur_ir).copied().unwrap_or(false))
         };
         if !every {
+            // shortcut: the console's own order needs every lane it reads to
+            // exist. Where the wave does not run whole (the code's branching
+            // leaves lanes out, which no other form of the program makes
+            // whole), the sum is taken the host's way: the lanes' low halves
+            // widened to f32, one wave sum, rounded once to 16 bits. That
+            // differs from the console's balanced f16 tree by one partial
+            // sum's rounding, and it lets the program translate where it was
+            // refused ("a wave sum of 16-bit floats where not every lane runs": 28
+            // compute_graph_ops:CS_TransposeVecMatMulAlignedOperation).
             if halves {
                 need(self.cur_ir);
+            }
+            // The console's sum is exact only over every lane's term; here some lanes of
+            // the wave do not run on the host (they are inside a branch of their own).
+            if f16_sum_wide_on() {
+                return self.half_sum_wide(x, halves);
             }
             return Err(WHERE);
         }
@@ -2023,6 +2054,48 @@ impl<'a> Lower<'a> {
         let total = self.s.m.bin(c, Bin::And, total, low);
         let first = self.s.m.bin(c, Bin::And, lo, high);
         Ok(self.s.m.bin(c, Bin::Or, first, total))
+    }
+
+    /// [`Self::half_sum`] where not every lane of the wave runs: the sum of the terms of
+    /// the lanes that do, added as f32 (`waveActiveOp.f32`, the low half of each lane's term
+    /// widened first) and rounded to 16 bits once at the end.
+    ///
+    /// shortcut: this is not the console's sum. The console adds 16-bit floats in its
+    /// tree order and rounds to 16 bits at every step ([`Self::half_sum`] does that where
+    /// every lane runs); here there is one rounding at the end, of a 24-bit-odd sum, so a
+    /// total that lands between two halves rounds once where the console's rounded many
+    /// times, and the terms of the lanes that do not run are missing altogether (the
+    /// console's whole-wave section keeps every lane's term in its register). Both differ
+    /// only in the last places of the 16-bit result: for a sum small enough not to round at
+    /// all they agree. `VICTORY_F16_SUM_WIDE=0` refuses this case as before.
+    ///
+    /// The high half of the result is lane 0's term's, as in the exact path (no `v_add_f16`
+    /// writes it).
+    fn half_sum_wide(&mut self, x: V, halves: bool) -> Result<V, Why> {
+        let c = self.cur;
+        let f32t = self.s.t.f32;
+        let low = self.s.m.i32(0xFFFF);
+        let high = self.s.m.i32(0xFFFF_0000);
+        let zero = self.s.m.i32(0);
+        let term = self.s.m.bin(c, Bin::And, x, low);
+        let term = self.s.op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[term]);
+        let (k, u) = (self.s.m.i8(0), self.s.m.i8(0));
+        let mut total = self.s.op(c, "waveActiveOp.f32", Attr::NoUnwind, f32t, 119, &[term, k, u]);
+        if halves {
+            // two host waves of 32 hold the console's 64 lanes: the second half's sum is
+            // read where the first holds it and added (the exchange of [`Self::half_sum`]).
+            let c = self.cur;
+            let bits = self.as_int(total);
+            let (lo, hi) = self.exchange_halves(c, bits);
+            let (lo, hi) = (self.as_float(lo), self.as_float(hi));
+            total = self.s.m.bin(self.cur, Bin::Add, lo, hi);
+        }
+        let sum = self.f16_nearest(total);
+        let c = self.cur;
+        let sum = self.s.m.bin(c, Bin::And, sum, low);
+        let lane0 = self.read_lane(x, zero);
+        let first = self.s.m.bin(c, Bin::And, lane0, high);
+        Ok(self.s.m.bin(c, Bin::Or, first, sum))
     }
 
     fn run(mut self) -> Result<Lowered, Stop> {
@@ -3721,6 +3794,41 @@ impl<'a> Lower<'a> {
         self.s.m.cmp(at, pred::NE, t, z)
     }
 
+    /// The condition a select or a carry-in takes from a scalar mask
+    /// operand: this lane's bit of the register the mask is held in, or an
+    /// inline 0 or -1 (no lane, every lane). The caller tries the masks the
+    /// structure pass followed first.
+    fn select_condition(&mut self, inst: &Inst, mask: Option<&Operand>) -> Result<V, Why> {
+        const UNTRACKED: Why = "a select on an untracked mask";
+        // Inline 0 and -1: no lane or every lane.
+        match mask {
+            Some(&Operand::Const(128)) => return Ok(self.s.m.bool(false)),
+            Some(&Operand::Const(193)) => return Ok(self.s.m.bool(true)),
+            _ => {}
+        }
+        let Some(&Operand::Scalar { code, .. }) = mask else {
+            return Err(UNTRACKED);
+        };
+        if code == NULL {
+            return Ok(self.s.m.bool(false));
+        }
+        // A mask the code holds as a number: this lane's bit of it. Exact
+        // where host lanes are the console's.
+        if self.mask_data != MaskData::Console || self.local {
+            return Err(UNTRACKED);
+        }
+        let lo = self.i32_of(inst.read(Reg::S(code)).ok_or(UNTRACKED)?)?;
+        let hi = if self.x.native.wave64 {
+            // wave64: the register after it holds lanes 32-63.
+            Some(self.i32_of(inst.read(Reg::S(code + 1)).ok_or(UNTRACKED)?)?)
+        } else {
+            None
+        };
+        self.cross_lane(false)?;
+        Ok(self.lane_bit(self.cur, lo, hi))
+    }
+
+
     /// The value of the high dword of the wave64 register pair whose low
     /// dword holds `lo` (none in wave32).
     fn pair_high(&self, lo: Value) -> Option<Value> {
@@ -4964,6 +5072,65 @@ impl<'a> Lower<'a> {
                     self.set(lo, Val::I32(r));
                     Ok(())
                 }
+                // Ported from TuxBox (brcly, Apache-2.0) 1a50eb9, which restores
+                // the same three families (see NOTICE). None of them writes SCC.
+                "s_flbit_i32_b64" => {
+                    // From the top: the first set bit of the high word, else
+                    // 32 past the low word's own, -1 for a zero pair.
+                    let (a, b) = (half(self, 0, 0)?, half(self, 0, 1)?);
+                    let i32t = self.s.t.i32;
+                    let flbit = |l: &mut Self, x: V| {
+                        l.s.op(c, "unaryBits.i32", Attr::ReadNone, i32t, 33, &[x])
+                    };
+                    let (fl, fh) = (flbit(self, a), flbit(self, b));
+                    let k32 = self.s.m.i32(32);
+                    let fl = self.s.m.bin(c, Bin::Add, fl, k32);
+                    let (z, ones) = (self.s.m.i32(0), self.s.m.i32(u32::MAX));
+                    let low = self.s.m.cmp(c, pred::NE, a, z);
+                    let high = self.s.m.cmp(c, pred::NE, b, z);
+                    let r = self.s.m.select(c, low, fl, ones);
+                    let r = self.s.m.select(c, high, fh, r);
+                    self.set(lo, Val::I32(r));
+                    Ok(())
+                }
+                "s_ff0_i32_b64" => {
+                    // The first zero bit from the bottom: the lowest set bit of
+                    // the complement, -1 when both words are all ones.
+                    let (a, b) = (half(self, 0, 0)?, half(self, 0, 1)?);
+                    let i32t = self.s.t.i32;
+                    let ones = self.s.m.i32(u32::MAX);
+                    let (na, nb) = (
+                        self.s.m.bin(c, Bin::Xor, a, ones),
+                        self.s.m.bin(c, Bin::Xor, b, ones),
+                    );
+                    let ff1 = |l: &mut Self, x: V| {
+                        l.s.op(c, "unaryBits.i32", Attr::ReadNone, i32t, 32, &[x])
+                    };
+                    let (fa, fb) = (ff1(self, na), ff1(self, nb));
+                    let k32 = self.s.m.i32(32);
+                    let fb = self.s.m.bin(c, Bin::Add, fb, k32);
+                    let (z, none) = (self.s.m.i32(0), self.s.m.i32(u32::MAX));
+                    let low = self.s.m.cmp(c, pred::NE, na, z);
+                    let high = self.s.m.cmp(c, pred::NE, nb, z);
+                    let r = self.s.m.select(c, high, fb, none);
+                    let r = self.s.m.select(c, low, fa, r);
+                    self.set(lo, Val::I32(r));
+                    Ok(())
+                }
+                "s_bcnt0_i32_b64" => {
+                    // The zero bits of the pair: 64 less both words' set bits.
+                    let (a, b) = (half(self, 0, 0)?, half(self, 0, 1)?);
+                    let i32t = self.s.t.i32;
+                    let count = |l: &mut Self, x: V| {
+                        l.s.op(c, "unaryBits.i32", Attr::ReadNone, i32t, 31, &[x])
+                    };
+                    let (ca, cb) = (count(self, a), count(self, b));
+                    let both = self.s.m.bin(c, Bin::Add, ca, cb);
+                    let k64 = self.s.m.i32(64);
+                    let r = self.s.m.bin(c, Bin::Sub, k64, both);
+                    self.set(lo, Val::I32(r));
+                    Ok(())
+                }
                 "s_and_b64" | "s_or_b64" | "s_xor_b64" | "s_andn2_b64" | "s_orn2_b64"
                 | "s_nand_b64" | "s_nor_b64" | "s_xnor_b64" | "s_not_b64" => {
                     let ones = self.s.m.i32(u32::MAX);
@@ -5129,6 +5296,26 @@ impl<'a> Lower<'a> {
                     .s
                     .op(c, "unaryBits.i32", Attr::ReadNone, self.s.t.i32, op, &[a]);
                 (r, None)
+            }
+            "s_ff0_i32_b32" => {
+                // Ported from TuxBox (brcly, Apache-2.0) 1a50eb9: the first
+                // zero bit is the lowest set bit of the complement.
+                let a = src32(self, 0)?;
+                let ones = self.s.m.i32(u32::MAX);
+                let n = self.s.m.bin(c, Bin::Xor, a, ones);
+                let r = self
+                    .s
+                    .op(c, "unaryBits.i32", Attr::ReadNone, self.s.t.i32, 32, &[n]);
+                (r, None)
+            }
+            "s_bcnt0_i32_b32" => {
+                // The zero bits: 32 less the set bits.
+                let a = src32(self, 0)?;
+                let c32 = self
+                    .s
+                    .op(c, "unaryBits.i32", Attr::ReadNone, self.s.t.i32, 31, &[a]);
+                let k32 = self.s.m.i32(32);
+                (self.s.m.bin(c, Bin::Sub, k32, c32), None)
             }
             "s_bfe_u32" | "s_bfe_i32" => {
                 // src1: offset in bits 0-4, width in bits 16-22.
@@ -7107,40 +7294,48 @@ impl<'a> Lower<'a> {
                 float(self, r)
             }
             "v_cndmask_b32" => {
-                let mask = match v.src.get(2) {
-                    Some(&Operand::Scalar { code, .. }) => inst.read(Reg::S(code)),
-                    _ => None,
-                };
                 const UNTRACKED: Why = "a select on an untracked mask";
-                let cond = match mask.and_then(|m| self.x.st.masks.get(&m).copied()) {
-                    Some(m) => self.boolean(m, c)?,
-                    // A mask the code holds as a number (a constant bit
-                    // pattern: every other lane, every other pair...):
-                    // this lane's bit of it. Exact where host lanes are
-                    // the console's.
-                    None if self.mask_data == MaskData::Console => {
-                        // Each host wave taken as a wave of its own has no
-                        // console lane numbers to pick the bits by.
-                        if self.local {
-                            return Err("a constant lane mask in a half-wave");
-                        }
-                        let m = mask.ok_or(UNTRACKED)?;
-                        let lo = self.i32_of(m).map_err(|_| UNTRACKED)?;
-                        // wave64: the register after it holds lanes 32-63.
-                        let high = match v.src.get(2) {
-                            Some(&Operand::Scalar { code, .. }) if self.x.native.wave64 => {
-                                Some(inst.read(Reg::S(code + 1)).ok_or(UNTRACKED)?)
-                            }
+                // Inline 0 and -1: no lane, every lane (a constant for every
+                // host lane order).
+                let cond = match v.src.get(2) {
+                    Some(&Operand::Const(128)) => self.s.m.bool(false),
+                    Some(&Operand::Const(193)) => self.s.m.bool(true),
+                    mask => {
+                        let read = match mask {
+                            Some(&Operand::Scalar { code, .. }) => inst.read(Reg::S(code)),
                             _ => None,
                         };
-                        let hi = match high {
-                            Some(h) => Some(self.i32_of(h).map_err(|_| UNTRACKED)?),
-                            None => None,
-                        };
-                        self.cross_lane(false)?;
-                        self.lane_bit(c, lo, hi)
+                        match read.and_then(|m| self.x.st.masks.get(&m).copied()) {
+                            Some(m) => self.boolean(m, c)?,
+                            // A mask the code holds as a number (a constant bit
+                            // pattern: every other lane, every other pair...):
+                            // this lane's bit of it. Exact where host lanes are
+                            // the console's.
+                            None if self.mask_data == MaskData::Console => {
+                                // Each host wave taken as a wave of its own has no
+                                // console lane numbers to pick the bits by.
+                                if self.local {
+                                    return Err("a constant lane mask in a half-wave");
+                                }
+                                let m = read.ok_or(UNTRACKED)?;
+                                let lo = self.i32_of(m).map_err(|_| UNTRACKED)?;
+                                // wave64: the register after it holds lanes 32-63.
+                                let high = match mask {
+                                    Some(&Operand::Scalar { code, .. }) if self.x.native.wave64 => {
+                                        Some(inst.read(Reg::S(code + 1)).ok_or(UNTRACKED)?)
+                                    }
+                                    _ => None,
+                                };
+                                let hi = match high {
+                                    Some(h) => Some(self.i32_of(h).map_err(|_| UNTRACKED)?),
+                                    None => None,
+                                };
+                                self.cross_lane(false)?;
+                                self.lane_bit(c, lo, hi)
+                            }
+                            None => return Err(UNTRACKED),
+                        }
                     }
-                    None => return Err(UNTRACKED),
                 };
                 if v.abs != 0 || v.neg != 0 {
                     let (a, bb) = (f(self, 0)?, f(self, 1)?);
@@ -7163,10 +7358,11 @@ impl<'a> Lower<'a> {
                         Some(&Operand::Scalar { code, .. }) => inst.read(Reg::S(code)),
                         _ => None,
                     };
-                    let m = m
-                        .and_then(|m| self.x.st.masks.get(&m).copied())
-                        .ok_or("a carry-in from an untracked mask")?;
-                    Some(self.boolean(m, c)?)
+                    Some(match m.and_then(|m| self.x.st.masks.get(&m).copied()) {
+                        Some(m) => self.boolean(m, c)?,
+                        // Not followed by structure: this lane's bit of the register.
+                        None => self.select_condition(inst, v.src.get(2))?,
+                    })
                 } else {
                     None
                 };
@@ -10649,6 +10845,22 @@ impl<'a> Lower<'a> {
                         self.vals.insert(arg, val);
                     }
                 }
+                // A lane mask dword this path left in the register: in a pixel
+                // or vertex program (the host's wave) the join is read only
+                // through a zero test or a count, so the ballot of the host
+                // wave stands in for it.
+                let lo = self.x.st.highs.get(&arg).copied().unwrap_or(arg);
+                let ballot_ok = self.mask_data == MaskData::Host
+                    && !bit
+                    && self.read_phis.contains(&phi.value)
+                    && self.x.st.masks.contains_key(&lo)
+                    && self.def_block.get(&lo).is_some_and(|&d| d != self.cur_ir);
+                let ballot = if ballot_ok {
+                    self.mask_dword(arg).ok()
+                } else {
+                    None
+                };
+                let ballot_ok = ballot.is_some();
                 let x = match (self.vals.get(&arg).copied(), bit) {
                     (Some(Val::I32(x)), false) | (Some(Val::Bit(x)), true) => x,
                     (Some(Val::Missing(_)) | None, false)
@@ -10698,6 +10910,12 @@ impl<'a> Lower<'a> {
                     (Some(Val::Bit(_)), false) if self.read_phis.contains(&phi.value) => {
                         return Err(Stop::Retry(phi.value, "an SCC joined with SGPR values"));
                     }
+                    // A mask dword the other path left in the register: its ballot
+                    // (a pixel or vertex program reads such a join only through a
+                    // zero test or a count). shortcut: the ballot is the host
+                    // wave's, so a join read some other way would differ from the
+                    // console, which `mask_ok` does not see; upgrade if one shows up.
+                    (None | Some(Val::Missing(_)), false) if ballot_ok => ballot.unwrap(),
                     (Some(Val::Missing(why)), _) if self.read_phis.contains(&phi.value) => {
                         return Err(Stop::Retry(phi.value, why));
                     }
@@ -10866,17 +11084,25 @@ mod tests {
 
     /// Whether a synthetic compute program translates with these input registers.
     fn lowers(words: &[u32], rsrc2: u32) -> Result<(), crate::ShaderError> {
+        lowers_cs(words, rsrc2, false, [1, 1, 1]).map(|_| ())
+    }
+
+    /// [`lowers`] with the wave size and the group's threads given.
+    #[allow(dead_code)]
+    fn lowers_cs(
+        words: &[u32],
+        rsrc2: u32,
+        wave64: bool,
+        threads: [u32; 3],
+    ) -> Result<Lowered, crate::ShaderError> {
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let native = NativeProgram {
             stage: HwStage::Cs,
-            wave64: false,
+            wave64,
             vgprs: 256,
             layout: vec![],
             used: vec![],
-            io: StageIo::Cs(ComputeIo {
-                rsrc2,
-                threads: [1, 1, 1],
-            }),
+            io: StageIo::Cs(ComputeIo { rsrc2, threads }),
             code,
         };
         let p = ir::build(&native.code, false, 256).unwrap();
@@ -10894,8 +11120,8 @@ mod tests {
             prims: vec![],
             mesh_stride: 0,
         })
-        .map(|_| ())
     }
+
 
     /// Lowers a compute program with the root parameters `layout` (in user
     /// SGPRs from s0 on) and the used resources `used`.
@@ -11211,6 +11437,41 @@ mod tests {
         for head in bit_tests {
             let words: Vec<u32> = head.iter().chain(&tail).copied().collect();
             lowers(&words, 0).unwrap();
+        }
+    }
+
+    #[test]
+    fn scalar_bit_searches_lower() {
+        // The searches and zero counts (TuxBox 1a50eb9): each result is
+        // compared and branched on, so the value has to be built.
+        let tail = [
+            0xBF07_8010, // s_cmp_lg_u32 s16, 0
+            0xBF85_0001, // s_cbranch_scc1 -> s_endpgm
+            0xBE84_0380, // s_mov_b32 s4, 0
+            S_ENDPGM,
+        ];
+        let heads: [(&[u32], &str); 5] = [
+            (&[0xBE90_1600], "s_flbit_i32_b64"), // s16, s[0:1]
+            (&[0xBE90_1200], "s_ff0_i32_b64"),   // s16, s[0:1]
+            (&[0xBE90_0E00], "s_bcnt0_i32_b64"), // s16, s[0:1]
+            (&[0xBE90_1100], "s_ff0_i32_b32"),   // s16, s0
+            (&[0xBE90_0D00], "s_bcnt0_i32_b32"), // s16, s0
+        ];
+        for (head, name) in heads {
+            let words: Vec<u32> = head.iter().chain(&tail).copied().collect();
+            lowers(&words, 0).unwrap();
+            // The encodings above name s16 as the destination and s0 as the
+            // source; a two-dword source starts at the even register 0.
+            let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let p = ir::build(&code, false, 256).unwrap();
+            let inst = p
+                .blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .find(|i| i.name() == name)
+                .unwrap_or_else(|| panic!("{name} decoded"));
+            assert!(inst.write(crate::ir::Reg::S(16)).is_some(), "{name}");
+            assert!(inst.read(crate::ir::Reg::S(0)).is_some(), "{name}");
         }
     }
 
