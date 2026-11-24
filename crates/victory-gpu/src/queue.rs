@@ -828,6 +828,15 @@ extern "system" fn present(
         const COPY_SOURCE: u32 = 0x800;
         let state = crate::resource::host_transition(resource, COPY_SOURCE)
             .map_or(COPY_SOURCE, |(_, before)| before);
+        // Diagnostics: whether the frame shown is our copy as the title left
+        // it, or one whose newest bytes no submitted list uploaded yet.
+        #[cfg(feature = "diagnostics")]
+        if let Some(pending) = crate::texture::present_pending(resource) {
+            crate::copystat::add(crate::copystat::C::PresentFilled, 1);
+            if pending {
+                crate::copystat::add(crate::copystat::C::PresentPending, 1);
+            }
+        }
         let shown = host.present(texture, state, frame);
         crate::resource::host_transition(resource, state);
         #[cfg(feature = "diagnostics")]

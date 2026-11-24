@@ -66,7 +66,42 @@ struct Last {
     asked: u64,
     /// The frame a partly mapped texture was last read in.
     partial: Option<u64>,
+    /// The guard said "not written" and this check hashed anyway (the
+    /// texture's turn); a changed hash then is a write the guard missed.
+    checked: bool,
+    /// A write the guard missed was found: the texture is hashed at every
+    /// check from then on. A movie's frames, written by the title into view
+    /// memory every frame, were refreshed one frame in eight (older frames
+    /// shown again and again).
+    missed: bool,
 }
+
+impl Last {
+    /// `hash` is not the hash of the last read: what the guard let pass
+    /// as unwritten was written.
+    fn changed(&mut self, hash: blake3::Hash) {
+        if self.checked && self.hash.is_some() && !self.missed {
+            self.missed = true;
+            // Told once per texture, so a run says whether the guard misses
+            // writes at all (the intro: the movie's frames) and what it
+            // costs to stop trusting it there.
+            static SAID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = MISSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+                tracing::warn!(
+                    n,
+                    "a texture was written while the view guard said it was not: hashed at every check from now on (VICTORY_TEXTURE_GUARD_TRUST=1 does not learn this)"
+                );
+            }
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::TexGuardMissed, 1);
+        }
+        self.hash = Some(hash);
+    }
+}
+
+/// Textures found written while the guard said they were not.
+pub(crate) static MISSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 // SAFETY: the staging mapping is written only at submission, under
 // `last`'s lock; the title memory is only read.
@@ -653,8 +688,12 @@ impl Staging {
             const HASH_EVERY: u64 = 8;
             let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
             last.asked = now;
-            let turn = crate::frame::current().wrapping_add((start >> 16) as u64) % HASH_EVERY == 0;
-            if unwritten && !turn {
+            let turn = crate::frame::current().wrapping_add((start >> 16) as u64).is_multiple_of(HASH_EVERY);
+            last.checked = unwritten && turn;
+            // `VICTORY_TEXTURE_GUARD_TRUST=1`: a missed write is not learnt from.
+            static TRUST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            let trust = *TRUST.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_GUARD_TRUST").is_some_and(|v| v == "1"));
+            if unwritten && !turn && (trust || !last.missed) {
                 return 0;
             }
         }
@@ -696,7 +735,7 @@ impl Staging {
                 if last.hash == Some(hash) {
                     return false;
                 }
-                last.hash = Some(hash);
+                last.changed(hash);
                 if read.iter().all(|&b| b == 0) {
                     return false;
                 }
@@ -718,7 +757,7 @@ impl Staging {
                 if last.hash == Some(hash) {
                     return size;
                 }
-                last.hash = Some(hash);
+                last.changed(hash);
                 self.detile(tiled);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
@@ -734,7 +773,7 @@ impl Staging {
         if last.hash == Some(hash) {
             return size;
         }
-        last.hash = Some(hash);
+        last.changed(hash);
         self.detile(tiled);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
@@ -981,6 +1020,21 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
     there
 }
 
+/// Whether the texture the title is about to show has the title's newer
+/// bytes still to be put up: `Some(true)` if a staging for it exists and
+/// holds bytes no submitted list uploaded yet (`dirty` since the last
+/// upload), `Some(false)` if it exists and is up to date, `None` if its
+/// contents never come from title memory (the host renders to it). For the
+/// present, which shows our copy of it either way: the run's
+/// "written behind the guard" and the present line say whether a movie's
+/// frames are ever a submission late.
+pub(crate) fn present_pending(resource: This) -> Option<bool> {
+    let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+    let staging = map.as_ref()?.get(&(resource as usize))?;
+    use std::sync::atomic::Ordering::Relaxed;
+    Some(staging.dirty.load(Relaxed) && !staging.uploaded.load(Relaxed))
+}
+
 /// The staging state of a title texture, made on first use.
 fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
@@ -1163,5 +1217,33 @@ mod title_memory_tests {
                 assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod guard_tests {
+    use super::Last;
+
+    #[test]
+    fn a_change_the_guard_let_pass_makes_the_texture_hashed_every_check() {
+        let (a, b) = (blake3::hash(b"a"), blake3::hash(b"b"));
+        let mut last = Last::default();
+        last.changed(a);
+        assert!(!last.missed);
+        // A turn's hash that finds a change after the guard said unwritten.
+        last.checked = true;
+        last.changed(b);
+        assert!(last.missed);
+        assert_eq!(last.hash, Some(b));
+    }
+
+    #[test]
+    fn a_first_read_or_a_checked_turn_without_a_change_is_not_a_miss() {
+        let mut last = Last {
+            checked: true,
+            ..Default::default()
+        };
+        last.changed(blake3::hash(b"a"));
+        assert!(!last.missed);
     }
 }
