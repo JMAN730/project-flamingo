@@ -336,8 +336,8 @@ const GATHER4_L_WAVE32: &[u32] = &[
 ];
 
 /// The console waterfall of [`resource::tests::WATERFALL_INDEXED_WAVE32`]
-/// whose loaded descriptor is only read as numbers, never sampled (the
-/// ray-tracing resolve reads an image's size that way): the loop ends in
+/// whose loaded descriptor is only read as numbers, never sampled: the
+/// loop ends in
 /// `v_alignbit_b32 v1, s14, s13, 30`, which is the width - 1 and, from bit
 /// 16, the height - 1 of the image descriptor's dwords 1 and 2.
 const WATERFALL_SIZE_ONLY_WAVE32: &[u32] = &[

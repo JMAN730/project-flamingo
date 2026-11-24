@@ -3842,7 +3842,11 @@ impl<'a> Lower<'a> {
                 .and_then(|a| self.x.native.layout.get(a.param))
                 .is_some_and(|rp| matches!(rp.root, RootType::Table | RootType::ResourceHeap));
             let (uav, dwords, stride) = match used {
-                Some(u) if matches!(u.kind, ResourceType::Srv | ResourceType::Uav) => {
+                // An entry of another width than the load would be read wrong.
+                Some(u)
+                    if u32::from(u.dwords) == count
+                        && matches!(u.kind, ResourceType::Srv | ResourceType::Uav) =>
+                {
                     (u.kind == ResourceType::Uav, u.dwords, u.stride)
                 }
                 None if in_views => (false, count as u8, 0),
