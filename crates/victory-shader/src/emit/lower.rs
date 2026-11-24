@@ -22,6 +22,16 @@ use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 type Why = &'static str;
 
+/// The element stride of a table-bound structured buffer, whose host
+/// descriptor carries `StructureByteStride`. A flat byte-offset access to it
+/// goes through a structured handle at (offset / stride, offset % stride):
+/// drivers check a raw handle's offsets against the stride (NVIDIA returns
+/// zeros past the first element). Root views have no stride and stay raw.
+fn structured_stride(used: Option<&UsedResource>) -> Option<u32> {
+    let u = used?;
+    (u.root == RootType::Table && u.stride >= 4 && u.stride.is_multiple_of(4)).then_some(u.stride)
+}
+
 #[derive(Debug, Clone, Copy)]
 enum Val {
     I32(V),
@@ -3822,7 +3832,13 @@ impl<'a> Lower<'a> {
         // rest). A UAV, known as one or written elsewhere, keeps its kind.
         let u = self.uav_bits(src, kind);
         if u != 0 || matches!(kind, Some(k) if k.kind == ResourceType::Srv) {
-            let h = self.handle(site, src, false, (11 | u, 0))?;
+            let stride = structured_stride(kind);
+            let props = match stride {
+                Some(s) => (12 | u, s),
+                None => (11 | u, 0),
+            };
+            let h = self.handle(site, src, false, props)?;
+            let stride_v = stride.map(|s| self.s.m.i32(s));
             for k in 0..count {
                 let off = self.s.m.i32(4 * k);
                 let a = self.s.m.bin(c, Bin::Add, addr, off);
@@ -3835,6 +3851,13 @@ impl<'a> Lower<'a> {
                 };
                 let mask = self.s.m.i8(1);
                 let (u, al) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
+                let (a, u) = match stride_v {
+                    Some(sv) => (
+                        self.s.m.bin(c, Bin::UDiv, a, sv),
+                        self.s.m.bin(c, Bin::URem, a, sv),
+                    ),
+                    None => (a, u),
+                };
                 let r = self.s.op(
                     c,
                     "rawBufferLoad.f32",
@@ -7942,7 +7965,16 @@ impl<'a> Lower<'a> {
                     let h = self.handle(site, src, false, (12 | u, stride))?;
                     (h, [index, off, iu])
                 }
-                None => (self.handle(site, src, false, (11 | u, 0))?, [off, iu, iu]),
+                None => match structured_stride(used) {
+                    Some(stride) => {
+                        let h = self.handle(site, src, false, (12 | u, stride))?;
+                        let sv = self.s.m.i32(stride);
+                        let idx = self.s.m.bin(c, Bin::UDiv, off, sv);
+                        let eoff = self.s.m.bin(c, Bin::URem, off, sv);
+                        (h, [idx, eoff, iu])
+                    }
+                    None => (self.handle(site, src, false, (11 | u, 0))?, [off, iu, iu]),
+                },
             };
             let Operand::Vector { reg, .. } = *d else {
                 return Err("buffer atomic data");
@@ -8028,6 +8060,34 @@ impl<'a> Lower<'a> {
                 }
                 vals = wide;
             }
+            if !typed
+                && index.is_none()
+                && let Some(stride) = structured_stride(used)
+            {
+                // One dword at a time: a store may cross into the next element.
+                let h = self.handle(site, src, false, (12 | u, stride))?;
+                let sv = self.s.m.i32(stride);
+                let (mask, align) = (self.s.m.i8(1), self.s.m.i32(4));
+                let access = self.narrow(guard, root_ok);
+                let at = self.begin_guarded(access);
+                let void = self.s.t.void;
+                for (k, &v) in vals.iter().enumerate() {
+                    let four = self.s.m.i32(4 * k as u32);
+                    let a = self.s.m.bin(self.cur, Bin::Add, off, four);
+                    let idx = self.s.m.bin(self.cur, Bin::UDiv, a, sv);
+                    let eoff = self.s.m.bin(self.cur, Bin::URem, a, sv);
+                    self.s.op(
+                        self.cur,
+                        "rawBufferStore.i32",
+                        Attr::NoUnwind,
+                        void,
+                        140,
+                        &[h, idx, eoff, v, iu, iu, iu, mask, align],
+                    );
+                }
+                self.end_guarded(at, &[]);
+                return Ok(());
+            }
             let mut args = Vec::new();
             let (op, name) = if typed {
                 // shortcut: typed stores are taken to write all four channels
@@ -8081,6 +8141,36 @@ impl<'a> Lower<'a> {
             };
             for (k, x) in self.format_load(h, off, f, count)?.into_iter().enumerate() {
                 let x = self.zero_unless(root_ok, x);
+                self.write(inst, Reg::V(reg + k as u8), x, guard);
+            }
+            return Ok(());
+        }
+        if !typed
+            && index.is_none()
+            && let Some(stride) = structured_stride(used)
+        {
+            // One dword at a time: a load may cross into the next element.
+            let Some(Operand::Vector { reg, .. }) = *data else {
+                return Err("a buffer result");
+            };
+            let h = self.handle(site, src, false, (12 | u, stride))?;
+            let sv = self.s.m.i32(stride);
+            let (mask, align) = (self.s.m.i8(1), self.s.m.i32(4));
+            for k in 0..count {
+                let four = self.s.m.i32(4 * k);
+                let a = self.s.m.bin(c, Bin::Add, off, four);
+                let idx = self.s.m.bin(c, Bin::UDiv, a, sv);
+                let eoff = self.s.m.bin(c, Bin::URem, a, sv);
+                let r = self.s.op(
+                    c,
+                    "rawBufferLoad.f32",
+                    Attr::ReadOnly,
+                    self.s.t.res_ret,
+                    139,
+                    &[h, idx, eoff, mask, align],
+                );
+                let x = self.s.m.extract(c, r, 0);
+                let x = self.as_int(x);
                 self.write(inst, Reg::V(reg + k as u8), x, guard);
             }
             return Ok(());
@@ -9331,6 +9421,57 @@ mod tests {
             host_wave64: true,
         })
         .unwrap();
+    }
+
+    /// Flat byte-offset accesses to a table-bound StructuredBuffer<56> go
+    /// through a structured handle (upstream #984): a raw handle of it reads
+    /// zeros past the first element on NVIDIA.
+    #[test]
+    fn flat_accesses_to_a_structured_buffer_use_its_stride() {
+        let program = |access: &[u32]| {
+            let mut w = vec![
+                0xBE84_0300, // s_mov_b32 s4, s0
+                0xBE85_0380, // s_mov_b32 s5, 0
+                0xF408_0202,
+                0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], null
+                0x7E00_02FF,
+                80,          // v_mov_b32 v0, 80
+            ];
+            w.extend_from_slice(access);
+            w.extend_from_slice(&[
+                0xD834_0000,
+                0x0000_0100, // ds_write_b32 v0, v1
+                S_ENDPGM,
+            ]);
+            w
+        };
+        let used = |stride, root| {
+            vec![UsedResource {
+                kind: ResourceType::Srv,
+                root,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride,
+                dwords: 4,
+                user_data: 0,
+                slot: 0,
+            }]
+        };
+        let load = program(&[0xE030_1000, 0x8002_0100]); // buffer_load_dword v1, v0, s[8:11], 0 offen
+        let scalar = program(&[
+            0xF420_0304,
+            0xFA00_0000, // s_buffer_load_dword s12, s[8:11], null
+            0x7E02_020C, // v_mov_b32 v1, s12
+        ]);
+        for words in [&load, &scalar] {
+            let l = lower_with(words, vec![root(RootType::Table, 0, 0)], used(56, RootType::Table))
+                .unwrap();
+            assert!(l.heap_props.contains(&(12, 56)), "{:?}", l.heap_props);
+            // A raw buffer (stride 1) stays raw.
+            let l = lower_with(words, vec![root(RootType::Table, 0, 0)], used(1, RootType::Table))
+                .unwrap();
+            assert!(l.heap_props.contains(&(11, 0)), "{:?}", l.heap_props);
+        }
     }
 
     /// v_cvt_f32_f64 reads a register pair as a double (upstream #978).
