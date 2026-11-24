@@ -50,11 +50,15 @@ runs the newer one, so fixes to VIctory Try itself need no new download.
 2. Installs Rust and the C++ Build Tools if they are missing.
 3. Downloads the newest source, adds upstream's new fixes, and builds `victory.exe`. The first build takes
    a while; after that it only rebuilds when the source changed.
-4. Runs `victory.exe run <game exe> --execute` and shows the output.
+4. Runs `victory.exe run <game exe> --execute --console series-s` and shows
+   the output. From 1.8 the game sees an Xbox Series S by default: it then
+   presents its menus on a separate UI plane, which VIctory composites, where
+   as a Series X it has shown a black screen so far.
 5. When the game stops, you choose what's next:
    - **Enter**: run again;
    - **U**: update to the newest version and run;
    - **G**: change the game paths;
+   - **C**: switch between Series S and Series X (remembered);
    - **Q**: quit.
 
 ## Requirements

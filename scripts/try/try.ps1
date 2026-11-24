@@ -15,7 +15,7 @@
 
 $ErrorActionPreference = 'Continue'
 $ProgressPreference = 'SilentlyContinue'
-$TryVersion = '1.7'
+$TryVersion = '1.8'
 $ForkUrl = 'https://github.com/MfDev0/victory.git'
 $Branch = 'arena/59fabb00-victory'
 $UpstreamUrl = 'https://github.com/Marvisak/VIctory.git'
@@ -34,11 +34,13 @@ function Step([string]$msg) { Write-Host ''; Write-Host ('== ' + $msg) -Foregrou
 function Bad([string]$msg) { Write-Host ('  ' + $msg) -ForegroundColor Red }
 
 function Load-Config {
-    $c = @{ game_dir = ''; game_exe = ''; built_key = ''; added = '' }
+    # console: series-s shows the menus (two planes, composited), where
+    # series-x has stayed black for everyone so far (upstream #841, #211).
+    $c = @{ game_dir = ''; game_exe = ''; built_key = ''; added = ''; console = 'series-s' }
     if (Test-Path $ConfigPath) {
         try {
             $j = Get-Content -Path $ConfigPath -Raw | ConvertFrom-Json
-            foreach ($k in @('game_dir', 'game_exe', 'built_key', 'added')) { if ($j.$k) { $c[$k] = [string]$j.$k } }
+            foreach ($k in @('game_dir', 'game_exe', 'built_key', 'added', 'console')) { if ($j.$k) { $c[$k] = [string]$j.$k } }
         } catch {}
     }
     return $c
@@ -383,7 +385,9 @@ function Run-Game {
         Bad "Press U to try again; if it fails, send $(Join-Path $LogDir 'build.log')"
     }
     if ($c.added) { Say "plus upstream: $(@($c.added -split "`n").Count) new fix(es) on top" }
-    Say "command: victory.exe run `"$($c.game_exe)`" --execute   (VICTORY_GAME_DIR=$($c.game_dir))"
+    if ($c.console -ne 'series-x') { $c.console = 'series-s' }
+    Say "console: Xbox $(if ($c.console -eq 'series-s') { 'Series S' } else { 'Series X' })   (C switches)"
+    Say "command: victory.exe run `"$($c.game_exe)`" --execute --console $($c.console)   (VICTORY_GAME_DIR=$($c.game_dir))"
     Say 'To stop: close the game window. (Ctrl+C closes VIctory Try too.)'
     $env:VICTORY_GAME_DIR = $c.game_dir
     $env:RUST_BACKTRACE = '1'
@@ -391,7 +395,7 @@ function Run-Game {
     $log = Join-Path $LogDir "game-$stamp.log"
     Push-Location $TryHome
     try {
-        & (Victory-Exe) run $c.game_exe --execute 2>&1 | ForEach-Object { "$_" } | Tee-Object -FilePath $log
+        & (Victory-Exe) run $c.game_exe --execute --console $c.console 2>&1 | ForEach-Object { "$_" } | Tee-Object -FilePath $log
         $code = $LASTEXITCODE
     } finally { Pop-Location }
     Write-Host ''
@@ -460,10 +464,14 @@ while ($true) {
     Run-Game
     Write-Host ''
     Say 'Enter = run again    U = update to the newest version and run'
-    Say 'G = change the game paths    Q = quit'
+    Say 'G = change the game paths    C = switch Series S / Series X    Q = quit'
     $k = (Read-Host '  Choice').Trim().ToUpper()
     if ($k -eq 'Q') { exit 0 }
     if ($k -eq 'G') { while (-not (Ask-Game $true)) {} }
+    if ($k -eq 'C') {
+        $script:Config.console = $(if ($script:Config.console -eq 'series-s') { 'series-x' } else { 'series-s' })
+        Save-Config
+    }
     if ($k -eq 'U') {
         $changed = Update-Source
         if ($changed -or -not (Test-Path (Victory-Exe))) { if (-not (Build-All)) { Bad 'the new build FAILED: the game runs on the last working build (older fixes). Send the error above.' } }
