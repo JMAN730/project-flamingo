@@ -41,6 +41,9 @@ pub(crate) struct Lowered {
     pub has_isnan_op: bool,
     #[cfg(test)]
     pub has_fcmp_uno: bool,
+    /// Whether an unsigned integer `>` compare was emitted.
+    #[cfg(test)]
+    pub has_iugt: bool,
     /// The props of each heap handle, in creation order.
     #[cfg(test)]
     pub handle_props: Vec<(u32, u32)>,
@@ -960,6 +963,8 @@ impl<'a> Lower<'a> {
         #[cfg(test)]
         let has_fcmp_uno = self.s.m.has_cmp(pred::UNO);
         #[cfg(test)]
+        let has_iugt = self.s.m.has_cmp(pred::IUGT);
+        #[cfg(test)]
         let handle_props = {
             let mut h: Vec<_> = self.handles.iter().map(|(k, v)| (*v, k.4)).collect();
             h.sort_unstable();
@@ -980,6 +985,8 @@ impl<'a> Lower<'a> {
             has_isnan_op,
             #[cfg(test)]
             has_fcmp_uno,
+            #[cfg(test)]
+            has_iugt,
             #[cfg(test)]
             handle_props,
         })
@@ -1607,10 +1614,11 @@ impl<'a> Lower<'a> {
     /// minimum of the three instead (the host's minimum skips NaNs, so that
     /// is the smallest number among them).
     ///
-    /// Uses `dx.op.isSpecialFloat.f32` (`IsNaN`) instead of `fcmp uno`: some
-    /// D3D12 drivers (observed on Intel Iris Xe) fold `fcmp uno x, x` to false
-    /// under default shader fast-math, returning the wrong operand when the
-    /// third input is NaN.
+    /// The NaN test is on the operands' bits ([`Self::is_nan_bits`]), not a
+    /// float compare: drivers fold `fcmp uno x, x` to false under default
+    /// shader fast-math (observed on Intel Iris Xe and NVIDIA, upstream
+    /// #726, #745), returning the median where the hardware gives the
+    /// least operand. An integer compare leaves them nothing to assume.
     fn med3(&mut self, a: V, b: V, third: V) -> V {
         let c = self.cur;
         let lo = self.binary(36, a, b);
@@ -1618,15 +1626,24 @@ impl<'a> Lower<'a> {
         let t = self.binary(36, hi, third);
         let median = self.binary(35, lo, t);
         let least = self.binary(36, lo, third);
-        let is_nan = |l: &mut Self, x: V| {
-            l.s.op(c, "isSpecialFloat.f32", Attr::ReadNone, l.s.t.i1, 8, &[x])
-        };
-        let nan_a = is_nan(self, a);
-        let nan_b = is_nan(self, b);
-        let nan_c = is_nan(self, third);
-        let ab = self.s.m.bin(c, Bin::Or, nan_a, nan_b);
-        let nan = self.s.m.bin(c, Bin::Or, ab, nan_c);
+        let na = self.is_nan_bits(a);
+        let nb = self.is_nan_bits(b);
+        let n3 = self.is_nan_bits(third);
+        let ab = self.s.m.bin(c, Bin::Or, na, nb);
+        let nan = self.s.m.bin(c, Bin::Or, ab, n3);
         self.s.m.select(c, nan, least, median)
+    }
+
+    /// Whether `f` is a NaN, tested on its bits (`|f| > +inf` as integers).
+    /// A float `fcmp uno` is not used: drivers (observed on NVIDIA) assume
+    /// no NaNs there and fold it to false, so the NaN case was lost.
+    fn is_nan_bits(&mut self, f: V) -> V {
+        let c = self.cur;
+        let bits = self.as_int(f);
+        let abs = self.s.m.i32(0x7FFF_FFFF);
+        let inf = self.s.m.i32(0x7F80_0000);
+        let mag = self.s.m.bin(c, Bin::And, bits, abs);
+        self.s.m.cmp(c, pred::IUGT, mag, inf)
     }
 
     /// `a - floor(a)`, which on the hardware never reaches 1.0: where it
@@ -7831,7 +7848,7 @@ mod tests {
     }
 
     #[test]
-    fn med3_f32_emits_dxil_isnan_instead_of_fcmp_uno() {
+    fn med3_f32_tests_nan_on_bits_not_a_float_compare() {
         // v_med3_f32 v0, v1, v2, v3 (VOP3 opcode 0x157)
         let src0 = 256 + 1u32;
         let src1 = 256 + 2u32;
@@ -7843,12 +7860,12 @@ mod tests {
         ];
         let lowered = lower_words(&words).unwrap();
         assert!(
-            lowered.has_isnan_op,
-            "v_med3_f32 must emit dx.op.isSpecialFloat.f32 (IsNaN)"
+            lowered.has_iugt,
+            "v_med3_f32 must test NaN as |bits| > +inf, unsigned"
         );
         assert!(
-            !lowered.has_fcmp_uno,
-            "v_med3_f32 must not emit fcmp uno (folded away by some drivers)"
+            !lowered.has_fcmp_uno && !lowered.has_isnan_op,
+            "v_med3_f32 must not test NaN with floats (folded away by drivers, #726, #745)"
         );
     }
 
