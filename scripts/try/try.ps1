@@ -15,7 +15,7 @@
 
 $ErrorActionPreference = 'Continue'
 $ProgressPreference = 'SilentlyContinue'
-$TryVersion = '3.3'
+$TryVersion = '3.4'
 $ForkUrl = 'https://github.com/MfDev0/victory.git'
 $Branch = 'arena/59fabb00-victory'
 # Other places the fork may live (renamed to CAtez, or a backup copy), tried
@@ -40,11 +40,11 @@ function Bad([string]$msg) { Write-Host ('  ' + $msg) -ForegroundColor Red }
 function Load-Config {
     # console: series-x, the profile the fork's base (fxceless/victory-gta6)
     # renders the world with on NVIDIA (RTX 3080, 3070 Ti, 4070).
-    $c = @{ game_dir = ''; game_exe = ''; built_key = ''; added = ''; console = 'series-x'; base = ''; fast = ''; loop = '' }
+    $c = @{ game_dir = ''; game_exe = ''; built_key = ''; added = ''; console = 'series-x'; base = ''; fast = ''; loop = ''; prepared = '' }
     if (Test-Path $ConfigPath) {
         try {
             $j = Get-Content -Path $ConfigPath -Raw | ConvertFrom-Json
-            foreach ($k in @('game_dir', 'game_exe', 'built_key', 'added', 'console', 'base', 'fast', 'loop')) { if ($j.$k) { $c[$k] = [string]$j.$k } }
+            foreach ($k in @('game_dir', 'game_exe', 'built_key', 'added', 'console', 'base', 'fast', 'loop', 'prepared')) { if ($j.$k) { $c[$k] = [string]$j.$k } }
         } catch {}
     }
     # Try 3.0 moved to the victory-gta6 base: start once on Series X.
@@ -420,36 +420,18 @@ function Build-All {
 
 # ------------------------------------------------------------- run
 
-function Run-Game {
+# The settings a run uses, also for Prepare-Shaders (the shader cache keys
+# its translations by some of them: the same ones are needed both times).
+function Set-RunEnv {
     $c = $script:Config
-    Step 'Running the game with VIctory'
-    Say "game: $($c.game_exe)"
-    # What victory.exe was built from (not just what was downloaded): a
-    # failed build keeps the last working one.
-    $built = ''
-    if ("$($c.built_key)" -match '^fork:([0-9a-f]{7,40})') { $built = $Matches[1] }
-    $fetched = (G rev-parse -q --verify refs/remotes/origin/fork) | Select-Object -First 1
-    if ($built) {
-        $line = (G log -1 --format='%h %s' $built) | Select-Object -First 1
-        Say "VIctory: built from $line"
-    }
-    if ($built -and $fetched -and ($built -ne $fetched)) {
-        $new = (G log -1 --format='%h %s' $fetched) | Select-Object -First 1
-        Bad "this is an OLDER build: the newest fork ($new) did not build."
-        Bad "Press U to try again; if it fails, send $(Join-Path $LogDir 'build.log')"
-    }
-    if ($c.added) { Say "plus upstream: $(@($c.added -split "`n").Count) new fix(es) on top" }
-    if ($c.console -ne 'series-x') { $c.console = 'series-s' }
-    Say "console: Xbox $(if ($c.console -eq 'series-s') { 'Series S' } else { 'Series X' })   (C switches)"
-    Say "command: victory.exe run `"$($c.game_exe)`" --execute --console $($c.console)   (VICTORY_GAME_DIR=$($c.game_dir))"
-    Say 'To stop: close the game window. (Ctrl+C closes VIctory Try too.)'
     $env:VICTORY_GAME_DIR = $c.game_dir
     $env:RUST_BACKTRACE = '1'
     # Long shader loops pass the 2 s driver timeout; 256 turns was the
     # stable middle on an 8 GB RTX 3060 Ti (victory-gta6 #18): 32 makes hair
     # glow and the scene darker, 1024 lost the device after 7 min.
     # 128 once a relay run has lost the card (see Check-Run).
-    $script:LoopFromTry = -not $env:VICTORY_SHADER_LOOP_LIMIT
+    # (Whether the user set it before VIctory Try started, not a run before.)
+    $script:LoopFromTry = -not $script:UserLoop
     if ($script:LoopFromTry) { $env:VICTORY_SHADER_LOOP_LIMIT = $(if ($c.loop) { $c.loop } else { '256' }) }
     # Speed: results land as the card finishes (2-3 fps and stable on that
     # card). F mode instead sends submissions ahead with card buffers: 4-5 fps
@@ -473,6 +455,56 @@ function Run-Game {
     if (-not $env:VICTORY_CACHE_DIR) { $env:VICTORY_CACHE_DIR = Join-Path $TryHome 'cache-gta6' }
     # Shaders that do not translate are saved here (zip and send this folder).
     if (-not $env:VICTORY_DUMP_FAILED) { $env:VICTORY_DUMP_FAILED = Join-Path $TryHome 'failed-shaders' }
+}
+
+# Translates every shader in the game folder into the shader cache before the
+# game starts (victory.exe prepare): once after each new build, so the world
+# does not wait minutes for its shaders while the game runs (see-through
+# objects, 1 fps) and the game need not be restarted again and again.
+function Prepare-Shaders {
+    $c = $script:Config
+    Step 'Preparing the game''s shaders (once after each update; the game is not running)'
+    Say 'This translates every shader in the game folder ahead of time. It can take several minutes.'
+    Say 'Later launches of this build skip it. P in the menu runs it again.'
+    $log = Join-Path $LogDir 'prepare.log'
+    Push-Location $TryHome
+    try {
+        & (Victory-Exe) prepare $c.game_dir 2>&1 | ForEach-Object { "$_" } | Tee-Object -FilePath $log
+        $code = $LASTEXITCODE
+    } finally { Pop-Location }
+    if ($code -eq 0) { Say 'shaders prepared' }
+    else { Bad "preparing the shaders stopped (code $code; output in $log): the game translates the rest itself" }
+    # Not again for this build either way: a failure would repeat each launch.
+    $c.prepared = $c.built_key
+    Save-Config
+}
+
+
+function Run-Game {
+    $c = $script:Config
+    Step 'Running the game with VIctory'
+    Say "game: $($c.game_exe)"
+    # What victory.exe was built from (not just what was downloaded): a
+    # failed build keeps the last working one.
+    $built = ''
+    if ("$($c.built_key)" -match '^fork:([0-9a-f]{7,40})') { $built = $Matches[1] }
+    $fetched = (G rev-parse -q --verify refs/remotes/origin/fork) | Select-Object -First 1
+    if ($built) {
+        $line = (G log -1 --format='%h %s' $built) | Select-Object -First 1
+        Say "VIctory: built from $line"
+    }
+    if ($built -and $fetched -and ($built -ne $fetched)) {
+        $new = (G log -1 --format='%h %s' $fetched) | Select-Object -First 1
+        Bad "this is an OLDER build: the newest fork ($new) did not build."
+        Bad "Press U to try again; if it fails, send $(Join-Path $LogDir 'build.log')"
+    }
+    if ($c.added) { Say "plus upstream: $(@($c.added -split "`n").Count) new fix(es) on top" }
+    if ($c.console -ne 'series-x') { $c.console = 'series-s' }
+    Say "console: Xbox $(if ($c.console -eq 'series-s') { 'Series S' } else { 'Series X' })   (C switches)"
+    Say "command: victory.exe run `"$($c.game_exe)`" --execute --console $($c.console)   (VICTORY_GAME_DIR=$($c.game_dir))"
+    Say 'To stop: close the game window. (Ctrl+C closes VIctory Try too.)'
+    Set-RunEnv
+    if ("$($c.prepared)" -ne "$($c.built_key)") { Prepare-Shaders }
     Say "failed shaders saved to: $($env:VICTORY_DUMP_FAILED)"
     Say "shader loop limit: $($env:VICTORY_SHADER_LOOP_LIMIT)   skipped programs: $($env:VICTORY_SKIP_PIPELINES)"
     Say 'The first world visit compiles ~700 pipelines (slow, the picture may be white: auto-exposure); the next launch loads them.'
@@ -604,6 +636,7 @@ function Run-Newer {
 }
 
 $script:Config = Load-Config
+$script:UserLoop = $env:VICTORY_SHADER_LOOP_LIMIT
 while (-not (Ask-Game $false)) {}
 if (-not (Ensure-Tools)) { exit 1 }
 $changed = Update-Source
@@ -615,10 +648,12 @@ while ($true) {
     Run-Game
     Write-Host ''
     Say 'Enter = run again    U = update to the newest version and run'
-    Say 'G = change the game paths    C = switch Series S / Series X    F = switch speed mode    Q = quit'
+    Say 'G = change the game paths    C = switch Series S / Series X    F = switch speed mode'
+    Say 'P = prepare all shaders again (done by itself after each update)    Q = quit'
     $k = (Read-Host '  Choice').Trim().ToUpper()
     if ($k -eq 'Q') { exit 0 }
     if ($k -eq 'G') { while (-not (Ask-Game $true)) {} }
+    if ($k -eq 'P') { $script:Config.prepared = '' }
     if ($k -eq 'F') {
         $script:Config.fast = $(if ($script:Config.fast -eq '1') { '' } else { '1' })
         Save-Config

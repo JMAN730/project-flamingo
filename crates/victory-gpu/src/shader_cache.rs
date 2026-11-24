@@ -89,6 +89,25 @@ fn build() -> &'static [u8; 32] {
     })
 }
 
+/// Fills the cache ahead of a run (`victory prepare`): the container's
+/// translation as this executable makes it in a run on this PC (the host's
+/// wave width and view heap limit, found as a run finds them), taken from
+/// the cache or made and stored now. Whether it translates.
+///
+/// A rebuilt VIctory keys its translations afresh, so the first world
+/// visit after every update translated each shader again while the title
+/// waited for it (draws dropped, objects see-through); prepared, a run
+/// finds them all.
+pub fn prepare(container: &[u8]) -> bool {
+    crate::descriptor::host::probe_view_limit();
+    host_shader(container).is_ok()
+}
+
+/// Translations found in the cache and made, since the start.
+pub fn prepared_counts() -> (u64, u64) {
+    counts()
+}
+
 /// The translation of a console shader container, from the cache when
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {

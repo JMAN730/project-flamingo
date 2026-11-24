@@ -49,6 +49,33 @@ pub fn use_shader_cache(dir: std::path::PathBuf) {
     let _ = dir;
 }
 
+/// `victory prepare`: the container's translation put in the shader cache
+/// [`use_shader_cache`] opened, as a run on this PC makes it. Whether it
+/// translates (always `false` off Windows, where nothing runs).
+pub fn prepare_shader(container: &[u8]) -> bool {
+    #[cfg(windows)]
+    {
+        victory_gpu::shader_cache::prepare(container)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = container;
+        false
+    }
+}
+
+/// Translations found in the shader cache and made, since the start.
+pub fn prepared_shader_counts() -> (u64, u64) {
+    #[cfg(windows)]
+    {
+        victory_gpu::shader_cache::prepared_counts()
+    }
+    #[cfg(not(windows))]
+    {
+        (0, 0)
+    }
+}
+
 pub(crate) fn module() -> HleModule {
     HleModule {
         name: "d3d12x",

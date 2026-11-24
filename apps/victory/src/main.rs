@@ -5,6 +5,7 @@
 
 mod census;
 mod inspect;
+mod prepare;
 mod run;
 mod shader;
 mod translate;
@@ -85,6 +86,15 @@ enum Command {
         #[arg(long)]
         jobs: Option<usize>,
     },
+    /// Translate every shader in the game files into the shader cache a
+    /// run reads, ahead of the run (no game running), so the world does
+    /// not wait for its shaders on the first visit after an update.
+    Prepare {
+        paths: Vec<PathBuf>,
+        /// Worker threads (default: half the logical cores).
+        #[arg(long)]
+        jobs: Option<usize>,
+    },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
         exe: PathBuf,
@@ -146,6 +156,7 @@ fn main() -> Result<()> {
             verbose,
             disasm,
         } => shader::run(paths, verbose || disasm, disasm),
+        Command::Prepare { paths, jobs } => prepare::run(paths, jobs),
         Command::Translate {
             paths,
             validate,
