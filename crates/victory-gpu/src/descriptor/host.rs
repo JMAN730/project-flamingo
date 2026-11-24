@@ -20,7 +20,7 @@ pub(crate) struct HostHeap {
     /// Slots mirroring the title's; `spare` more follow them.
     count: u32,
     /// Dynamic slots past the title's: [`DYNAMIC`] in a view heap (or
-    /// [`MIN_DYNAMIC`] where the host will not take that many more),
+    /// [`MIN_DYNAMIC`] where the host refused that heap),
     /// [`SAMPLER_DYNAMIC`] in a capped sampler heap, none in another.
     spare: u32,
     sampler: bool,
@@ -90,22 +90,19 @@ fn max_view_heap(host: &Host) -> u32 {
 
 /// The view heaps to try for `count` title slots on a device that takes
 /// `limit` views, in order: (heap size, title slots, dynamic slots). The
-/// larger dynamic range where it fits on top of every title slot, else the
-/// smaller one, else the title's slots are cut so that the smaller one
-/// still fits (shortcut: descriptors past the host's limit are left out; a
-/// title that reaches them needs remapping). None is over `limit`.
+/// full dynamic range always: on top of every title slot where that fits,
+/// else the title's slots are cut to make room for it (shortcut:
+/// descriptors past the host's limit are left out; a title that reaches
+/// them needs remapping). A capped heap with 2^16 dynamic slots ran dry in
+/// every world submission and dropped most indirect draws, where 2^18
+/// dropped none (upstream #747: RTX 4070 Ti, 5060 Ti, 5070 Ti). Then, if
+/// the host refuses that, the smaller range. None is over `limit`.
 fn view_heap_sizes(count: u32, limit: u32) -> Vec<(u32, u32, u32)> {
-    let mut sizes: Vec<(u32, u32, u32)> = [DYNAMIC, MIN_DYNAMIC]
-        .into_iter()
-        .filter_map(|extra| {
-            let size = count.checked_add(extra)?;
-            (size <= limit).then_some((size, count, extra))
-        })
-        .collect();
-    if count.saturating_add(MIN_DYNAMIC) > limit {
-        sizes.push((limit, limit.saturating_sub(MIN_DYNAMIC), MIN_DYNAMIC));
-    }
-    sizes
+    let planned = |extra: u32| match count.checked_add(extra) {
+        Some(size) if size <= limit => (size, count, extra),
+        _ => (limit, limit.saturating_sub(extra), extra),
+    };
+    vec![planned(DYNAMIC), planned(MIN_DYNAMIC)]
 }
 
 /// Slots past the title's in a view heap, for tables a draw needs made
@@ -115,8 +112,8 @@ fn view_heap_sizes(count: u32, limit: u32) -> Vec<(u32, u32, u32)> {
 /// each a device removal shortly after; upstream #59).
 const DYNAMIC: u32 = 1 << 18;
 
-/// The dynamic slots of a view heap whose host would not take [`DYNAMIC`]
-/// more (a capped heap, NVIDIA): the title's slots keep their room first.
+/// The dynamic slots of a view heap the host refused with [`DYNAMIC`]: a
+/// last resort, too few for the world (upstream #747).
 const MIN_DYNAMIC: u32 = 1 << 16;
 
 /// The host's limit for shader-visible sampler heaps, on every binding
@@ -1180,28 +1177,34 @@ mod tests {
     /// that takes 1,000,000 (upstream #735).
     #[test]
     fn view_heaps_stay_within_the_device_limit() {
-        let capped = view_heap_sizes(1 << 20, PORTABLE_VIEWS);
+        // 2^20 title slots on a 1M device: the full dynamic range, the
+        // title's slots cut (upstream #735, #747).
         assert_eq!(
-            capped,
-            [(PORTABLE_VIEWS, PORTABLE_VIEWS - MIN_DYNAMIC, MIN_DYNAMIC)]
+            view_heap_sizes(1 << 20, PORTABLE_VIEWS),
+            [
+                (PORTABLE_VIEWS, PORTABLE_VIEWS - DYNAMIC, DYNAMIC),
+                (PORTABLE_VIEWS, PORTABLE_VIEWS - MIN_DYNAMIC, MIN_DYNAMIC),
+            ]
         );
         assert_eq!(
             view_heap_sizes(4, PORTABLE_VIEWS),
             [(4 + DYNAMIC, 4, DYNAMIC), (4 + MIN_DYNAMIC, 4, MIN_DYNAMIC)]
         );
-        let only_small = PORTABLE_VIEWS - DYNAMIC + 1;
         assert_eq!(
-            view_heap_sizes(only_small, PORTABLE_VIEWS),
-            [(only_small + MIN_DYNAMIC, only_small, MIN_DYNAMIC)]
+            view_heap_sizes(800_000, PORTABLE_VIEWS),
+            [
+                (PORTABLE_VIEWS, PORTABLE_VIEWS - DYNAMIC, DYNAMIC),
+                (800_000 + MIN_DYNAMIC, 800_000, MIN_DYNAMIC),
+            ]
         );
-        // A device that reports a larger limit gets the larger range.
+        // A device that reports a larger limit keeps every title slot.
         assert_eq!(
             view_heap_sizes(1 << 20, 1 << 21)[0],
             ((1 << 20) + DYNAMIC, 1 << 20, DYNAMIC)
         );
         for count in [0, 1, 999_999, 1_000_000, u32::MAX] {
             let sizes = view_heap_sizes(count, PORTABLE_VIEWS);
-            assert!(!sizes.is_empty());
+            assert_eq!(sizes[0].2, DYNAMIC);
             for (size, titles, extra) in sizes {
                 assert!(size <= PORTABLE_VIEWS && titles + extra == size && titles <= count);
             }
