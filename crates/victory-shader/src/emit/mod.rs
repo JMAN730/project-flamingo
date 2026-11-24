@@ -463,6 +463,23 @@ pub fn emit(
                 }
             }
         }
+        // `VICTORY_WAVE_WIDE=last`: the wave-wide form only for programs every other form left
+        // asking for 64-lane waves, which a 32-lane host refuses outright (E_INVALIDARG at
+        // pipeline creation: 02384a60fda6f2d0, 2da4beb386509b77, 6b82bc7d22016cb5 on NVIDIA,
+        // victory-gta6 #7). Opt-in: the form's barriers lost the card for two other programs.
+        if !wide_on && std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "last") {
+            let base = forms
+                .iter()
+                .rev()
+                .filter_map(|(_, f)| f.as_ref().map(|f| &f.0))
+                .next()
+                .unwrap_or(p);
+            let again = widen(c, native, base, why);
+            report("wave-wide branches (last)", &again);
+            if done(&again) {
+                return again.map(|(shader, _)| shader);
+            }
+        }
     }
     // SCC of a mask operation joined with a scalar test behind a per-lane skip (the 32-lane
     // trace programs): right once the wave takes that skip together ([`widen`]; the
