@@ -601,6 +601,10 @@ pub(crate) fn back_begin(done: &std::sync::Arc<Done>, from: usize, to: usize) ->
     if first >= last {
         return Vec::new();
     }
+    // Before a page is made inaccessible: the title's own writes there take
+    // the access fault this handler resolves (run cb-1: a write to a held
+    // block with no handler installed yet was the run's crash).
+    install();
     let mut held = Vec::new();
     let take = |a: usize, b: usize, held: &mut Vec<usize>| {
         let mut old = 0;
@@ -849,6 +853,7 @@ fn install() {
         }
         if !is_write {
             // A read of memory that is not ours: as before, someone else's.
+            // (A read of a block a job holds is answered above.)
             return EXCEPTION_CONTINUE_SEARCH;
         }
         // Held across both checks: another thread may have opened the block
@@ -863,6 +868,32 @@ fn install() {
         if writable(at) {
             EXCEPTION_CONTINUE_EXECUTION
         } else {
+            // Not a block we hold and not memory the title may write: say who
+            // knows the address, so a fault like cb-1's is diagnosable (which
+            // registry, whether a job still holds its block or the block was
+            // given back, and the protection it has now).
+            static SAID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            if SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 16 {
+                use windows_sys::Win32::System::Memory::{
+                    MEMORY_BASIC_INFORMATION, PAGE_NOACCESS, VirtualQuery,
+                };
+                // SAFETY: plain data filled in by the query.
+                let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+                // SAFETY: a valid out pointer of the right size.
+                let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+                let g = guards();
+                tracing::warn!(
+                    at = format_args!("{at:#x}"),
+                    block = format_args!("{:#x}", at / BLOCK),
+                    written = is_write,
+                    protect = format_args!("{:#x}", if n != 0 { info.Protect } else { 0 }),
+                    noaccess = n != 0 && info.Protect == PAGE_NOACCESS,
+                    guarded = g.protected.contains(&(at / BLOCK)),
+                    absent = g.absent.contains(&(at / BLOCK)),
+                    owed = back().get(&(at / BLOCK)).is_some(),
+                    "an access fault this handler cannot resolve: not writable, not a write-back job's block"
+                );
+            }
             EXCEPTION_CONTINUE_SEARCH
         }
     }
@@ -946,6 +977,57 @@ mod tests {
         second.finish();
         back_release(&taken_again, &second);
         assert!(writable(at), "given back by the job that last held it");
+        // SAFETY: the memory allocated above.
+        unsafe { VirtualFree(at as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// A title write into a block a write-back job holds takes the access
+    /// fault, and the handler opens the block and lets the write through.
+    /// Run cb-1 died here: the handler had not been installed (nothing had
+    /// guarded a view in that run yet), so the title's own store to a held
+    /// block was an unhandled 0xc0000005.
+    #[test]
+    fn a_title_write_into_a_held_block_is_resolved() {
+        // SAFETY: two blocks of private memory, freed at the end.
+        let at = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                2 * BLOCK,
+                MEM_COMMIT | MEM_RESERVE,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert_ne!(at, 0);
+        let done = std::sync::Arc::new(Done::default());
+        let held = back_begin(&done, at, at + 2 * BLOCK);
+        assert_eq!(held, [at / BLOCK, at / BLOCK + 1]);
+        assert!(!writable(at), "held inaccessible while the job runs");
+        // The job finishes while the title's store is on its way (as the
+        // worker does: the blocks are given back, then the job is done).
+        let job = {
+            let done = done.clone();
+            let held = held.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                back_release(&held, &done);
+                done.finish();
+            })
+        };
+        // A store in the first block, then one that straddles the two: the
+        // handler waits for the job, which opens both.
+        // SAFETY: our own memory; the instruction runs again once the block
+        // is given back.
+        unsafe {
+            (at as *mut u64).write_volatile(0x1234_5678);
+            // (the last four bytes of the first block and the first of the
+            // second: unaligned on purpose)
+            ((at + BLOCK - 4) as *mut u32).write_volatile(0x9abc_def0);
+        }
+        job.join().expect("the job's thread");
+        assert!(writable(at));
+        assert!(back_pending(at).is_none());
+        // SAFETY: our memory, written just above.
+        assert_eq!(unsafe { ((at + BLOCK - 4) as *const u32).read() }, 0x9abc_def0);
         // SAFETY: the memory allocated above.
         unsafe { VirtualFree(at as *mut _, 0, MEM_RELEASE) };
     }
