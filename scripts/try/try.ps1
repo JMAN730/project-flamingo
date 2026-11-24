@@ -15,7 +15,7 @@
 
 $ErrorActionPreference = 'Continue'
 $ProgressPreference = 'SilentlyContinue'
-$TryVersion = '1.6'
+$TryVersion = '1.7'
 $ForkUrl = 'https://github.com/MfDev0/victory.git'
 $Branch = 'arena/59fabb00-victory'
 $UpstreamUrl = 'https://github.com/Marvisak/VIctory.git'
@@ -368,8 +368,20 @@ function Run-Game {
     $c = $script:Config
     Step 'Running the game with VIctory'
     Say "game: $($c.game_exe)"
-    $build = (G log -1 --format='%h %s' refs/remotes/origin/fork) | Select-Object -First 1
-    if ($build) { Say "VIctory: fork at $build" }
+    # What victory.exe was built from (not just what was downloaded): a
+    # failed build keeps the last working one.
+    $built = ''
+    if ("$($c.built_key)" -match '^fork:([0-9a-f]{7,40})') { $built = $Matches[1] }
+    $fetched = (G rev-parse -q --verify refs/remotes/origin/fork) | Select-Object -First 1
+    if ($built) {
+        $line = (G log -1 --format='%h %s' $built) | Select-Object -First 1
+        Say "VIctory: built from $line"
+    }
+    if ($built -and $fetched -and ($built -ne $fetched)) {
+        $new = (G log -1 --format='%h %s' $fetched) | Select-Object -First 1
+        Bad "this is an OLDER build: the newest fork ($new) did not build."
+        Bad "Press U to try again; if it fails, send $(Join-Path $LogDir 'build.log')"
+    }
     if ($c.added) { Say "plus upstream: $(@($c.added -split "`n").Count) new fix(es) on top" }
     Say "command: victory.exe run `"$($c.game_exe)`" --execute   (VICTORY_GAME_DIR=$($c.game_dir))"
     Say 'To stop: close the game window. (Ctrl+C closes VIctory Try too.)'
@@ -454,6 +466,6 @@ while ($true) {
     if ($k -eq 'G') { while (-not (Ask-Game $true)) {} }
     if ($k -eq 'U') {
         $changed = Update-Source
-        if ($changed -or -not (Test-Path (Victory-Exe))) { if (-not (Build-All)) { Say 'keeping the last working build' } }
+        if ($changed -or -not (Test-Path (Victory-Exe))) { if (-not (Build-All)) { Bad 'the new build FAILED: the game runs on the last working build (older fixes). Send the error above.' } }
     }
 }
