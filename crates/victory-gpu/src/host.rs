@@ -623,6 +623,27 @@ fn create() -> windows::core::Result<Host> {
     }
 }
 
+/// The adapter and the driver the host device is on, as one line: host
+/// pipelines are valid for these alone, so the warm-up list's file name
+/// takes a hash of it (another adapter or a new driver starts a list of its
+/// own instead of meeting 2,000 pipelines that do not load).
+pub(crate) fn adapter_identity() -> Option<String> {
+    let adapter = host()?.adapter.clone()?;
+    // SAFETY: plain DXGI queries on a live adapter.
+    unsafe {
+        let desc = adapter.cast::<IDXGIAdapter1>().ok()?.GetDesc1().ok()?;
+        let end = desc.Description.iter().position(|c| *c == 0).unwrap_or(desc.Description.len());
+        let name = String::from_utf16_lossy(&desc.Description[..end]);
+        // The user-mode driver's version, where the adapter answers for a
+        // device (not the software adapter, nor Wine's DXGI).
+        let driver = adapter.CheckInterfaceSupport(&IDXGIDevice::IID as *const _).ok();
+        Some(match driver {
+            Some(v) => format!("{name} {:04x}:{:04x} driver {:#018x}", desc.VendorId, desc.DeviceId, v),
+            None => format!("{name} {:04x}:{:04x}", desc.VendorId, desc.DeviceId),
+        })
+    }
+}
+
 /// DXGI may return hardware for `EnumWarpAdapter` (notably under Proton).
 /// Reject it before creating a device in diagnostics' software-only mode.
 fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {

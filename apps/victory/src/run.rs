@@ -130,6 +130,7 @@ pub fn run(
         .join()
         .map_err(|_| anyhow::anyhow!("title main thread panicked"))??;
     println!("title exited with {code}");
+    victory_hle::modules::d3d12x::report_shader_caches();
     Ok(())
 }
 
@@ -151,6 +152,7 @@ pub fn warmup() -> Result<()> {
         ),
         None => println!("warm-up        nothing to do (no list yet, VICTORY_WARMUP=0, or no host GPU)"),
     }
+    victory_hle::modules::d3d12x::report_shader_caches();
     Ok(())
 }
 

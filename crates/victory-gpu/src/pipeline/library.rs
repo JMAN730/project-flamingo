@@ -585,7 +585,9 @@ pub(crate) fn save(now: bool) {
         tracing::warn!(error = %e, "host pipeline library not saved");
         return;
     }
-    super::warm::flush(dir);
+    // Through a temporary file at the end of a run (the writes a run makes
+    // as it goes are appended).
+    super::warm::flush(dir, now);
     let tmp = dir.join(LIBRARY_FILE).with_extension("tmp");
     // The bytes of the library written to `tmp`; 0 when no pipeline was
     // added: the library on disk is then what it was, and only the early

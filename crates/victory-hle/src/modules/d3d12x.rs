@@ -57,6 +57,12 @@ pub fn warm_up() -> Option<victory_gpu::pipeline::WarmUpReport> {
     victory_gpu::pipeline::warm_up()
 }
 
+/// The sizes of RADV's disk cache and of vkd3d-proton's, after a run.
+#[cfg(windows)]
+pub fn report_shader_caches() {
+    victory_gpu::pipeline::report_shader_caches();
+}
+
 pub(crate) fn module() -> HleModule {
     HleModule {
         name: "d3d12x",

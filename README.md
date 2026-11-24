@@ -200,6 +200,11 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 | `VICTORY_D3D12_GBV=1` | with the above, GPU-based validation (bad descriptor use reported, not faulted; slow) |
 | `VICTORY_D3D12_DRED=1` | on a GPU failure, the allocation hit and the commands in flight |
 | `VICTORY_PIPELINE_WAIT_MS=24` | reduce the per-frame wait for background pipeline creation from the default of 500 ms. A draw can be omitted until its pipeline is ready |
+| `VICTORY_WARMUP=0` | off: do not build the listed title pipelines before the title starts (on by default while `warm-pipelines-*.bin` holds a list) |
+| `VICTORY_WARMUP_THREADS=<n>` | warm-up workers (default: all processors, 2 to 16; no worker past the first is added while less than 4 GB is free) |
+| `VICTORY_WARMUP_MAX_SECS=<n>` | stop the warm-up after that long and start the title (default: no limit; closing its window does the same) |
+| `VICTORY_WARMUP_WINDOW=0` | no progress window (the log line every 2 s stays) |
+| `VICTORY_LIBRARY_COLD=1` | start as if there were no host pipeline library file (measurements; the run then writes a new one) |
 | `VICTORY_SKIP_PIPELINES=<hash>,...` | omit draws and dispatches, including indirect ones, whose pipeline contains a listed 16-digit shader hash |
 | `VICTORY_GPU_TIMING=1` | with the above, each list of a submission run and timed on its own; slow lists logged with their slowest commands |
 | `VICTORY_D3D12_WARP=1` | host device on the software adapter (slow; cannot reset the driver) |
