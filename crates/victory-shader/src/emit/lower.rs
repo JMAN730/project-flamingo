@@ -3698,6 +3698,62 @@ impl<'a> Lower<'a> {
         (r, carry)
     }
 
+    /// The low and high halves of the 64-bit float source `k` (a register
+    /// pair or an inline constant, which a 64-bit operand reads as a double),
+    /// with its abs and neg modifiers applied to the sign bit.
+    fn src64_pair(&mut self, inst: &Inst, k: usize) -> Result<(V, V), Why> {
+        let Fields::Valu(v) = &inst.fields else {
+            unreachable!()
+        };
+        if v.sdwa.is_some() || v.dpp.is_some() {
+            return Err("64-bit operand modifiers");
+        }
+        let op = *v.src.get(k).ok_or("a missing operand")?;
+        let pair = |l: &mut Self, r: Reg, r1: Reg| -> Result<(V, V), Why> {
+            let lo = l.i32_of(inst.read(r).ok_or("an unread operand")?)?;
+            let hi = l.i32_of(inst.read(r1).ok_or("an unread operand")?)?;
+            Ok((lo, hi))
+        };
+        let (lo, hi) = match op {
+            Operand::Vector { reg, .. } => pair(self, Reg::V(reg), Reg::V(reg + 1))?,
+            Operand::Scalar { code, .. } if code != NULL => {
+                pair(self, Reg::S(code), Reg::S(code + 1))?
+            }
+            Operand::Const(code) => {
+                let bits = match code {
+                    // Integers, sign-extended to 64 bits.
+                    128..=208 => {
+                        let x = crate::resource::inline(code).ok_or("a special operand")?;
+                        i64::from(x as i32) as u64
+                    }
+                    240 => 0.5f64.to_bits(),
+                    241 => (-0.5f64).to_bits(),
+                    242 => 1.0f64.to_bits(),
+                    243 => (-1.0f64).to_bits(),
+                    244 => 2.0f64.to_bits(),
+                    245 => (-2.0f64).to_bits(),
+                    246 => 4.0f64.to_bits(),
+                    247 => (-4.0f64).to_bits(),
+                    248 => 0x3FC4_5F30_6DC9_C882, // 1 / (2 pi)
+                    _ => return Err("a 64-bit literal"),
+                };
+                (self.s.m.i32(bits as u32), self.s.m.i32((bits >> 32) as u32))
+            }
+            _ => return Err("a 64-bit operand"),
+        };
+        let c = self.cur;
+        let mut hi = hi;
+        if v.abs >> k & 1 != 0 {
+            let m = self.s.m.i32(0x7FFF_FFFF);
+            hi = self.s.m.bin(c, Bin::And, hi, m);
+        }
+        if v.neg >> k & 1 != 0 {
+            let m = self.s.m.i32(0x8000_0000);
+            hi = self.s.m.bin(c, Bin::Xor, hi, m);
+        }
+        Ok((lo, hi))
+    }
+
     fn scc_in(&mut self, inst: &Inst) -> Result<V, Why> {
         let v = inst.read(Reg::Scc).ok_or("an unread SCC")?;
         match self.get(v)? {
@@ -5336,6 +5392,17 @@ impl<'a> Lower<'a> {
                 };
                 let r = self.s.m.cast(c, op, a, self.s.t.i32);
                 int(self, r)
+            }
+            "v_cvt_f32_f64" => {
+                // Rounded to nearest, as the console's default mode does.
+                let (lo, hi) = self.src64_pair(inst, 0)?;
+                self.s.flags |= flags::DOUBLE;
+                let f64t = self.s.m.double();
+                let d = self
+                    .s
+                    .op(c, "makeDouble.f64", Attr::ReadNone, f64t, 101, &[lo, hi]);
+                let r = self.s.m.cast(c, Cast::FpTrunc, d, self.s.t.f32);
+                float(self, r)
             }
             "v_cvt_f32_i32" | "v_cvt_f32_u32" | "v_cvt_f32_ubyte0" | "v_cvt_f32_ubyte1"
             | "v_cvt_f32_ubyte2" | "v_cvt_f32_ubyte3" => {
@@ -9180,6 +9247,18 @@ mod tests {
             lowers(&[0xE1C8_0000, 0, S_ENDPGM]).is_ok(),
             "buffer_gl1_inv"
         );
+    }
+
+    /// v_cvt_f32_f64 reads a register pair as a double (upstream #978).
+    #[test]
+    fn v_cvt_f32_f64_lowers() {
+        let l = lower_words(&[
+            0x7E00_1F00, // v_cvt_f32_f64 v0, v[0:1]
+            0x7E02_1FF2, // v_cvt_f32_f64 v1, 1.0
+            S_ENDPGM,
+        ])
+        .unwrap();
+        assert!(l.funcs.iter().any(|f| f == "dx.op.makeDouble.f64"), "{:?}", l.funcs);
     }
 
     /// Lowers a pixel program with one target: whether it translates.
