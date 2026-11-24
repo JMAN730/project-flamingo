@@ -1179,20 +1179,34 @@ extern "system" fn reset_x(this: This, allocator: This, pipeline: This, _flags: 
 /// its instance descriptions there (and wrote through our old
 /// `E_NOTIMPL` as a pointer).
 extern "system" fn allocate_upload(this: This, size: u64, alignment: u64) -> *mut u8 {
-    let align = usize::try_from(alignment).unwrap_or(0).max(16);
+    if this.is_null() {
+        return std::ptr::null_mut();
+    }
+    let Ok(raw_align) = usize::try_from(alignment) else {
+        return std::ptr::null_mut();
+    };
+    if raw_align != 0 && !raw_align.is_power_of_two() {
+        return std::ptr::null_mut();
+    }
+    let align = raw_align.max(16);
     let Some(len) = usize::try_from(size)
         .ok()
         .and_then(|s| s.checked_add(align))
     else {
         return std::ptr::null_mut();
     };
-    if this.is_null() || !align.is_power_of_two() {
+    let mut block = Vec::new();
+    if block.try_reserve_exact(len).is_err() {
         return std::ptr::null_mut();
     }
-    let mut block = vec![0u8; len];
+    block.resize(len, 0);
     let start = block.as_mut_ptr();
-    // SAFETY: the offset is below `align`, so `size` bytes fit after it.
-    let at = unsafe { start.add(start.align_offset(align)) };
+    let offset = start.align_offset(align);
+    if offset >= align {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: `offset < align` and `len == size + align`, so `size` bytes fit at `start + offset`.
+    let at = unsafe { start.add(offset) };
     // SAFETY: the title passes one of our lists.
     let uploads = unsafe { &(*this.cast::<List>()).uploads };
     // Moving the vector keeps its heap block where it is.
@@ -2023,5 +2037,68 @@ mod tests {
         for object in [list, allocator, waits, ready, done] {
             assert_eq!(release(object), 0);
         }
+    }
+
+    #[test]
+    fn allocate_upload_rejects_bad_alignments_and_oversized_requests() {
+        let null = std::ptr::null();
+        let mut allocator = null;
+        assert_eq!(
+            create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
+            S_OK
+        );
+        let mut list = null;
+        assert_eq!(
+            create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list),
+            S_OK
+        );
+
+        assert!(allocate_upload(null, 16, 16).is_null(), "null list");
+        for bad in [3u64, 5, 6, 7, 9, 10, 12, 15, 0x30] {
+            assert!(
+                allocate_upload(list, 8, bad).is_null(),
+                "non-power-of-two alignment {bad} must fail"
+            );
+        }
+        // Oversized alignments and sizes must return null rather than panicking
+        // or aborting across the FFI boundary.
+        assert!(
+            allocate_upload(list, 16, 1u64 << 63).is_null(),
+            "alignment > isize::MAX must return null"
+        );
+        assert!(
+            allocate_upload(list, isize::MAX as u64, 16).is_null(),
+            "size + align > isize::MAX must return null"
+        );
+        assert!(
+            allocate_upload(list, u64::MAX, 16).is_null(),
+            "wrapping size must return null"
+        );
+        assert!(
+            allocate_upload(list, 1u64 << 50, 16).is_null(),
+            "unallocatable size must return null"
+        );
+        // SAFETY: `list` is ours and stays live until released below.
+        let uploads = unsafe { &(*list.cast::<List>()).uploads };
+        assert!(uploads.lock().unwrap().is_empty());
+
+        // Default alignment (0) and valid sub-16 powers of two still succeed
+        // with at least 16-byte alignment.
+        for align in [0u64, 1, 2, 4, 8, 16, 64] {
+            let p = allocate_upload(list, 24, align);
+            let want = align.max(16) as usize;
+            assert!(
+                !p.is_null() && (p as usize).is_multiple_of(want),
+                "valid alignment {align} failed"
+            );
+            // SAFETY: 24 bytes were allocated at `p`.
+            unsafe { p.write_bytes(0x5a, 24) };
+        }
+        assert_eq!(close(list), S_OK);
+        assert_eq!(reset(list, allocator, null), S_OK);
+        assert!(uploads.lock().unwrap().is_empty());
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        assert_eq!(release(list), 0);
+        assert_eq!(release(allocator), 0);
     }
 }
