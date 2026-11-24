@@ -1621,7 +1621,10 @@ impl State {
             // title mapped: again in 120 frames, as before).
             let again = match partly {
                 Some(mapped) => Some((frame + 1, mapped)),
-                None => (!whole).then_some((frame + 120, 0)),
+                // A texture not all mapped: looked at again as a staged
+                // texture's own re-read does (`partial_frames`), not in 120
+                // frames as before.
+                None => (!whole).then_some((frame + crate::texture::partial_frames(), 0)),
             };
             if again.is_some() {
                 HEAP_TEXTURES_PARTLY[1].fetch_add(1, Ordering::Relaxed);

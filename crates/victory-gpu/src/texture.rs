@@ -330,6 +330,36 @@ pub(crate) static UNLOCKED: [std::sync::atomic::AtomicU64; 2] = [const { std::sy
 /// These say for what.
 pub(crate) static REFRESH_WAITS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
+/// Frames between two reads of a texture only part of which is mapped
+/// (`VICTORY_TEXTURE_PARTIAL_FRAMES`, default 30): reading around unmapped
+/// pages is slow and nothing tells us when pages arrive, so a mip that
+/// streams in shows up to this many frames late.
+pub(crate) fn partial_frames() -> u64 {
+    static N: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_PARTIAL_FRAMES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(30)
+    })
+}
+
+/// Frames between two reads of a texture none of whose mips is mapped
+/// (`VICTORY_TEXTURE_UNMAPPED_FRAMES`, default 2): it is black until one
+/// arrives — a character's clothes and skin, the report's flat surfaces —
+/// so it is looked at again straight away rather than up to 30 frames
+/// later. Only for textures with nothing there: an unmapped read is the
+/// whole texture's bytes of failing kernel reads.
+fn unmapped_frames() -> u64 {
+    static N: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_UNMAPPED_FRAMES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2)
+    })
+}
+
 /// `f`'s result, its time added to [`REFRESH_WAITS`]' place `slot`.
 fn waited<T>(slot: usize, f: impl FnOnce() -> T) -> T {
     let started = std::time::Instant::now();
@@ -697,8 +727,12 @@ impl Staging {
             } else if window.1 == 0 {
                 crate::copystat::add(crate::copystat::C::ResidentNone, 1);
             }
+            // Read again in `partial_frames`, or in `unmapped_frames` when
+            // no mip at all is there (the texture is black until one
+            // arrives, where a partly mapped one shows its small mips).
+            let wait = if window.1 == 0 { unmapped_frames() } else { partial_frames() };
             let frame = crate::frame::current();
-            if last.partial.is_some_and(|at| frame < at + 30) {
+            if last.partial.is_some_and(|at| frame < at + wait) {
                 return 0;
             }
             last.partial = Some(frame);
@@ -1328,7 +1362,28 @@ mod resident_tests {
         // A view that starts inside the resident range keeps the overlap of
         // the two (mips 5 and 6 of the 3..7 it asked for).
         assert_eq!(narrowed((3, 4), (5, 4), 9), (5, 2));
-        // Everything there: unchanged (0 levels means the rest).
-        assert_eq!(narrowed((0, 0), (0, 9), 9), (0, 9));
+    }
+
+    #[test]
+    fn a_chain_fills_in_over_frames_and_the_view_widens() {
+        // The same chain as the texture's streamer maps it: the tail block
+        // first, then mip 4, 3, 2, 1 and 0, a frame or two apart. The view
+        // a surface samples widens each time (nothing else changes: the
+        // refresh records the window, the heap pass remakes the view).
+        let chain = chain();
+        let steps = [(1024, (5, 4)), (2048, (4, 5)), (4096, (3, 6)), (8192, (2, 7)), (16384, (1, 8)), (32768, (0, 9))];
+        let mut last = (9, 0);
+        for (mapped, want) in steps {
+            let window = resident_suffix(&chain, mapped);
+            assert_eq!(window, want, "mapped {mapped}");
+            // Never narrower than before, and it ends at the chain's end.
+            assert!(window.0 <= last.0 && window.1 >= last.1, "mapped {mapped}: {window:?} after {last:?}");
+            assert_eq!(window.0 + window.1, 9);
+            // The window a view of every mip names is the resident one.
+            assert_eq!(narrowed((0, 0), window, 9), want);
+            last = window;
+        }
+        // All of it there: the view is the title's again.
+        assert_eq!(narrowed((0, 0), resident_suffix(&chain, 32768), 9), (0, 9));
     }
 }
