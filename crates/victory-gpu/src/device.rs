@@ -590,4 +590,54 @@ mod tests {
         assert_eq!(info[1], 48);
         assert_eq!(check(device(), 6, (&raw mut info).cast(), 4), E_INVALIDARG);
     }
+
+    #[test]
+    fn feature_options_report_the_rdna2_tiers() {
+        type Check = extern "system" fn(This, u32, *mut c_void, u32) -> HRESULT;
+        let device = device();
+        let check = slot::<Check>(device, 0x68);
+        let mut options = [0u32; 16];
+        assert_eq!(check(device, 0, options.as_mut_ptr().cast(), 64), S_OK);
+        assert_eq!(options, OPTIONS);
+        assert_eq!(
+            (options[3], options[4], options[8], options[9], options[15]),
+            (3, 3, 3, 40, 2)
+        );
+        assert_eq!(
+            check(device, 0, options.as_mut_ptr().cast(), 60),
+            E_INVALIDARG
+        );
+        assert_eq!(check(device, 0, std::ptr::null_mut(), 64), E_INVALIDARG);
+    }
+
+    #[test]
+    fn feature_architecture_is_unified_and_coherent() {
+        type Check = extern "system" fn(This, u32, *mut c_void, u32) -> HRESULT;
+        let device = device();
+        let check = slot::<Check>(device, 0x68);
+        let mut arch = [0u32; 4];
+        assert_eq!(check(device, 1, arch.as_mut_ptr().cast(), 16), S_OK);
+        assert_eq!(arch, [0, 0, 1, 1]);
+        arch[0] = 1;
+        assert_eq!(check(device, 1, arch.as_mut_ptr().cast(), 16), E_INVALIDARG);
+    }
+
+    #[test]
+    fn feature_multisample_has_one_level_for_the_hardware_counts() {
+        type Check = extern "system" fn(This, u32, *mut c_void, u32) -> HRESULT;
+        let device = device();
+        let check = slot::<Check>(device, 0x68);
+        let levels = |samples: u32| {
+            // Format, sample count, flags in; quality levels out.
+            let mut query = [28, samples, 0, 99];
+            assert_eq!(check(device, 4, query.as_mut_ptr().cast(), 16), S_OK);
+            query[3]
+        };
+        for samples in [1, 2, 4, 8] {
+            assert_eq!(levels(samples), 1, "{samples} samples");
+        }
+        for samples in [0, 3, 16] {
+            assert_eq!(levels(samples), 0, "{samples} samples");
+        }
+    }
 }
