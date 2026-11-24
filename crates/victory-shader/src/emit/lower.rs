@@ -3692,17 +3692,11 @@ impl<'a> Lower<'a> {
             .max_by_key(|u| u.table_offset_dwords)
     }
 
-    /// The `IsUAV` and `IsGloballyCoherent` bits of every handle of the
-    /// resource descriptor `src`, from all of its uses in the program, not
-    /// only the access at hand: one descriptor read by a load and written by
-    /// a store is one UAV, and both handles must say so. `used` is what the
-    /// root signature says of it (heap descriptors: nothing).
-    ///
-    /// A UAV is globally coherent when some plain access through it has
-    /// `glc` (it skips the per-CU cache, as LLVM's GFX10 memory model lowers
-    /// a device-scope atomic load, to see other groups' writes). On atomics
-    /// `glc` only asks for the old value.
-    fn uav_bits(&self, src: &Source, used: Option<&UsedResource>) -> u32 {
+    /// Every instruction that reads or writes through the resource
+    /// descriptor `src`: the same dwords of the same scalar load, or of a
+    /// twin load of them.
+    fn accesses(&self, src: &Source) -> Vec<&'a Inst> {
+        let p: &'a Program = self.x.p;
         let leaves: Vec<(Site, u8)> = src
             .leaves()
             .into_iter()
@@ -3719,12 +3713,160 @@ impl<'a> Lower<'a> {
                 _ => false,
             }) || other == src
         };
-        let (mut written, mut coherent) = (false, false);
-        for d in &self.x.res.descriptors {
-            if d.role != Role::Resource || !same(&d.source) {
-                continue;
+        self.x
+            .res
+            .descriptors
+            .iter()
+            .filter(|d| d.role == Role::Resource && same(&d.source))
+            .map(|d| &p.blocks[d.site.0].insts[d.site.1])
+            .collect()
+    }
+
+    /// Whether the cube image `src` is a cube array: some sample or gather
+    /// through it passes a slice in its face operand. The console has no
+    /// array bit in the instruction; it takes the face operand as
+    /// `8 × slice + face` (Mesa's `prepare_cube_coords` builds it with one
+    /// multiply-add by 8.0), so a face operand built that way, or a
+    /// constant of 8 or more, names a slice. Every access through the
+    /// descriptor then takes the array's kind, as the view is one.
+    // shortcut: a cube array only ever sampled at slice 0 (or with the slice
+    // multiplied in some other way, or 16-bit coordinates) stays a cube.
+    fn cube_array(&self, src: &Source) -> bool {
+        self.accesses(src).into_iter().any(|i| {
+            let Fields::Image {
+                addr,
+                dim: 3,
+                a16: false,
+                ..
+            } = &i.fields
+            else {
+                return false;
+            };
+            let n = i.name();
+            if !n.starts_with("image_sample") && !n.starts_with("image_gather") {
+                return false;
             }
-            let i: &Inst = &self.x.p.blocks[d.site.0].insts[d.site.1];
+            // s, t, face after the offset, bias and reference words (cube
+            // samples take no gradients).
+            let first = usize::from(n.ends_with("_o"))
+                + usize::from(n.starts_with("image_sample_b"))
+                + usize::from(n.starts_with("image_sample_c"));
+            let regs: Vec<u8> = addr
+                .iter()
+                .filter_map(|a| match *a {
+                    Operand::Vector { reg, dwords } => Some((0..dwords).map(move |k| reg + k)),
+                    _ => None,
+                })
+                .flatten()
+                .collect();
+            regs.get(first + 2)
+                .and_then(|&r| i.read(Reg::V(r)))
+                .is_some_and(|face| self.slice_in_face(face, 8))
+        })
+    }
+
+    /// The instruction writing `v` (none for a phi or an input).
+    fn writer(&self, v: Value) -> Option<&'a Inst> {
+        let p: &'a Program = self.x.p;
+        let b = *self.def_block.get(&v)?;
+        p.blocks[b]
+            .insts
+            .iter()
+            .find(|i| i.writes.iter().any(|w| w.1 == v))
+    }
+
+    /// The bits of `op` as `inst` reads it, if a constant: inline, literal,
+    /// or moved into the register from one (at most `depth` moves back).
+    fn constant_bits(&self, inst: &Inst, op: &Operand, depth: u8) -> Option<u32> {
+        let moved = |reg: Reg, mov: &str| {
+            let w = self.writer(inst.read(reg)?)?;
+            if depth == 0 || w.name() != mov {
+                return None;
+            }
+            let src = match &w.fields {
+                Fields::Sop { src, .. } => src.first()?,
+                Fields::Valu(v) if v.sdwa.is_none() && v.dpp.is_none() => v.src.first()?,
+                _ => return None,
+            };
+            self.constant_bits(w, src, depth - 1)
+        };
+        match *op {
+            Operand::Literal(x) => Some(x),
+            Operand::Const(code) => crate::resource::inline(code),
+            Operand::Scalar { code, .. } => moved(Reg::S(code), "s_mov_b32"),
+            Operand::Vector { reg, .. } => moved(Reg::V(reg), "v_mov_b32"),
+            Operand::Attr { .. } => None,
+        }
+    }
+
+    /// Whether the cube face operand `face` carries a slice (`8 × slice +
+    /// face`, see [`Self::cube_array`]), following at most `depth` moves.
+    fn slice_in_face(&self, face: Value, depth: u8) -> bool {
+        let Some(w) = self.writer(face) else {
+            return false;
+        };
+        let Fields::Valu(v) = &w.fields else {
+            return false;
+        };
+        let eight = 8.0f32.to_bits();
+        let bits = |n: usize| {
+            v.src
+                .get(n)
+                .and_then(|o| self.constant_bits(w, o, 4))
+                .filter(|_| v.neg >> n & 1 == 0 && v.abs >> n & 1 == 0)
+        };
+        let at_least_eight = |x: Option<u32>| x.is_some_and(|x| f32::from_bits(x) >= 8.0);
+        match w.name() {
+            "v_mov_b32" if depth > 0 && v.sdwa.is_none() && v.dpp.is_none() => {
+                match v.src.first() {
+                    Some(&Operand::Vector { reg, .. }) => w
+                        .read(Reg::V(reg))
+                        .is_some_and(|x| self.slice_in_face(x, depth - 1)),
+                    _ => at_least_eight(bits(0)),
+                }
+            }
+            // slice × 8.0 + face (the multiplied operands come first).
+            "v_fma_f32" | "v_fmac_f32" | "v_fmamk_f32" | "v_fmaak_f32" | "v_mad_f32"
+            | "v_mac_f32" | "v_madmk_f32" | "v_madak_f32" => {
+                bits(0) == Some(eight) || bits(1) == Some(eight)
+            }
+            // face + (slice × 8.0), or face plus a constant slice folded in.
+            "v_add_f32" => (0..2).any(|n| {
+                let product = match v.src.get(n) {
+                    Some(&Operand::Vector { reg, .. }) => w
+                        .read(Reg::V(reg))
+                        .and_then(|x| self.writer(x))
+                        .is_some_and(|m| {
+                            let Fields::Valu(mv) = &m.fields else {
+                                return false;
+                            };
+                            m.name() == "v_mul_f32"
+                                && (0..2).any(|k| {
+                                    mv.src.get(k).and_then(|o| self.constant_bits(m, o, 4))
+                                        == Some(eight)
+                                })
+                        }),
+                    _ => false,
+                };
+                product || at_least_eight(bits(n))
+            }),
+            _ => false,
+        }
+    }
+
+    /// The `IsUAV` and `IsGloballyCoherent` bits of every handle of the
+    /// resource descriptor `src`, from all of its uses in the program, not
+    /// only the access at hand: one descriptor read by a load and written by
+    /// a store is one UAV, and both handles must say so. `used` is what the
+    /// root signature says of it (heap descriptors: nothing).
+    ///
+    /// A UAV is globally coherent when some plain access through it has
+    /// `glc` (it skips the per-CU cache, as LLVM's GFX10 memory model lowers
+    /// a device-scope atomic load, to see other groups' writes). On atomics
+    /// `glc` only asks for the old value.
+    fn uav_bits(&self, src: &Source, used: Option<&UsedResource>) -> u32 {
+        let (mut written, mut coherent) = (false, false);
+        for i in self.accesses(src) {
             let (Fields::Buffer { cache, .. }
             | Fields::Image { cache, .. }
             | Fields::Smem { cache, .. }) = &i.fields
@@ -5978,6 +6120,13 @@ impl<'a> Lower<'a> {
             .get(&(site, false))
             .copied()
             .ok_or("an untracked image")?;
+        // A cube array: its slice is in the face operand.
+        let kind = if kind == 5 && self.cube_array(src) {
+            9
+        } else {
+            kind
+        };
+        let cube = matches!(kind, 5 | 9);
         let store = name.starts_with("image_store");
         let u = self.uav_bits(src, self.used_kind(src)) | if store { 0x1000 } else { 0 };
         let uav = u & 0x1000 != 0;
@@ -6173,12 +6322,21 @@ impl<'a> Lower<'a> {
                 2 | 5 | 6 => [true, true, false, true],
                 _ => [true, true, true, true],
             };
+            // The console counts a cube array's layers in faces (Mesa
+            // lowers a cube array's size query to divide them by 6).
+            let layers = (kind == 9).then(|| {
+                let z = self.s.m.extract(c, d, 2);
+                let six = self.s.m.i32(6);
+                self.s.m.bin(c, Bin::Mul, z, six)
+            });
             let Operand::Vector { reg, .. } = *data else {
                 return Err("an image result");
             };
             for (k, ch) in (0..4u32).filter(|ch| dmask >> ch & 1 != 0).enumerate() {
                 let x = if ch == 3 && uav || !present[ch as usize] {
                     one
+                } else if let (2, Some(layers)) = (ch, layers) {
+                    layers
                 } else {
                     self.s.m.extract(c, d, ch)
                 };
@@ -6227,15 +6385,29 @@ impl<'a> Lower<'a> {
                     l.as_float(x)
                 }
             };
-            if kind == 5 && (*unorm || op == 63 || op == 81) {
+            if cube && (*unorm || op == 63 || op == 81) {
                 return Err("a cube sample with texel coordinates, gradients or a level query");
             }
             for (k, slot) in cs.iter_mut().enumerate().take(coords) {
                 let x = addr_packed(self, coord_base, k)?;
                 *slot = to_float(self, x);
             }
-            if kind == 5 {
-                let dir = self.cube_direction(cs[0], cs[1], cs[2]);
+            if cube {
+                let face = if kind == 9 {
+                    // 8 × slice + face: the slice is the fourth coordinate.
+                    let (eighth, eight) = (
+                        self.s.m.f32(0.125f32.to_bits()),
+                        self.s.m.f32(8.0f32.to_bits()),
+                    );
+                    let x = self.s.m.bin(c, Bin::Mul, cs[2], eighth);
+                    let slice = self.unary(27, x);
+                    let whole = self.s.m.bin(c, Bin::Mul, slice, eight);
+                    cs[3] = slice;
+                    self.s.m.bin(c, Bin::Sub, cs[2], whole)
+                } else {
+                    cs[2]
+                };
+                let dir = self.cube_direction(cs[0], cs[1], face);
                 cs[..3].copy_from_slice(&dir);
             }
             if *unorm {
@@ -6273,7 +6445,7 @@ impl<'a> Lower<'a> {
                 }
                 return Ok(());
             }
-            let offsets = if kind == 5 {
+            let offsets = if cube {
                 0
             } else {
                 (coords - usize::from(kind == 6 || kind == 7)).min(3)
@@ -6497,9 +6669,8 @@ impl<'a> Lower<'a> {
     /// The direction a cube sample's face coordinates stand for: the
     /// console takes s and t in [1, 2] (`v_cubesc`/`v_cubetc` over
     /// `|v_cubema|`, plus 1.5) and the face id (`v_cubeid`), which the
-    /// host's cube sampling turns back into the same texel.
-    // shortcut: the view is taken as a cube, not a cube array (whose face
-    // operand adds 8 × the slice).
+    /// host's cube sampling turns back into the same texel. A cube array's
+    /// slice is taken out of `face` first (see [`Self::cube_array`]).
     fn cube_direction(&mut self, s: V, t: V, face: V) -> [V; 3] {
         let c = self.cur;
         let k = |l: &mut Self, v: f32| l.s.m.f32(v.to_bits());
@@ -7595,6 +7766,76 @@ mod tests {
         // Never written: a constant buffer, as before.
         let props = program(&[&scalar]);
         assert_eq!(props, [(13, 0x1_0000)]);
+    }
+
+    #[test]
+    fn a_cube_sample_whose_face_operand_holds_a_slice_is_a_cube_array() {
+        // An image (heap view 0), a buffer (view 1), an immediate sampler,
+        // s = t = 1.5; then the face operand in v3, a cube sample of it
+        // and a store of the result (the reproducer of upstream #720).
+        let head: [u32; 14] = [
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF40C_0202,
+            0xFA00_0000, // s_load_dwordx8 s[8:15], s[4:5], 0
+            0xF408_0502,
+            0xFA00_0020, // s_load_dwordx4 s[20:23], s[4:5], 32
+            0xBE90_0380, // s_mov_b32 s16, 0
+            0xBE91_0380, // s_mov_b32 s17, 0
+            0xBE92_0380, // s_mov_b32 s18, 0
+            0xBE93_0380, // s_mov_b32 s19, 0
+            0x7E02_02FF,
+            0x3FC0_0000, // v_mov_b32 v1, 1.5
+            0x7E04_02FF,
+            0x3FC0_0000, // v_mov_b32 v2, 1.5
+            0x7E0A_02F2, // v_mov_b32 v5, 1.0 (the slice)
+        ];
+        let tail: [u32; 4] = [
+            0xF09C_0118,
+            0x0082_0401, // image_sample_lz v4, v[1:3], s[8:15], s[16:19] dmask:1 dim:CUBE
+            0xE070_0000,
+            0x8005_0400, // buffer_store_dword v4, off, s[20:23]
+        ];
+        let image_kind = |face: &[u32], extra: &[u32]| {
+            let words = [&head[..], face, &tail[..], extra, &[S_ENDPGM]].concat();
+            let props = heap_props(&words);
+            let images: Vec<u32> = props
+                .iter()
+                .filter(|p| p.1 == 0x409)
+                .map(|p| p.0 & 0xFF)
+                .collect();
+            assert_eq!(images.len(), 1, "{props:x?}");
+            images[0]
+        };
+        // A bare face id: a cube, as before.
+        assert_eq!(image_kind(&[0x7E06_02F4], &[]), 5); // v_mov_b32 v3, 2.0
+        // 8 × slice + face, as the console compiler builds it.
+        let fmac = [
+            0x7E06_02F4, // v_mov_b32 v3, 2.0
+            0x5606_0AFF,
+            0x4100_0000, // v_fmac_f32 v3, 8.0, v5
+        ];
+        assert_eq!(image_kind(&fmac, &[]), 9);
+        // The product and the sum apart.
+        let mul_add = [
+            0x7E12_02F4, // v_mov_b32 v9, 2.0
+            0x100C_0AFF,
+            0x4100_0000, // v_mul_f32 v6, 8.0, v5
+            0x0606_1306, // v_add_f32 v3, v6, v9
+        ];
+        assert_eq!(image_kind(&mul_add, &[]), 9);
+        // A constant slice folded in: 10.0 is slice 1, face 2.
+        assert_eq!(image_kind(&[0x7E06_02FF, 0x4120_0000], &[]), 9);
+        // A multiply-add by something else is no slice.
+        let fmac_four = [0x7E06_02F4, 0x5606_0AF6]; // v_fmac_f32 v3, 4.0, v5
+        assert_eq!(image_kind(&fmac_four, &[]), 5);
+        // A size query of the same view takes the array's kind too.
+        let resinfo = [
+            0x7E0E_0280, // v_mov_b32 v7, 0
+            0xF038_0718,
+            0x0002_0607, // image_get_resinfo v[6:8], v7, s[8:15] dmask:0x7 dim:CUBE
+        ];
+        assert_eq!(image_kind(&fmac, &resinfo), 9);
+        assert_eq!(image_kind(&[0x7E06_02F4], &resinfo), 5);
     }
 
     #[test]
