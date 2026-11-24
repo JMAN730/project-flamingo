@@ -1024,7 +1024,7 @@ pub(crate) fn resident_mips(memory: *const u8, layout: &victory_formats::texture
     if layout.size == 0 || layout.mips.is_empty() {
         return (0, 0);
     }
-    let mapped = mapped_bytes(memory, layout.size as usize);
+    let mapped = mapped_prefix(memory, layout.size as usize);
     if mapped >= layout.size {
         return (0, layout.mips.len() as u32);
     }
@@ -1032,6 +1032,27 @@ pub(crate) fn resident_mips(memory: *const u8, layout: &victory_formats::texture
         return (0, 0);
     }
     resident_suffix(&layout.mip_extents(), mapped)
+}
+
+/// Bytes of `[at, at + len)` mapped from its start without a gap, by 64 KiB
+/// blocks (the console's page, how the title maps a texture: from the
+/// start, smallest mips first). [`mapped_bytes`] counts every mapped block,
+/// which is not the same thing: a texture whose first blocks are missing
+/// (1,642 uploads in run fx-d3dc-1) has none of its smaller mips.
+fn mapped_prefix(at: *const u8, len: usize) -> u64 {
+    const BLOCK: usize = 64 << 10;
+    let mut there = 0u64;
+    let mut block = at as usize;
+    let end = block.saturating_add(len);
+    while block < end {
+        let n = (end - block).min(BLOCK);
+        if readable(block, 1, true).0 != 1 {
+            break;
+        }
+        there += n as u64;
+        block += n;
+    }
+    there
 }
 
 /// The resident mip window `(first, count)` of a texture a view is made on:
