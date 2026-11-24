@@ -9,15 +9,17 @@
 //! Non-indexed rectangle-list draws follow the clamp with GPU-side
 //! rectangle expansion in [`crate::rectangles`].
 //!
-//! Each list also has a budget (2^27 vertex instances or threads, groups
-//! counted as 64 threads, mesh groups as 128): records past it run empty,
-//! so a list of thousands of garbage records cannot run for seconds
-//! either.
+//! Each list also has budgets (2^27 vertex instances or threads, groups
+//! counted as 64 threads; and 2^15 mesh groups): records past them run
+//! empty, so a list of thousands of garbage records cannot run for seconds
+//! either. A mesh record is limited to 4,096 groups: captured direct mesh
+//! work peaks at 260 groups, and allowing D3D12's 65,535 let one corrupt
+//! indirect record keep an RX 6700 XT busy until the driver was reset.
 //!
 //! shortcut: the bounds (2^24 vertices, 2^26 vertex instances, 65,535
-//! groups per dimension and 2^20 per dispatch, one-dimensional mesh
-//! dispatches, the budget) cut legitimate work beyond them; raise them if
-//! the title needs more.
+//! compute groups per dimension and 2^20 per dispatch, 4,096 groups per
+//! one-dimensional mesh dispatch, the budgets) cut legitimate work beyond
+//! them; raise them if the title needs more.
 
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
@@ -34,17 +36,21 @@ use crate::host::{HostList, host, transition};
 const SOURCE: &str = r#"
 cbuffer Record : register(b0) { uint kind; uint stride; uint records; uint unused; };
 RWStructuredBuffer<uint> args : register(u0);
-// The list's work so far (vertex instances, threads): past the budget,
-// records run empty.
+// The list's work so far (word 0: vertex instances, threads; word 1: mesh
+// groups): past the budget, records run empty.
 RWStructuredBuffer<uint> budget : register(u1);
 static const uint BUDGET = 1u << 27;
-// Groups of one dispatch; more run empty.
+static const uint MESH_BUDGET = 1u << 15;
+// Groups of one dispatch (one mesh dispatch); more run empty.
 static const uint GROUPS = 1u << 20;
+static const uint MESH_GROUPS = 1u << 12;
 [numthreads(64, 1, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
     if (id.x >= records) return;
     uint at = id.x * (stride / 4);
     uint cost;
+    uint counter = 0;
+    uint limit = BUDGET;
     if (kind <= 1) {
         // Draws: vertex or index count, then instances.
         uint count = min(args[at], 1u << 24);
@@ -64,8 +70,10 @@ void main(uint3 id : SV_DispatchThreadID) {
         args[at + 2] = g.z;
     } else {
         // Mesh dispatches: the console's are one-dimensional.
-        uint3 g = uint3(min(args[at], 65535u), min(args[at + 1], 1u), min(args[at + 2], 1u));
-        cost = g.x * g.y * g.z * 128;
+        uint3 g = uint3(min(args[at], MESH_GROUPS), min(args[at + 1], 1u), min(args[at + 2], 1u));
+        cost = g.x * g.y * g.z;
+        counter = 1;
+        limit = MESH_BUDGET;
         args[at] = g.x;
         args[at + 1] = g.y;
         args[at + 2] = g.z;
@@ -74,14 +82,14 @@ void main(uint3 id : SV_DispatchThreadID) {
     // All accesses to the counter are atomic; a rejected record must
     // never reopen the budget for later records.
     uint before;
-    InterlockedAdd(budget[0], 0u, before);
+    InterlockedAdd(budget[counter], 0u, before);
     [allow_uav_condition]
     while (true) {
-        if (before >= BUDGET) break;
-        uint remaining = BUDGET - before;
+        if (before >= limit) break;
+        uint remaining = limit - before;
         uint next = before + min(cost, remaining);
         uint observed;
-        InterlockedCompareExchange(budget[0], before, next, observed);
+        InterlockedCompareExchange(budget[counter], before, next, observed);
         if (observed == before) {
             if (cost <= remaining) return;
             break;
@@ -405,6 +413,16 @@ pub(crate) fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
 
 #[cfg(test)]
 mod tests {
+    /// A corrupt mesh record must not regain D3D12's 65,535-group maximum:
+    /// one such record ran until the driver reset an RX 6700 XT.
+    #[test]
+    fn mesh_indirect_work_is_bounded() {
+        assert!(super::SOURCE.contains("MESH_GROUPS = 1u << 12"));
+        assert!(super::SOURCE.contains("min(args[at], MESH_GROUPS)"));
+        assert!(super::SOURCE.contains("MESH_BUDGET = 1u << 15"));
+        assert!(super::SOURCE.contains("budget[counter]"));
+    }
+
 
     /// The clamp bounds a draw, a dispatch and a mesh dispatch on the GPU.
     #[test]
@@ -475,7 +493,7 @@ mod tests {
         let read = |at: usize| unsafe { std::slice::from_raw_parts(words.add(at / 4), 3).to_vec() };
         assert_eq!(read(0)[..2], [1 << 24, 4]);
         assert_eq!(read(16), [65_535, 2, 3]);
-        assert_eq!(read(32), [65_535, 1, 1]);
+        assert_eq!(read(32), [4_096, 1, 1]);
     }
     /// The clamp compiles with the system's compiler and the host takes it.
     #[test]
