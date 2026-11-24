@@ -529,6 +529,31 @@ mod tests {
         Ok(())
     }
 
+    /// A wave64 pixel program whose SGPR holds a lane mask's high dword (a compare result) on one
+    /// path and a number on the other, then compares it with zero: the
+    /// join's mask side was a lane mask read as data, which refused the
+    /// whole program. The ballot stands in for it (wave-size independent for
+    /// the zero test the console compiler emits).
+    #[test]
+    fn a_scalar_joining_a_lane_mask_and_a_number_lowers_in_pixel_programs() {
+        let words = [
+            0x7E00_02F2u32, // v_mov_b32 v0, 1.0
+            0xD405_000A,    // v_cmp_lg_f32_e64 s[10:11], v0, 0
+            0x0001_0100,
+            0xBE8C_0383, // s_mov_b32 s12, 3
+            0xBF02_850C, // s_cmp_gt_i32 s12, 5
+            0xBF85_0001, // s_cbranch_scc1 +1 (past the next word)
+            0xBE8B_0385, // s_mov_b32 s11, 5
+            0xBF06_800B, // s_cmp_eq_u32 s11, 0
+            0x850D_8081, // s_cselect_b32 s13, 1, 0
+            0x7E02_020D, // v_mov_b32 v1, s13
+            0xF800_1883, // exp mrtz v0, v1, off, off done vm
+            0x0000_0100,
+            0xBF81_0000, // s_endpgm
+        ];
+        emit_depth_stencil_ps(&words, true).unwrap();
+    }
+
     /// A lane mask spilled into a VGPR lane (`v_writelane_b32`) and restored
     /// into another SGPR (`v_readlane_b32`, same constant lane) is the same
     /// mask: the select below followed it as an untracked one and refused.

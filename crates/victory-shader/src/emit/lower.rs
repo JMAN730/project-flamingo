@@ -8526,33 +8526,55 @@ impl<'a> Lower<'a> {
                 let Some(qb) = self.tail[q] else { continue };
                 let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
                 let arg = phi.args[n];
-                let x = match (self.vals.get(&arg).copied(), bit) {
-                    (Some(Val::I32(x)), false) | (Some(Val::Bit(x)), true) => x,
-                    (Some(Val::Bit(_)), false) if self.read_phis.contains(&phi.value) => {
-                        return Err(Stop::Retry(phi.value, "an SCC joined with SGPR values"));
-                    }
-                    // A descriptor's dwords reaching a join that also takes
-                    // data (the registers are reused after the last access).
-                    // shortcut: undefined on that edge, assuming the program
-                    // reads the joined value only after the data edge.
-                    (Some(Val::Missing(_)), _) if self.descriptor_dword(arg) => {
-                        if bit {
-                            self.s.m.undef(self.s.t.i1)
-                        } else {
-                            self.s.m.undef(self.s.t.i32)
+                // A mask dword the other path left in the register: its
+                // ballot (a pixel or vertex program reads such a join only
+                // through a zero test or a count, the same on any wave size).
+                // shortcut: the ballot is the host wave's, so a join read
+                // some other way would differ from the console.
+                let val = self.vals.get(&arg).copied();
+                let lo = self.x.st.highs.get(&arg).copied().unwrap_or(arg);
+                let ballot = if self.mask_data == MaskData::Host
+                    && !bit
+                    && matches!(val, None | Some(Val::Missing(_)))
+                    && self.read_phis.contains(&phi.value)
+                    && self.x.st.masks.contains_key(&lo)
+                    && self.def_block.get(&lo).is_some_and(|&d| d != self.cur_ir)
+                {
+                    self.mask_dword(arg).ok()
+                } else {
+                    None
+                };
+                let x = if let Some(x) = ballot {
+                    x
+                } else {
+                    match (val, bit) {
+                        (Some(Val::I32(x)), false) | (Some(Val::Bit(x)), true) => x,
+                        (Some(Val::Bit(_)), false) if self.read_phis.contains(&phi.value) => {
+                            return Err(Stop::Retry(phi.value, "an SCC joined with SGPR values"));
                         }
+                        // A descriptor's dwords reaching a join that also takes
+                        // data (the registers are reused after the last access).
+                        // shortcut: undefined on that edge, assuming the program
+                        // reads the joined value only after the data edge.
+                        (Some(Val::Missing(_)), _) if self.descriptor_dword(arg) => {
+                            if bit {
+                                self.s.m.undef(self.s.t.i1)
+                            } else {
+                                self.s.m.undef(self.s.t.i32)
+                            }
+                        }
+                        (Some(Val::Missing(why)), _)
+                            if self.read_phis.contains(&phi.value)
+                                || through.contains(&phi.value) && self.zero_is_wrong(arg) =>
+                        {
+                            return Err(Stop::Retry(phi.value, why));
+                        }
+                        _ if self.read_phis.contains(&phi.value) => {
+                            return Err(Stop::Retry(phi.value, "a join of mismatched values"));
+                        }
+                        _ if bit => self.s.m.bool(false),
+                        _ => self.s.m.i32(0),
                     }
-                    (Some(Val::Missing(why)), _)
-                        if self.read_phis.contains(&phi.value)
-                            || through.contains(&phi.value) && self.zero_is_wrong(arg) =>
-                    {
-                        return Err(Stop::Retry(phi.value, why));
-                    }
-                    _ if self.read_phis.contains(&phi.value) => {
-                        return Err(Stop::Retry(phi.value, "a join of mismatched values"));
-                    }
-                    _ if bit => self.s.m.bool(false),
-                    _ => self.s.m.i32(0),
                 };
                 incoming.push((x, qb));
             }
