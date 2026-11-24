@@ -238,18 +238,24 @@ pub(crate) fn pc_format(format: u32) -> u32 {
 }
 
 /// The format a render target or unordered-access texture of `format` is
-/// made in on the host, and that render target views and pipelines name:
-/// `R16G16B16A16_FLOAT` (10) for `R9G9B9E5_SHAREDEXP` (67), which PC D3D12
-/// forbids as a render target or unordered-access resource; else
-/// [`pc_format`]. Textures only sampled keep `R9G9B9E5_SHAREDEXP`.
+/// made in on the host, and that render target views and pipelines name,
+/// for formats PC D3D12 forbids as one or the other: `R16G16B16A16_FLOAT`
+/// (10) for `R9G9B9E5_SHAREDEXP` (67), and `R8G8B8A8_UNORM` (28), the same
+/// channels with more bits, for `B5G5R5A1_UNORM` (86, no unordered access)
+/// and `B4G4R4A4_UNORM` (115, no render target); else [`pc_format`].
+/// Textures only sampled keep their format. The host refused these
+/// textures outright before (upstream #735, #741): the title's resource was
+/// null.
 pub(crate) fn target_format(format: u32) -> u32 {
     const R9G9B9E5_SHAREDEXP: u32 = 67;
     const RGBA16_FLOAT: u32 = 10;
-    let format = pc_format(format);
-    if format == R9G9B9E5_SHAREDEXP {
-        RGBA16_FLOAT
-    } else {
-        format
+    const B5G5R5A1_UNORM: u32 = 86;
+    const B4G4R4A4_UNORM: u32 = 115;
+    const RGBA8_UNORM: u32 = 28;
+    match pc_format(format) {
+        R9G9B9E5_SHAREDEXP => RGBA16_FLOAT,
+        B5G5R5A1_UNORM | B4G4R4A4_UNORM => RGBA8_UNORM,
+        format => format,
     }
 }
 
@@ -2525,9 +2531,18 @@ void main() {
         assert_eq!(target_format(118), 45);
     }
 
+    #[test]
+    fn small_unorm_targets_substitute_rgba8() {
+        assert_eq!(target_format(86), 28);
+        assert_eq!(target_format(115), 28);
+        // Sampled copies keep their format; B5G6R5 renders on PC.
+        assert_eq!(pc_format(86), 86);
+        assert_eq!(target_format(85), 85);
+    }
+
     #[cfg(windows)]
     #[test]
-    fn r9g9b9e5_render_target_and_uav_textures_create_on_host() {
+    fn substituted_render_target_and_uav_textures_create_on_host() {
         if crate::host::host().is_none() {
             return;
         }
@@ -2544,8 +2559,20 @@ void main() {
             layout: 0,
             flags,
         };
-        for (flags, expected_host_format) in [(0, 67), (4, 10), (5, 10)] {
-            let d = tex_desc(flags);
+        for (format, flags, expected_host_format) in [
+            (67, 0, 67),
+            (67, 4, 10),
+            (67, 5, 10),
+            // B5G5R5A1 has no unordered access on PC, B4G4R4A4 no render
+            // target (upstream #735).
+            (86, 0, 86),
+            (86, 5, 28),
+            (115, 1, 28),
+        ] {
+            let d = ResourceDesc {
+                format,
+                ..tex_desc(flags)
+            };
             let mut out = std::ptr::null();
             let hr = create_committed(
                 std::ptr::null(),
@@ -2557,12 +2584,12 @@ void main() {
                 &RESOURCE_IIDS[0],
                 &mut out,
             );
-            assert_eq!(hr, S_OK, "flags {flags}");
+            assert_eq!(hr, S_OK, "format {format} flags {flags}");
             let host = host_resource(out).expect("host texture created");
             // SAFETY: a live host texture.
             let got = unsafe { host.GetDesc() }.Format.0 as u32;
-            assert_eq!(got, expected_host_format, "flags {flags}");
-            assert_eq!(view_format(out), None, "flags {flags}");
+            assert_eq!(got, expected_host_format, "format {format} flags {flags}");
+            assert_eq!(view_format(out), None, "format {format} flags {flags}");
             assert_eq!(slot::<Release>(out, 0x10)(out), 0);
         }
     }

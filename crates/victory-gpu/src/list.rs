@@ -502,6 +502,38 @@ extern "system" fn copy_buffer_region(
     let _ = (this, dst, dst_offset, src, src_offset, len);
 }
 
+/// Whether host formats `a` and `b` can meet in one copy: the same family.
+/// A render target or UAV texture whose console format PC forbids is made
+/// in another format (`resource::target_format`); a copy between it and a
+/// texture of the title's own format would be refused by the runtime, so it
+/// is skipped.
+#[cfg(any(windows, test))]
+fn same_family(a: u32, b: u32) -> bool {
+    let ok = a == b || crate::resource::family(a) == crate::resource::family(b);
+    if !ok {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            tracing::warn!(
+                a,
+                b,
+                "texture copy between formats of different families skipped (a substituted target)",
+            );
+        });
+    }
+    ok
+}
+
+/// [`same_family`] for two host resources.
+#[cfg(windows)]
+fn copyable(
+    to: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    from: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+) -> bool {
+    // SAFETY: live resources.
+    let (a, b) = unsafe { (to.GetDesc().Format.0, from.GetDesc().Format.0) };
+    same_family(a as u32, b as u32)
+}
+
 extern "system" fn copy_resource(this: This, dst: This, src: This) {
     #[cfg(windows)]
     {
@@ -512,6 +544,9 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             crate::resource::host_resource(dst),
             crate::resource::host_resource(src),
         ) {
+            if !copyable(to, from) {
+                return;
+            }
             // A texture the title fills through memory has its contents in
             // the staging copy until an upload records them.
             if crate::texture::title_written(from) {
@@ -605,6 +640,11 @@ extern "system" fn copy_texture_region(
                         "texture-to-buffer readback skipped: host format has a different texel size",
                     );
                 });
+                return;
+            }
+            // SAFETY: a live texture.
+            let from_format = unsafe { from_tex.GetDesc() }.Format.0 as u32;
+            if !same_family(from_format, host_format) {
                 return;
             }
             if total == 0 || lines == 0 || row_bytes == 0 {
@@ -714,6 +754,9 @@ extern "system" fn copy_texture_region(
             let Some(texture) = crate::resource::host_resource(src.resource) else {
                 return;
             };
+            if !copyable(to, texture) {
+                return;
+            }
             if crate::texture::title_written(texture) {
                 crate::texture::upload(&list, src.resource, texture);
             }
@@ -1591,6 +1634,21 @@ static NEWER_LIST_FUNCTIONS: Table<160> = Table(list_table(true));
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    /// A texture made in a substituted target format meets only its own
+    /// family in a copy (upstream #735): RGBA8 and its typeless and sRGB
+    /// twins copy, the title's B5G5R5A1 or R9G9B9E5 textures do not.
+    #[test]
+    fn copies_stay_within_a_format_family() {
+        use crate::resource::target_format;
+        assert!(same_family(28, 28));
+        assert!(same_family(27, 29));
+        assert!(same_family(10, 2 + 8));
+        assert!(!same_family(target_format(86), 86));
+        assert!(!same_family(target_format(115), 115));
+        assert!(!same_family(target_format(67), 67));
+        assert!(same_family(86, 86));
+    }
 
     #[cfg(windows)]
     #[test]
