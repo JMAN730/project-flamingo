@@ -15,7 +15,7 @@
 
 $ErrorActionPreference = 'Continue'
 $ProgressPreference = 'SilentlyContinue'
-$TryVersion = '1.8'
+$TryVersion = '1.9'
 $ForkUrl = 'https://github.com/MfDev0/victory.git'
 $Branch = 'arena/59fabb00-victory'
 $UpstreamUrl = 'https://github.com/Marvisak/VIctory.git'
@@ -391,6 +391,13 @@ function Run-Game {
     Say 'To stop: close the game window. (Ctrl+C closes VIctory Try too.)'
     $env:VICTORY_GAME_DIR = $c.game_dir
     $env:RUST_BACKTRACE = '1'
+    # Long shader loops hang the GPU (device hung about 40 s into the world):
+    # leave a loop after 1024 turns unless set already (64 if it still hangs).
+    if (-not $env:VICTORY_SHADER_LOOP_LIMIT) { $env:VICTORY_SHADER_LOOP_LIMIT = '1024' }
+    # Series X draws the world at 2560x1440 and its 4K upscale stays black:
+    # show the 1440p picture instead (set VICTORY_PRESENT_1440P=0 to turn off).
+    if ($c.console -eq 'series-x' -and -not $env:VICTORY_PRESENT_1440P) { $env:VICTORY_PRESENT_1440P = '1' }
+    Say "shader loop limit: $($env:VICTORY_SHADER_LOOP_LIMIT)$(if ($env:VICTORY_PRESENT_1440P) { "   world view: $($env:VICTORY_PRESENT_1440P)" })"
     $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
     $log = Join-Path $LogDir "game-$stamp.log"
     Push-Location $TryHome
