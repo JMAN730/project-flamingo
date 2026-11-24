@@ -981,6 +981,80 @@ extern "system" fn clear_dsv(
     let _ = (this, handle, flags, depth, stencil, count, rects);
 }
 
+/// Clear a resource-backed texture with a matching bound GPU UAV and CPU UAV.
+#[cfg(windows)]
+fn clear_uav(
+    this: This,
+    gpu: u64,
+    cpu: u64,
+    resource: This,
+    value: crate::draw::UavClear,
+    count: u32,
+    rects: *const Rect,
+) {
+    let rects = if count == 0 || rects.is_null() {
+        &[]
+    } else {
+        // SAFETY: the title passes count rectangles in the host's layout.
+        unsafe { std::slice::from_raw_parts(rects.cast(), count as usize) }
+    };
+    with_state(this, |list, state| {
+        state.clear_texture_uav(list, gpu, cpu, resource, value, rects)
+    });
+}
+
+extern "system" fn clear_uav_uint(
+    this: This,
+    gpu: u64,
+    cpu: u64,
+    resource: This,
+    values: *const [u32; 4],
+    count: u32,
+    rects: *const Rect,
+) {
+    #[cfg(windows)]
+    // SAFETY: the title passes four values; null is tolerated.
+    if let Some(values) = unsafe { values.as_ref() } {
+        clear_uav(
+            this,
+            gpu,
+            cpu,
+            resource,
+            crate::draw::UavClear::Uint(*values),
+            count,
+            rects,
+        );
+    }
+    #[cfg(not(windows))]
+    let _ = (this, gpu, cpu, resource, values, count, rects);
+}
+
+extern "system" fn clear_uav_float(
+    this: This,
+    gpu: u64,
+    cpu: u64,
+    resource: This,
+    values: *const [f32; 4],
+    count: u32,
+    rects: *const Rect,
+) {
+    #[cfg(windows)]
+    // SAFETY: the title passes four values; null is tolerated.
+    if let Some(values) = unsafe { values.as_ref() } {
+        clear_uav(
+            this,
+            gpu,
+            cpu,
+            resource,
+            crate::draw::UavClear::Float(*values),
+            count,
+            rects,
+        );
+    }
+    #[cfg(not(windows))]
+    let _ = (this, gpu, cpu, resource, values, count, rects);
+}
+
 /// `CopyMemoryToMemoryX(destination, source, size, flags)`: GPU addresses
 /// are title memory, copied at submission like buffer copies (if mapped).
 extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags: u32) {
@@ -1537,7 +1611,7 @@ fn defer_write(this: This, address: u64, what: Written, bytes: usize) {
 /// layout): IUnknown 3, object 4, device child 1, list 1, graphics list 96
 /// (59 as on PC, then console ones), then versions 1-6 (6 + 1 + 1 + 11 + 3
 /// + 13): 140 slots.
-const METHODS: [(usize, *const ()); 52] = [
+const METHODS: [(usize, *const ()); 54] = [
     (0, list_query as *const ()),
     (2, list_release as *const ()),
     (7, object::parent_device as *const ()),      // 0x38
@@ -1578,6 +1652,8 @@ const METHODS: [(usize, *const ()); 52] = [
     (50, state::targets as *const ()),            // 0x190
     (51, clear_dsv as *const ()),                 // 0x198
     (52, clear_rtv as *const ()),                 // 0x1a0
+    (53, clear_uav_uint as *const ()),            // 0x1a8
+    (54, clear_uav_float as *const ()),           // 0x1b0
     (59, execute_indirect as *const ()),          // 0x1d8 indirect
     (60, copy_memory as *const ()),               // 0x1e0
     (68, ignored_state as *const ()),             // 0x220 depth bounds
@@ -1774,6 +1850,25 @@ mod tests {
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         assert_eq!(release(list), 0);
         assert_eq!(release(allocator), 0);
+    }
+
+    /// The UAV clears sit in their slots (0x1a8, 0x1b0), not the
+    /// missing-method stub (upstream #771), and the table stays in slot
+    /// order without duplicates.
+    #[test]
+    fn uav_clears_fill_their_slots() {
+        let has = |i: usize, f: *const ()| METHODS.iter().any(|&(j, g)| j == i && g == f);
+        assert!(has(53, clear_uav_uint as *const ()));
+        assert!(has(54, clear_uav_float as *const ()));
+        assert!(METHODS.windows(2).all(|w| w[0].0 < w[1].0));
+    }
+
+    /// A clear with no values does nothing, host or not.
+    #[test]
+    fn uav_clears_tolerate_null_values() {
+        let null = std::ptr::null();
+        clear_uav_uint(null, 0, 0, null, std::ptr::null(), 0, std::ptr::null());
+        clear_uav_float(null, 0, 0, null, std::ptr::null(), 0, std::ptr::null());
     }
 
     #[test]

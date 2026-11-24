@@ -388,6 +388,50 @@ impl HostHeap {
         }
     }
 
+    /// Makes a matched native UAV pair from the CPU view. The GPU slot is
+    /// held until list reset like the descriptors in a fresh table.
+    pub(crate) fn clear_texture_uav(
+        &self,
+        list: &crate::host::HostList,
+        texture: &ID3D12Resource,
+        words: Option<&[u32; 10]>,
+    ) -> Option<(
+        u32,
+        D3D12_GPU_DESCRIPTOR_HANDLE,
+        D3D12_CPU_DESCRIPTOR_HANDLE,
+    )> {
+        let mut desc = words.map(uav_desc);
+        if !fits(texture, desc.as_mut().map(|d| &mut d.Format), true) {
+            return None;
+        }
+        let device = &host()?.device;
+        let cpu = list.clear_uav_cpu()?;
+        let slot = self.dynamic(1)?;
+        // SAFETY: both handles name live heap slots. Copy from the
+        // CPU-only heap to the shader-visible heap.
+        let gpu = unsafe {
+            device.CreateUnorderedAccessView(
+                texture,
+                None::<&ID3D12Resource>,
+                desc.as_ref().map(std::ptr::from_ref),
+                cpu,
+            );
+            device.CopyDescriptorsSimple(
+                1,
+                self.cpu(slot),
+                cpu,
+                D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+            );
+            D3D12_GPU_DESCRIPTOR_HANDLE {
+                ptr: self.heap.GetGPUDescriptorHandleForHeapStart().ptr
+                    + u64::from(slot) * u64::from(self.step),
+            }
+        };
+        // The list's texture state retains the resource through execution.
+        self.keep(slot, None);
+        Some((slot, gpu, cpu))
+    }
+
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
     /// host cannot.
     pub(crate) fn make_at(&self, index: u32, view: &View) {

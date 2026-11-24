@@ -367,6 +367,9 @@ pub(crate) struct HostList {
     /// expanded vertices, rewritten draw arguments and per-draw atomic
     /// counters, reused across draws and across resets.
     rect_scratch: Mutex<RectScratch>,
+    /// A CPU-only heap of one UAV slot, for the CPU descriptor of a UAV
+    /// clear, made on first use.
+    clear_uav_cpu: OnceLock<Option<ID3D12DescriptorHeap>>,
     /// The texts of the markers `note_op` set, in order (for device-removed
     /// data without marker texts), with the host GPU range a copy reads.
     #[cfg(feature = "diagnostics")]
@@ -647,6 +650,7 @@ impl Host {
                 pipelines: Mutex::default(),
                 budget: OnceLock::new(),
                 rect_scratch: Mutex::default(),
+                clear_uav_cpu: OnceLock::new(),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
@@ -1409,6 +1413,29 @@ impl HostList {
         let at = s.used;
         s.used += len;
         Some((gpu + at, (data + at as usize) as *mut u8))
+    }
+
+    /// The CPU-only UAV slot used when recording a clear. D3D12 uses
+    /// this descriptor during recording, so the next clear may reuse it.
+    pub(crate) fn clear_uav_cpu(&self) -> Option<D3D12_CPU_DESCRIPTOR_HANDLE> {
+        let heap = self
+            .clear_uav_cpu
+            .get_or_init(|| {
+                // SAFETY: plain allocation of a CPU-only view heap.
+                unsafe {
+                    host()?
+                        .device
+                        .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                            Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                            NumDescriptors: 1,
+                            ..Default::default()
+                        })
+                }
+                .ok()
+            })
+            .as_ref()?;
+        // SAFETY: the list owns this heap until it is dropped.
+        Some(unsafe { heap.GetCPUDescriptorHandleForHeapStart() })
     }
 
     /// The host address of the list's indirect-work budget, zeroed at each
