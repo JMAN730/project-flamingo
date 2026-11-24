@@ -4078,11 +4078,15 @@ impl<'a> Lower<'a> {
                 // to the host when the load is a raw one (#798): a UAV or a
                 // known SRV. Else the load is a constant buffer, whose size
                 // no handle of the same slot can query.
+                // A structured table view is one to the scalar loads too
+                // (`smem`), so the size query names the same view and
+                // reports its record count (upstream #995).
                 Fields::Smem { .. } if un.starts_with("s_buffer_load") => {
                     if u == 0 && !used.is_some_and(|u| u.kind == ResourceType::Srv) {
                         return Err("a constant buffer's descriptor read as data");
                     }
-                    ((11 | u, 0), None)
+                    let props = structured_stride(used).map_or((11 | u, 0), |s| (12 | u, s));
+                    (props, None)
                 }
                 _ => return Err("a scalar memory read as data"),
             };
@@ -10203,6 +10207,39 @@ mod tests {
             err.to_string().contains("constant buffer's descriptor read as data"),
             "unexpected error: {err}"
         );
+    }
+
+    /// The same program with a structured SRV (16-byte records): the size
+    /// query and the scalar load name one structured view, so the record
+    /// count word reads the view's element count (upstream #995).
+    #[test]
+    fn s_buffer_load_structured_descriptor_size_uses_one_structured_view() {
+        let words = [
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], null
+            0xF420_0304,
+            0xFA00_0000, // s_buffer_load_dword s12, s[8:11], null
+            0x800D_0A0C, // s_add_u32 s13, s12, s10
+            0x7E02_020D, // v_mov_b32 v1, s13
+            0xD834_0000,
+            0x0000_0100, // ds_write_b32 v0, v1
+            S_ENDPGM,
+        ];
+        let used = vec![UsedResource {
+            kind: ResourceType::Srv,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 16,
+            dwords: 4,
+            user_data: 0,
+            slot: 0,
+        }];
+        let l = lower_with(&words, vec![root(RootType::Table, 0, 0)], used).unwrap();
+        assert!(!l.heap_props.is_empty());
+        assert!(l.heap_props.iter().all(|&p| p == (12, 16)), "{:?}", l.heap_props);
     }
 
     /// Tables of 2D textures at s0 and samplers at s1.
