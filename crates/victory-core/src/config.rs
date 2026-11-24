@@ -646,6 +646,9 @@ fn is_drive_path(path: &Path) -> bool {
 fn subdir(root: &Path, sub: &str) -> Result<PathBuf> {
     ensure_plain_subdir(sub)?;
     let dir = root.join(sub);
+    // The runtime keeps these paths even when a title changes its working
+    // directory.
+    let dir = std::path::absolute(&dir).with_context(|| format!("resolving {}", dir.display()))?;
     ensure_outside_repo(&dir)?;
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     Ok(dir)
