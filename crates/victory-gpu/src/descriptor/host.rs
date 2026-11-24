@@ -76,7 +76,7 @@ pub(crate) struct HostHeap {
     /// the last [`TABLED_FRAMES`] frames is due only [`TABLED_GRACE`]
     /// frames later, by when its draw has read it. A title that builds a
     /// table per draw writes thousands of texture views a frame into slots
-    /// only tables read (Grand Theft Auto VI: some 2,500 a frame in its
+    /// only tables read (the title: some 2,500 a frame in its
     /// opening cutscene, a few hundred textures over and over), and every
     /// one of them stood in the queue of textures picked by index, ahead
     /// of or behind the ones shaders do pick by index.
@@ -252,7 +252,7 @@ const TABLED_FRAMES: u64 = 240;
 /// Frames a write of a table's slot waits in the queue for the draw that
 /// reads it, before the slot is taken for one shaders pick by index.
 /// Frames as `crate::frame::current` counts them: in its opening cutscene
-/// Grand Theft Auto VI begins two or three of them per frame it presents
+/// The title begins two or three of them per frame it presents
 /// (435 begun in the 353 s of run 52's, for some 140 presented).
 const TABLED_GRACE: u64 = 8;
 
@@ -512,7 +512,7 @@ const PORTABLE_VIEWS: u32 = 1_000_000;
 /// Asks the host, once, whether it caps view heaps at [`PORTABLE_VIEWS`],
 /// and if so tells the translator now (`set_view_heap_limit`) instead of
 /// when the title's heap is made: a shader keeps the limit it was
-/// translated with, and Grand Theft Auto VI makes 25 pipelines (their
+/// translated with, and the title makes 25 pipelines (their
 /// shaders translated at once) before it makes its view heap. Those would
 /// read a view index past the heap unclamped, the read that hangs NVIDIA.
 /// Called before a shader is translated.
@@ -863,6 +863,13 @@ impl HostHeap {
         self.unmake(&mut made, index);
         STALE[4].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         true
+    }
+
+    /// Whether host slot `index` shows a host texture now (a texture was
+    /// made for it, and its memory was there then).
+    pub(crate) fn texture_slot_has_contents(&self, index: u32) -> bool {
+        let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        made.get(index as usize).is_some_and(|&key| key != 0)
     }
 
     /// Makes host slot `index` null again, as it is before its view is
@@ -1372,6 +1379,68 @@ macro_rules! once {
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| tracing::warn!($($arg)*));
     }};
+}
+
+/// Narrows a shader resource view of `texture` to the mips of `resource`
+/// whose memory is there ([`crate::texture::resident`]): `MostDetailedMip`
+/// up to the most detailed resident one, `MipLevels` to what is left.
+/// Returns the mips it names, `None` if the view is not narrowed (the
+/// texture is all there, or is not a 2D view, or none of it is known).
+fn narrow_to_resident(
+    resource: crate::object::This,
+    texture: &ID3D12Resource,
+    desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC,
+) -> Option<(u32, u32)> {
+    let resident = crate::texture::resident(resource)?;
+    if resident.1 == 0 {
+        return None;
+    }
+    // SAFETY: a live resource.
+    let mips = u32::from(unsafe { texture.GetDesc() }.MipLevels);
+    let asked = match desc.ViewDimension {
+        D3D12_SRV_DIMENSION_TEXTURE2D => {
+            // SAFETY: the union member of a 2D view.
+            let t = unsafe { desc.Anonymous.Texture2D };
+            (t.MostDetailedMip, t.MipLevels)
+        }
+        D3D12_SRV_DIMENSION_TEXTURE2DARRAY => {
+            // SAFETY: the union member of a 2D array view.
+            let t = unsafe { desc.Anonymous.Texture2DArray };
+            (t.MostDetailedMip, t.MipLevels)
+        }
+        _ => return None,
+    };
+    let (first, count) = crate::texture::narrowed(asked, resident, mips);
+    if (first, count) == (asked.0, if asked.1 == 0 { mips } else { asked.1 }) {
+        return None;
+    }
+    match desc.ViewDimension {
+        D3D12_SRV_DIMENSION_TEXTURE2D => {
+            // SAFETY: as above.
+            let t = unsafe { &mut desc.Anonymous.Texture2D };
+            *t = D3D12_TEX2D_SRV {
+                MostDetailedMip: first,
+                MipLevels: count,
+                PlaneSlice: t.PlaneSlice,
+                ResourceMinLODClamp: t.ResourceMinLODClamp,
+            };
+        }
+        _ => {
+            // SAFETY: as above.
+            let t = unsafe { &mut desc.Anonymous.Texture2DArray };
+            *t = D3D12_TEX2D_ARRAY_SRV {
+                MostDetailedMip: first,
+                MipLevels: count,
+                FirstArraySlice: t.FirstArraySlice,
+                ArraySize: t.ArraySize,
+                PlaneSlice: t.PlaneSlice,
+                ResourceMinLODClamp: t.ResourceMinLODClamp,
+            };
+        }
+    }
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(crate::copystat::C::ViewNarrowed, 1);
+    Some((first, count))
 }
 
 /// A view description from its words, with the format as the host has it.
@@ -2048,6 +2117,16 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 let mut desc = desc.as_ref().map(srv_desc);
                 if !fits(texture, desc.as_mut().map(|d| &mut d.Format), false) {
                     return None;
+                }
+                // A texture only part of which is mapped (streaming in):
+                // sample the mips that are there, not the zeros of the ones
+                // that are not. The console streams a texture's mips into
+                // place and clamps the level of detail to what arrived; the
+                // host has no clamp but the view's window.
+                if let Some(d) = desc.as_mut()
+                    && let Some(mips) = narrow_to_resident(resource, texture, d)
+                {
+                    let _ = mips;
                 }
                 // SAFETY: a live texture and a slot of our heap.
                 unsafe {

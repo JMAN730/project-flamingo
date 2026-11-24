@@ -46,6 +46,9 @@ pub(crate) struct Staging {
     /// The staging buffer's bytes (counted in `STAGED` while it lives).
     bytes: u64,
     memory: *const u8,
+    /// The resource the staging buffer is of, for the resident mip window
+    /// its views are narrowed to ([`note_resident`]).
+    resource: This,
     last: Mutex<Last>,
     /// Whether the staging buffer was detiled since a submitted list last
     /// uploaded it, and whether one has uploaded it at all: a list records
@@ -569,6 +572,36 @@ fn waited_out(us: u64) {
     });
 }
 
+/// Frames between two reads of a texture only part of which is mapped
+/// (`VICTORY_TEXTURE_PARTIAL_FRAMES`, default 30): reading around unmapped
+/// pages is slow and nothing tells us when pages arrive, so a mip that
+/// streams in shows up to this many frames late.
+pub(crate) fn partial_frames() -> u64 {
+    static N: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_PARTIAL_FRAMES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(30)
+    })
+}
+
+/// Frames between two reads of a texture none of whose mips is mapped
+/// (`VICTORY_TEXTURE_UNMAPPED_FRAMES`, default 2): it is black until one
+/// arrives — a character's clothes and skin, the report's flat surfaces —
+/// so it is looked at again straight away rather than up to 30 frames
+/// later. Only for textures with nothing there: an unmapped read is the
+/// whole texture's bytes of failing kernel reads.
+fn unmapped_frames() -> u64 {
+    static N: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_UNMAPPED_FRAMES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2)
+    })
+}
+
 /// `f`'s result, its time added to [`REFRESH_WAITS`]' place `slot`.
 fn waited<T>(slot: usize, f: impl FnOnce() -> T) -> T {
     let started = std::time::Instant::now();
@@ -1000,10 +1033,25 @@ impl Staging {
             // shortcut: read again at most every 30 frames (reading around
             // unmapped pages is slow, and nothing tells us when pages
             // arrive): a mip that streams in shows up to 30 frames late.
+            // What of it is there, as a mip window: the views of it are
+            // narrowed to it while it lasts (a streamed texture's mips
+            // arrive from the smallest, at the start of each slice).
+            let window = resident_mips(self.memory, &self.layout);
+            note_resident(self.resource, window, false);
+            #[cfg(feature = "diagnostics")]
+            if window.1 > 0 && window.0 > 0 {
+                crate::copystat::add(crate::copystat::C::ResidentNarrowed, 1);
+            } else if window.1 == 0 {
+                crate::copystat::add(crate::copystat::C::ResidentNone, 1);
+            }
             // Read through the kernel, which needs no lock over the mapping.
             drop(_mapped);
+            // Read again in `partial_frames`, or in `unmapped_frames` when
+            // no mip at all is there (the texture is black until one
+            // arrives, where a partly mapped one shows its small mips).
+            let wait = if window.1 == 0 { unmapped_frames() } else { partial_frames() };
             let frame = crate::frame::current();
-            if last.partial.is_some_and(|at| frame < at + 30) {
+            if last.partial.is_some_and(|at| frame < at + wait) {
                 return 0;
             }
             last.partial = Some(frame);
@@ -1029,6 +1077,8 @@ impl Staging {
             let _ = changed;
             return size;
         }
+        // All of it is there: no view of it is narrowed any more.
+        note_resident(self.resource, (0, 0), true);
         if through_copy() {
             // A read through the kernel, which needs no lock.
             drop(_mapped);
@@ -1415,6 +1465,103 @@ pub(crate) fn present_fill(list: &HostList, resource: This, texture: &ID3D12Reso
     filled
 }
 
+/// The mips of a title texture whose memory is all there: `(first, count)`,
+/// `(0, 0)` if none is.
+///
+/// A streamed texture's pages arrive a few blocks at a time, and its
+/// smallest mips lie at the start of each slice (`Layout::mip_extents`), so
+/// what is there is a suffix of the mip chain: the memory below `mapped`
+/// holds every mip from `first` on. A view over that range samples what the
+/// console's residency clamp would have it sample, instead of reading zeros
+/// for the mips that have not arrived.
+pub(crate) fn resident_suffix(extents: &[(u64, u64)], mapped: u64) -> (u32, u32) {
+    let n = extents.len();
+    let mut first = n;
+    while first > 0 {
+        if extents[first - 1].1 > mapped {
+            break;
+        }
+        first -= 1;
+    }
+    (first as u32, (n - first) as u32)
+}
+
+/// [`resident_suffix`] of the texture at `memory`: the mips all of whose
+/// bytes are mapped now.
+pub(crate) fn resident_mips(memory: *const u8, layout: &victory_formats::texture::Layout) -> (u32, u32) {
+    if layout.size == 0 || layout.mips.is_empty() {
+        return (0, 0);
+    }
+    let mapped = mapped_prefix(memory, layout.size as usize);
+    if mapped >= layout.size {
+        return (0, layout.mips.len() as u32);
+    }
+    if mapped == 0 {
+        return (0, 0);
+    }
+    resident_suffix(&layout.mip_extents(), mapped)
+}
+
+/// Bytes of `[at, at + len)` mapped from its start without a gap, by 64 KiB
+/// blocks (the console's page, how the title maps a texture: from the
+/// start, smallest mips first). [`mapped_bytes`] counts every mapped block,
+/// which is not the same thing: a texture whose first blocks are missing
+/// (1,642 uploads in run fx-d3dc-1) has none of its smaller mips.
+fn mapped_prefix(at: *const u8, len: usize) -> u64 {
+    const BLOCK: usize = 64 << 10;
+    let mut there = 0u64;
+    let mut block = at as usize;
+    let end = block.saturating_add(len);
+    while block < end {
+        let n = (end - block).min(BLOCK);
+        if readable(block, 1, true).0 != 1 {
+            break;
+        }
+        there += n as u64;
+        block += n;
+    }
+    there
+}
+
+/// The resident mip window `(first, count)` of a texture a view is made on:
+/// what [`resident_mips`] found at its last upload. `None` while it is all
+/// there (or nothing is known: no staging buffer, no view to narrow).
+pub(crate) fn resident(resource: This) -> Option<(u32, u32)> {
+    static RESIDENT: Mutex<Option<HashMap<usize, (u32, u32)>>> = Mutex::new(None);
+    let map = RESIDENT.lock().unwrap_or_else(|e| e.into_inner());
+    map.as_ref()?.get(&(resource as usize)).copied()
+}
+
+/// Notes the resident mip window of `resource` (`(0, 0)` when none of its
+/// mips is there): a view of it is narrowed to it while it stands, and
+/// widened when more has arrived.
+pub(crate) fn note_resident(resource: This, window: (u32, u32), whole: bool) {
+    static RESIDENT: Mutex<Option<HashMap<usize, (u32, u32)>>> = Mutex::new(None);
+    let mut map = RESIDENT.lock().unwrap_or_else(|e| e.into_inner());
+    let map = map.get_or_insert_with(HashMap::new);
+    if whole {
+        map.remove(&(resource as usize));
+    } else {
+        map.insert(resource as usize, window);
+    }
+}
+
+/// The mips a view asks for, `(MostDetailedMip, MipLevels or 0 for the
+/// rest)`, narrowed to the resident ones: what the view should name so that
+/// every mip it can sample is there.
+pub(crate) fn narrowed(asked: (u32, u32), resident: (u32, u32), mips: u32) -> (u32, u32) {
+    let (first, levels) = asked;
+    let end = if levels == 0 { mips } else { first.saturating_add(levels).min(mips) };
+    let (rfirst, rcount) = resident;
+    let rend = rfirst.saturating_add(rcount).min(mips);
+    let start = first.max(rfirst).min(rend.saturating_sub(1));
+    let stop = end.min(rend);
+    // Nothing the view asked for is there: its most detailed resident mip
+    // alone (the picture is the smallest mip, not black).
+    let count = stop.saturating_sub(start).max(1);
+    (start, count)
+}
+
 /// The staging state of a title texture, made on first use.
 fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
@@ -1480,6 +1627,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         mips: u32::from(d.MipLevels),
         bytes: total,
         memory,
+        resource,
         last: Mutex::default(),
         dirty: std::sync::atomic::AtomicBool::new(true),
         uploaded: std::sync::atomic::AtomicBool::new(false),

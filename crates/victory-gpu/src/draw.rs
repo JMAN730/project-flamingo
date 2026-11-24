@@ -149,7 +149,7 @@ const WINDOW_MOST: u64 = 64;
 ///
 /// The step is the one the title is seen to take, not the stride its
 /// command signature names: it draws one record a call, for which the
-/// stride means nothing, and Grand Theft Auto VI names 12 bytes (the three
+/// stride means nothing, and the title names 12 bytes (the three
 /// words of a mesh dispatch) for records it keeps 32 bytes apart (2,173 of
 /// a frame's 3,349 mesh records in run 87's listed frame; 283 are 16
 /// apart, which ends a window). Walked by the named stride the window
@@ -260,7 +260,7 @@ impl State {
 }
 
 /// An experiment on the title's scissor rectangles (`VICTORY_SCISSOR_TEST=full`):
-/// they are all widened to the whole target. Grand Theft Auto VI's room at
+/// they are all widened to the whole target. The title's room at
 /// the start of the prologue lost its walls in five runs of seven, and in
 /// those runs the player's body and the world outside were cut by one
 /// rectangle around the window (run 85, frame 2046): one run with this on
@@ -364,6 +364,20 @@ pub(crate) static HEAP_TEXTURES_AWAY: AtomicU64 = AtomicU64::new(0);
 /// Slots the pass found up to date already: their texture is uploaded by
 /// the draws that read it through a table (it has a staging buffer).
 pub(crate) static HEAP_TEXTURES_TABLED: AtomicU64 = AtomicU64::new(0);
+/// Times a placed texture's slot was kept as it was because its memory was
+/// unmapped and it showed a texture already ([`keep_contents`]).
+pub(crate) static HEAP_TEXTURES_KEPT: AtomicU64 = AtomicU64::new(0);
+
+/// Whether a slot whose texture's memory was unmapped keeps the texture it
+/// shows (`VICTORY_TEXTURE_KEEP=0` nulls it: it draws black).
+fn keep_contents() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    // Live (crate::switches): a nulled slot samples black, a kept one whatever it last held.
+    crate::switches::b(
+        "VICTORY_TEXTURE_KEEP",
+        *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_KEEP").is_none_or(|v| v != "0")),
+    )
+}
 /// The queue of textures picked by index at the last pass
 /// (`TextureQueue::census`): slots in it, due, waiting for their memory,
 /// uploaded in part, and the frames the oldest due one has waited.
@@ -1567,6 +1581,17 @@ impl State {
                 let mapped = crate::texture::mapped_bytes(address as *const u8, len as usize);
                 if mapped == 0 {
                     HEAP_TEXTURES_AWAY.fetch_add(1, Ordering::Relaxed);
+                    // Its memory went away. A slot that shows a texture
+                    // already keeps it: the title streams a texture out of
+                    // that address only until it streams the next one in,
+                    // and a slot left as it was shows the texture that was
+                    // there (stale for a moment) where a null slot draws
+                    // black (`VICTORY_TEXTURE_KEEP=0` nulls it, as before).
+                    if keep_contents() && host.texture_slot_has_contents(index) {
+                        HEAP_TEXTURES_KEPT.fetch_add(1, Ordering::Relaxed);
+                        host.texture_slot_later(index, write, frame, most);
+                        continue;
+                    }
                     // Streamed out: what the slot showed is let go.
                     host.texture_slot_gone(index);
                     host.texture_slot_later(index, write, frame, most);
@@ -1644,7 +1669,10 @@ impl State {
             // title mapped: again in 120 frames, as before).
             let again = match partly {
                 Some(mapped) => Some((frame + 1, mapped)),
-                None => (!whole).then_some((frame + 120, 0)),
+                // A texture not all mapped: looked at again as a staged
+                // texture's own re-read does (`partial_frames`), not in 120
+                // frames as before.
+                None => (!whole).then_some((frame + crate::texture::partial_frames(), 0)),
             };
             if again.is_some() {
                 HEAP_TEXTURES_PARTLY[1].fetch_add(1, Ordering::Relaxed);
@@ -1783,7 +1811,7 @@ impl State {
             let targets: Vec<String> = self.targets.iter().filter_map(|&t| described(t)).collect();
             let _ = write!(text, " targets {targets:?} depth {:?} state [{}]", described(self.depth), p.state);
             // The title's scissor and viewport at this draw (the first of
-            // each): Grand Theft Auto VI draws what it sees through a
+            // each): the title draws what it sees through a
             // portal (a window, from inside a room) under the portal's
             // rectangle, and the listing did not say which draws those are.
             if let Some(r) = self.scissors.first() {
@@ -2359,7 +2387,7 @@ impl State {
             crate::pipeline::note_drop(self.pipeline as This);
             return false;
         };
-        // Indirect rectangles (Grand Theft Auto VI's tiled lighting, 256
+        // Indirect rectangles (the title's tiled lighting, 256
         // indirect draws a frame, makes their corners from the vertex
         // number) are completed by the pipeline's geometry stage: the
         // arguments stay the title's, three vertices a rectangle. They
