@@ -8,7 +8,7 @@ fn a_title_dll_that_does_not_prepare_is_named() {
     let cache = tempfile::tempdir().unwrap();
     std::fs::write(title.path().join("broken.dll"), b"MZ not a PE").unwrap();
     let wanted = |_: &str| true;
-    let loaded = victory_loader::load_title_dll("broken.dll", title.path(), cache.path(), &wanted);
+    let loaded = victory_loader::load_title_dll("broken.dll", &[title.path()], cache.path(), &wanted);
     let Err(error) = loaded else {
         panic!("a DLL that is not a PE loaded");
     };
@@ -47,7 +47,7 @@ fn a_title_dll_in_a_case_sensitive_folder_is_found_by_any_spelling() {
     for name in ["Late.dll", "LATE.DLL", "late.dll"] {
         let cache = tempfile::tempdir().unwrap();
         let dlls =
-            victory_loader::load_title_dll(name, title.path(), cache.path(), &wanted).unwrap();
+            victory_loader::load_title_dll(name, &[title.path()], cache.path(), &wanted).unwrap();
         let names: Vec<_> = dlls.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(names, ["late.dll"], "loading {name}");
     }

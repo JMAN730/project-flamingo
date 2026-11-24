@@ -124,10 +124,17 @@ pub fn run(
         Console::SeriesS => victory_hle::console::Console::SeriesS,
     });
     println!("console        {}", victory_hle::console::current().name());
-    let dlls = victory_loader::load_title_dlls(image.info(), title_dir, &images, &wanted)?;
+    // Title DLLs: next to the exe, else with the game files.
+    let dll_dirs: Vec<&Path> = if package.as_path() == title_dir {
+        vec![title_dir]
+    } else {
+        vec![title_dir, package.as_path()]
+    };
+    let dlls = victory_loader::load_title_dlls(image.info(), &dll_dirs, &images, &wanted)?;
     for (name, dll) in &dlls {
         println!("title dll      {name} at {:#x}", dll.base());
-        victory_hle::runtime::set_image_path(dll.base(), &title_dir.join(name));
+        let path = find_in(&dll_dirs, name).unwrap_or_else(|| title_dir.join(name));
+        victory_hle::runtime::set_image_path(dll.base(), &path);
     }
 
     let policy = match unimplemented {
@@ -166,7 +173,7 @@ pub fn run(
     diagnostics(&image, &cfg);
     let late = LateDlls {
         host: resolver.host.clone(),
-        title_dir: title_dir.to_owned(),
+        title_dirs: dll_dirs.iter().map(|d| d.to_path_buf()).collect(),
         cache_dir: images,
         policy,
         mapped: std::sync::Mutex::new(dlls.clone()),
@@ -342,7 +349,8 @@ fn title_dll(host: &victory_hle::HostPolicy, dll: &str) -> bool {
 #[cfg(windows)]
 struct LateDlls {
     host: victory_hle::HostPolicy,
-    title_dir: std::path::PathBuf,
+    /// Where title DLLs are looked for, in order.
+    title_dirs: Vec<std::path::PathBuf>,
     cache_dir: std::path::PathBuf,
     policy: victory_loader::UnimplementedPolicy,
     /// Every title DLL mapped so far, to bind new ones against.
@@ -371,9 +379,10 @@ impl LateDlls {
             let new = {
                 let mut mapped = self.mapped.lock().unwrap_or_else(|e| e.into_inner());
                 let wanted = |dll: &str| title_dll(&self.host, dll) && image_named(dll).is_none();
+                let dirs: Vec<&Path> = self.title_dirs.iter().map(|d| d.as_path()).collect();
                 let new = victory_loader::load_title_dll(
                     file,
-                    &self.title_dir,
+                    &dirs,
                     &self.cache_dir,
                     &wanted,
                 )?;
@@ -392,7 +401,8 @@ impl LateDlls {
                         dll.base()
                     );
                     show(name, dll.bind_imports(&resolver, self.policy)?);
-                    set_image_path(dll.base(), &self.title_dir.join(name));
+                    let path = find_in(&dirs, name).unwrap_or_else(|| self.title_dirs[0].join(name));
+                    set_image_path(dll.base(), &path);
                 }
                 // Visible before their `DllMain`s run, which may load more.
                 mapped.extend(new.iter().cloned());
