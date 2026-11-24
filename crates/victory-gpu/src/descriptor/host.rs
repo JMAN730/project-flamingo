@@ -931,7 +931,7 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
         return false;
     }
     // Every family has more than one format, its typeless one first.
-    let typeless = family(own) == own && family(own + 1) == own;
+    let typeless = crate::resource::is_typeless(own);
     if let Some(format) = format.as_deref_mut()
         && unordered
         && let Some(&(_, linear)) = crate::resource::SRGB
@@ -942,6 +942,14 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
     }
     let view = format.as_ref().map_or(0, |f| f.0 as u32);
     if view == 0 {
+        // A described view of a typeless texture with no format reads it
+        // as the family's concrete format (upstream #970). With no
+        // description at all the host would take the typeless format,
+        // which it refuses.
+        if typeless && let Some(format) = format {
+            format.0 = crate::resource::concrete_srv_format(own) as i32;
+            return true;
+        }
         return !typeless;
     }
     // A texture whose console format PC forbids as a render target or UAV
@@ -959,11 +967,14 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
     let twin = crate::resource::SRGB
         .iter()
         .any(|&(s, l)| (s, l) == (view, own) || (l, s) == (view, own));
-    if let Some(format) = format
-        && !typeless
-        && !(twin && casts_typed())
-    {
-        *format = d.Format;
+    if let Some(format) = format {
+        if !typeless && !(twin && casts_typed()) {
+            *format = d.Format;
+        } else if typeless && crate::resource::is_typeless(view) {
+            // A typeless view of a typeless texture: the host needs a
+            // concrete format (upstream #970).
+            format.0 = crate::resource::concrete_srv_format(view) as i32;
+        }
     }
     true
 }

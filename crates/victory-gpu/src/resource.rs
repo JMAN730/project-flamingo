@@ -295,6 +295,28 @@ pub(crate) fn family(format: u32) -> u32 {
     }
 }
 
+/// Whether `format` is the typeless head of a family of several formats.
+pub(crate) fn is_typeless(format: u32) -> bool {
+    format != 0 && family(format) == format && family(format + 1) == format
+}
+
+/// A format a shader can read a typeless `format`'s texture as: a depth
+/// family's readable aspect (not its depth-stencil format), else the
+/// family's main typed format. Others are their own. (Upstream #970.)
+pub(crate) fn concrete_srv_format(format: u32) -> u32 {
+    match format {
+        19 => 21, // R32G8X24 -> R32_FLOAT_X8X24_TYPELESS
+        44 => 46, // R24G8 -> R24_UNORM_X8_TYPELESS
+        39 => 41, // R32 -> R32_FLOAT
+        53 => 56, // R16 -> R16_UNORM
+        90 => 87, // B8G8R8A8 -> B8G8R8A8_UNORM
+        92 => 88, // B8G8R8X8 -> B8G8R8X8_UNORM
+        94 => 95, // BC6H -> BC6H_UF16
+        f if is_typeless(f) => f + 1,
+        f => f,
+    }
+}
+
 /// sRGB formats and their linear twins: 8-bit color, then BC1, BC2, BC3
 /// and BC7.
 pub(crate) const SRGB: [(u32, u32); 7] = [
@@ -2692,5 +2714,26 @@ void main() {
 
         // Ordinary buffer -> stays 1 mip
         assert_eq!(get_desc(&buffer(256)).mip_levels, 1);
+    }
+
+    #[test]
+    fn concrete_srv_format_resolves_color_and_depth_families() {
+        for (typeless, typed) in [
+            (27, 28),
+            (90, 87),
+            (92, 88),
+            (9, 10),
+            (94, 95),
+            (97, 98),
+            (19, 21),
+            (44, 46),
+            (39, 41),
+            (53, 56),
+            (28, 28),
+            (46, 46),
+        ] {
+            assert_eq!(concrete_srv_format(typeless), typed, "format {typeless}");
+        }
+        assert!(is_typeless(27) && !is_typeless(28) && !is_typeless(0));
     }
 }
