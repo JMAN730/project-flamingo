@@ -995,7 +995,11 @@ fn give_back(v: Vec<u8>) {
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
     pool.push(v);
     pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
-    pool.truncate(8);
+    // wbk's count (as many as copies a frame can hold at once, 27 in the
+    // steady state) under fx-prs' byte cap above: the cap bounds the memory,
+    // the count stops a frame's copies from allocating fresh buffers whose
+    // pages fault as the snapshot is written.
+    pool.truncate(32);
     let (mut seen, mut total) = (0, 0usize);
     pool.retain(|v| {
         seen += 1;
