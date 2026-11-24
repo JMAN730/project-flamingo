@@ -1169,6 +1169,21 @@ extern "system" fn sync(_: This, _flags: u32, _control: u32, _address: u64, _siz
 
 /// Reset with console flags `(allocator, pipeline, flags)`; the flags only
 /// tune the console's command memory.
+/// `ClearState` (0x58): the host list's state and ours back to their
+/// defaults, `pipeline` bound at the next draw or dispatch.
+extern "system" fn clear_state(this: This, pipeline: This) {
+    #[cfg(windows)]
+    with_state(this, |host, state| {
+        // SAFETY: an open list; the translated pipeline is bound later.
+        unsafe { host.list.ClearState(None) };
+        state.clear(pipeline);
+        #[cfg(feature = "diagnostics")]
+        host.note_op(|| format!("clear state {pipeline:?}"));
+    });
+    #[cfg(not(windows))]
+    let _ = (this, pipeline);
+}
+
 extern "system" fn reset_x(this: This, allocator: This, pipeline: This, _flags: u32) -> HRESULT {
     reset(this, allocator, pipeline)
 }
@@ -1625,13 +1640,14 @@ fn defer_write(this: This, address: u64, what: Written, bytes: usize) {
 /// layout): IUnknown 3, object 4, device child 1, list 1, graphics list 96
 /// (59 as on PC, then console ones), then versions 1-6 (6 + 1 + 1 + 11 + 3
 /// + 13): 140 slots.
-const METHODS: [(usize, *const ()); 54] = [
+const METHODS: [(usize, *const ()); 55] = [
     (0, list_query as *const ()),
     (2, list_release as *const ()),
     (7, object::parent_device as *const ()),      // 0x38
     (8, list_type as *const ()),                  // 0x40
     (9, close as *const ()),                      // 0x48
     (10, reset as *const ()),                     // 0x50
+    (11, clear_state as *const ()),               // 0x58
     (12, state::draw as *const ()),               // 0x60 instanced
     (13, state::draw_indexed as *const ()),       // 0x68 indexed
     (14, state::dispatch as *const ()),           // 0x70

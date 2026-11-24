@@ -195,6 +195,16 @@ impl State {
         self.pipeline = pipeline as usize;
     }
 
+    /// `ClearState`: every binding back to its default as at a reset, with
+    /// `pipeline` set. The list keeps its dynamic descriptor slots: draws
+    /// recorded before the clear still read them.
+    pub(crate) fn clear(&mut self, pipeline: This) {
+        let dynamic = std::mem::take(&mut self.dynamic);
+        *self = State::default();
+        self.dynamic = dynamic;
+        self.pipeline = pipeline as usize;
+    }
+
     /// Takes the dynamic descriptor slots held by this recording, so a
     /// pending host list can keep them alive until its submission finishes.
     pub(crate) fn take_dynamic(&mut self) -> Vec<(usize, u32, u32)> {
@@ -1605,6 +1615,41 @@ mod depth_tests {
         };
         assert_eq!(release(views), 0);
         assert_eq!(release(depth), 0);
+    }
+}
+
+#[cfg(test)]
+mod clear_state_tests {
+    use super::*;
+
+    #[test]
+    fn clear_resets_bindings_but_keeps_dynamic_slots() {
+        // A synthetic slot record: no registered heap, so giving it back
+        // does nothing.
+        let dynamic = (0, 64, 3);
+        let mut state = State::default();
+        state.pipeline = 1;
+        state.heaps = [2, 3];
+        state.targets = vec![8];
+        state.topology = 4;
+        state.host_pipeline = 10;
+        state.host_roots = [11, 12];
+        state.host_heaps = [13, 14];
+        state.fresh_tables = [((4, 15), dynamic.1)].into();
+        state.dynamic = vec![dynamic];
+        let pipeline: This = std::ptr::dangling();
+        state.clear(pipeline);
+        assert_eq!(state.pipeline, pipeline as usize);
+        assert_eq!(state.heaps, [0; 2]);
+        assert!(state.targets.is_empty());
+        assert_eq!(state.topology, 0);
+        assert_eq!(state.host_pipeline, 0);
+        assert_eq!(state.host_roots, [0; 2]);
+        assert_eq!(state.host_heaps, [0; 2]);
+        assert!(state.fresh_tables.is_empty());
+        assert_eq!(state.dynamic, [dynamic]);
+        state.reset(std::ptr::null());
+        assert!(state.dynamic.is_empty());
     }
 }
 
