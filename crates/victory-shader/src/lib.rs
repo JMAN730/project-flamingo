@@ -14,6 +14,7 @@ pub mod agility;
 pub mod dxbc;
 pub mod dxil;
 pub mod emit;
+mod hash;
 pub mod gfx10;
 pub mod io;
 pub mod ir;
