@@ -1042,11 +1042,19 @@ pub(super) fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
             return false;
         }
         Fields::Sop { src, .. } => src.iter().collect(),
-        Fields::Valu(v)
-            if !matches!(i.name(), "v_cndmask_b32") && !i.name().contains("_co_ci_") =>
-        {
-            v.src.iter().collect()
+        // A select or a carry-in reads its mask operand: followed by the
+        // structure pass it is no data use, untracked it is read as a
+        // number (this lane's bit of the register), which needs the
+        // console's lane order (fixed by #84/#86).
+        Fields::Valu(v) if matches!(i.name(), "v_cndmask_b32") || i.name().contains("_co_ci_") => {
+            return match v.src.get(2) {
+                Some(&Operand::Scalar { code, .. }) if code != NULL => {
+                    i.read(Reg::S(code)).is_some_and(|m| !is_mask(m))
+                }
+                _ => false,
+            };
         }
+        Fields::Valu(v) => v.src.iter().collect(),
         _ => return false,
     };
     ops.into_iter().any(|op| match *op {
@@ -1055,7 +1063,6 @@ pub(super) fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
     })
 }
 
-<<<<<<< HEAD
 /// The parameters packing 16-bit rows two per dword and where each lays
 /// its elements out: (first row, [(dword, register, column, columns)]).
 ///
@@ -3725,13 +3732,11 @@ impl<'a> Lower<'a> {
     }
 
     /// The condition a select or a carry-in takes from a scalar mask
-    /// operand: the mask the structure pass followed, this lane's bit of
-    /// the register it holds, or an inline 0 or -1 (no lane, every lane).
+    /// operand: this lane's bit of the register the mask is held in, or an
+    /// inline 0 or -1 (no lane, every lane). The caller tries the masks the
+    /// structure pass followed first.
     fn select_condition(&mut self, inst: &Inst, mask: Option<&Operand>) -> Result<V, Why> {
         const UNTRACKED: Why = "a select on an untracked mask";
-        if let Some(&m) = inst.writes.first().and_then(|&(_, v)| self.x.st.select_masks.get(&v)) {
-            return self.boolean(m, self.cur);
-        }
         // Inline 0 and -1: no lane or every lane.
         match mask {
             Some(&Operand::Const(128)) => return Ok(self.s.m.bool(false)),
@@ -7147,40 +7152,48 @@ impl<'a> Lower<'a> {
                 float(self, r)
             }
             "v_cndmask_b32" => {
-                let mask = match v.src.get(2) {
-                    Some(&Operand::Scalar { code, .. }) => inst.read(Reg::S(code)),
-                    _ => None,
-                };
                 const UNTRACKED: Why = "a select on an untracked mask";
-                let cond = match mask.and_then(|m| self.x.st.masks.get(&m).copied()) {
-                    Some(m) => self.boolean(m, c)?,
-                    // A mask the code holds as a number (a constant bit
-                    // pattern: every other lane, every other pair...):
-                    // this lane's bit of it. Exact where host lanes are
-                    // the console's.
-                    None if self.mask_data == MaskData::Console => {
-                        // Each host wave taken as a wave of its own has no
-                        // console lane numbers to pick the bits by.
-                        if self.local {
-                            return Err("a constant lane mask in a half-wave");
-                        }
-                        let m = mask.ok_or(UNTRACKED)?;
-                        let lo = self.i32_of(m).map_err(|_| UNTRACKED)?;
-                        // wave64: the register after it holds lanes 32-63.
-                        let high = match v.src.get(2) {
-                            Some(&Operand::Scalar { code, .. }) if self.x.native.wave64 => {
-                                Some(inst.read(Reg::S(code + 1)).ok_or(UNTRACKED)?)
-                            }
+                // Inline 0 and -1: no lane, every lane (a constant for every
+                // host lane order).
+                let cond = match v.src.get(2) {
+                    Some(&Operand::Const(128)) => self.s.m.bool(false),
+                    Some(&Operand::Const(193)) => self.s.m.bool(true),
+                    mask => {
+                        let read = match mask {
+                            Some(&Operand::Scalar { code, .. }) => inst.read(Reg::S(code)),
                             _ => None,
                         };
-                        let hi = match high {
-                            Some(h) => Some(self.i32_of(h).map_err(|_| UNTRACKED)?),
-                            None => None,
-                        };
-                        self.cross_lane(false)?;
-                        self.lane_bit(c, lo, hi)
+                        match read.and_then(|m| self.x.st.masks.get(&m).copied()) {
+                            Some(m) => self.boolean(m, c)?,
+                            // A mask the code holds as a number (a constant bit
+                            // pattern: every other lane, every other pair...):
+                            // this lane's bit of it. Exact where host lanes are
+                            // the console's.
+                            None if self.mask_data == MaskData::Console => {
+                                // Each host wave taken as a wave of its own has no
+                                // console lane numbers to pick the bits by.
+                                if self.local {
+                                    return Err("a constant lane mask in a half-wave");
+                                }
+                                let m = read.ok_or(UNTRACKED)?;
+                                let lo = self.i32_of(m).map_err(|_| UNTRACKED)?;
+                                // wave64: the register after it holds lanes 32-63.
+                                let high = match mask {
+                                    Some(&Operand::Scalar { code, .. }) if self.x.native.wave64 => {
+                                        Some(inst.read(Reg::S(code + 1)).ok_or(UNTRACKED)?)
+                                    }
+                                    _ => None,
+                                };
+                                let hi = match high {
+                                    Some(h) => Some(self.i32_of(h).map_err(|_| UNTRACKED)?),
+                                    None => None,
+                                };
+                                self.cross_lane(false)?;
+                                self.lane_bit(c, lo, hi)
+                            }
+                            None => return Err(UNTRACKED),
+                        }
                     }
-                    None => return Err(UNTRACKED),
                 };
                 if v.abs != 0 || v.neg != 0 {
                     let (a, bb) = (f(self, 0)?, f(self, 1)?);

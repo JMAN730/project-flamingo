@@ -991,9 +991,11 @@ mod tests {
     /// A carry-in reading a join of compares after a divergent branch. A
     /// lane that skipped the inner compare has VCC clear there (VOPC clears
     /// inactive lanes), not the first compare's bit, so the join is no
-    /// per-lane phi: lowering refuses it.
+    /// per-lane phi: lowering used to refuse it as "a carry-in from an
+    /// untracked mask". It now takes this lane's bit of the register, which
+    /// is what the console reads at the use (JMAN730/victory #86).
     #[test]
-    fn a_carry_in_from_a_divergent_join_is_refused() {
+    fn a_carry_in_from_a_divergent_join_reads_this_lanes_bit() {
         let body = [
             0x7E04_028B, // v_mov_b32 v2, 11
             0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
@@ -1003,8 +1005,7 @@ mod tests {
             0x88FE_027E, // s_or_b64 exec, exec, s[2:3]
             0x5002_0480, // v_add_co_ci_u32 v1, vcc, 0, v2, vcc
         ];
-        let e = stores_v1(&body).unwrap_err().to_string();
-        assert!(e.contains("a carry-in from an untracked mask"), "{e}");
+        stores_v1(&body).unwrap();
     }
 
     /// A pixel shader writing a constant colour.
