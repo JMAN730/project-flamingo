@@ -43,6 +43,8 @@ jobs:
           cargo test --workspace --locked --no-fail-fast 2>&1 | Tee-Object -FilePath test-output.txt
           $code = $LASTEXITCODE
           # Failing tests and panics as annotations (readable through the API).
-          Select-String -Path test-output.txt -Pattern 'FAILED|panicked|^error|could not compile|STATUS_|exit code' |
-            Select-Object -First 40 | ForEach-Object { Write-Output "::error::$($_.Line)" }
+          # (case-sensitive, and all in one: a step shows at most 10 annotations)
+          $hits = @(Select-String -CaseSensitive -Path test-output.txt -Pattern ' FAILED|panicked|^error|could not compile|STATUS_|^---- |left: |right: ' |
+            Select-Object -First 80 | ForEach-Object { $_.Line.Trim() })
+          if ($hits.Count -gt 0) { Write-Output ("::error::" + ($hits -join ' %0A ')) }
           exit $code
