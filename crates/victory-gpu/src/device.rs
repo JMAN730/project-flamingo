@@ -423,10 +423,10 @@ static FUNCTIONS: Table<160> = {
     f[41] = signature::create as *const (); // 0x148
     f[48] = queue::create_x as *const (); // 0x180
     f[55] = pipeline::create_derived as *const (); // 0x1b8
-    f[57] = object::ignore as *const (); // 0x1c8
+    f[57] = pipeline::deserialize as *const (); // 0x1c8 graphics
     f[61] = descriptor::create_sampler_x as *const (); // 0x1e8
     f[62] = pipeline::create_compute_x as *const (); // 0x1f0
-    f[67] = object::ignore as *const (); // 0x218
+    f[67] = pipeline::deserialize as *const (); // 0x218 compute
     f[69] = object::ignore as *const (); // 0x228 debug error filter
     f[70] = descriptor::create_placed_srv as *const (); // 0x230
     f[71] = descriptor::create_placed_uav as *const (); // 0x238
@@ -474,10 +474,14 @@ mod tests {
         );
         let missing = slot::<extern "system" fn() -> HRESULT>(device, 0xf0);
         assert_eq!(missing(), E_NOTIMPL);
-        let s1c8 = slot::<extern "system" fn() -> HRESULT>(device, 0x1c8);
-        assert_eq!(s1c8(), S_OK);
-        let s218 = slot::<extern "system" fn() -> HRESULT>(device, 0x218);
-        assert_eq!(s218(), S_OK);
+        // The console pipeline cache is refused with no object, so the
+        // title builds its pipelines (S_OK left it a null pipeline).
+        type Deserialize = extern "system" fn(This, *const u8, *const Iid, *mut This) -> HRESULT;
+        for offset in [0x1c8, 0x218] {
+            let mut out = device;
+            let hr = slot::<Deserialize>(device, offset)(device, [0u8; 8].as_ptr(), &IID, &mut out);
+            assert_eq!((hr, out), (E_NOTIMPL, std::ptr::null()));
+        }
     }
 
     #[test]

@@ -394,6 +394,29 @@ pub(crate) extern "system" fn create_compute_x(
     create_compute(this, desc, iid, out)
 }
 
+/// Device methods 0x1c8 and 0x218, `Deserialize{Graphics,Compute}PipelineStateX(blob,
+/// iid, out)`: a pipeline from the console driver's serialized form, which
+/// we cannot read. Refused with no object, so the title makes the pipeline
+/// from its description instead. Answering S_OK (as this fork once did)
+/// left the title with a null pipeline: its pipeline workers then read
+/// through it (title+0x247a098) and the run ended about a second in.
+pub(crate) extern "system" fn deserialize(
+    _: This,
+    _blob: *const u8,
+    _iid: *const Iid,
+    out: *mut This,
+) -> HRESULT {
+    static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::info!("console pipeline cache refused: the title builds its pipelines itself");
+    }
+    if !out.is_null() {
+        // SAFETY: the title passes somewhere for the pipeline.
+        unsafe { out.write(std::ptr::null()) };
+    }
+    object::E_NOTIMPL
+}
+
 /// One part of a derived pipeline: which part, then its description, at
 /// the size of the largest (the blend state).
 pub(crate) const DERIVED_PART: usize = 0x14c;
@@ -634,6 +657,14 @@ mod tests {
             &pipeline(q).shaders[1]
         ));
         assert_eq!(slot::<extern "system" fn(This) -> u32>(p, 0x10)(p), 0);
+    }
+
+    #[test]
+    fn serialized_pipelines_are_refused_with_no_object() {
+        let mut out = 1usize as This;
+        let hr = deserialize(std::ptr::null(), [0u8; 16].as_ptr(), &PIPELINE_IIDS[0], &mut out);
+        assert!(hr < 0);
+        assert!(out.is_null());
     }
 
     #[test]
