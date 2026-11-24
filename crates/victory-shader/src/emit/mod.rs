@@ -102,6 +102,8 @@ mod valu_tests;
 mod waterfall_tests;
 #[cfg(all(test, windows))]
 mod wave64_tests;
+#[cfg(test)]
+mod wave64_double_tests;
 mod wave;
 
 use crate::dxbc::{Container, FourCC};
@@ -458,6 +460,38 @@ pub fn emit(
                 report("local waves (APPROXIMATE, any mask)", &local);
                 if done(&local) {
                     return local.map(|(shader, _)| shader);
+                }
+            }
+        }
+        // Last of all, and only when asked for (`VICTORY_WAVE64_DOUBLE=1`): one host thread per
+        // two console lanes, a host wave per console wave ([`lower::with_doubled`]), with every
+        // lane branch taken by the wave as on the console ([`all_wide`]). Exact; programs that
+        // translate in any form above keep it.
+        if lower::doubled_on() {
+            match all_wide(p) {
+                Ok(wide) => {
+                    let io = io::raise(p, native)?;
+                    // Descriptors as the wave's control flow leaves them. Where that is a join of
+                    // a descriptor with stale registers (one set inside a skip and read after
+                    // its join, `alphaResolve:CS_AlphTransmissionPrefilterMip`'s sampler: a wave
+                    // that skipped reads whatever the registers held), as the per-lane form
+                    // traces them: what the program's other translations use.
+                    // shortcut: a wave that skipped gets the descriptor of one that did not.
+                    let res = match resource::track(p, &native.layout, native.stage, Some(&wide)) {
+                        Ok(r) => r,
+                        Err(_) => resource::track(p, &native.layout, native.stage, Some(st))?,
+                    };
+                    let st = wide;
+                    let again = lower::with_doubled(|| emit_program(c, native, p, &st, &io, &res));
+                    report("doubled", &again);
+                    if done(&again) {
+                        return again.map(|(shader, _)| shader);
+                    }
+                }
+                Err(what) => {
+                    if why {
+                        eprintln!("WAVE64-RETRY doubled: {what}");
+                    }
                 }
             }
         }
