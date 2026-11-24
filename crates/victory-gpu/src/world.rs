@@ -37,9 +37,21 @@ fn parse_world_pick(v: &str) -> Option<WorldPick> {
     Some(WorldPick::Size(2560, 1440))
 }
 
-/// The world target noted for the frame being built: (frame, area, copy).
-static WORLD: std::sync::Mutex<Option<(u64, u64, std::sync::Arc<crate::resource::HostTexture>)>> =
-    std::sync::Mutex::new(None);
+/// A color target a frame rendered to: the frame (presents before it),
+/// its area and its host copy.
+struct Candidate {
+    frame: u64,
+    area: u64,
+    copy: std::sync::Arc<crate::resource::HostTexture>,
+}
+
+/// The color targets of the last frames, at most [`KEPT`] (newest first).
+static WORLD: std::sync::Mutex<Vec<Candidate>> = std::sync::Mutex::new(Vec::new());
+const KEPT: usize = 16;
+
+/// Draws run on the host since the last present from which `auto` takes
+/// the frame for one of the world.
+const AUTO_DRAWS: u64 = 800;
 
 /// Notes a render target bound by the frame being built, for
 /// [`take_world`] (cheap when `VICTORY_PRESENT_1440P` is unset).
@@ -71,28 +83,56 @@ pub(crate) fn note_world(resource: crate::object::This) {
     }
     let frame = crate::queue::presented();
     let mut world = WORLD.lock().unwrap_or_else(|e| e.into_inner());
-    let keep = match &*world {
-        // The last one bound wins at the asked size; the largest in auto.
-        Some((f, a, _)) if *f == frame && pick == WorldPick::Largest => area > *a,
-        _ => true,
-    };
-    if keep {
-        *world = Some((frame, area, copy));
-    }
+    // The last bound comes first; one entry per texture.
+    world.retain(|c| c.copy.texture != copy.texture && c.frame + 2 >= frame);
+    world.insert(0, Candidate { frame, area, copy });
+    world.truncate(KEPT);
 }
 
-/// The world target to present in place of `plane0` (a host texture), if
-/// `VICTORY_PRESENT_1440P` asks for one and the frame (or the one before)
-/// rendered to one; logged once.
+/// The world target to present in place of the presented planes
+/// (`planes`, host textures, plane 0 first), if `VICTORY_PRESENT_1440P`
+/// asks for one and the last frames rendered to one that is no plane
+/// (`auto` would otherwise find the 4K interface plane): at a size, the
+/// last bound; in `auto`, the largest of the newest frame. The frame's
+/// targets are logged a few times, to choose a size.
 pub(crate) fn take_world(
-    plane0: &ID3D12Resource,
+    planes: &[&ID3D12Resource],
 ) -> Option<std::sync::Arc<crate::resource::HostTexture>> {
-    world_pick()?;
-    let (frame, _, copy) = WORLD.lock().unwrap_or_else(|e| e.into_inner()).clone()?;
-    // A frame without one shows the title's own (menus, loading screens).
-    if frame + 2 < crate::queue::presented() || copy.texture == *plane0 {
-        return None;
+    let pick = world_pick()?;
+    let now = crate::queue::presented();
+    let world = WORLD.lock().unwrap_or_else(|e| e.into_inner());
+    let fresh = || {
+        world
+            .iter()
+            .filter(|c| c.frame + 2 >= now && !planes.iter().any(|&p| c.copy.texture == *p))
+    };
+    if now.is_power_of_two() && now >= 256 {
+        let sizes: Vec<String> = world
+            .iter()
+            .map(|c| {
+                // SAFETY: a live host texture.
+                let d = unsafe { c.copy.texture.GetDesc() };
+                let plane = planes.iter().any(|&p| c.copy.texture == *p);
+                format!("{}x{} f{}{}", d.Width, d.Height, d.Format.0, if plane { " (plane)" } else { "" })
+            })
+            .collect();
+        tracing::info!(frame = now, targets = ?sizes, "VICTORY_PRESENT_1440P: color targets of the last frames");
     }
+    // `auto` only for a frame of the world (menus draw a few hundred, the
+    // world thousands), so menus keep showing the title's own planes.
+    static LAST_DRAWN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let drawn = crate::draw::drawn();
+    let since = drawn.saturating_sub(LAST_DRAWN.swap(drawn, std::sync::atomic::Ordering::Relaxed));
+    let chosen = match pick {
+        WorldPick::Size(..) => fresh().next(),
+        WorldPick::Largest if since < AUTO_DRAWS => None,
+        WorldPick::Largest => {
+            let newest = fresh().map(|c| c.frame).max()?;
+            fresh().filter(|c| c.frame == newest).max_by_key(|c| c.area)
+        }
+    }?;
+    let copy = chosen.copy.clone();
+    drop(world);
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         // SAFETY: a live host texture.

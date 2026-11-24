@@ -400,7 +400,9 @@ fn show(resources: Vec<object::Held>) {
             return;
         }
         let mut sources: Vec<(&_, u32)> = shown_planes.iter().map(|&(_, t, s)| (t, s)).collect();
-        let world = crate::world::take_world(sources[0].0);
+        let planes: Vec<&_> = sources.iter().map(|&(t, _)| t).collect();
+        let world = crate::world::take_world(&planes);
+        drop(planes);
         if let Some(copy) = &world {
             let state = crate::host::legal_state(&copy.texture, copy.state.load(Ordering::Relaxed));
             sources[0] = (&copy.texture, state);
