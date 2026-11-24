@@ -3996,19 +3996,31 @@ impl Host {
         // (`VICTORY_ASK_ONCE`): per copy, the span of its refreshed ranges.
         if crate::watch::once() {
             let mut spans: std::collections::HashMap<usize, (usize, usize)> = std::collections::HashMap::new();
+            // The textures the submission samples, by their memory: their
+            // refreshes asked the kernel once each (30-70 µs, and 246-400 ms
+            // of a streaming frame in run fx-d3dc-1; 1,590 ms in the same
+            // frames with the remap wait switched off, which frees them to
+            // run). One asking for the submission answers them from the
+            // journal, as it does the copies.
+            let mut textures: Vec<(usize, usize)> = Vec::new();
             for list in runs {
                 for step in &list.deferred().copies {
-                    if let Step::Refresh(shadow, address, len) = step
-                        && !shadow.unwatched()
-                    {
-                        let span = spans
-                            .entry(std::sync::Arc::as_ptr(shadow) as usize)
-                            .or_insert((*address, *address + *len));
-                        *span = (span.0.min(*address), span.1.max(*address + *len));
+                    match step {
+                        Step::Refresh(shadow, address, len) if !shadow.unwatched() => {
+                            let span = spans
+                                .entry(std::sync::Arc::as_ptr(shadow) as usize)
+                                .or_insert((*address, *address + *len));
+                            *span = (span.0.min(*address), span.1.max(*address + *len));
+                        }
+                        Step::Texture(staging) => textures.push(staging.memory()),
+                        _ => {}
                     }
                 }
             }
-            let ranges: Vec<(usize, usize)> = spans.into_values().collect();
+            let mut ranges: Vec<(usize, usize)> = spans.into_values().collect();
+            textures.sort_unstable();
+            textures.dedup();
+            ranges.append(&mut textures);
             crate::watch::ask_once(&ranges);
             // Behind flights: the title wrote memory that a flight's shaders
             // may write too, and this submission refreshes it. The flights
@@ -5807,7 +5819,8 @@ impl Meter {
             let [through, left] = [0, 1].map(|i| crate::texture::UNLOCKED[i].swap(0, Ordering::Relaxed) as f64 / frames);
             if through + left > 0.0 {
                 tracing::info!(
-                    "texture refreshes that did not wait for title memory to hold still, per frame (VICTORY_TEXTURE_NO_WAIT=1): \
+                    "texture refreshes that did not wait for title memory to hold still, per frame (the frame's budget, \
+                     VICTORY_TEXTURE_WAIT_US; 0 or VICTORY_TEXTURE_NO_WAIT=1 for none): \
                      {through:.1} read through the kernel, {left:.1} left for the next refresh (a page was not there)"
                 );
             }
