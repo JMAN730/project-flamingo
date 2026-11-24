@@ -1974,7 +1974,6 @@ impl<'a> Lower<'a> {
     /// runs, in a thread group that does not fill its waves, and for each half-wave on its
     /// own (half a sum is no sum).
     fn half_sum(&mut self, x: V) -> Result<V, Why> {
-        const WHERE: Why = "a wave sum of 16-bit floats where not every lane runs";
         let threads = self.s.threads.ok_or("a wave sum of 16-bit floats outside compute")?;
         if threads.iter().product::<u32>() % 64 != 0 {
             return Err("a wave sum of 16-bit floats in a wave that is not full");
@@ -1994,10 +1993,19 @@ impl<'a> Lower<'a> {
             all_lane_blocks(self.x.st).is_some_and(|all| all.get(self.cur_ir).copied().unwrap_or(false))
         };
         if !every {
+            // shortcut: the console's own order needs every lane it reads to
+            // exist. Where the wave does not run whole (the code's branching
+            // leaves lanes out, which no other form of the program makes
+            // whole), the sum is taken the host's way: the lanes' low halves
+            // widened to f32, one wave sum, rounded once to 16 bits. That
+            // differs from the console's balanced f16 tree by one partial
+            // sum's rounding, and it lets the program translate where it was
+            // refused ("a wave sum of 16-bit floats where not every lane runs": 28
+            // compute_graph_ops:CS_TransposeVecMatMulAlignedOperation).
             if halves {
                 need(self.cur_ir);
             }
-            return Err(WHERE);
+            return Ok(self.half_sum_wide(x));
         }
         let c = self.cur;
         let i32t = self.s.t.i32;
@@ -2023,6 +2031,26 @@ impl<'a> Lower<'a> {
         let total = self.s.m.bin(c, Bin::And, total, low);
         let first = self.s.m.bin(c, Bin::And, lo, high);
         Ok(self.s.m.bin(c, Bin::Or, first, total))
+    }
+
+    /// [`Self::half_sum`] where the wave does not run whole: the low halves
+    /// summed as f32 in one wave operation and rounded once to 16 bits, lane
+    /// 0's high half kept, as the exact sum keeps it.
+    fn half_sum_wide(&mut self, x: V) -> V {
+        let c = self.cur;
+        let (low, high) = (self.s.m.i32(0xFFFF), self.s.m.i32(0xFFFF_0000));
+        let f32t = self.s.t.f32;
+        let h = self.s.m.bin(c, Bin::And, x, low);
+        let f = self.s.op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[h]);
+        let k = self.s.m.i8(0);
+        let sum = self.s.op(c, "waveActiveOp.f32", Attr::NoUnwind, f32t, 119, &[f, k, k]);
+        self.s.flags |= flags::WAVE_OPS;
+        let sum = self.f16_nearest(sum);
+        let zero = self.s.m.i32(0);
+        let first = self.read_lane(x, zero);
+        let first = self.s.m.bin(c, Bin::And, first, high);
+        let sum = self.s.m.bin(c, Bin::And, sum, low);
+        self.s.m.bin(c, Bin::Or, first, sum)
     }
 
     fn run(mut self) -> Result<Lowered, Stop> {
@@ -10866,17 +10894,25 @@ mod tests {
 
     /// Whether a synthetic compute program translates with these input registers.
     fn lowers(words: &[u32], rsrc2: u32) -> Result<(), crate::ShaderError> {
+        lowers_cs(words, rsrc2, false, [1, 1, 1]).map(|_| ())
+    }
+
+    /// [`lowers`] with the wave size and the group's threads given.
+    #[allow(dead_code)]
+    fn lowers_cs(
+        words: &[u32],
+        rsrc2: u32,
+        wave64: bool,
+        threads: [u32; 3],
+    ) -> Result<Lowered, crate::ShaderError> {
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let native = NativeProgram {
             stage: HwStage::Cs,
-            wave64: false,
+            wave64,
             vgprs: 256,
             layout: vec![],
             used: vec![],
-            io: StageIo::Cs(ComputeIo {
-                rsrc2,
-                threads: [1, 1, 1],
-            }),
+            io: StageIo::Cs(ComputeIo { rsrc2, threads }),
             code,
         };
         let p = ir::build(&native.code, false, 256).unwrap();
@@ -10894,8 +10930,8 @@ mod tests {
             prims: vec![],
             mesh_stride: 0,
         })
-        .map(|_| ())
     }
+
 
     /// Lowers a compute program with the root parameters `layout` (in user
     /// SGPRs from s0 on) and the used resources `used`.
