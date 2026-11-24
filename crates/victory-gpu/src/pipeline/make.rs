@@ -78,6 +78,17 @@ impl Pending {
         let took = started.elapsed();
         if took > Duration::from_secs(2) {
             tracing::info!(ms = took.as_millis() as u64, heavy = self.heavy(), shaders = ?self.shaders, "slow host pipeline");
+            // With `VICTORY_DUMP_FAILED=<dir>`: their containers in `slow`,
+            // to find out offline what makes the driver's compile slow.
+            if let Some(dir) = std::env::var_os("VICTORY_DUMP_FAILED") {
+                let dir = std::path::Path::new(&dir).join("slow");
+                for s in &self.shaders {
+                    let file = dir.join(format!("{}-{}.dxbc", s.stage, s.hash));
+                    if !file.exists() {
+                        let _ = std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&file, &s.container));
+                    }
+                }
+            }
         }
         let (lock, done) = &DONE;
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
