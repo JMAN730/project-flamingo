@@ -105,7 +105,39 @@ fn root_wide(root: &Path) -> Vec<u16> {
 /// a virtual drive. The lexical rules are host-independent so CI tests
 /// them; only the mounted drives come from here.
 pub(crate) fn translate(path: &[u16]) -> Option<Vec<u16>> {
-    paths::translate(path, &drives())
+    let first = paths::translate(path, &drives())?;
+    // A drive with a second folder (the package split between the game
+    // files and the exe's folder): a path missing from the first is taken
+    // from the second when it is there.
+    let fallback = FALLBACKS.lock().unwrap_or_else(|e| e.into_inner());
+    if fallback.is_empty() || exists(&first) {
+        return Some(first);
+    }
+    match paths::translate(path, &fallback) {
+        Some(second) if exists(&second) => Some(second),
+        _ => Some(first),
+    }
+}
+
+/// Second folders of drives (see [`mount_fallback`]).
+static FALLBACKS: Mutex<Vec<(u16, Vec<u16>)>> = Mutex::new(Vec::new());
+
+/// Whether the host path `path` (NUL-terminated) names a file or folder.
+fn exists(path: &[u16]) -> bool {
+    use windows_sys::Win32::Storage::FileSystem::{GetFileAttributesW, INVALID_FILE_ATTRIBUTES};
+    // SAFETY: a NUL-terminated wide string.
+    unsafe { GetFileAttributesW(path.as_ptr()) != INVALID_FILE_ATTRIBUTES }
+}
+
+/// Gives the drive `letter` a second host folder: paths missing from its
+/// own root are looked up there (the exe's folder when the game files lie
+/// elsewhere).
+pub fn mount_fallback(letter: char, root: &Path) {
+    let letter = letter.to_ascii_uppercase() as u16;
+    tracing::info!(drive = %char::from_u32(letter.into()).unwrap_or('?'), root = %root.display(), "virtual drive fallback");
+    let mut fallback = FALLBACKS.lock().unwrap_or_else(|e| e.into_inner());
+    fallback.retain(|(l, _)| *l != letter);
+    fallback.push((letter, root_wide(root)));
 }
 
 /// A title's wide path: the host path when it is on a virtual drive, else
