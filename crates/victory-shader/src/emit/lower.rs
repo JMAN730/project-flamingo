@@ -41,6 +41,9 @@ pub(crate) struct Lowered {
     pub has_isnan_op: bool,
     #[cfg(test)]
     pub has_fcmp_uno: bool,
+    /// The props of each heap handle, in creation order.
+    #[cfg(test)]
+    pub handle_props: Vec<(u32, u32)>,
 }
 
 pub(crate) struct Parts<'a> {
@@ -943,6 +946,12 @@ impl<'a> Lower<'a> {
         let has_isnan_op = self.s.m.has_dx_op("dx.op.isSpecialFloat.f32", 8);
         #[cfg(test)]
         let has_fcmp_uno = self.s.m.has_cmp(pred::UNO);
+        #[cfg(test)]
+        let handle_props = {
+            let mut h: Vec<_> = self.handles.iter().map(|(k, v)| (*v, k.4)).collect();
+            h.sort_unstable();
+            h.into_iter().map(|(_, p)| p).collect()
+        };
         Ok(Lowered {
             cmp_samplers,
             root_cbvs,
@@ -954,6 +963,8 @@ impl<'a> Lower<'a> {
             has_isnan_op,
             #[cfg(test)]
             has_fcmp_uno,
+            #[cfg(test)]
+            handle_props,
         })
     }
 
@@ -3120,8 +3131,11 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
-        if matches!(kind, Some(u) if u.kind == ResourceType::Srv) {
-            let h = self.handle(site, src, false, (11, 0))?;
+        // A buffer view read as scalars: raw loads (constant buffers are the
+        // rest). A UAV, known as one or written elsewhere, keeps its kind.
+        let u = self.uav_bits(src, kind);
+        if u != 0 || matches!(kind, Some(k) if k.kind == ResourceType::Srv) {
+            let h = self.handle(site, src, false, (11 | u, 0))?;
             for k in 0..count {
                 let off = self.s.m.i32(4 * k);
                 let a = self.s.m.bin(c, Bin::Add, addr, off);
@@ -3303,10 +3317,9 @@ impl<'a> Lower<'a> {
             let used = self.used_kind(&src);
             let ui: &Inst = &self.x.p.blocks[at.0].insts[at.1];
             let un = ui.name();
-            let uav = un.contains("store")
-                || un.contains("atomic")
-                || used.is_some_and(|u| u.kind == ResourceType::Uav);
-            let u = if uav { 0x1000 } else { 0 };
+            let written = un.contains("store") || un.contains("atomic");
+            let u = self.uav_bits(&src, used) | if written { 0x1000 } else { 0 };
+            let uav = u & 0x1000 != 0;
             let (props, image) = match &ui.fields {
                 Fields::Image { dim, .. } => {
                     let kind = match dim {
@@ -3677,6 +3690,58 @@ impl<'a> Lower<'a> {
                     && u.table_offset_dwords <= dword
             })
             .max_by_key(|u| u.table_offset_dwords)
+    }
+
+    /// The `IsUAV` and `IsGloballyCoherent` bits of every handle of the
+    /// resource descriptor `src`, from all of its uses in the program, not
+    /// only the access at hand: one descriptor read by a load and written by
+    /// a store is one UAV, and both handles must say so. `used` is what the
+    /// root signature says of it (heap descriptors: nothing).
+    ///
+    /// A UAV is globally coherent when some plain access through it has
+    /// `glc` (it skips the per-CU cache, as LLVM's GFX10 memory model lowers
+    /// a device-scope atomic load, to see other groups' writes). On atomics
+    /// `glc` only asks for the old value.
+    fn uav_bits(&self, src: &Source, used: Option<&UsedResource>) -> u32 {
+        let leaves: Vec<(Site, u8)> = src
+            .leaves()
+            .into_iter()
+            .filter_map(|l| match *l {
+                Source::Loaded { load, first } => Some((load, first)),
+                _ => None,
+            })
+            .collect();
+        let same = |other: &Source| {
+            other.leaves().into_iter().any(|l| match *l {
+                Source::Loaded { load, first } => leaves
+                    .iter()
+                    .any(|&(at, f)| f == first && (at == load || self.twin_loads(at, load))),
+                _ => false,
+            }) || other == src
+        };
+        let (mut written, mut coherent) = (false, false);
+        for d in &self.x.res.descriptors {
+            if d.role != Role::Resource || !same(&d.source) {
+                continue;
+            }
+            let i: &Inst = &self.x.p.blocks[d.site.0].insts[d.site.1];
+            let (Fields::Buffer { cache, .. }
+            | Fields::Image { cache, .. }
+            | Fields::Smem { cache, .. }) = &i.fields
+            else {
+                continue;
+            };
+            let n = i.name();
+            let atomic = n.contains("atomic");
+            written |= atomic || n.contains("store");
+            coherent |= cache.glc && !atomic;
+        }
+        let uav = used.map_or(written, |u| u.kind == ResourceType::Uav);
+        match (uav, coherent) {
+            (false, _) => 0,
+            (true, false) => 0x1000,
+            (true, true) => 0x1000 | 0x4000,
+        }
     }
 
     /// A handle for the descriptor `src` read at `site`.
@@ -5914,11 +5979,9 @@ impl<'a> Lower<'a> {
             .copied()
             .ok_or("an untracked image")?;
         let store = name.starts_with("image_store");
-        let uav = store
-            || self
-                .used_kind(src)
-                .is_some_and(|u| u.kind == ResourceType::Uav);
-        let props = (kind | if uav { 0x1000 } else { 0 }, 0x409);
+        let u = self.uav_bits(src, self.used_kind(src)) | if store { 0x1000 } else { 0 };
+        let uav = u & 0x1000 != 0;
+        let props = (kind | u, 0x409);
         if let Some(op) = name.strip_prefix("image_atomic_") {
             // GLC returns the old value. DXIL implements subtraction by adding
             // the two's complement of the operand at the same width.
@@ -5975,7 +6038,7 @@ impl<'a> Lower<'a> {
             } else {
                 original
             };
-            let h = self.handle(site, src, false, (kind | 0x1000, component))?;
+            let h = self.handle(site, src, false, (kind | 0x1000 | u, component))?;
             let mut args = vec![h];
             let (intrinsic, opcode) = if compare {
                 let comparand = if wide {
@@ -6600,8 +6663,8 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
-        let uav = store || atomic.is_some() || used.is_some_and(|u| u.kind == ResourceType::Uav);
-        let u = if uav { 0x1000 } else { 0 };
+        let u = self.uav_bits(src, used) | if store || atomic.is_some() { 0x1000 } else { 0 };
+        let uav = u & 0x1000 != 0;
         let iu = self.s.m.undef(self.s.t.i32);
         if let Some(op) = atomic {
             let d = data.as_ref().ok_or("buffer atomic data")?;
@@ -7448,6 +7511,90 @@ mod tests {
         assert_eq!(refusal(&words), refusal(&direct));
         words[8] = 0xBF07_8000; // read the group id instead; the timestamp is dead
         lowers(&words, group_ids_xy).expect("dead timestamp");
+    }
+
+    /// The props of the heap handles of a compute program whose s4 holds
+    /// the resource heap's address.
+    fn heap_props(words: &[u32]) -> Vec<(u32, u32)> {
+        use crate::native::{RootParam, RootType};
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 256,
+            layout: vec![RootParam {
+                root: RootType::ResourceHeap,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 4,
+                slot: 0,
+            }],
+            used: vec![],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 5 << 1,
+                threads: [1, 1, 1],
+            }),
+            code,
+        };
+        let p = ir::build(&native.code, false, 256).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let lowered = lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+        })
+        .unwrap();
+        lowered.handle_props
+    }
+
+    #[test]
+    fn a_heap_descriptor_written_anywhere_is_a_uav_in_every_access() {
+        const HEAP: [u32; 4] = [
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0 (the heap's first view)
+            0x7E00_0280, // v_mov_b32 v0, 0
+        ];
+        const LOAD: [u32; 2] = [0xE030_1000, 0x8002_0100]; // buffer_load_dword v1, v0, s[8:11], 0 offen
+        const LOAD_GLC: [u32; 2] = [0xE030_5000, 0x8002_0100]; // ... glc
+        const STORE: [u32; 2] = [0xE070_1004, 0x8002_0100]; // buffer_store_dword v1, ... offset:4
+        let program = |body: &[&[u32]]| {
+            let mut w = HEAP.to_vec();
+            body.iter().for_each(|b| w.extend_from_slice(b));
+            w.push(S_ENDPGM);
+            heap_props(&w)
+        };
+        // Read only: a raw SRV, as before.
+        assert_eq!(program(&[&LOAD]), [(0xB, 0)]);
+        // Read and written: one raw UAV, the load's handle included (it was
+        // an SRV handle of the UAV descriptor).
+        assert_eq!(program(&[&LOAD, &STORE]), [(0x100B, 0)]);
+        assert_eq!(program(&[&STORE, &LOAD]), [(0x100B, 0)]);
+        // A glc load of it: globally coherent, in every handle.
+        assert_eq!(program(&[&LOAD_GLC, &STORE]), [(0x500B, 0)]);
+        assert_eq!(program(&[&LOAD, &LOAD_GLC, &STORE]), [(0x500B, 0)]);
+        // glc alone does not make an SRV a UAV.
+        assert_eq!(program(&[&LOAD_GLC]), [(0xB, 0)]);
+        // Scalar reads of a written view: a raw UAV, not a constant buffer.
+        let scalar: [u32; 3] = [
+            0xF420_0304,
+            0xFA00_0000, // s_buffer_load_dword s12, s[8:11], 0
+            0x7E04_020C, // v_mov_b32 v2, s12
+        ];
+        let store_v2: [u32; 2] = [0xE070_1008, 0x8002_0200]; // buffer_store_dword v2, ... offset:8
+        assert_eq!(program(&[&scalar, &store_v2]), [(0x100B, 0)]);
+        // Never written: a constant buffer, as before.
+        let props = program(&[&scalar]);
+        assert_eq!(props, [(13, 0x1_0000)]);
     }
 
     #[test]
