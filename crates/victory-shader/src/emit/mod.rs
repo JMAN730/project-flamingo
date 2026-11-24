@@ -1003,6 +1003,19 @@ mod tests {
             }
         }
     }
+
+    /// v_ldexp_f32, v_frexp_mant_f32 and v_frexp_exp_i32_f32 translate.
+    #[test]
+    fn ldexp_and_frexp_translate() {
+        // v_ldexp_f32 v0, v1, v2
+        translate_stored(&[0xD762_0000, 0x0002_0501]).unwrap();
+        // v_frexp_mant_f32 v0, v1; v_frexp_exp_i32_f32 v0, v1
+        translate_stored(&[0x7E00_8101]).unwrap();
+        translate_stored(&[0x7E00_7F01]).unwrap();
+        // VOP3 forms with |v1| and -v1.
+        translate_stored(&[0xD5C0_0100, 0x0000_0101]).unwrap();
+        translate_stored(&[0xD5BF_0000, 0x2000_0101]).unwrap();
+    }
 }
 
 #[cfg(test)]
