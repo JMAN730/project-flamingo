@@ -516,8 +516,17 @@ fn rename(mut blocks: Vec<Block>, wave64: bool, vgprs: u16) -> Program {
         }
         for inst in &mut block.insts {
             for (reg, v) in &mut inst.reads {
-                *v = current[index(*reg)];
-                debug_assert_ne!(*v, NONE, "{reg:?} read at {:#x}", inst.machine.offset);
+                let mut value = current[index(*reg)];
+                if value == NONE {
+                    // No reaching definition: the hardware's registers start
+                    // at zero (Leonida tools/rdna2spirv.py:15973). Give the
+                    // read a zero-valued entry input instead of leaking NONE
+                    // into the emitter as "a value defined after its use".
+                    value = new_value();
+                    inputs.push((*reg, value));
+                    current[index(*reg)] = value;
+                }
+                *v = value;
             }
             for (reg, v) in &mut inst.writes {
                 *v = new_value();
