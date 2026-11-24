@@ -33,9 +33,21 @@ jobs:
           if ($errors) { $errors | ForEach-Object { Write-Output "::error::try.ps1 line $($_.Extent.StartLineNumber): $($_.Message)" }; exit 1 }
           Write-Output 'try.ps1 parses'
       - name: Clippy
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+        shell: pwsh
+        run: |
+          cargo clippy --workspace --all-targets --locked --message-format=short -- -D warnings 2>&1 | Tee-Object -FilePath clippy.txt
+          $code = $LASTEXITCODE
+          $hits = @(Select-String -CaseSensitive -Path clippy.txt -Pattern ': (error|warning)|^error' | Select-Object -First 60 | ForEach-Object { $_.Line.Trim() })
+          if ($code -ne 0 -and $hits.Count -gt 0) { Write-Output ("::error::" + ($hits -join ' %0A ')) }
+          exit $code
       - name: Clippy, diagnostics build
-        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+        shell: pwsh
+        run: |
+          cargo clippy --workspace --all-targets --all-features --locked --message-format=short -- -D warnings 2>&1 | Tee-Object -FilePath clippy.txt
+          $code = $LASTEXITCODE
+          $hits = @(Select-String -CaseSensitive -Path clippy.txt -Pattern ': (error|warning)|^error' | Select-Object -First 60 | ForEach-Object { $_.Line.Trim() })
+          if ($code -ne 0 -and $hits.Count -gt 0) { Write-Output ("::error::" + ($hits -join ' %0A ')) }
+          exit $code
       # Includes xtask's repository_passes_policy, the asset-policy check.
       - name: Tests
         shell: pwsh
