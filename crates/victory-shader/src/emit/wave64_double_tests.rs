@@ -139,6 +139,11 @@ impl Asm {
 /// v1 when `threads[1] > 1`), 4 root constants in s0..s3, a raw UAV's descriptor in s[8:11]
 /// and 512 bytes of LDS, then `body`.
 fn native(body: &[u32], threads: [u32; 3]) -> NativeProgram {
+    native_lds(body, threads, 512)
+}
+
+/// [`native`] with `lds` bytes of LDS (a multiple of 512).
+fn native_lds(body: &[u32], threads: [u32; 3], lds: u32) -> NativeProgram {
     let mut words = vec![
         0xBE85_0380, // s_mov_b32 s5, 0
         0x3D << 26 | 0x02 << 18 | 8 << 6 | 2,
@@ -180,8 +185,8 @@ fn native(body: &[u32], threads: [u32; 3]) -> NativeProgram {
             slot: 1,
         }],
         io: StageIo::Cs(ComputeIo {
-            // 5 user SGPRs (s0..s4), thread id components, 512 bytes of LDS
-            rsrc2: 5 << 1 | tidig << 11 | 1 << 15,
+            // 5 user SGPRs (s0..s4), thread id components, LDS in 512-byte units
+            rsrc2: 5 << 1 | tidig << 11 | (lds / 512) << 15,
             threads,
         }),
         code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
@@ -538,6 +543,8 @@ fn a_loop_of_different_lengths_per_half_shares_lds_in_lockstep() {
 
 /// 256 threads, 4 console waves. In each wave, lane s0 writes `s1 + t` to LDS dword w (its
 /// wave); `s_barrier`; every lane reads dword `(w + 1) & 3` and stores it with `t << 16`.
+/// Once with LDS to spare, once with all of the host's 32 KiB taken (no dword left for the
+/// counter that hands console threads to host waves: they come from flat thread indices).
 #[test]
 fn several_console_waves_meet_at_the_titles_barrier() {
     let words = Asm::default()
@@ -563,21 +570,23 @@ fn several_console_waves_meet_at_the_titles_barrier() {
         .op(vop2(OR, 3, v(3), 4))
         .op2(store(3, 5, 0))
         .done();
-    let native = native(&words, [256, 1, 1]);
-    let shader = doubled(&native, &["s_barrier", "ds_write_b32"], false);
-    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
-    let s1 = 1000;
-    for s0 in [0u32, 33, 63] {
-        let Some(out) = on_the_card(&shader, [s0, s1, 0, 0], 256) else { return };
-        let want: Vec<u32> = (0..256u32)
-            .map(|t| {
-                let next = ((t >> 6) + 1) & 3;
-                (s1 + 64 * next + s0) | t << 16
-            })
-            .collect();
-        assert_eq!(out, want, "lane {s0} of each wave writes");
+    for lds in [512, 32 * 1024] {
+        let native = native_lds(&words, [256, 1, 1], lds);
+        let shader = doubled(&native, &["s_barrier", "ds_write_b32"], false);
+        let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        let s1 = 1000;
+        for s0 in [0u32, 33, 63] {
+            let Some(out) = on_the_card(&shader, [s0, s1, 0, 0], 256) else { return };
+            let want: Vec<u32> = (0..256u32)
+                .map(|t| {
+                    let next = ((t >> 6) + 1) & 3;
+                    (s1 + 64 * next + s0) | t << 16
+                })
+                .collect();
+            assert_eq!(out, want, "lane {s0} of each wave writes, {lds} bytes of LDS");
+        }
+        eprintln!("ran on the hardware device ({lds} bytes of LDS): 4 console waves, the barrier, every thread id once");
     }
-    eprintln!("ran on the hardware device: 4 console waves, the barrier, every thread id once");
 }
 
 /// A 16 x 16 group (4 console waves): each thread stores `x | y << 8` at its flat index, so

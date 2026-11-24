@@ -960,6 +960,9 @@ thread_local! {
     static DOUBLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// The host's group-shared memory, in dwords (D3D12: 32 KiB a thread group).
+const MAX_LDS_DWORDS: u32 = 32 * 1024 / 4;
+
 /// Runs `f` with a console wave64 compute program on a 32-lane host lowered "doubled": one
 /// host thread runs console lanes `l` and `l + 32` of one console wave, so a host wave of 32
 /// is a whole console wave of 64. `f`'s program must be structured with every per-lane branch
@@ -1320,12 +1323,16 @@ impl<'a> Lower<'a> {
                 // One host thread per pair of console lanes, a host wave per console wave: the
                 // host's group is half the console's, flat (thread ids are made from the console
                 // thread index, `thread_id`). Console threads go to host waves in the order the
-                // waves take them (`wave_base`, one LDS dword).
+                // waves take them (`wave_base`, one LDS dword), where the host's 32 KiB of LDS
+                // has room for that dword; else by the host wave's flat thread indices
+                // (`console_thread`).
                 doubled = Some(cs.threads);
                 s.threads = Some([group / 2, 1, 1]);
                 console_lanes = true;
-                halves = Some(s.lds_dwords);
-                s.lds_dwords += 1;
+                if s.lds_dwords < MAX_LDS_DWORDS {
+                    halves = Some(s.lds_dwords);
+                    s.lds_dwords += 1;
+                }
                 s.wave_size = Some(32);
             }
         }
@@ -3681,10 +3688,21 @@ impl<'a> Lower<'a> {
     fn console_thread(&mut self) -> V {
         let (e, i32t) = (self.s.entry, self.s.t.i32);
         let lane = self.s.op(e, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
-        if self.doubled.is_some()
-            && let Some(base) = self.wave_base()
-        {
+        if self.doubled.is_some() {
             // host wave n (base 32 n) is console wave n: its threads 64 n + 32 half + lane
+            let base = match self.wave_base() {
+                Some(base) => base,
+                None => {
+                    // (no LDS dword to spare) the wave's first flat index, rounded down to 32:
+                    // the host group is flat, and its waves hold aligned runs of 32 indices
+                    // shortcut: as the console-lanes form below assumes; no API promises it
+                    let flat = self.s.op(e, "flattenedThreadIdInGroup.i32", Attr::ReadNone, i32t, 96, &[]);
+                    let first = self.s.op(e, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[flat]);
+                    self.s.flags |= flags::WAVE_OPS;
+                    let mask = self.s.m.i32(!31);
+                    self.s.m.bin(e, Bin::And, first, mask)
+                }
+            };
             let one = self.s.m.i32(1);
             let twice = self.s.m.bin(e, Bin::Shl, base, one);
             let k = self.s.m.i32(32 * self.half);
@@ -4156,7 +4174,7 @@ impl<'a> Lower<'a> {
         let [x, y, _] = self.doubled.or(self.s.threads).expect("compute");
         let e = self.s.entry;
         let i32t = self.s.t.i32;
-        if self.halves.is_some() {
+        if self.halves.is_some() || self.doubled.is_some() {
             let f = self.console_thread();
             self.s.flags |= flags::WAVE_OPS;
             let (xk, yk, xy) = (self.s.m.i32(x), self.s.m.i32(y), self.s.m.i32(x * y));
