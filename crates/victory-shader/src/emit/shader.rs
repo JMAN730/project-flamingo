@@ -440,6 +440,7 @@ impl Shader {
         if passes != 0 {
             self.m.optimise(passes);
             let used = self.m.usage();
+            let has_sv_barycentrics = self.inputs.iter().any(|e| e.kind == 28);
             for (flag, used) in [
                 (flags::WAVE_OPS, used.wave_ops),
                 (flags::INT64, used.int64),
@@ -447,6 +448,10 @@ impl Shader {
                 (flags::RESOURCE_HEAP, used.heap_views),
                 (flags::SAMPLER_HEAP, used.heap_samplers),
                 (flags::ATOMIC_TYPED64 | flags::ATOMIC_HEAP64, used.atomic64),
+                (
+                    flags::BARYCENTRICS,
+                    used.barycentrics || has_sv_barycentrics,
+                ),
             ] {
                 if !used {
                     self.flags &= !flag;

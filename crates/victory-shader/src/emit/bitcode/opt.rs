@@ -69,6 +69,8 @@ pub(crate) struct Usage {
     pub heap_samplers: bool,
     /// A 64-bit atomic.
     pub atomic64: bool,
+    /// An `attributeAtVertex` call (requires `flags::BARYCENTRICS`).
+    pub barycentrics: bool,
 }
 
 /// What makes two instructions without an effect the same value.
@@ -1007,6 +1009,8 @@ impl Module {
                     }
                 } else if name.starts_with("atomic") && name.ends_with(".i64") {
                     u.atomic64 = true;
+                } else if name.starts_with("attributeAtVertex") {
+                    u.barycentrics = true;
                 } else if name.starts_with("textureLoad") || name.starts_with("bufferLoad") {
                     u.typed_uav_loads |= args.get(1).and_then(|&h| annotation(h)).is_none_or(
                         |(kind, components)| kind & 0x1000 != 0 && components >> 8 & 0xff > 1,
