@@ -39,8 +39,7 @@ pub(crate) fn counts() -> (u64, u64) {
 /// What identifies this build: the BLAKE3 of our executable file and of
 /// the translation settings it runs with (the loop and spin-wait limits,
 /// which `VICTORY_SHADER_LOOP_LIMIT` and `VICTORY_SHADER_SPIN_LIMIT` change
-/// at run time, and whether the host device runs 64-lane waves, known once
-/// it is created).
+/// at run time).
 fn build() -> &'static [u8; 32] {
     static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
     BUILD.get_or_init(|| {
@@ -63,7 +62,6 @@ fn build() -> &'static [u8; 32] {
             Ok(mut bytes) => {
                 bytes.extend_from_slice(&limit.to_le_bytes());
                 bytes.extend_from_slice(&spin.to_le_bytes());
-                bytes.push(u8::from(victory_shader::emit::host_wave64()));
                 *blake3::hash(&bytes).as_bytes()
             }
             Err(e) => {
