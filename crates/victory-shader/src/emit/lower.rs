@@ -7235,7 +7235,31 @@ impl<'a> Lower<'a> {
             })
     }
 
+    /// Adds to `read_phis` every phi an incoming value of a read phi. A
+    /// read only marks the phi it takes the value from, so a join feeding
+    /// another join looked unread: a value with no DXIL form then quietly
+    /// became zero (or false) on that edge, and the program translated with
+    /// a different answer. Following the joins makes the reader refuse it,
+    /// as it does for a value read without a join in between.
+    fn follow_phi_reads(&mut self) {
+        let p = self.x.p;
+        let mut queue: Vec<Value> = self.read_phis.iter().copied().collect();
+        while let Some(v) = queue.pop() {
+            let Some(&(b, i)) = self.phi_at.get(&v) else {
+                continue;
+            };
+            for &arg in &p.blocks[b].phis[i].args {
+                if self.phi_at.contains_key(&arg) && self.read_phis.insert(arg) {
+                    queue.push(arg);
+                }
+            }
+        }
+    }
+
     fn fill_phis(&mut self) -> Result<(), Stop> {
+        // A phi read only through another phi is as live as its reader, so
+        // a missing incoming value stays missing (see `follow_phi_reads`).
+        self.follow_phi_reads();
         let p = self.x.p;
         for (v, b, i) in std::mem::take(&mut self.data_phis) {
             let phi = &p.blocks[b].phis[i];
@@ -7362,6 +7386,68 @@ mod tests {
             !lowered.has_fcmp_uno,
             "v_med3_f32 must not emit fcmp uno (folded away by some drivers)"
         );
+    }
+
+    #[test]
+    fn a_missing_value_stays_missing_through_two_live_joins() {
+        /// Whether the compute program translates with the group-id SGPRs
+        /// enabled (`rsrc2 = 3 << 7`).
+        fn lowers(words: &[u32], rsrc2: u32) -> Result<(), crate::ShaderError> {
+            let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let native = NativeProgram {
+                stage: HwStage::Cs,
+                wave64: false,
+                vgprs: 256,
+                layout: vec![],
+                used: vec![],
+                io: StageIo::Cs(ComputeIo {
+                    rsrc2,
+                    threads: [1, 1, 1],
+                }),
+                code,
+            };
+            let p = ir::build(&native.code, false, 256).unwrap();
+            let res = resource::track(&p, &native.layout, native.stage).unwrap();
+            let io = io::raise(&p, &native).unwrap();
+            let st = structure::structure(&p).unwrap();
+            lower(&Parts {
+                native: &native,
+                p: &p,
+                st: &st,
+                io: &io,
+                res: &res,
+                inputs: vec![],
+                outputs: vec![],
+                prims: vec![],
+                mesh_stride: 0,
+            })
+            .map(|_| ())
+        }
+        let mut words = [
+            0xF490_0180,
+            0,           // s_memtime s[6:7]
+            0xBF06_8000, // s_cmp_eq_u32 s0, 0 (s0 = group id X)
+            0xBF85_0001, // skip the first overwrite
+            0xBE86_0380, // s_mov_b32 s6, 0
+            0xBF06_8101, // s_cmp_eq_u32 s1, 1 (s1 = group id Y)
+            0xBF85_0001, // skip the second overwrite
+            0xBE86_0381, // s_mov_b32 s6, 1
+            0xBF07_8006, // s_cmp_lg_u32 s6, 0
+            0xBF85_0001, // use the result to branch
+            0xBE83_0380,
+            S_ENDPGM,
+        ];
+        let group_ids_xy = 3 << 7;
+        // Compare to a read with no joins, so the two agree.
+        let refusal = |code: &[u32]| match lowers(code, group_ids_xy) {
+            Ok(()) => None,
+            Err(crate::ShaderError::Unsupported { what, .. }) => Some(what),
+            Err(error) => panic!("{error}"),
+        };
+        let direct = [&words[..2], &words[8..]].concat();
+        assert_eq!(refusal(&words), refusal(&direct));
+        words[8] = 0xBF07_8000; // read the group id instead; the timestamp is dead
+        lowers(&words, group_ids_xy).expect("dead timestamp");
     }
 
     #[test]
