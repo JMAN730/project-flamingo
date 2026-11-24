@@ -330,7 +330,8 @@ fn translate(
     let Some(dxil) = container.part(FourCC::DXIL).map(|p| p.data) else {
         return t.fail("no DXIL part (SM5 or older)".into(), example);
     };
-    if !lock(seen).insert(blake3::hash(dxil)) && !list {
+    let key = translation_key(&container);
+    if !lock(seen).insert(key) && !list {
         t.duplicates += 1;
         return;
     }
@@ -423,6 +424,18 @@ fn translate(
             }
         }
     }
+}
+
+fn translation_key(container: &Container<'_>) -> blake3::Hash {
+    // Emission reads signatures and pipeline metadata alongside the DXIL.
+    // Parsed parts exclude bytes after a container embedded in another file.
+    let mut hash = blake3::Hasher::new();
+    for part in &container.parts {
+        hash.update(&part.fourcc.0);
+        hash.update(&(part.data.len() as u64).to_le_bytes());
+        hash.update(part.data);
+    }
+    hash.finalize()
 }
 
 /// Validates an emitted shader if asked to.
@@ -679,4 +692,55 @@ fn tally_structured(program: &ir::Program, s: &structure::Structured, t: &mut Ta
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn shader_with_signature(signature: &[u8]) -> Vec<u8> {
+        let mut bytes = vec![0; 40]; // Header and two part offsets.
+        bytes[..4].copy_from_slice(b"DXBC");
+        bytes[20..22].copy_from_slice(&1u16.to_le_bytes());
+        bytes[28..32].copy_from_slice(&2u32.to_le_bytes());
+        let parts = [(b"DXIL", b"synthetic program".as_slice()), (b"ISG1", signature)];
+        for (index, (tag, part)) in parts.into_iter().enumerate() {
+            let offset = bytes.len() as u32;
+            let table = 32 + index * 4;
+            bytes[table..table + 4].copy_from_slice(&offset.to_le_bytes());
+            bytes.extend_from_slice(tag);
+            bytes.extend_from_slice(&(part.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(part);
+        }
+        let size = bytes.len() as u32;
+        bytes[24..28].copy_from_slice(&size.to_le_bytes());
+        bytes
+    }
+
+    #[test]
+    fn translates_distinct_signatures_and_skips_duplicate_parts() {
+        let first = shader_with_signature(b"first signature");
+        let second = shader_with_signature(b"second signature");
+        let mut embedded = first.clone();
+        embedded.extend_from_slice(b"unrelated bytes after the container");
+        let seen = Mutex::new(HashSet::new());
+        let mut tally = Tally::default();
+        let mut checks = Checks {
+            keep: None,
+            validator: None,
+            host: None,
+        };
+        for data in [&first, &second, &embedded] {
+            translate(
+                &Source::Raw { offset: 0, data },
+                Path::new("synthetic"),
+                &seen,
+                &mut tally,
+                &mut checks,
+            );
+        }
+
+        assert_eq!(tally.containers, 3);
+        assert_eq!(tally.duplicates, 1);
+    }
 }
