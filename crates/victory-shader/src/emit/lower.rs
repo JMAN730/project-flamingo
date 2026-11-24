@@ -7714,7 +7714,6 @@ mod tests {
         // Other values with no DXIL form that only joins carry still become
         // zero there, as before (refusing them stopped hundreds of programs
         // that translated, upstream #736): only a direct read refuses.
-        let mut words = words;
         words[8] = 0xBF07_8006; // read s6 again
         words[0..2].copy_from_slice(&[0xBE86_1F00, 0xBF80_0000]); // s_getpc_b64 s[6:7]; s_nop
         let direct = [&words[..2], &words[8..]].concat();
