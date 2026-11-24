@@ -116,13 +116,11 @@ fn event_after(
     // offset is inside it. Only step to the next tick once that instant has
     // passed (review note on #321).
     let mut tick = first + (elapsed / interval) as u64 + extra;
-    let mut at = u128::from(tick - first) * interval + remainder;
-    if at <= elapsed {
+    if u128::from(tick - first) * interval + remainder <= elapsed {
         tick += 1;
-        at += interval;
     }
     tick = tick.max(last + 1);
-    at = u128::from(tick - first) * interval + remainder;
+    let at = u128::from(tick - first) * interval + remainder;
     (tick, at.saturating_sub(elapsed))
 }
 
