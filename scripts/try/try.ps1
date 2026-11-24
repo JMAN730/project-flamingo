@@ -15,7 +15,7 @@
 
 $ErrorActionPreference = 'Continue'
 $ProgressPreference = 'SilentlyContinue'
-$TryVersion = '3.0'
+$TryVersion = '3.1'
 $ForkUrl = 'https://github.com/MfDev0/victory.git'
 $Branch = 'arena/59fabb00-victory'
 # Other places the fork may live (renamed to CAtez, or a backup copy), tried
@@ -40,11 +40,11 @@ function Bad([string]$msg) { Write-Host ('  ' + $msg) -ForegroundColor Red }
 function Load-Config {
     # console: series-x, the profile the fork's base (fxceless/victory-gta6)
     # renders the world with on NVIDIA (RTX 3080, 3070 Ti, 4070).
-    $c = @{ game_dir = ''; game_exe = ''; built_key = ''; added = ''; console = 'series-x'; base = '' }
+    $c = @{ game_dir = ''; game_exe = ''; built_key = ''; added = ''; console = 'series-x'; base = ''; fast = '' }
     if (Test-Path $ConfigPath) {
         try {
             $j = Get-Content -Path $ConfigPath -Raw | ConvertFrom-Json
-            foreach ($k in @('game_dir', 'game_exe', 'built_key', 'added', 'console', 'base')) { if ($j.$k) { $c[$k] = [string]$j.$k } }
+            foreach ($k in @('game_dir', 'game_exe', 'built_key', 'added', 'console', 'base', 'fast')) { if ($j.$k) { $c[$k] = [string]$j.$k } }
         } catch {}
     }
     # Try 3.0 moved to the victory-gta6 base: start once on Series X.
@@ -445,12 +445,28 @@ function Run-Game {
     Say 'To stop: close the game window. (Ctrl+C closes VIctory Try too.)'
     $env:VICTORY_GAME_DIR = $c.game_dir
     $env:RUST_BACKTRACE = '1'
-    # Long shader loops hang the GPU (device hung about 40 s into the world):
-    # leave a loop after 64 turns unless set already (held 30 fps longest).
-    if (-not $env:VICTORY_SHADER_LOOP_LIMIT) { $env:VICTORY_SHADER_LOOP_LIMIT = '64' }
+    # Long shader loops pass the 2 s driver timeout; 256 turns was the
+    # stable middle on an 8 GB RTX 3060 Ti (victory-gta6 #18): 32 makes hair
+    # glow and the scene darker, 1024 lost the device after 7 min.
+    if (-not $env:VICTORY_SHADER_LOOP_LIMIT) { $env:VICTORY_SHADER_LOOP_LIMIT = '256' }
+    # Speed: results land as the card finishes (2-3 fps and stable on that
+    # card). F mode instead sends submissions ahead with card buffers: 4-5 fps
+    # on a 12 GB RTX 4070 (victory-gta6 #27), lost the device sooner on an
+    # 8 GB laptop.
+    $fastVars = @(@('VICTORY_LATE_WAIT', '3'), @('VICTORY_WIDE_BACK', '1'), @('VICTORY_CARD_BUFFERS_MIN_MB', '1'), @('VICTORY_CARD_BUFFERS_MB', '1024'))
+    if ($c.fast -eq '1') {
+        foreach ($kv in $fastVars) { [Environment]::SetEnvironmentVariable($kv[0], $kv[1], 'Process') }
+        [Environment]::SetEnvironmentVariable('VICTORY_RELAY', $null, 'Process')
+        Say 'speed: F mode (late waits, card buffers)   (F switches back)'
+    } else {
+        foreach ($kv in $fastVars) { [Environment]::SetEnvironmentVariable($kv[0], $null, 'Process') }
+        [Environment]::SetEnvironmentVariable('VICTORY_RELAY', '2', 'Process')
+        Say 'speed: relay (stable)   (F switches to the faster, riskier mode)'
+    }
     # The hit-detection program that page-faults the card (upstream #981),
     # skipped as the NVIDIA world runs on victory-gta6 did.
-    if (-not $env:VICTORY_SKIP_PIPELINES) { $env:VICTORY_SKIP_PIPELINES = 'eeed82b877b44b5f' }
+    # And the meshlet culling that hung at load (b83629b90cd2b7bc, #18 there).
+    if (-not $env:VICTORY_SKIP_PIPELINES) { $env:VICTORY_SKIP_PIPELINES = 'eeed82b877b44b5f,b83629b90cd2b7bc' }
     # Its own cache: the old base's pipeline library and shaders do not mix.
     if (-not $env:VICTORY_CACHE_DIR) { $env:VICTORY_CACHE_DIR = Join-Path $TryHome 'cache-gta6' }
     # Shaders that do not translate are saved here (zip and send this folder).
@@ -531,10 +547,14 @@ while ($true) {
     Run-Game
     Write-Host ''
     Say 'Enter = run again    U = update to the newest version and run'
-    Say 'G = change the game paths    C = switch Series S / Series X    Q = quit'
+    Say 'G = change the game paths    C = switch Series S / Series X    F = switch speed mode    Q = quit'
     $k = (Read-Host '  Choice').Trim().ToUpper()
     if ($k -eq 'Q') { exit 0 }
     if ($k -eq 'G') { while (-not (Ask-Game $true)) {} }
+    if ($k -eq 'F') {
+        $script:Config.fast = $(if ($script:Config.fast -eq '1') { '' } else { '1' })
+        Save-Config
+    }
     if ($k -eq 'C') {
         $script:Config.console = $(if ($script:Config.console -eq 'series-s') { 'series-x' } else { 'series-s' })
         Save-Config
