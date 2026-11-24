@@ -65,7 +65,9 @@ pub fn run(
         Some(build) => {
             println!("build          {} ({hash})", build.label);
             if execute {
-                check_startup_archive(&title_dir.join(build.startup_archive))?;
+                let mut dirs = vec![title_dir];
+                dirs.extend(cfg.game_dir.as_deref());
+                check_startup_archive(&dirs, build.startup_archive);
             }
         }
         None => println!("build          unknown ({hash})"),
@@ -168,25 +170,53 @@ pub fn run(
     Ok(())
 }
 
+/// Checks that the build's startup archive is there before running it, in
+/// the exe's folder or the game folder (any letter case). Only a warning:
+/// a stop here kept titles from starting whose packages lay the archive
+/// out differently, and the title reports a missing archive itself.
 #[cfg(windows)]
-fn check_startup_archive(path: &Path) -> Result<()> {
+fn check_startup_archive(dirs: &[&Path], name: &str) {
     use std::io::Read;
 
+    let found = dirs.iter().find_map(|dir| {
+        let exact = dir.join(name);
+        if exact.is_file() {
+            return Some(exact);
+        }
+        std::fs::read_dir(dir).ok()?.flatten().map(|e| e.path()).find(|p| {
+            p.is_file()
+                && p.file_name()
+                    .is_some_and(|f| f.to_string_lossy().eq_ignore_ascii_case(name))
+        })
+    });
+    let Some(path) = found else {
+        let looked: Vec<String> = dirs.iter().map(|d| d.display().to_string()).collect();
+        let rpfs: Vec<String> = dirs
+            .iter()
+            .filter_map(|d| std::fs::read_dir(d).ok())
+            .flat_map(|r| r.flatten())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|f| f.to_ascii_lowercase().ends_with(".rpf"))
+            .take(12)
+            .collect();
+        eprintln!(
+            "warning: startup archive {name} not found in {}; archives there: {}. \
+             Starting anyway; if the title stops, give the folder that holds {name} as the game folder.",
+            looked.join(" or "),
+            if rpfs.is_empty() { "none".to_owned() } else { rpfs.join(", ") }
+        );
+        return;
+    };
     let mut magic = [0; 4];
-    std::fs::File::open(path)
-        .and_then(|mut file| file.read_exact(&mut magic))
-        .with_context(|| {
-            format!(
-                "Cannot read startup archive {}. Check that the file from your package is present and readable.",
-                path.display()
-            )
-        })?;
-    anyhow::ensure!(
-        magic == *b"9FPR",
-        "Invalid RPF9 header in {}. Restore the startup archive from your package.",
-        path.display()
-    );
-    Ok(())
+    let read = std::fs::File::open(&path).and_then(|mut file| file.read_exact(&mut magic));
+    match read {
+        Err(e) => eprintln!("warning: cannot read startup archive {}: {e}", path.display()),
+        Ok(()) if magic != *b"9FPR" => eprintln!(
+            "warning: {} has no RPF9 header: restore it from your package if the title stops",
+            path.display()
+        ),
+        Ok(()) => {}
+    }
 }
 
 /// The debugging aids (README): scheduled stack dumps, watched values and
