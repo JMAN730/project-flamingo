@@ -271,10 +271,11 @@ pub fn run(
     if !pairs.is_empty() {
         let host = Host::new(false).map_err(anyhow::Error::msg)?;
         let kept = lock(&kept);
-        let find = |name: &str| kept.iter().find(|(l, _)| l.contains(name));
         for (v, p) in &pairs {
-            let made = match (find(v), find(p)) {
-                (Some((_, vs)), Some((_, ps))) => if vs.stage == HwStage::Ms {
+            let graphics = find_shader(&kept, v, &[HwStage::Vs, HwStage::Ms]);
+            let pixel = find_shader(&kept, p, &[HwStage::Ps]);
+            let made = match (graphics, pixel) {
+                (Some(vs), Some(ps)) => if vs.stage == HwStage::Ms {
                     host.mesh_pipeline(vs, ps)
                 } else {
                     host.pipeline(vs, ps)
@@ -301,6 +302,17 @@ pub fn run(
         "scan incomplete (traversal errors: {walk_errors})"
     );
     Ok(())
+}
+
+fn find_shader<'a>(
+    shaders: &'a [(String, emit::HostShader)],
+    name: &str,
+    stages: &[HwStage],
+) -> Option<&'a emit::HostShader> {
+    shaders
+        .iter()
+        .find(|(label, shader)| stages.contains(&shader.stage) && label.contains(name))
+        .map(|(_, shader)| shader)
 }
 
 fn translate(
@@ -697,6 +709,19 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pipeline_pair_selects_each_shader_by_stage() {
+        let ps = host::stub_ps();
+        let vs = host::stub_vs(&ps).unwrap();
+        let shaders = [("shared Ps".to_owned(), ps), ("shared Vs".to_owned(), vs)];
+
+        let graphics = find_shader(&shaders, "shared", &[HwStage::Vs, HwStage::Ms]);
+        let pixel = find_shader(&shaders, "shared", &[HwStage::Ps]);
+        assert_eq!(graphics.map(|shader| shader.stage), Some(HwStage::Vs));
+        assert_eq!(pixel.map(|shader| shader.stage), Some(HwStage::Ps));
+        assert!(find_shader(&shaders, "Vs", &[HwStage::Ps]).is_none());
+    }
 
     fn shader_with_signature(signature: &[u8]) -> Vec<u8> {
         let mut bytes = vec![0; 40]; // Header and two part offsets.
