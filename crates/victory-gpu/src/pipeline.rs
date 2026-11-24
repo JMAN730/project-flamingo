@@ -102,6 +102,11 @@ pub(crate) struct Translated {
 
 #[cfg(windows)]
 impl Shader {
+    /// The container's size in bytes.
+    pub(crate) fn size(&self) -> usize {
+        self.container.len()
+    }
+
     /// The translation, made on first use; a shader that does not
     /// translate is logged once.
     pub(crate) fn translated(&self) -> Option<&Translated> {

@@ -66,9 +66,19 @@ impl Pending {
         }
     }
 
+    /// Whether a shader's container is past [`HEAVY_BYTES`].
+    fn heavy(&self) -> bool {
+        self.shaders.iter().any(|s| s.size() > HEAVY_BYTES)
+    }
+
     fn make(&self) {
+        let started = Instant::now();
         self.made
             .get_or_init(|| HostPipeline::new(&self.shaders, self.graphics.as_deref()));
+        let took = started.elapsed();
+        if took > Duration::from_secs(2) {
+            tracing::info!(ms = took.as_millis() as u64, heavy = self.heavy(), shaders = ?self.shaders, "slow host pipeline");
+        }
         let (lock, done) = &DONE;
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         done.notify_all();
@@ -191,9 +201,23 @@ const EARLY: u8 = 1;
 const REQUESTED: u8 = 2;
 const MAKING: u8 = 3;
 
+/// A shader container past this size makes its pipeline heavy: the
+/// world's biggest compute programs (275 of 60-78 KB in Grand Theft Auto
+/// VI's first world frames) each took the RTX 4060's driver ~18 s to
+/// compile. Queued with the rest, they held every worker for minutes while
+/// 1,600 small draw pipelines waited behind them, so the world's draws
+/// were dropped and the picture stayed black.
+const HEAVY_BYTES: usize = 32 * 1024;
+
 struct Queue {
     early: VecDeque<Arc<Pending>>,
     requested: VecDeque<Arc<Pending>>,
+    /// Heavy pipelines, made by at most `heavy_limit` workers at once so
+    /// the others keep making the light ones.
+    heavy_early: VecDeque<Arc<Pending>>,
+    heavy_requested: VecDeque<Arc<Pending>>,
+    heavy_making: usize,
+    heavy_limit: usize,
 }
 
 impl Queue {
@@ -201,6 +225,10 @@ impl Queue {
         Self {
             early: VecDeque::new(),
             requested: VecDeque::new(),
+            heavy_early: VecDeque::new(),
+            heavy_requested: VecDeque::new(),
+            heavy_making: 0,
+            heavy_limit: 1,
         }
     }
 
@@ -212,24 +240,39 @@ impl Queue {
             return None;
         }
         p.queue_state.store(priority, Ordering::Relaxed);
+        let heavy = p.heavy();
         if priority == REQUESTED {
             REQUESTED_WAITING.fetch_add(1, Ordering::Relaxed);
-            self.requested.push_back(p.clone());
+            let lane = if heavy { &mut self.heavy_requested } else { &mut self.requested };
+            lane.push_back(p.clone());
         } else {
-            self.early.push_back(p.clone());
+            let lane = if heavy { &mut self.heavy_early } else { &mut self.early };
+            lane.push_back(p.clone());
         }
         Some(prev == NOT_QUEUED)
     }
 
+    /// The next pipeline to make: light requested ones first, then heavy
+    /// requested ones while a heavy slot is free, then those queued early.
     fn pop(&mut self) -> Option<Arc<Pending>> {
-        let p = self.requested.pop_front().inspect(|_| {
-            REQUESTED_WAITING.fetch_sub(1, Ordering::Relaxed);
-        });
-        let p = p.or_else(|| {
+        fn early(lane: &mut VecDeque<Arc<Pending>>) -> Option<Arc<Pending>> {
             // An early entry can have been promoted and claimed already.
-            std::iter::from_fn(|| self.early.pop_front())
+            std::iter::from_fn(|| lane.pop_front())
                 .find(|p| p.queue_state.load(Ordering::Relaxed) == EARLY)
-        })?;
+        }
+        let heavy_free = self.heavy_making < self.heavy_limit;
+        let requested = |lane: &mut VecDeque<Arc<Pending>>| {
+            lane.pop_front().inspect(|_| {
+                REQUESTED_WAITING.fetch_sub(1, Ordering::Relaxed);
+            })
+        };
+        let p = requested(&mut self.requested)
+            .or_else(|| heavy_free.then(|| requested(&mut self.heavy_requested)).flatten())
+            .or_else(|| early(&mut self.early))
+            .or_else(|| heavy_free.then(|| early(&mut self.heavy_early)).flatten())?;
+        if p.heavy() {
+            self.heavy_making += 1;
+        }
         p.queue_state.store(MAKING, Ordering::Relaxed);
         Some(p)
     }
@@ -272,24 +315,51 @@ fn next() -> Arc<Pending> {
     }
 }
 
-/// Starts the workers (half the logical processors, 2 to 8) on first use.
+/// A worker is done with `p`: frees its heavy slot.
+fn finished(p: &Pending) {
+    if p.heavy() {
+        let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+        queue.heavy_making = queue.heavy_making.saturating_sub(1);
+        AVAILABLE.notify_all();
+    }
+}
+
+/// Starts the workers on first use: two thirds of the logical processors,
+/// 2 to 10, half of them (1 to 3: the driver ran out of memory with six
+/// heavy compiles at once) allowed on heavy pipelines.
 fn workers() -> bool {
     static RUNNING: OnceLock<bool> = OnceLock::new();
     *RUNNING.get_or_init(|| {
         let mut running = false;
-        let workers = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
+        let workers = std::thread::available_parallelism().map_or(2, |n| (n.get() * 2 / 3).clamp(2, 10));
+        let heavy = (workers / 2).clamp(1, 3);
+        QUEUE.lock().unwrap_or_else(|e| e.into_inner()).heavy_limit = heavy;
+        tracing::info!(workers, heavy, "pipeline workers");
         for i in 0..workers {
             let spawned = std::thread::Builder::new()
                 .name(format!("victory-pipelines-{i}"))
                 .spawn(|| {
-                    // Below the title's own threads (loading, recording).
-                    // SAFETY: a plain call on our own thread.
-                    unsafe {
-                        use windows::Win32::System::Threading::*;
-                        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
-                    }
+                    let mut raised = None;
                     loop {
-                        next().make();
+                        let p = next();
+                        // Below the title's own threads (loading, recording)
+                        // unless draws are waiting on a long backlog: the
+                        // title then spins at full load and the workers
+                        // starved (4-9 pipelines a minute in the world).
+                        let raise = REQUESTED_WAITING.load(Ordering::Relaxed) > BACKLOG;
+                        if raised != Some(raise) {
+                            raised = Some(raise);
+                            // SAFETY: a plain call on our own thread.
+                            unsafe {
+                                use windows::Win32::System::Threading::*;
+                                let _ = SetThreadPriority(
+                                    GetCurrentThread(),
+                                    if raise { THREAD_PRIORITY_NORMAL } else { THREAD_PRIORITY_BELOW_NORMAL },
+                                );
+                            }
+                        }
+                        p.make();
+                        finished(&p);
                         if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
                             drained();
                         } else {
@@ -361,5 +431,29 @@ mod tests {
         assert_eq!(queue.push(&promoted, REQUESTED), None);
         assert!(Arc::ptr_eq(&queue.pop().unwrap(), &earlier));
         assert!(queue.pop().is_none());
+    }
+
+    /// Heavy pipelines wait while their slots are taken; light ones and
+    /// those queued early go on past them.
+    #[test]
+    fn heavy_pipelines_do_not_hold_up_light_ones() {
+        let big = super::super::shader("compute", &vec![7u8; HEAVY_BYTES + 1]);
+        let heavy = || Arc::new(Pending::new(vec![big.clone()], None));
+        let (h1, h2) = (heavy(), heavy());
+        let light = Arc::new(Pending::new(Vec::new(), None));
+        let early = Arc::new(Pending::new(Vec::new(), None));
+        let mut queue = Queue::new();
+        assert_eq!(queue.heavy_limit, 1);
+
+        queue.push(&h1, REQUESTED);
+        queue.push(&h2, REQUESTED);
+        queue.push(&early, EARLY);
+        queue.push(&light, REQUESTED);
+        assert!(Arc::ptr_eq(&queue.pop().unwrap(), &light));
+        assert!(Arc::ptr_eq(&queue.pop().unwrap(), &h1));
+        assert!(Arc::ptr_eq(&queue.pop().unwrap(), &early));
+        assert!(queue.pop().is_none(), "the heavy slot is taken");
+        queue.heavy_making -= 1;
+        assert!(Arc::ptr_eq(&queue.pop().unwrap(), &h2));
     }
 }
