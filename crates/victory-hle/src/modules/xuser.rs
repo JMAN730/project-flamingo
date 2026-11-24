@@ -314,8 +314,9 @@ extern "system" fn find_for_device(_: This, _device: *const c_void, _: *mut Hand
 ///
 /// This slot was a `missing` stub (E_NOTIMPL, no output written). The title calls it during
 /// its account init right after XUserAddAsync and dereferences the output regardless, which
-/// is the null read of issue #348 (its second suggestion).
-extern "system" fn get_max_users(_: This, _: Handle, out: *mut u32) -> HRESULT {
+/// is the null read of issue #348 (its second suggestion). `XUserGetMaxUsers` takes only the
+/// output pointer, so the method is `(this, maxUsers)`: no user handle.
+extern "system" fn get_max_users(_: This, out: *mut u32) -> HRESULT {
     put(out, 1)
 }
 
@@ -398,6 +399,16 @@ mod tests {
                 assert_eq!(&name[..used], expected, "component {component}");
             }
         }
+    }
+
+    /// `XUserGetMaxUsers(uint32_t*)`: the output is the first argument after
+    /// `this`, with no user handle before it.
+    #[test]
+    fn maximum_users_writes_through_the_first_argument() {
+        type MaxUsers = extern "system" fn(This, *mut u32) -> HRESULT;
+        let mut max = 0;
+        assert_eq!(slot::<MaxUsers>(&OBJECT, 0x30)(&OBJECT, &mut max), S_OK);
+        assert_eq!(max, 1);
     }
 
     #[test]
