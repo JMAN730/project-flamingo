@@ -214,7 +214,7 @@ pub(crate) fn segments(this: This) -> Vec<Segment> {
 
 /// The host list behind a title list, if there is a host GPU.
 #[cfg(windows)]
-fn host_list(this: This) -> Option<std::sync::Arc<crate::host::HostList>> {
+pub(crate) fn host_list(this: This) -> Option<std::sync::Arc<crate::host::HostList>> {
     if this.is_null() {
         return None;
     }
@@ -1355,6 +1355,13 @@ extern "system" fn allocate_upload(this: This, size: u64, alignment: u64) -> *mu
 /// arguments, nothing returned.
 extern "system" fn ignored_state(_: This) {}
 
+extern "system" fn depth_bounds(this: This, min: f32, max: f32) {
+    #[cfg(windows)]
+    with_state(this, |list, s| s.set_depth_bounds(list, min, max));
+    #[cfg(not(windows))]
+    let _ = (this, min, max);
+}
+
 /// The title's draw state (decision 0007, step 3), kept for its draws or
 /// set on the host list at once. Without a host GPU these do nothing.
 #[cfg(windows)]
@@ -1869,7 +1876,7 @@ const METHODS: [(usize, *const ()); 53] = [
     (55, discard_resource as *const ()),          // 0x1b8
     (59, execute_indirect as *const ()),          // 0x1d8 indirect
     (60, copy_memory as *const ()),               // 0x1e0
-    (68, ignored_state as *const ()),             // 0x220 depth bounds
+    (68, depth_bounds as *const ()),              // 0x220
     (69, write32 as *const ()),                   // 0x228
     (70, write64 as *const ()),                   // 0x230
     (71, wait32 as *const ()),                    // 0x238, 32 bits

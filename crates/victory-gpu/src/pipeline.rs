@@ -736,3 +736,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(all(test, windows))]
+mod depth_bounds_test;
