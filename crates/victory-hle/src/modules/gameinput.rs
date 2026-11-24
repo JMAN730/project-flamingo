@@ -342,8 +342,12 @@ struct State {
     running: Vec<(u64, ThreadId)>,
     /// Events waiting for the single delivery loop.
     queue: VecDeque<Event>,
-    /// One thread drains `queue`; other producers only append.
-    delivering: bool,
+    /// The one thread draining `queue`; other producers only append.
+    deliverer: Option<ThreadId>,
+    /// Events ever queued, and how many of them have run or been skipped:
+    /// a blocking enumeration waits until its own events are done.
+    queued: u64,
+    delivered: u64,
 }
 
 pub struct Hub {
@@ -389,7 +393,9 @@ impl Hub {
                 pending: Vec::new(),
                 running: Vec::new(),
                 queue: VecDeque::new(),
-                delivering: false,
+                deliverer: None,
+                queued: 0,
+                delivered: 0,
             }),
             returned: Condvar::new(),
         }));
@@ -436,24 +442,31 @@ impl Hub {
     /// callback joins the same queue instead of nesting. One unregistered
     /// since the event was queued does not run, and `UnregisterCallback`
     /// waits for one that runs.
-    fn deliver(&self, events: Vec<Event>) {
-        {
-            let mut state = self.state();
-            state.queue.extend(events);
-            if state.delivering {
-                return;
-            }
-            state.delivering = true;
-        }
+    ///
+    /// Returns how many events had been queued once these were: when
+    /// `delivered` reaches it, they are done. If another thread is already
+    /// delivering, these run there and this returns at once.
+    fn deliver(&self, events: Vec<Event>) -> u64 {
         let me = std::thread::current().id();
+        let target = {
+            let mut state = self.state();
+            state.queued += events.len() as u64;
+            state.queue.extend(events);
+            let target = state.queued;
+            if state.deliverer.is_some() {
+                return target;
+            }
+            state.deliverer = Some(me);
+            target
+        };
         loop {
             let e = {
                 let mut state = self.state();
                 match state.queue.pop_front() {
                     Some(e) => e,
                     None => {
-                        state.delivering = false;
-                        return;
+                        state.deliverer = None;
+                        return target;
                     }
                 }
             };
@@ -461,6 +474,8 @@ impl Hub {
             {
                 let mut state = self.state();
                 if !state.callbacks.iter().any(|c| c.token == r.token) {
+                    state.delivered += 1;
+                    self.returned.notify_all();
                     continue;
                 }
                 state.running.push((r.token, me));
@@ -477,7 +492,23 @@ impl Hub {
             if let Some(i) = state.running.iter().position(|&x| x == (r.token, me)) {
                 state.running.swap_remove(i);
             }
+            state.delivered += 1;
             self.returned.notify_all();
+        }
+    }
+
+    /// Waits until the events counted up to `target` have run on the
+    /// delivering thread. Called from that thread itself (a callback that
+    /// registers), they are queued behind it and cannot run first, so this
+    /// returns rather than deadlock.
+    fn wait_delivered(&self, target: u64) {
+        let me = std::thread::current().id();
+        let mut state = self.state();
+        while state.delivered < target && state.deliverer.is_some_and(|t| t != me) {
+            state = self
+                .returned
+                .wait(state)
+                .unwrap_or_else(PoisonError::into_inner);
         }
     }
 
@@ -828,7 +859,12 @@ extern "system" fn register_device(
         // SAFETY: checked non-null.
         unsafe { out.write(registration.token) };
     }
-    hub.deliver(found);
+    // A blocking enumeration's callbacks have all run before registration
+    // returns, even when another thread is delivering and runs them.
+    let target = hub.deliver(found);
+    if enumeration != 0 && enumeration != ASYNC_ENUMERATION {
+        hub.wait_delivered(target);
+    }
     S_OK
 }
 /// Guide button and keyboard layout callbacks: neither ever changes here.
@@ -1907,6 +1943,96 @@ mod tests {
             CALLS.load(Ordering::SeqCst) >= 2,
             "initial and hotplug both ran"
         );
+    }
+
+    /// A blocking enumeration registered while the poll thread is inside a
+    /// callback has its callbacks run there, and registration waits for them.
+    #[test]
+    fn blocking_enumeration_waits_while_another_thread_delivers() {
+        use std::sync::atomic::AtomicBool;
+        static HELD: AtomicU32 = AtomicU32::new(0);
+        static SEEN: AtomicU32 = AtomicU32::new(0);
+        static RELEASE: AtomicBool = AtomicBool::new(false);
+        extern "system" fn hold(_: u64, _: *mut c_void, _: *const Device, _: u64, _: u32, _: u32) {
+            HELD.fetch_add(1, Ordering::SeqCst);
+            while !RELEASE.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        extern "system" fn seen(_: u64, _: *mut c_void, _: *const Device, _: u64, _: u32, _: u32) {
+            SEEN.fetch_add(1, Ordering::SeqCst);
+        }
+        type Register = extern "system" fn(
+            This,
+            *const Device,
+            u32,
+            u32,
+            u32,
+            *mut c_void,
+            Option<DeviceCallback>,
+            *mut u64,
+        ) -> HRESULT;
+        let (hub, host) = fake();
+        let register = slot::<Register, _>(&hub.object, 0x48);
+        HELD.store(0, Ordering::SeqCst);
+        SEEN.store(0, Ordering::SeqCst);
+        RELEASE.store(false, Ordering::SeqCst);
+        let mut token = 0;
+        let no_context = std::ptr::null_mut();
+        let any_device = std::ptr::null();
+        assert_eq!(
+            register(
+                &hub.object,
+                any_device,
+                GAMEPAD_KIND,
+                1,
+                0,
+                no_context,
+                Some(hold),
+                &mut token
+            ),
+            S_OK
+        );
+        // Plugging a pad in runs `hold` on the poll thread, which stays in it.
+        let poller = std::thread::spawn(move || {
+            host.lock().unwrap().pads[1] = Some(PadState::default());
+            hub.poll();
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while HELD.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_ne!(
+            HELD.load(Ordering::SeqCst),
+            0,
+            "the poll thread is delivering"
+        );
+        let registrar = std::thread::spawn(move || {
+            let mut token = 0;
+            let any_device = std::ptr::null();
+            let r = register(
+                &hub.object,
+                any_device,
+                GAMEPAD_KIND,
+                1,
+                2,
+                std::ptr::null_mut(),
+                Some(seen),
+                &mut token,
+            );
+            (r, SEEN.load(Ordering::SeqCst))
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            !registrar.is_finished(),
+            "registration waits for its callbacks"
+        );
+        assert_eq!(SEEN.load(Ordering::SeqCst), 0);
+        RELEASE.store(true, Ordering::SeqCst);
+        let (r, seen_at_return) = registrar.join().unwrap();
+        assert_eq!(r, S_OK);
+        assert_ne!(seen_at_return, 0, "its callbacks ran before it returned");
+        poller.join().unwrap();
     }
 
     #[test]
