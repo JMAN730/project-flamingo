@@ -425,8 +425,8 @@ fn format_eta(secs: u64) -> String {
 /// sizes: a start that builds pipelines reads them, a run adds to them.
 /// Reported after a run (`apps/victory/src/run.rs`).
 pub fn report_shader_caches() {
-    for (what, dir) in shader_cache_dirs() {
-        match size(&dir) {
+    for (what, dir) in victory_pipeline::caches::dirs() {
+        match victory_pipeline::caches::size(&dir) {
             Some((files, bytes)) => tracing::info!(
                 cache = what,
                 dir = %dir.display(),
@@ -437,55 +437,6 @@ pub fn report_shader_caches() {
             None => tracing::info!(cache = what, dir = %dir.display(), "shader cache: no folder"),
         }
     }
-}
-
-/// Where RADV and vkd3d-proton keep their shader caches, as asked for by
-/// their own variables first and by the usual folders after.
-fn shader_cache_dirs() -> Vec<(&'static str, std::path::PathBuf)> {
-    let env = |name: &str| std::env::var_os(name).map(std::path::PathBuf::from);
-    let home = env("HOME").or_else(|| env("USERPROFILE"));
-    let cache = match env("XDG_CACHE_HOME") {
-        Some(dir) => dir,
-        None => home.as_ref().map_or_else(std::path::PathBuf::new, |h| h.join(".cache")),
-    };
-    let radv = env("MESA_SHADER_CACHE_DIR").unwrap_or_else(|| cache.join("mesa_shader_cache"));
-    // vkd3d-proton's: its own variable first, then the folder it writes to
-    // (Windows builds use LOCALAPPDATA, Wine's a cache folder).
-    let local = cache.join("vkd3d-proton");
-    let windows = env("LOCALAPPDATA").map(|d| d.join("vkd3d-proton"));
-    let vkd3d = env("VKD3D_SHADER_CACHE_PATH")
-        .or_else(|| {
-            std::iter::once(local.as_path())
-                .chain(windows.as_deref())
-                .find(|d| d.is_dir())
-                .map(|d| d.to_owned())
-        })
-        .unwrap_or(local);
-    vec![("RADV (mesa_shader_cache)", radv), ("vkd3d-proton", vkd3d)]
-}
-
-/// Files and bytes under `dir`, two levels deep (`None` if it does not
-/// exist).
-fn size(dir: &Path) -> Option<(u64, u64)> {
-    fn walk(dir: &Path, depth: u8, files: &mut u64, bytes: &mut u64) -> std::io::Result<()> {
-        for entry in std::fs::read_dir(dir)? {
-            let Ok(entry) = entry else { continue };
-            let Ok(kind) = entry.file_type() else { continue };
-            if kind.is_dir() && depth > 0 {
-                walk(&entry.path(), depth - 1, files, bytes)?;
-            } else if kind.is_file() {
-                *files += 1;
-                *bytes += entry.metadata().map_or(0, |m| m.len());
-            }
-        }
-        Ok(())
-    }
-    if !dir.is_dir() {
-        return None;
-    }
-    let (mut files, mut bytes) = (0, 0);
-    walk(dir, 1, &mut files, &mut bytes).ok()?;
-    Some((files, bytes))
 }
 
 /// A small window whose title is the progress; closing it stops the
