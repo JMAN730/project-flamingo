@@ -908,7 +908,15 @@ impl State {
             let (Some(host), Some(index)) = (heap.host(), heap.index(end)) else {
                 continue;
             };
-            if index >= host.count() {
+            // A buffer view off its elements in the host copy is copied
+            // into scratch memory, which a fresh slot views (#986).
+            if index >= host.count()
+                || (u.kind == ResourceType::Srv
+                    && crate::descriptor::view(end)
+                        .as_ref()
+                        .and_then(crate::descriptor::host::unaligned_srv)
+                        .is_some())
+            {
                 fresh.push(u.slot);
             }
         }
@@ -993,9 +1001,27 @@ impl State {
                         host.constant_at(index, gpu, size);
                     }
                     Some(view) => {
-                        host.make_at(index, &view);
-                        if let Some(u) = used {
-                            self.depth_sampled |= readable(list, u, &view, read_only_depth);
+                        if let Some((src, len, align, mut desc)) =
+                            crate::descriptor::host::unaligned_srv(&view)
+                        {
+                            // The elements copied at submission into
+                            // element-aligned scratch memory the list keeps.
+                            // shortcut: from title memory, so GPU writes to
+                            // the buffer earlier in the submission are not
+                            // seen.
+                            if let Some((buffer, at, to)) = list.scratch_aligned(len, align) {
+                                list.defer_fill(to, src as *const u8, len as usize);
+                                // A buffer view (unaligned_srv checks).
+                                desc.Anonymous.Buffer.FirstElement = at / align;
+                                host.srv_at(index, &buffer, &desc);
+                            } else {
+                                host.make_null(index);
+                            }
+                        } else {
+                            host.make_at(index, &view);
+                            if let Some(u) = used {
+                                self.depth_sampled |= readable(list, u, &view, read_only_depth);
+                            }
                         }
                     }
                     None => {

@@ -1425,18 +1425,36 @@ impl HostList {
     /// `len` bytes of upload memory (256-byte aligned) until the list is
     /// reset: the host GPU address and the CPU pointer.
     pub(crate) fn scratch(&self, len: u64) -> Option<(u64, *mut u8)> {
+        let (_, at, gpu, data) = self.scratch_in(len.max(1).next_multiple_of(256), 256)?;
+        Some((gpu + at, data))
+    }
+
+    /// `len` bytes of upload memory aligned to `align` (within its buffer)
+    /// until the list is reset: the buffer, the offset in it and the CPU
+    /// pointer.
+    pub(crate) fn scratch_aligned(
+        &self,
+        len: u64,
+        align: u64,
+    ) -> Option<(ID3D12Resource, u64, *mut u8)> {
+        let (buffer, at, _, data) = self.scratch_in(len.max(1), align.max(1))?;
+        Some((buffer, at, data))
+    }
+
+    /// Scratch memory: the buffer, the offset in it, the buffer's GPU
+    /// address and the CPU pointer at the offset.
+    fn scratch_in(&self, len: u64, align: u64) -> Option<(ID3D12Resource, u64, u64, *mut u8)> {
         let host = host()?;
         let mut s = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
-        let len = len.max(1).next_multiple_of(256);
         if len > SCRATCH_CHUNK {
             let (buffer, data) = host.upload_buffer(len)?;
             name(&buffer, || format!("list scratch {len:#x}"));
             // SAFETY: a live buffer.
             let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-            self.deferred().uploads.push(buffer);
-            return Some((gpu, data));
+            self.deferred().uploads.push(buffer.clone());
+            return Some((buffer, 0, gpu, data));
         }
-        if s.used + len > SCRATCH_CHUNK && s.current < s.chunks.len() {
+        if s.used.next_multiple_of(align) + len > SCRATCH_CHUNK && s.current < s.chunks.len() {
             (s.current, s.used) = (s.current + 1, 0);
         }
         if s.current == s.chunks.len() {
@@ -1447,10 +1465,11 @@ impl HostList {
             s.chunks.push((buffer, data as usize, gpu));
             s.used = 0;
         }
+        let buffer = s.chunks[s.current].0.clone();
         let (_, data, gpu) = s.chunks[s.current];
-        let at = s.used;
-        s.used += len;
-        Some((gpu + at, (data + at as usize) as *mut u8))
+        let at = s.used.next_multiple_of(align);
+        s.used = at + len;
+        Some((buffer, at, gpu, (data + at as usize) as *mut u8))
     }
 
     /// The CPU-only UAV slot used when recording a clear. D3D12 uses
