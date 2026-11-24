@@ -55,12 +55,6 @@ runs the newer one, so fixes to VIctory Try itself need no new download.
    - **Enter**: run again;
    - **U**: update to the newest version and run;
    - **G**: change the game paths;
-   - **O**: switch between this fork and the official VIctory
-     (Marvisak/VIctory main, built unchanged, exactly as its README says:
-     `cargo build --release -p victory`, then
-     `victory.exe run <game dir>\<the title's exe> --execute`). Official
-     VIctory reads the game files from the exe's folder, so there the exe
-     must sit with the `.rpf` files;
    - **Q**: quit.
 
 ## Requirements

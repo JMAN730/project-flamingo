@@ -15,7 +15,7 @@
 
 $ErrorActionPreference = 'Continue'
 $ProgressPreference = 'SilentlyContinue'
-$TryVersion = '1.5'
+$TryVersion = '1.6'
 $ForkUrl = 'https://github.com/MfDev0/victory.git'
 $Branch = 'arena/59fabb00-victory'
 $UpstreamUrl = 'https://github.com/Marvisak/VIctory.git'
@@ -34,11 +34,11 @@ function Step([string]$msg) { Write-Host ''; Write-Host ('== ' + $msg) -Foregrou
 function Bad([string]$msg) { Write-Host ('  ' + $msg) -ForegroundColor Red }
 
 function Load-Config {
-    $c = @{ game_dir = ''; game_exe = ''; built_key = ''; added = ''; flavor = 'fork' }
+    $c = @{ game_dir = ''; game_exe = ''; built_key = ''; added = '' }
     if (Test-Path $ConfigPath) {
         try {
             $j = Get-Content -Path $ConfigPath -Raw | ConvertFrom-Json
-            foreach ($k in @('game_dir', 'game_exe', 'built_key', 'added', 'flavor')) { if ($j.$k) { $c[$k] = [string]$j.$k } }
+            foreach ($k in @('game_dir', 'game_exe', 'built_key', 'added')) { if ($j.$k) { $c[$k] = [string]$j.$k } }
         } catch {}
     }
     return $c
@@ -254,9 +254,7 @@ function Update-Source {
     $fork = (G rev-parse -q --verify refs/remotes/origin/fork) | Select-Object -First 1
     if (-not $fork) { Bad "the source download is broken: delete the victory folder in $TryHome and start again"; return $null }
     $up = (G rev-parse -q --verify refs/remotes/upstream/main) | Select-Object -First 1
-    # Which VIctory: this fork (with upstream's new fixes) or the official one
-    # (upstream main exactly as it is).
-    $key = "$($script:Config.flavor):$fork+$up"
+    $key = "fork:$fork+$up"
     if (($key -eq $script:Config.built_key) -and (Test-Path (Victory-Exe))) {
         Say 'no changes since last time'
         return $false
@@ -270,17 +268,6 @@ function Update-Source {
 # $script:Added (returned arrays: an empty one counted as one fix).
 function Prepare-Source([bool]$withUpstream) {
     $null = G cherry-pick --abort
-    if ($script:Config.flavor -eq 'official') {
-        $script:Added = @()
-        $up = (G rev-parse -q --verify refs/remotes/upstream/main) | Select-Object -First 1
-        if (-not $up) { Bad 'official VIctory could not be downloaded: building this fork instead'; $script:Config.flavor = 'fork' }
-        else {
-            Say 'building the official VIctory (Marvisak/VIctory main), unchanged'
-            $null = G checkout -q -f -B try refs/remotes/upstream/main
-            $null = G clean -fdq
-            return
-        }
-    }
     $null = G checkout -q -f -B try refs/remotes/origin/fork
     $null = G clean -fdq
     $added = @()
@@ -381,15 +368,9 @@ function Run-Game {
     $c = $script:Config
     Step 'Running the game with VIctory'
     Say "game: $($c.game_exe)"
-    if ($c.flavor -eq 'official') {
-        $build = (G log -1 --format='%h %s' refs/remotes/upstream/main) | Select-Object -First 1
-        if ($build) { Say "VIctory: OFFICIAL (Marvisak/VIctory main) at $build" }
-        Say 'official VIctory reads the game files from the exe''s folder: the exe must sit with the .rpf files'
-    } else {
-        $build = (G log -1 --format='%h %s' refs/remotes/origin/fork) | Select-Object -First 1
-        if ($build) { Say "VIctory: fork at $build" }
-        if ($c.added) { Say "plus upstream: $(@($c.added -split "`n").Count) new fix(es) on top" }
-    }
+    $build = (G log -1 --format='%h %s' refs/remotes/origin/fork) | Select-Object -First 1
+    if ($build) { Say "VIctory: fork at $build" }
+    if ($c.added) { Say "plus upstream: $(@($c.added -split "`n").Count) new fix(es) on top" }
     Say "command: victory.exe run `"$($c.game_exe)`" --execute   (VICTORY_GAME_DIR=$($c.game_dir))"
     Say 'To stop: close the game window. (Ctrl+C closes VIctory Try too.)'
     $env:VICTORY_GAME_DIR = $c.game_dir
@@ -467,24 +448,9 @@ while ($true) {
     Run-Game
     Write-Host ''
     Say 'Enter = run again    U = update to the newest version and run'
-    if ($script:Config.flavor -eq 'official') { $other = 'this fork' } else { $other = 'the official VIctory' }
-    Say "G = change the game paths    O = switch to $other    Q = quit"
+    Say 'G = change the game paths    Q = quit'
     $k = (Read-Host '  Choice').Trim().ToUpper()
     if ($k -eq 'Q') { exit 0 }
-    if ($k -eq 'O') {
-        if ($script:Config.flavor -eq 'official') { $script:Config.flavor = 'fork' } else { $script:Config.flavor = 'official' }
-        Save-Config
-        Say "now using: $($script:Config.flavor)"
-        $changed = Update-Source
-        if (-not (Build-All)) {
-            Bad 'that build failed: switching back to this fork'
-            $script:Config.flavor = 'fork'
-            Save-Config
-            $changed = Update-Source
-            if ($changed -or -not (Test-Path (Victory-Exe))) { $null = Build-All }
-        }
-        continue
-    }
     if ($k -eq 'G') { while (-not (Ask-Game $true)) {} }
     if ($k -eq 'U') {
         $changed = Update-Source
