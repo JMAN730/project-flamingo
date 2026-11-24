@@ -377,6 +377,10 @@ pub(crate) struct Stage {
     pub(crate) shader: Arc<Shader>,
     /// The root parameter of its user data, and its size in dwords.
     pub(crate) user_data: Option<(u32, u32)>,
+    /// Its user data is a root CBV of upload memory, not root constants:
+    /// the signature would cost more than the host's 64 dwords otherwise
+    /// (see [`fit_root_signature`]).
+    pub(crate) user_data_cbv: bool,
     /// Root parameters of its root views: (title root parameter, ours).
     pub(crate) root_cbvs: Vec<(u8, u32)>,
     pub(crate) root_srvs: Vec<(u8, u32)>,
@@ -483,6 +487,7 @@ impl HostPipeline {
             let mut stage = Stage {
                 shader: shader.clone(),
                 user_data: None,
+                user_data_cbv: false,
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
                 root_uavs: Vec::new(),
@@ -595,13 +600,15 @@ impl HostPipeline {
             }
             bound.push(stage);
         }
-        let (root, root_blob) = match root_signature(&host.device, &params, &samplers, compute.is_some()) {
-            Ok(root) => root,
-            Err(e) => {
-                tracing::warn!(error = %e, ?shaders, "host root signature refused");
-                return None;
-            }
-        };
+        fit_root_signature(&mut params, &mut bound);
+        let (root, root_blob) =
+            match root_signature(&host.device, &params, &samplers, compute.is_some()) {
+                Ok(root) => root,
+                Err(e) => {
+                    tracing::warn!(error = %e, ?shaders, "host root signature refused");
+                    return None;
+                }
+            };
         let code = |i: usize| {
             stages.get(i).and_then(|(s, _)| s.translated()).map_or(
                 D3D12_SHADER_BYTECODE::default(),
@@ -938,6 +945,66 @@ fn code_bytes(code: &D3D12_SHADER_BYTECODE) -> Vec<u8> {
     unsafe { std::slice::from_raw_parts(code.pShaderBytecode.cast::<u8>(), code.BytecodeLength) }.to_vec()
 }
 
+/// The most a host root signature may cost, in dwords.
+const MAX_ROOT_COST: u32 = 64;
+
+/// What a root parameter costs in the host's 64 dwords.
+fn root_param_cost(p: &D3D12_ROOT_PARAMETER1) -> u32 {
+    match p.ParameterType {
+        // SAFETY: the member the type names.
+        D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS => unsafe { p.Anonymous.Constants.Num32BitValues },
+        D3D12_ROOT_PARAMETER_TYPE_CBV
+        | D3D12_ROOT_PARAMETER_TYPE_SRV
+        | D3D12_ROOT_PARAMETER_TYPE_UAV => 2,
+        _ => 1,
+    }
+}
+
+/// Fits the signature in the host's 64 dwords: a pipeline whose stages'
+/// user data and root views cost more (a pixel shader with 40 dwords of
+/// user data after a vertex shader with 20, say) was refused, and every
+/// draw with it dropped. The largest user data block moves to a root CBV
+/// (2 dwords; the shader reads `b0` the same either way) until it fits.
+/// Idea from upstream #644 (6fa53a51).
+fn fit_root_signature(params: &mut [D3D12_ROOT_PARAMETER1], stages: &mut [Stage]) {
+    let user: Vec<_> = stages.iter().map(|s| s.user_data).collect();
+    for i in spill_user_data(params, &user) {
+        stages[i].user_data_cbv = true;
+    }
+}
+
+/// The stages (indices into `user`, each stage's user data parameter and
+/// dwords) whose user data [`fit_root_signature`] moves to a root CBV,
+/// changing their parameters in `params`.
+fn spill_user_data(params: &mut [D3D12_ROOT_PARAMETER1], user: &[Option<(u32, u32)>]) -> Vec<usize> {
+    let mut spilled = Vec::new();
+    while params.iter().map(root_param_cost).sum::<u32>() > MAX_ROOT_COST {
+        let Some((i, param)) = user
+            .iter()
+            .enumerate()
+            .filter(|(i, u)| !spilled.contains(i) && u.is_some_and(|(_, n)| n > 2))
+            .max_by_key(|(i, u)| (u.map_or(0, |(_, n)| n), std::cmp::Reverse(*i)))
+            .and_then(|(i, u)| Some((i, u.as_ref()?.0)))
+        else {
+            break;
+        };
+        let visibility = params[param as usize].ShaderVisibility;
+        params[param as usize] = D3D12_ROOT_PARAMETER1 {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_CBV,
+            Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                    ShaderRegister: 0,
+                    RegisterSpace: USER_DATA_SPACE,
+                    Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_STATIC,
+                },
+            },
+            ShaderVisibility: visibility,
+        };
+        spilled.push(i);
+    }
+    spilled
+}
+
 fn root_signature(
     device: &ID3D12Device,
     params: &[D3D12_ROOT_PARAMETER1],
@@ -987,6 +1054,41 @@ fn root_signature(
 
 #[cfg(test)]
 mod tests {
+
+    /// Over 64 dwords, the largest user data blocks become root CBVs until
+    /// the signature fits; under it nothing changes.
+    #[test]
+    fn oversized_root_signatures_spill_user_data() {
+        let constants = |n| D3D12_ROOT_PARAMETER1 {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+            Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                Constants: D3D12_ROOT_CONSTANTS {
+                    ShaderRegister: 0,
+                    RegisterSpace: USER_DATA_SPACE,
+                    Num32BitValues: n,
+                },
+            },
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+        };
+        let cbv = D3D12_ROOT_PARAMETER1 {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_CBV,
+            ..Default::default()
+        };
+        let cost = |p: &[D3D12_ROOT_PARAMETER1]| p.iter().map(root_param_cost).sum::<u32>();
+        // VS 20 + 2 root CBVs, PS 40: 64 + 4.
+        let mut params = vec![constants(20), cbv, cbv, constants(40)];
+        assert_eq!(cost(&params), 64);
+        assert!(spill_user_data(&mut params, &[Some((0, 20)), Some((3, 40))]).is_empty());
+        params.push(cbv);
+        assert_eq!(spill_user_data(&mut params, &[Some((0, 20)), Some((3, 40))]), [1]);
+        assert_eq!(params[3].ParameterType, D3D12_ROOT_PARAMETER_TYPE_CBV);
+        assert_eq!(params[0].ParameterType, D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS);
+        assert_eq!(cost(&params), 28);
+        // Both, when one is not enough.
+        let mut params = vec![constants(63), constants(63)];
+        assert_eq!(spill_user_data(&mut params, &[Some((0, 63)), Some((1, 63))]), [0, 1]);
+        assert_eq!(cost(&params), 4);
+    }
     use std::path::{Path, PathBuf};
     use std::sync::atomic::Ordering;
 

@@ -935,12 +935,33 @@ impl State {
                         None => self.user_value(compute, u.slot, u.root, u.dword),
                     };
                 }
-                // SAFETY: an open list; `values` covers the parameter.
-                unsafe {
-                    if compute {
-                        l.SetComputeRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
+                if stage.user_data_cbv {
+                    // Spilled (see the host root signature): the values in
+                    // upload memory the list keeps until it is reset.
+                    if let Some((gpu, to)) = list.scratch(u64::from(dwords) * 4) {
+                        // SAFETY: `to` is at least `dwords` mapped dwords.
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(values.as_ptr(), to.cast(), values.len())
+                        };
+                        // SAFETY: an open list; a 256-byte aligned live address.
+                        unsafe {
+                            if compute {
+                                l.SetComputeRootConstantBufferView(param, gpu);
+                            } else {
+                                l.SetGraphicsRootConstantBufferView(param, gpu);
+                            }
+                        }
                     } else {
-                        l.SetGraphicsRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
+                        once!("no upload memory for user data: left unset");
+                    }
+                } else {
+                    // SAFETY: an open list; `values` covers the parameter.
+                    unsafe {
+                        if compute {
+                            l.SetComputeRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
+                        } else {
+                            l.SetGraphicsRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
+                        }
                     }
                 }
             }
