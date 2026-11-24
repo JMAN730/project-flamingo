@@ -60,6 +60,12 @@ void main(uint3 id : SV_DispatchThreadID) {
     if (id.x >= eff_count) return;
     uint src_at = args_offset + id.x * stride;
     uint dst_at = id.x * stride;
+    // A tight buffer's last record ends at its argument payload (the title
+    // allocates `(records - 1) * stride + payload`): reading a whole stride
+    // there would read past its buffer, writing one past the scratch. Every
+    // other record is a full stride, as the record before it reads on.
+    uint payload = (kind <= 1) ? ((kind == 0) ? 16u : 20u) : 12u;
+    uint copy_end = ((id.x + 1u) == records) ? payload : stride;
     uint cost;
     uint2 draw_counts = uint2(0, 0);
     uint3 groups = uint3(0, 0, 0);
@@ -118,7 +124,7 @@ void main(uint3 id : SV_DispatchThreadID) {
             draw_counts = uint2(0, 0);
         }
         dst_args.Store2(dst_at, draw_counts);
-        for (uint off = 8; off < stride; off += 4) {
+        for (uint off = 8; off < copy_end; off += 4) {
             dst_args.Store(dst_at + off, src_args.Load(src_at + off));
         }
     } else {
@@ -126,7 +132,7 @@ void main(uint3 id : SV_DispatchThreadID) {
             groups = uint3(0, 0, 0);
         }
         dst_args.Store3(dst_at, groups);
-        for (uint off = 12; off < stride; off += 4) {
+        for (uint off = 12; off < copy_end; off += 4) {
             dst_args.Store(dst_at + off, src_args.Load(src_at + off));
         }
     }
@@ -221,12 +227,32 @@ fn min_stride(kind: u32) -> Option<u32> {
     }
 }
 
-/// Validates record alignment and returns the scratch byte size `stride * records`.
+/// The record's argument bytes (its payload): the least stride of `kind`.
+fn payload(kind: u32) -> Option<u64> {
+    min_stride(kind).map(u64::from)
+}
+
+/// The scratch span `records` records need: `(records - 1) * stride +
+/// payload`, the last record ending at its argument payload (the title's
+/// buffers are tight, so `stride * records` read past the last record's
+/// arguments into memory the title did not allocate).
+fn required_bytes((kind, stride, records): (u32, u32, u32)) -> Option<u64> {
+    let payload = payload(kind)?;
+    if records == 0 {
+        return Some(0);
+    }
+    let last = u64::from(records - 1).checked_mul(u64::from(stride))?;
+    last.checked_add(payload).filter(|&bytes| bytes <= u64::from(u32::MAX))
+}
+
+/// Validates record alignment and returns the scratch byte span
+/// ([`required_bytes`]).
 fn validate_layout(
-    (kind, stride, records): (u32, u32, u32),
+    layout: (u32, u32, u32),
     src_offset: u64,
     count_offset: Option<u64>,
 ) -> Option<u64> {
+    let (kind, stride, _) = layout;
     let min = min_stride(kind)?;
     if stride < min || !stride.is_multiple_of(4) || !src_offset.is_multiple_of(4) {
         return None;
@@ -234,8 +260,7 @@ fn validate_layout(
     if count_offset.is_some_and(|off| !off.is_multiple_of(4)) {
         return None;
     }
-    let bytes = u64::from(stride).checked_mul(u64::from(records))?;
-    (bytes <= u64::from(u32::MAX)).then_some(bytes)
+    required_bytes(layout)
 }
 
 /// Records, in `list`, the non-destructive clamp of up to `records` records of
@@ -720,6 +745,22 @@ void main() {
         assert_eq!(run(&mut warp, 2), [0, 0, 0]);
     }
 
+    /// The last record's span is its payload: a tight title buffer asks for
+    /// `(records - 1) * stride + payload` bytes, never a whole last stride
+    /// (which read past the buffer and past the scratch).
+    #[test]
+    fn resolved_bytes_of_a_tight_buffer_end_at_the_last_payload() {
+        for (kind, payload) in [(0u32, 16u64), (1, 20), (2, 12), (10, 12)] {
+            for (stride, records) in [(payload as u32, 1u32), (32, 1), (32, 7), (24, 4096)] {
+                let bytes = required_bytes((kind, stride, records)).unwrap();
+                assert_eq!(bytes, u64::from(records - 1) * u64::from(stride) + payload);
+            }
+            assert_eq!(required_bytes((kind, 32, 0)), Some(0));
+        }
+        // A layout whose last payload overflows 32 bits is refused, not clamped.
+        assert_eq!(required_bytes((2, 12, u32::MAX)), None);
+    }
+
     /// The clamp compiles with the system's compiler and the host takes it.
     #[test]
     fn argument_clamp_builds() {
@@ -734,7 +775,10 @@ void main() {
         assert_eq!(validate_layout((0, 16, 4), 0, None), Some(64));
         assert_eq!(validate_layout((1, 20, 4), 64, Some(128)), Some(80));
         assert_eq!(validate_layout((2, 12, 0), 0, Some(0)), Some(0));
-        assert_eq!(validate_layout((10, 16, 2), 8, None), Some(32));
+        // Tight: the last record ends at its payload, not at a whole stride.
+        assert_eq!(validate_layout((10, 16, 2), 8, None), Some(28));
+        assert_eq!(validate_layout((2, 24, 4096), 0, None), Some(4095 * 24 + 12));
+        assert_eq!(validate_layout((0, 16, 1), 0, None), Some(16));
         // Undersized strides for each kind.
         assert_eq!(validate_layout((0, 12, 1), 0, None), None);
         assert_eq!(validate_layout((1, 16, 1), 0, None), None);
