@@ -598,6 +598,43 @@ unsafe fn instruction_bytes(at: usize) -> String {
     hex.join(" ")
 }
 
+/// `len` bytes at `address` as hex, if all of them are committed, readable
+/// and not a guard page; `None` otherwise (nothing is read then).
+fn readable_hex(address: usize, len: usize) -> Option<String> {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE,
+        PAGE_EXECUTE_WRITECOPY, PAGE_GUARD, PAGE_READONLY, PAGE_READWRITE, PAGE_WRITECOPY,
+        VirtualQuery,
+    };
+    if address < 0x10000 || address.checked_add(len).is_none() {
+        return None;
+    }
+    let mut at = address;
+    while at < address + len {
+        // SAFETY: a zeroed MEMORY_BASIC_INFORMATION is valid.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: reads the address space's bookkeeping only.
+        if unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) } == 0 {
+            return None;
+        }
+        let readable = PAGE_READONLY
+            | PAGE_READWRITE
+            | PAGE_WRITECOPY
+            | PAGE_EXECUTE_READ
+            | PAGE_EXECUTE_READWRITE
+            | PAGE_EXECUTE_WRITECOPY;
+        if info.State != MEM_COMMIT || info.Protect & readable == 0 || info.Protect & PAGE_GUARD != 0
+        {
+            return None;
+        }
+        at = info.BaseAddress as usize + info.RegionSize;
+    }
+    // SAFETY: every page of the range is committed and readable.
+    let bytes = unsafe { std::slice::from_raw_parts(address as *const u8, len) };
+    let hex: Vec<_> = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    Some(hex.join(""))
+}
+
 /// MSVC's code for a C++ `throw`, and its magic first parameter.
 const CPP_EXCEPTION: i32 = 0xE06D_7363_u32 as i32;
 const CPP_MAGIC: usize = 0x1993_0520;
@@ -699,8 +736,55 @@ unsafe fn report(what: &str, info: *const EXCEPTION_POINTERS, to_file: bool) {
         context.R14,
         context.R15
     ));
-    for (i, pc) in unwind(*context).into_iter().enumerate() {
-        line(format!("  #{i:<2} {}", locate(pc as usize)));
+    let frames = unwind(*context);
+    for (i, pc) in frames.iter().enumerate() {
+        line(format!("  #{i:<2} {}", locate(*pc as usize)));
+    }
+    if code == EXCEPTION_ACCESS_VIOLATION {
+        // The code that faulted and its callers, and what the registers
+        // point at: enough to read the faulting function without the
+        // title's files. One print, so other threads' reports do not
+        // interleave with it.
+        // SAFETY: a plain query.
+        let thread = unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() };
+        let mut dump = format!("  dump of thread {thread}:");
+        let mut line = |l: String| {
+            dump.push('\n');
+            dump.push_str(&l);
+        };
+        if let Some(hex) = readable_hex(at.wrapping_sub(64), 64) {
+            line(format!("  code  {hex} |"));
+        }
+        if let Some(hex) = readable_hex(at, 32) {
+            line(format!("  code| {hex}"));
+        }
+        for (i, pc) in frames.iter().enumerate().skip(1).take(4) {
+            if let Some(hex) = readable_hex((*pc as usize).wrapping_sub(48), 48) {
+                line(format!("  #{i} called by  {hex} |"));
+            }
+        }
+        let registers = [
+            ("rax", context.Rax),
+            ("rcx", context.Rcx),
+            ("rdx", context.Rdx),
+            ("rsi", context.Rsi),
+            ("rdi", context.Rdi),
+            ("r8", context.R8),
+            ("r12", context.R12),
+            ("r15", context.R15),
+        ];
+        for (name, value) in registers {
+            if let Some(hex) = readable_hex(value as usize, 64) {
+                line(format!("  [{name}] {hex}"));
+            }
+        }
+        if let Some(hex) = readable_hex(context.Rsp as usize, 128) {
+            line(format!("  [rsp] {hex}"));
+        }
+        drop(line);
+        eprintln!("{dump}");
+        text.push_str(&dump);
+        text.push('\n');
     }
     if to_file {
         let end = report_end();
