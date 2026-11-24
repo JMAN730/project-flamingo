@@ -15,7 +15,7 @@
 
 $ErrorActionPreference = 'Continue'
 $ProgressPreference = 'SilentlyContinue'
-$TryVersion = '3.2'
+$TryVersion = '3.3'
 $ForkUrl = 'https://github.com/MfDev0/victory.git'
 $Branch = 'arena/59fabb00-victory'
 # Other places the fork may live (renamed to CAtez, or a backup copy), tried
@@ -508,6 +508,12 @@ function Check-Run([string]$log, [string]$stamp, [string]$crashes) {
         Say "speed: $median fps typical at the end (last $($last.Count) reports), $best fps best"
     } else {
         Say 'speed: no frame report in the log (the world was not reached, or the run was short)'
+    }
+    # Draws still waiting for their pipelines at the end: what is missing
+    # (see-through objects) until the next launches have compiled them.
+    $lastFrame = @($lines | Where-Object { $_ -match 'dropped ([0-9]+) without a host pipeline \(([0-9]+) being made\)' }) | Select-Object -Last 1
+    if ($lastFrame -and $lastFrame -match 'dropped ([0-9]+) without a host pipeline \(([0-9]+) being made\)') {
+        Say "at the end: $($Matches[1]) draws a frame still waiting for $($Matches[2]) pipelines being compiled (fewer each launch: run it again)"
     }
     Say "shaders that do not translate: $(& $count 'shader does not translate')"
     Say "pipelines the card refused: $(& $count 'host pipeline refused')"
