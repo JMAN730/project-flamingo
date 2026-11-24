@@ -46,6 +46,7 @@ pub mod root;
 mod sampler;
 #[cfg(windows)]
 pub mod shader_cache;
+mod switches;
 #[cfg(windows)]
 mod memory;
 #[cfg(windows)]
@@ -55,6 +56,8 @@ pub mod signature;
 mod texture;
 #[cfg(windows)]
 mod watch;
+#[cfg(windows)]
+mod writeback;
 
 #[cfg(windows)]
 pub use host::on_failure;

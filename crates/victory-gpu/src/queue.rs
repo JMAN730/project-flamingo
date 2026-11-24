@@ -69,7 +69,10 @@ fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 #[cfg(windows)]
 fn waits() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_QUEUE_WAIT").is_none_or(|v| v != "0"))
+    crate::switches::b(
+        "VICTORY_QUEUE_WAIT",
+        *ON.get_or_init(|| std::env::var_os("VICTORY_QUEUE_WAIT").is_none_or(|v| v != "0")),
+    )
 }
 
 /// Whether a submission is held list by list: the lists before the first
@@ -88,7 +91,10 @@ fn waits() -> bool {
 #[cfg(windows)]
 fn split() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_SPLIT_WAITS").is_none_or(|v| v != "0"))
+    crate::switches::b(
+        "VICTORY_SPLIT_WAITS",
+        *ON.get_or_init(|| std::env::var_os("VICTORY_SPLIT_WAITS").is_none_or(|v| v != "0")),
+    )
 }
 
 /// Whether a list is cut into host lists at its waits for memory values
@@ -778,12 +784,12 @@ extern "system" fn present(
     // its fence: a wait is not kept across frames.
     #[cfg(windows)]
     release_held(forces());
+    // The one poll of the debug tool's control folder at this frame boundary
+    // (`victory_core::ctl` owns the folder and the throttles): a shot or key
+    // request is taken for the frame's capture, and switches changed in
+    // `<ctl>/switches` are applied here, logged as `switches changed: K=V ...`.
+    crate::switches::poll(FRAMES.load(Ordering::Relaxed));
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
-    // The debug tool's control folder: a shot request is remembered here and
-    // saved by the frame's capture, key requests are held now. Nothing
-    // requested costs a few `stat` calls per 250 ms (see `ctl`).
-    #[cfg(all(windows, feature = "diagnostics"))]
-    crate::capture::poll();
     if frame.is_power_of_two() {
         let (draws, dispatches) = crate::list::take_counts();
         #[cfg(windows)]

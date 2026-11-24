@@ -1503,7 +1503,10 @@ void main(uint3 id : SV_DispatchThreadID) {
 /// a fetch that finds nothing and loses no shader write.
 fn rehash_runs() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_REHASH_RUNS").is_some_and(|v| v == "1"))
+    crate::switches::b(
+        "VICTORY_CARD_REHASH_RUNS",
+        *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_REHASH_RUNS").is_some_and(|v| v == "1")),
+    )
 }
 
 /// Since the last frame-rate line, of our own passes over copies in the
@@ -1674,19 +1677,27 @@ pub(crate) fn late() -> bool {
 /// `VICTORY_LATE_WAIT`: 0 (off), 1, or 2 ([`late_exact`]).
 fn late_stage() -> u8 {
     static STAGE: OnceLock<u8> = OnceLock::new();
-    *STAGE.get_or_init(|| {
-        if std::env::var_os("VICTORY_GPU_TIMING").is_some() {
-            return 0;
-        }
-        match std::env::var("VICTORY_LATE_WAIT").as_deref() {
-            Ok("1") => 1,
-            Ok("2") => 2,
-            Ok("3") => 3,
-            // The relay alone: on top of stage 3.
-            Err(_) if crate::shadow::relay() => 3,
-            _ => 0,
-        }
-    })
+    if std::env::var_os("VICTORY_GPU_TIMING").is_some() {
+        return 0;
+    }
+    let start = *STAGE.get_or_init(|| match std::env::var("VICTORY_LATE_WAIT").as_deref() {
+        Ok("1") => 1,
+        Ok("2") => 2,
+        Ok("3") => 3,
+        // The relay alone: on top of stage 3.
+        Err(_) if crate::shadow::relay() => 3,
+        _ => 0,
+    });
+    // Live (crate::switches); a change waits for nothing in the air.
+    crate::switches::u8v("VICTORY_LATE_WAIT", start)
+}
+
+/// Whether nothing is in the air: no flight to land and no write or signal
+/// behind one. The point at which a switch that changes how flights are
+/// held and landed may be changed (`crate::switches`).
+pub(crate) fn flights_quiet() -> bool {
+    let line = line();
+    line.line.is_empty() && line.written.is_empty() && line.landed.is_empty()
 }
 
 /// Stage 2 of [`late`] (`VICTORY_LATE_WAIT=2`): point 3 of its list is no
@@ -1775,7 +1786,9 @@ pub(crate) fn relay() -> bool {
 /// both wait for everything.
 fn relay_exact() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| relay() && std::env::var_os("VICTORY_RELAY").is_some_and(|v| v == "2"))
+    let start = *ON.get_or_init(|| relay() && std::env::var_os("VICTORY_RELAY").is_some_and(|v| v == "2"));
+    // Live: `VICTORY_RELAY=2` (crate::switches).
+    relay() && crate::switches::live_is("VICTORY_RELAY", 2).unwrap_or(start)
 }
 
 /// Told when something joins [`LINE`], for the thread that lands flights
@@ -1873,9 +1886,10 @@ mod relay_tests {
 /// all at once ran the slots out before (run 45).
 fn late_most() -> usize {
     static MOST: OnceLock<usize> = OnceLock::new();
-    *MOST.get_or_init(|| {
-        std::env::var("VICTORY_LATE_WAIT_LISTS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(128).max(1)
-    })
+    let start = *MOST
+        .get_or_init(|| std::env::var("VICTORY_LATE_WAIT_LISTS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(128));
+    // Live (crate::switches).
+    crate::switches::u64v("VICTORY_LATE_WAIT_LISTS", start as u64).max(1) as usize
 }
 
 /// Whether a submission with bottom-of-pipe writes may fly
@@ -1884,7 +1898,10 @@ fn late_most() -> usize {
 /// such a value from one that does not).
 fn late_writes() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_LATE_WAIT_WRITES").is_none_or(|v| v != "0"))
+    crate::switches::b(
+        "VICTORY_LATE_WAIT_WRITES",
+        *ON.get_or_init(|| std::env::var_os("VICTORY_LATE_WAIT_WRITES").is_none_or(|v| v != "0")),
+    )
 }
 
 /// Per host copy, the ranges a submission's shaders may write, as declared
@@ -2659,7 +2676,14 @@ fn read_backs(list: &HostList) {
 
 /// After the card ran what declared `back`: what shaders wrote there goes
 /// into title memory, and the ranges are done with.
-fn hand_back(back: &[Declared]) {
+///
+/// With the write-back on a thread of its own ([`crate::writeback`]) the
+/// work is posted there instead (`write_back_job`) and the submitting
+/// thread prepares the title's next submission meanwhile; the ranges stay
+/// `pending` (title memory there older than the copy) until the worker's
+/// merge ran, and a title thread that touches a block the job holds waits
+/// for it.
+pub(crate) fn hand_back_now(back: &[Declared]) {
     if crate::shadow::wide_back() {
         // Every range first (the pieces that differ, found on several
         // threads), then the merges, in order, as below.
@@ -2724,6 +2748,36 @@ fn hand_back(back: &[Declared]) {
         }
         shadow.copy_back_done(declared);
     }
+}
+
+/// A write-back job for `back` (`VICTORY_ASYNC_WRITEBACK=1`; `None` when the
+/// copy-back runs inline): each range is held inaccessible to the title with
+/// the job, so a title read of it waits for the worker's merge
+/// ([`crate::watch::back_begin`]). Copies in the card's memory are left to
+/// the submitting thread (their compare ran on the card).
+fn write_back_job(back: &[Declared]) -> crate::writeback::Job {
+    let mut job = crate::writeback::Job::new();
+    let done = job.done();
+    for (shadow, ranges) in back {
+        if shadow.carded() {
+            continue;
+        }
+        let mut sorted = ranges.clone();
+        sorted.sort_unstable();
+        let mut spans: Vec<(usize, usize)> = Vec::new();
+        for (from, to) in sorted {
+            match spans.last_mut() {
+                Some(last) if from <= last.1 => last.1 = last.1.max(to),
+                _ => spans.push((from, to)),
+            }
+        }
+        for (from, to) in spans {
+            shadow.write_back(from, to, done.clone());
+            job.blocks.extend(crate::watch::back_begin(&done, from, to));
+        }
+        job.back.push((shadow.clone(), ranges.clone()));
+    }
+    job
 }
 
 impl Host {
@@ -3723,6 +3777,8 @@ impl Host {
         }
         let was_working = working(true);
         let mut counted = false;
+        // A write-back job for this line, posted once its read-backs are in.
+        let mut settled_job: Option<crate::writeback::Job> = None;
         loop {
             let items = {
                 let mut line = line();
@@ -3807,8 +3863,32 @@ impl Host {
                         }
                     }
                 }
-                hand_back(&back);
+                let mut job = if crate::writeback::switched_on() && !back.is_empty() {
+                    let mut job = write_back_job(&back);
+                    for (shadow, ranges) in back.iter().filter(|(s, _)| s.carded()) {
+                        shadow.copy_back_done(ranges);
+                    }
+                    // The flights' bottom-of-pipe writes follow the
+                    // copy-back, on the same worker.
+                    for item in &items {
+                        if let Late::Write(at, what, bytes) = item {
+                            job.writes.push((*at, *what, *bytes));
+                        }
+                    }
+                    Some(job)
+                } else {
+                    hand_back_now(&back);
+                    None
+                };
                 COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
+                if let Some(job) = job.take()
+                    && !job.is_empty()
+                {
+                    // After the whole line has been read back (below), not
+                    // before: a fence signalled meanwhile may be read by the
+                    // title, and its blocks make it wait.
+                    settled_job = Some(job);
+                }
             }
             // In the order given: what tells the title the card is done.
             let mut last = 0;
@@ -3825,8 +3905,22 @@ impl Host {
                         }
                         landed.push((flight.lists, flight.order));
                     }
-                    Late::Write(at, what, bytes) => what.write(at as *mut u8, bytes),
-                    Late::Signal(fence, value) => crate::fence::set(fence as crate::object::This, value),
+                    // With the write-back on its own thread these are the
+                    // job's (it writes them after the copy-back).
+                    Late::Write(at, what, bytes) => {
+                        if settled_job.is_none() {
+                            what.write(at as *mut u8, bytes);
+                        }
+                    }
+                    Late::Signal(fence, value) => {
+                        // The fence's own words are not a job's copy-back
+                        // range, but a title thread that reads them must not
+                        // see the card's bytes half put back: wait first.
+                        if settled_job.is_some() {
+                            crate::watch::back_wait(fence, fence + 8);
+                        }
+                        crate::fence::set(fence as crate::object::This, value)
+                    }
                 }
             }
             if last > 0 {
@@ -3834,6 +3928,9 @@ impl Host {
                 bury(last);
             }
             line().landed.extend(landed);
+            if let Some(job) = settled_job.take() {
+                crate::writeback::submit(job);
+            }
         }
         if counted {
             self.log_messages();
@@ -3916,19 +4013,31 @@ impl Host {
         // (`VICTORY_ASK_ONCE`): per copy, the span of its refreshed ranges.
         if crate::watch::once() {
             let mut spans: std::collections::HashMap<usize, (usize, usize)> = std::collections::HashMap::new();
+            // The textures the submission samples, by their memory: their
+            // refreshes asked the kernel once each (30-70 µs, and 246-400 ms
+            // of a streaming frame in run fx-d3dc-1; 1,590 ms in the same
+            // frames with the remap wait switched off, which frees them to
+            // run). One asking for the submission answers them from the
+            // journal, as it does the copies.
+            let mut textures: Vec<(usize, usize)> = Vec::new();
             for list in runs {
                 for step in &list.deferred().copies {
-                    if let Step::Refresh(shadow, address, len) = step
-                        && !shadow.unwatched()
-                    {
-                        let span = spans
-                            .entry(std::sync::Arc::as_ptr(shadow) as usize)
-                            .or_insert((*address, *address + *len));
-                        *span = (span.0.min(*address), span.1.max(*address + *len));
+                    match step {
+                        Step::Refresh(shadow, address, len) if !shadow.unwatched() => {
+                            let span = spans
+                                .entry(std::sync::Arc::as_ptr(shadow) as usize)
+                                .or_insert((*address, *address + *len));
+                            *span = (span.0.min(*address), span.1.max(*address + *len));
+                        }
+                        Step::Texture(staging) => textures.push(staging.memory()),
+                        _ => {}
                     }
                 }
             }
-            let ranges: Vec<(usize, usize)> = spans.into_values().collect();
+            let mut ranges: Vec<(usize, usize)> = spans.into_values().collect();
+            textures.sort_unstable();
+            textures.dedup();
+            ranges.append(&mut textures);
             crate::watch::ask_once(&ranges);
             // Behind flights: the title wrote memory that a flight's shaders
             // may write too, and this submission refreshes it. The flights
@@ -4110,7 +4219,22 @@ impl Host {
             self.card_back(card, &mut submitted, &mut std::collections::HashSet::new());
         }
         let back = declared_writes(runs);
-        hand_back(&back);
+        // With the write-back on its own thread (`VICTORY_ASYNC_WRITEBACK=1`)
+        // the ranges are held and posted once the read-backs are in; the
+        // card's copies, whose compare ran there, are done here.
+        let mut job = if crate::writeback::switched_on() && !back.is_empty() {
+            let mut job = write_back_job(&back);
+            for (shadow, ranges) in back.iter().filter(|(s, _)| s.carded()) {
+                shadow.copy_back_done(ranges);
+            }
+            for list in runs {
+                job.writes.extend(list.deferred().writes.iter().copied());
+            }
+            Some(job)
+        } else {
+            hand_back_now(&back);
+            None
+        };
         if let Some(card) = card {
             self.card_done(card);
         }
@@ -4130,11 +4254,19 @@ impl Host {
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
         for list in runs {
             // Read backs first: a value written at the bottom of the pipe
-            // may be what tells the title that they are there.
+            // may be what tells the title that they are there. (On the
+            // worker they follow the copy-back there.)
             read_backs(list);
-            for &(at, what, bytes) in &list.deferred().writes {
-                what.write(at as *mut u8, bytes);
+            if job.is_none() {
+                for &(at, what, bytes) in &list.deferred().writes {
+                    what.write(at as *mut u8, bytes);
+                }
             }
+        }
+        if let Some(job) = job.take()
+            && !job.is_empty()
+        {
+            crate::writeback::submit(job);
         }
         self.log_messages();
         submitting(0, 0);
@@ -5713,7 +5845,8 @@ impl Meter {
             let [through, left] = [0, 1].map(|i| crate::texture::UNLOCKED[i].swap(0, Ordering::Relaxed) as f64 / frames);
             if through + left > 0.0 {
                 tracing::info!(
-                    "texture refreshes that did not wait for title memory to hold still, per frame (VICTORY_TEXTURE_NO_WAIT=1): \
+                    "texture refreshes that did not wait for title memory to hold still, per frame (the frame's budget, \
+                     VICTORY_TEXTURE_WAIT_US; 0 or VICTORY_TEXTURE_NO_WAIT=1 for none): \
                      {through:.1} read through the kernel, {left:.1} left for the next refresh (a page was not there)"
                 );
             }
