@@ -34,6 +34,10 @@ by the project owner's decision (2026-11-23), entered as an exception in
 repository's licence does not cover them. Nothing else of this kind is
 accepted.
 
+Not game data, so outside the rule but listed as the binary file it is:
+`docs/media/catez.gif`, the fork's README picture (owner's decision,
+2026-11-24).
+
 ## Where data lives
 
 Outside the repository, configured in `victory.toml`: `game_dir` (the
