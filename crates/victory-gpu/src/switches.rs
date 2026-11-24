@@ -34,7 +34,6 @@
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::time::{Duration, Instant};
 
 /// The switches that may be changed live, in the order they are logged.
 const NAMES: [&str; 13] = [
@@ -60,9 +59,6 @@ static VALUES: [AtomicI64; N] = [const { AtomicI64::new(-1) }; N];
 
 /// What was applied, as (name, value), to tell a change from a repeat.
 static APPLIED: Mutex<Vec<(String, i64)>> = Mutex::new(Vec::new());
-
-/// When the file was last looked at.
-static LAST: Mutex<Option<Instant>> = Mutex::new(None);
 
 fn index(name: &str) -> Option<usize> {
     NAMES.iter().position(|n| *n == name)
@@ -121,16 +117,6 @@ fn quiet() -> bool {
     }
 }
 
-/// The control folder the debug tool (`VICTORY_CTL_DIR`, else `<exe dir>/ctl`)
-/// names.
-fn ctl_dir() -> Option<std::path::PathBuf> {
-    if let Some(dir) = std::env::var_os("VICTORY_CTL_DIR") {
-        return Some(dir.into());
-    }
-    let exe = std::env::current_exe().ok()?;
-    Some(exe.parent()?.join("ctl"))
-}
-
 /// Parses the file: one `K=V` a line, `#` comments, blank lines skipped.
 /// `VICTORY_` is understood in front of a name or left off; a value of
 /// `1`, `on`, `true` or `yes` is 1, `0`, `off`, `false` or `no` is 0, and
@@ -174,23 +160,19 @@ fn parse(text: &str) -> Vec<(String, i64)> {
     out
 }
 
-/// Applies the file's switches, if they changed, at this frame boundary
-/// `frame`. Called once per present; it looks at the file at most once a
-/// second and when nothing is in the air for the switches that need it.
+/// The one poll at a present: the debug tool's requests (shots, held pad
+/// keys) and the switches, in that order, both through the control folder
+/// `victory_core::ctl` owns — one resolver (`ctl::dir`) and one set of
+/// throttles (`ctl::POLL_EVERY` for requests, `ctl::SWITCH_EVERY` here).
+/// Called once per present; it applies the switches at most once a second,
+/// and only when nothing is in the air for the ones that need it.
 pub(crate) fn poll(frame: u64) {
-    {
-        let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
-        let now = Instant::now();
-        if last.is_some_and(|t| now.duration_since(t) < Duration::from_secs(1)) {
-            return;
-        }
-        *last = Some(now);
-    }
-    let wanted = ctl_dir()
-        .map(|d| d.join("switches"))
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .map(|t| parse(&t))
-        .unwrap_or_default();
+    // A shot request is remembered for the frame's capture, key requests are
+    // held now (both inside `capture::poll` -> `victory_core::ctl::tick`).
+    #[cfg(all(windows, feature = "diagnostics"))]
+    crate::capture::poll();
+    let Some(text) = victory_core::ctl::switches_text() else { return };
+    let wanted = parse(&text);
     let mut applied = APPLIED.lock().unwrap_or_else(|e| e.into_inner());
     if *applied == wanted {
         return;

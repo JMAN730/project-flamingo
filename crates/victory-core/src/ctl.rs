@@ -22,6 +22,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 /// How often the folder is read, at most.
 pub const POLL_EVERY: Duration = Duration::from_millis(250);
 
+/// How often `switches` is read, at most: a run changes its switches at
+/// phase boundaries, seconds apart, and a frame is milliseconds.
+pub const SWITCH_EVERY: Duration = Duration::from_secs(1);
+
 /// How long a key is held when the request names no time.
 pub const DEFAULT_HOLD_MS: u64 = 150;
 
@@ -225,6 +229,28 @@ pub fn tick() -> Option<Request> {
         }
     }
     None
+}
+
+/// The text of `<ctl>/switches`, the switch settings a running game takes at
+/// a frame boundary (`crates/victory-gpu/src/switches.rs`): read at most once
+/// a [`SWITCH_EVERY`], and `None` when it is not time to look again.
+///
+/// `Some("")` is the file absent or empty: the start-up settings, which is
+/// what a `base` phase of `vic-run.sh` writes. The file is read whole and
+/// written whole by its writer (a temp file and `mv`), so a reader never
+/// sees half of one.
+pub fn switches_text() -> Option<String> {
+    let dir = dir()?;
+    static LAST: Mutex<Option<Instant>> = Mutex::new(None);
+    {
+        let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
+        match *last {
+            Some(at) if now.duration_since(at) < SWITCH_EVERY => return None,
+            _ => *last = Some(now),
+        }
+    }
+    Some(std::fs::read_to_string(dir.join("switches")).unwrap_or_default())
 }
 
 /// The UTC stamp a save is named after: `YYYYMMDD-HHMMSS`.

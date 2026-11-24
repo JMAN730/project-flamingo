@@ -784,16 +784,12 @@ extern "system" fn present(
     // its fence: a wait is not kept across frames.
     #[cfg(windows)]
     release_held(forces());
-    // The frame boundary: switches changed in `<ctl>/switches` are taken here
-    // (at most once a second, and only with nothing in the air for those that
-    // change how flights land), logged as `switches changed: K=V ...`.
+    // The one poll of the debug tool's control folder at this frame boundary
+    // (`victory_core::ctl` owns the folder and the throttles): a shot or key
+    // request is taken for the frame's capture, and switches changed in
+    // `<ctl>/switches` are applied here, logged as `switches changed: K=V ...`.
     crate::switches::poll(FRAMES.load(Ordering::Relaxed));
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
-    // The debug tool's control folder: a shot request is remembered here and
-    // saved by the frame's capture, key requests are held now. Nothing
-    // requested costs a few `stat` calls per 250 ms (see `ctl`).
-    #[cfg(all(windows, feature = "diagnostics"))]
-    crate::capture::poll();
     if frame.is_power_of_two() {
         let (draws, dispatches) = crate::list::take_counts();
         #[cfg(windows)]
