@@ -277,13 +277,16 @@ enum MaskData {
 /// What a value holding a lane mask read as a number stops with.
 const LANE_MASK: Why = "a lane mask read as data";
 
-/// Instructions that read a lane mask (not EXEC implicitly, not a lane's
-/// bit) as a number.
 /// Samples whose level comes from derivatives across each quad of lanes.
 fn implicit_derivatives(name: &str) -> bool {
-    matches!(name, "image_sample" | "image_sample_b")
+    matches!(
+        name,
+        "image_sample" | "image_sample_cl" | "image_sample_b" | "image_sample_b_cl"
+    )
 }
 
+/// Instructions that read a lane mask (not EXEC implicitly, not a lane's
+/// bit) as a number.
 fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
     let is_mask = |v: Value| st.masks.contains_key(&v) || st.highs.contains_key(&v);
     let ops: Vec<&Operand> = match &i.fields {
@@ -7732,6 +7735,11 @@ mod tests {
     /// The props of the heap handles of a compute program whose s4 holds
     /// the resource heap's address.
     fn heap_props(words: &[u32]) -> Vec<(u32, u32)> {
+        heap_lower(words).unwrap().handle_props
+    }
+
+    /// Lowers a compute program with a resource heap at s4.
+    fn heap_lower(words: &[u32]) -> Result<super::Lowered, crate::ShaderError> {
         use crate::native::{RootParam, RootType};
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let native = NativeProgram {
@@ -7757,7 +7765,7 @@ mod tests {
         let res = resource::track(&p, &native.layout, native.stage).unwrap();
         let io = io::raise(&p, &native).unwrap();
         let st = structure::structure(&p).unwrap();
-        let lowered = lower(&Parts {
+        lower(&Parts {
             native: &native,
             p: &p,
             st: &st,
@@ -7768,8 +7776,47 @@ mod tests {
             prims: vec![],
             mesh_stride: 0,
         })
-        .unwrap();
-        lowered.handle_props
+    }
+
+    #[test]
+    fn compute_samples_with_implicit_levels_keep_console_lanes() {
+        // Outside pixel shaders these take their level from each quad of
+        // console lanes (`quad_gradients`), whatever the clamp.
+        let head: [u32; 11] = [
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF40C_0202,
+            0xFA00_0000, // s_load_dwordx8 s[8:15], s[4:5], 0
+            0xF408_0502,
+            0xFA00_0020, // s_load_dwordx4 s[20:23], s[4:5], 32
+            0xBE90_0380, // s_mov_b32 s16, 0
+            0xBE91_0380, // s_mov_b32 s17, 0
+            0xBE92_0380, // s_mov_b32 s18, 0
+            0xBE93_0380, // s_mov_b32 s19, 0
+            0x7E02_0280, // v_mov_b32 v1, 0
+            0x7E04_0280, // v_mov_b32 v2, 0
+        ];
+        let regs: [u32; 2] = [
+            0x7E06_0280, // v_mov_b32 v3, 0
+            0x7E08_0280, // v_mov_b32 v4, 0
+        ];
+        for (name, word) in [
+            ("image_sample", 0xF080_0108),
+            ("image_sample_cl", 0xF084_0108),
+            ("image_sample_b", 0xF094_0108),
+            ("image_sample_b_cl", 0xF098_0108),
+        ] {
+            let tail: [u32; 5] = [
+                word,
+                0x0082_0501, // <name> v5, v[1:], s[8:15], s[16:19] dmask:1 dim:2D
+                0xE070_0000,
+                0x8005_0500, // buffer_store_dword v5, off, s[20:23]
+                S_ENDPGM,
+            ];
+            let words = [&head[..], &regs[..], &tail[..]].concat();
+            if let Err(e) = heap_lower(&words) {
+                panic!("{name}: {e}");
+            }
+        }
     }
 
     #[test]
