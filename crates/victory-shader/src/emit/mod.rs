@@ -962,6 +962,14 @@ mod tests {
     /// of the GPU tests in `valu_tests`), so a value `body` cannot produce
     /// stops the translation.
     fn translate_stored(body: &[u32]) -> Result<HostShader, ShaderError> {
+        translate_stored_with(body, &[])
+    }
+
+    /// [`translate_stored`] with more resources of the table declared.
+    fn translate_stored_with(
+        body: &[u32],
+        more: &[crate::native::UsedResource],
+    ) -> Result<HostShader, ShaderError> {
         use crate::native::{ResourceType, RootParam, UsedResource};
         let mut words = vec![
             0xBE85_0380, // s_mov_b32 s5, 0
@@ -990,7 +998,7 @@ mod tests {
                 param(RootType::Constants, 4, 0, 0),
                 param(RootType::Table, 1, 4, 1),
             ],
-            used: vec![UsedResource {
+            used: [UsedResource {
                 kind: ResourceType::Uav,
                 root: RootType::Table,
                 table_offset_dwords: 0,
@@ -999,7 +1007,10 @@ mod tests {
                 dwords: 4,
                 user_data: 4,
                 slot: 1,
-            }],
+            }]
+            .into_iter()
+            .chain(more.iter().cloned())
+            .collect(),
             io: StageIo::Cs(ComputeIo {
                 rsrc2: 5 << 1,
                 threads: [1, 1, 1],
@@ -1013,6 +1024,31 @@ mod tests {
         let container = crate::dxbc::build(&[]);
         let c = Container::parse(&container).unwrap();
         emit(&c, &native, &p, &st, &io, &res)
+    }
+
+    /// A view the program only measures takes its kind from the table's
+    /// range: a structured buffer's or a storage image's size, read as
+    /// data and never used here, translates.
+    #[test]
+    fn descriptor_read_only_as_data_takes_its_kind_from_the_range() {
+        use crate::native::{ResourceType, UsedResource};
+        let range = |kind, dwords, stride| UsedResource {
+            kind,
+            root: RootType::Table,
+            table_offset_dwords: 4,
+            lower_bound: 1,
+            stride,
+            dwords,
+            user_data: 4,
+            slot: 1,
+        };
+        // s_load_dwordx4 s[12:15], s[4:5], 16; v_mov_b32 v0, s14 (records)
+        let buffer = [0xF408_0302, 0xFA00_0010, 0x7E00_020E];
+        translate_stored_with(&buffer, &[range(ResourceType::Srv, 4, 16)]).unwrap();
+        translate_stored_with(&buffer, &[range(ResourceType::Uav, 4, 0)]).unwrap();
+        // s_load_dwordx8 s[12:19], s[4:5], 16; v_mov_b32 v0, s14 (height)
+        let image = [0xF40C_0302, 0xFA00_0010, 0x7E00_020E];
+        translate_stored_with(&image, &[range(ResourceType::Uav, 8, 0)]).unwrap();
     }
 
     /// Selects and carry-ins whose mask `structure` does not follow (a plain

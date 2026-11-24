@@ -3974,22 +3974,35 @@ impl<'a> Lower<'a> {
             };
             (first, src, props, image, uav)
         } else {
-            // An image the program only measures (it reads the size bits and
-            // samples the image in other programs): eight dwords are an image
-            // descriptor, taken here as a 2D texture.
+            // A view the program only measures (it reads the size bits and
+            // uses the view in other programs). The table's range, when one
+            // names the entry, says what it is; else the dwords read do:
+            // eight are an image descriptor, taken here as a 2D texture, and
+            // four a buffer only when a range gives its kind.
             // shortcut: a 3D or array image would report depth or layers 1.
+            const NONE: Why = "a descriptor read only as data";
             let src = Source::Loaded {
                 load: site,
                 first: 0,
             };
-            if count != 8
-                || self
-                    .used_kind(&src)
-                    .is_some_and(|u| u.kind != ResourceType::Srv)
-            {
-                return Err("a descriptor read only as data");
+            let used = self.used_kind(&src);
+            let (dwords, stride) = match used {
+                Some(u) if matches!(u.kind, ResourceType::Srv | ResourceType::Uav) => {
+                    (u32::from(u.dwords), u.stride)
+                }
+                None => (count, 0),
+                Some(_) => return Err(NONE),
+            };
+            let u = self.uav_bits(&src, used);
+            let uav = u & 0x1000 != 0;
+            match dwords {
+                8 => (0, src, (2 | u, 0x409), Some(2), uav),
+                4 if stride >= 4 && stride.is_multiple_of(4) => {
+                    (0, src, (12 | u, stride), None, uav)
+                }
+                4 if used.is_some() => (0, src, (11 | u, 0), None, uav),
+                _ => return Err(NONE),
             }
-            (0, src, (2, 0x409), Some(2), false)
         };
         let h = self.handle(site, &src, false, props)?;
         let c = self.cur;
