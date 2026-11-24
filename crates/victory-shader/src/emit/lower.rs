@@ -283,6 +283,14 @@ struct Lower<'a> {
     counters: HashMap<usize, (V, Vec<(V, usize)>)>,
     /// The block a loop stopped by [`LOOP_LIMIT`] leaves the program from.
     abort: Option<usize>,
+    /// Entry values holding pixel barycentric coordinates, loaded lazily via
+    /// `SV_Barycentrics` only when an instruction actually reads them.
+    barycentric_inputs: HashMap<Value, (Barycentric, u8)>,
+    /// Input signature element indices lowered via `attributeAtVertex`
+    /// (`nointerpolation`) instead of host-interpolated `loadInput`.
+    hand_interp: HashSet<usize>,
+    /// `v_interp_p1*` sites folded into a clean host-interpolated `p2` pair.
+    folded_p1: HashSet<Site>,
 }
 
 /// Iterations after which a loop is left (per entry into it), unless
@@ -470,6 +478,236 @@ fn atomic_descriptor_loads(p: &Program, res: &Resources) -> HashSet<Site> {
     loads
 }
 
+fn barycentric_mode(kind: Barycentric) -> Result<u8, Why> {
+    match kind {
+        Barycentric::PerspectiveCenter => Ok(2),
+        Barycentric::PerspectiveCentroid => Ok(3),
+        Barycentric::LinearCenter => Ok(4),
+        Barycentric::LinearCentroid => Ok(5),
+        Barycentric::PerspectiveSample => Ok(6),
+        Barycentric::LinearSample => Ok(7),
+        Barycentric::PerspectivePullModel => Err("pull-model interpolation"),
+    }
+}
+
+/// Signature element IDs in `inputs` that hold `attribute`.
+fn attr_input_ids(
+    inputs: &[SigElement],
+    native_io: &StageIo,
+    attribute: crate::io::Attribute,
+    f16: bool,
+) -> Vec<usize> {
+    let find = |row: u8, ch: u8| -> Option<usize> {
+        inputs.iter().position(|e| {
+            e.kind == 0 && e.row == Some(u32::from(row)) && ch >= e.col && ch < e.col + e.cols
+        })
+    };
+    let packing = match native_io {
+        StageIo::Ps { inputs, .. } => inputs
+            .iter()
+            .find(|i| i.row == attribute.row && i.fp16)
+            .map(|i| (i.pack2, (i.row2 != i.row).then_some(i.row2))),
+        _ => None,
+    };
+    let mut ids = Vec::new();
+    match packing {
+        None => {
+            if let Some(id) = find(attribute.row, attribute.channel) {
+                ids.push(id);
+            }
+        }
+        Some((pack2, b)) => {
+            let mut push_half = |h: u8| {
+                let src = if pack2 {
+                    packed_half(inputs, attribute.row, b, h)
+                } else {
+                    h.is_multiple_of(2).then_some((attribute.row, h / 2))
+                };
+                if let Some((row, ch)) = src
+                    && let Some(id) = find(row, ch)
+                    && !ids.contains(&id)
+                {
+                    ids.push(id);
+                }
+            };
+            let h = 2 * attribute.channel;
+            if f16 {
+                push_half(h + u8::from(attribute.high));
+            } else {
+                push_half(h);
+                push_half(h + 1);
+            }
+        }
+    }
+    ids
+}
+
+/// Whether a phi, or an instruction other than an interpolation's second
+/// half (`v_interp_p2*`), reads `v`.
+fn read_past_interpolation(p: &Program, v: Value) -> bool {
+    p.blocks.iter().any(|b| {
+        b.phis.iter().any(|p| p.args.contains(&v))
+            || b.insts
+                .iter()
+                .any(|i| !i.name().starts_with("v_interp_p2") && i.reads.iter().any(|r| r.1 == v))
+    })
+}
+
+/// Decides which pixel input signature elements must be lowered by hand via
+/// `dx.op.attributeAtVertex` (`nointerpolation`), and which `v_interp_p1*`
+/// sites can stay folded into a clean host-interpolated `v_interp_p2*` pair.
+fn plan_hand_interp(
+    p: &Program,
+    native: &NativeProgram,
+    inputs: &[SigElement],
+    interps: &[(Site, Interp)],
+) -> (HashSet<usize>, HashSet<Site>) {
+    let mut hand = HashSet::new();
+    let mut seen_mode: HashMap<usize, u8> = HashMap::new();
+    let mut paired_p1: HashSet<Site> = HashSet::new();
+
+    for &(site, ref interp) in interps {
+        let inst = &p.blocks[site.0].insts[site.1];
+        let f16 = inst.name().ends_with("_f16");
+        match interp {
+            Interp::Interpolated {
+                attribute,
+                barycentric,
+                first,
+            } => {
+                for &f in first {
+                    paired_p1.insert(f);
+                }
+                let Ok(mode) = barycentric_mode(*barycentric) else {
+                    continue;
+                };
+                for id in attr_input_ids(inputs, &native.io, *attribute, f16) {
+                    if let Some(&prev) = seen_mode.get(&id)
+                        && prev != mode
+                    {
+                        hand.insert(id);
+                    }
+                    seen_mode.insert(id, mode);
+                }
+            }
+            Interp::Computed { attribute, .. } => {
+                for id in attr_input_ids(inputs, &native.io, *attribute, f16) {
+                    hand.insert(id);
+                }
+            }
+            Interp::Vertex { attribute, vertex } => {
+                let ids = attr_input_ids(inputs, &native.io, *attribute, false);
+                if *vertex != 2 {
+                    hand.extend(ids);
+                } else {
+                    for id in ids {
+                        if let Some(&prev) = seen_mode.get(&id)
+                            && prev != 1
+                        {
+                            hand.insert(id);
+                        }
+                        seen_mode.insert(id, 1);
+                    }
+                }
+            }
+        }
+    }
+
+    // Any `v_interp_p1*` whose result is read outside `v_interp_p2*` (or not
+    // paired with a clean `Interp::Interpolated`) forces its input to hand
+    // interpolation so it computes the real `P0 + i * (P1 - P0)`.
+    let mut leaked_p1 = HashSet::new();
+    for (b, block) in p.blocks.iter().enumerate() {
+        for (i, inst) in block.insts.iter().enumerate() {
+            if !inst.name().starts_with("v_interp_p1") {
+                continue;
+            }
+            let site = (b, i);
+            let dst = match &inst.fields {
+                Fields::Vintrp { dst, .. } => Some(*dst),
+                Fields::Valu(v) => v.dst,
+                _ => None,
+            };
+            let leaked = match dst {
+                Some(Operand::Vector { reg, .. }) => inst
+                    .write(Reg::V(reg))
+                    .is_some_and(|w| read_past_interpolation(p, w)),
+                _ => false,
+            };
+            if leaked || !paired_p1.contains(&site) {
+                leaked_p1.insert(site);
+                if leaked {
+                    let attr_op = match &inst.fields {
+                        Fields::Vintrp { attr, .. } => Some(attr),
+                        Fields::Valu(v) => v.src.first(),
+                        _ => None,
+                    };
+                    if let Some(attr) =
+                        attr_op.and_then(|op| crate::io::interp_attribute(inst, op, native))
+                    {
+                        let f16 = inst.name().ends_with("_f16");
+                        for id in attr_input_ids(inputs, &native.io, attr, f16) {
+                            hand.insert(id);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut folded_p1 = HashSet::new();
+    for &(site, ref interp) in interps {
+        let Interp::Interpolated {
+            attribute, first, ..
+        } = interp
+        else {
+            continue;
+        };
+        let f16 = p.blocks[site.0].insts[site.1].name().ends_with("_f16");
+        let is_hand = attr_input_ids(inputs, &native.io, *attribute, f16)
+            .into_iter()
+            .any(|id| hand.contains(&id));
+        if !is_hand && first.iter().all(|f| !leaked_p1.contains(f)) {
+            folded_p1.extend(first.iter().copied());
+        }
+    }
+    // Unread `v_interp_p1*` instructions (neither paired nor read anywhere)
+    // can stay folded as 0 so they don't needlessly force `SV_Barycentrics`.
+    for (b, block) in p.blocks.iter().enumerate() {
+        for (i, inst) in block.insts.iter().enumerate() {
+            if !inst.name().starts_with("v_interp_p1") {
+                continue;
+            }
+            let site = (b, i);
+            if folded_p1.contains(&site) || paired_p1.contains(&site) {
+                continue;
+            }
+            let dst = match &inst.fields {
+                Fields::Vintrp { dst, .. } => Some(*dst),
+                Fields::Valu(v) => v.dst,
+                _ => None,
+            };
+            let used = match dst {
+                Some(Operand::Vector { reg, .. }) => inst.write(Reg::V(reg)).is_some_and(|w| {
+                    p.blocks.iter().any(|blk| {
+                        blk.phis.iter().any(|phi| phi.args.contains(&w))
+                            || blk
+                                .insts
+                                .iter()
+                                .any(|ins| ins.reads.iter().any(|r| r.1 == w))
+                    })
+                }),
+                _ => false,
+            };
+            if !used {
+                folded_p1.insert(site);
+            }
+        }
+    }
+
+    (hand, folded_p1)
+}
+
 fn unsupported(offset: usize, what: Why) -> Stop {
     Stop::Fail(ShaderError::Unsupported { offset, what })
 }
@@ -608,6 +846,15 @@ impl<'a> Lower<'a> {
             }
         }
         let fence_only_barrier = divergent_barriers(p, x.st, &no_barrier);
+        let barycentric_inputs: HashMap<Value, (Barycentric, u8)> =
+            x.io.inputs
+                .iter()
+                .filter_map(|&(v, input)| match input {
+                    Input::Barycentric { kind, index } => Some((v, (kind, index))),
+                    _ => None,
+                })
+                .collect();
+        let (hand_interp, folded_p1) = plan_hand_interp(p, x.native, &s.inputs, &x.io.interps);
         Lower {
             s,
             x,
@@ -679,6 +926,9 @@ impl<'a> Lower<'a> {
             code_table: None,
             counters: HashMap::new(),
             abort: None,
+            barycentric_inputs,
+            hand_interp,
+            folded_p1,
         }
     }
 
@@ -1258,6 +1508,9 @@ impl<'a> Lower<'a> {
                 },
                 Reg::Scc => Val::Missing("SCC on entry"),
                 Reg::V(_) => match io_inputs.get(&v) {
+                    // Barycentrics are loaded lazily in `get()` so normal
+                    // host-interpolated pixel shaders never emit `SV_Barycentrics`.
+                    Some(Input::Barycentric { .. }) => continue,
                     Some(&input) => self.input(input),
                     // Registers no one set read as zero (the validator
                     // refuses reads of undef).
@@ -1434,6 +1687,70 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// Loads one component of `SV_Barycentrics` (`index == 0` -> `.y` = `i`,
+    /// `index == 1` -> `.z` = `j`) with `kind`'s interpolation mode.
+    fn load_barycentric(&mut self, kind: Barycentric, index: u8) -> Result<Val, Why> {
+        let mode = barycentric_mode(kind)?;
+        let col = index + 1;
+        let id = match self.s.inputs.iter().position(|e| e.kind == 28) {
+            Some(id) => {
+                if self.s.inputs[id].interp != mode {
+                    return Err("two barycentric modes read directly");
+                }
+                id
+            }
+            None => {
+                self.s.inputs.push(SigElement {
+                    name: "SV_Barycentrics".into(),
+                    index: 0,
+                    kind: 28,
+                    comp: 9,
+                    interp: mode,
+                    row: None,
+                    col: 0,
+                    cols: 3,
+                    usage: 0,
+                    half: false,
+                });
+                self.s.inputs.len() - 1
+            }
+        };
+        self.s.flags |= flags::BARYCENTRICS;
+        Ok(self.load_any_input(id, col))
+    }
+
+    /// Loads one channel of input `id` at `vertex_id` (`0..=2`) via
+    /// `dx.op.attributeAtVertex` (`nointerpolation`).
+    fn attribute_at_vertex(&mut self, id: usize, col: u8, vertex_id: u8) -> V {
+        let e = &mut self.s.inputs[id];
+        e.interp = 1;
+        e.usage |= 1 << col;
+        let int = e.comp != 9;
+        let ty = if int { self.s.t.i32 } else { self.s.t.f32 };
+        let suffix = if int { ".i32" } else { ".f32" };
+        self.s.flags |= flags::BARYCENTRICS;
+        let entry = self.s.entry;
+        let args = [
+            self.s.m.i32(id as u32),
+            self.s.m.i32(0),
+            self.s.m.i8(col),
+            self.s.m.i8(vertex_id),
+        ];
+        let v = self.s.op(
+            entry,
+            &format!("attributeAtVertex{suffix}"),
+            Attr::ReadNone,
+            ty,
+            137,
+            &args,
+        );
+        if int {
+            v
+        } else {
+            self.s.m.cast(entry, Cast::Bitcast, v, self.s.t.i32)
+        }
+    }
+
     /// The DXIL form of an IR value.
     fn get(&mut self, v: Value) -> Result<Val, Why> {
         if self.phi_at.contains_key(&v) {
@@ -1447,6 +1764,11 @@ impl<'a> Lower<'a> {
             Some(&Val::Missing(w)) => return Err(w),
             Some(&val) => return Ok(val),
             None => {}
+        }
+        if let Some(&(kind, index)) = self.barycentric_inputs.get(&v) {
+            let val = self.load_barycentric(kind, index)?;
+            self.vals.insert(v, val);
+            return Ok(val);
         }
         if let Some(&(param, dword)) = self.params.get(&v) {
             let val = self.user(param, dword);
@@ -3899,17 +4221,6 @@ impl<'a> Lower<'a> {
             }
         }
         Ok(())
-    }
-
-    /// Whether a phi, or an instruction other than an interpolation's second
-    /// half (`v_interp_p2*`), reads `v`.
-    fn read_past_interpolation(&self, v: Value) -> bool {
-        self.x.p.blocks.iter().any(|b| {
-            b.phis.iter().any(|p| p.args.contains(&v))
-                || b.insts.iter().any(|i| {
-                    !i.name().starts_with("v_interp_p2") && i.reads.iter().any(|r| r.1 == v)
-                })
-        })
     }
 
     /// Whether an instruction or phi reads `v` other than as a resource
@@ -6517,52 +6828,35 @@ impl<'a> Lower<'a> {
     }
 
     fn interp(&mut self, inst: &Inst, site: Site) -> Result<(), Why> {
-        let Some(&interp) = self.interps.get(&site) else {
-            if inst.name().starts_with("v_interp_p1") {
-                let dst = match &inst.fields {
-                    Fields::Vintrp { dst, .. } => *dst,
-                    Fields::Valu(v) => v.dst.ok_or("an interpolation")?,
-                    _ => unreachable!(),
-                };
-                // The second half (`v_interp_p2*`) evaluates the whole
-                // attribute; it reads this register only as its accumulator.
-                // Any other reader, or a join, would take the zero as data.
-                if let Operand::Vector { reg, .. } = dst
-                    && let Some(w) = inst.write(Reg::V(reg))
-                {
-                    if self.read_past_interpolation(w) {
-                        return Err("the first half of an interpolation");
-                    }
-                    let z = self.s.m.i32(0);
-                    self.write(inst, Reg::V(reg), z, None);
-                }
-                return Ok(());
+        if self.folded_p1.contains(&site) {
+            let dst = match &inst.fields {
+                Fields::Vintrp { dst, .. } => *dst,
+                Fields::Valu(v) => v.dst.ok_or("an interpolation")?,
+                _ => unreachable!(),
+            };
+            // Folded into a clean host-interpolated `v_interp_p2*` pair.
+            if let Operand::Vector { reg, .. } = dst {
+                let z = self.s.m.i32(0);
+                self.write(inst, Reg::V(reg), z, None);
             }
-            return Err("the first half of an interpolation");
-        };
-        let (attribute, mode) = match interp {
-            Interp::Interpolated {
+            return Ok(());
+        }
+        let host_interp = match self.interps.get(&site) {
+            Some(&Interp::Interpolated {
                 attribute,
                 barycentric,
                 ..
-            } => (
-                attribute,
-                match barycentric {
-                    Barycentric::PerspectiveCenter => 2,
-                    Barycentric::PerspectiveCentroid => 3,
-                    Barycentric::PerspectiveSample => 6,
-                    Barycentric::LinearCenter => 4,
-                    Barycentric::LinearCentroid => 5,
-                    Barycentric::LinearSample => 7,
-                    Barycentric::PerspectivePullModel => return Err("pull-model interpolation"),
-                },
-            ),
-            // P0, the provoking vertex: a flat (nointerpolation) input.
-            Interp::Vertex {
+            }) if !self.attr_is_hand(*attribute, inst.name().ends_with("_f16")) => {
+                Some((*attribute, barycentric_mode(*barycentric)?))
+            }
+            Some(&Interp::Vertex {
                 attribute,
                 vertex: 2,
-            } => (attribute, 1),
-            Interp::Vertex { .. } => return Err("a non-provoking vertex value"),
+            }) if !self.attr_is_hand(*attribute, false) => Some((*attribute, 1)),
+            _ => None,
+        };
+        let Some((attribute, mode)) = host_interp else {
+            return self.interp_by_hand(inst, site);
         };
         let dst = match &inst.fields {
             Fields::Vintrp { dst, .. } => *dst,
@@ -6639,6 +6933,184 @@ impl<'a> Lower<'a> {
                     return Err("32-bit interpolation of a 16-bit input");
                 }
             }
+        };
+        // A pixel interpolates in every lane; guards only hide inactive ones.
+        self.write(inst, Reg::V(reg), x, None);
+        Ok(())
+    }
+
+    fn attr_is_hand(&self, attribute: crate::io::Attribute, f16: bool) -> bool {
+        attr_input_ids(&self.s.inputs, &self.x.native.io, attribute, f16)
+            .into_iter()
+            .any(|id| self.hand_interp.contains(&id))
+    }
+
+    /// Evaluates one interpolation instruction (`v_interp_p1*`, `v_interp_p2*`,
+    /// or `v_interp_mov_f32`) by hand from per-vertex values loaded through
+    /// `dx.op.attributeAtVertex`.
+    fn interp_by_hand(&mut self, inst: &Inst, site: Site) -> Result<(), Why> {
+        let name = inst.name();
+        let attribute = match self.interps.get(&site) {
+            Some(
+                &Interp::Interpolated { attribute, .. }
+                | &Interp::Computed { attribute, .. }
+                | &Interp::Vertex { attribute, .. },
+            ) => *attribute,
+            None => {
+                let attr_op = match &inst.fields {
+                    Fields::Vintrp { attr, .. } => attr,
+                    Fields::Valu(v) => v.src.first().ok_or("an interpolation")?,
+                    _ => return Err("an interpolation"),
+                };
+                crate::io::interp_attribute(inst, attr_op, self.x.native)
+                    .ok_or("an interpolation")?
+            }
+        };
+        let dst = match &inst.fields {
+            Fields::Vintrp { dst, .. } => *dst,
+            Fields::Valu(v) => v.dst.ok_or("an interpolation")?,
+            _ => unreachable!(),
+        };
+        let Operand::Vector { reg, .. } = dst else {
+            return Err("an interpolation");
+        };
+        let packing = match &self.x.native.io {
+            StageIo::Ps { inputs, .. } => inputs
+                .iter()
+                .find(|i| i.row == attribute.row && i.fp16)
+                .map(|i| (i.pack2, (i.row2 != i.row).then_some(i.row2))),
+            _ => None,
+        };
+        let f16 = name.ends_with("_f16");
+        let vertex_raw = |l: &mut Self, row: u8, ch: u8, vertex_id: u8| -> Result<V, Why> {
+            let (id, col) = l
+                .find_input(row, ch)
+                .ok_or("an input the signature lacks")?;
+            Ok(l.attribute_at_vertex(id, col, vertex_id))
+        };
+        let vertex_f32 = |l: &mut Self, vertex_id: u8| -> Result<V, Why> {
+            let raw = match packing {
+                None if f16 || attribute.high => {
+                    return Err("a 16-bit read of a 32-bit input");
+                }
+                None => vertex_raw(l, attribute.row, attribute.channel, vertex_id)?,
+                Some((pack2, b)) => {
+                    if !f16 {
+                        return Err("32-bit interpolation of a 16-bit input");
+                    }
+                    let h = 2 * attribute.channel + u8::from(attribute.high);
+                    let src = if pack2 {
+                        packed_half(&l.s.inputs, attribute.row, b, h)
+                    } else {
+                        h.is_multiple_of(2).then_some((attribute.row, h / 2))
+                    };
+                    let (row, ch) = src.ok_or("a packed input half no element holds")?;
+                    vertex_raw(l, row, ch, vertex_id)?
+                }
+            };
+            Ok(l.as_float(raw))
+        };
+        let c = self.cur;
+        let x = match name {
+            "v_interp_mov_f32" => {
+                let Fields::Vintrp {
+                    src: Operand::Const(vertex),
+                    ..
+                } = inst.fields
+                else {
+                    return Err("an interpolation");
+                };
+                // GFX10 encoding: 2 = P0 (provoking), 0 = P10 (vertex 1), 1 = P20 (vertex 2).
+                let vertex_id = match vertex {
+                    2 => 0,
+                    0 => 1,
+                    1 => 2,
+                    _ => return Err("an interpolation"),
+                };
+                match packing {
+                    None if attribute.high => return Err("a 16-bit read of a 32-bit input"),
+                    None => vertex_raw(self, attribute.row, attribute.channel, vertex_id)?,
+                    Some((pack2, b)) => {
+                        let half = |l: &mut Self, h: u8| -> Result<Option<V>, Why> {
+                            let src = if pack2 {
+                                packed_half(&l.s.inputs, attribute.row, b, h)
+                            } else {
+                                h.is_multiple_of(2).then_some((attribute.row, h / 2))
+                            };
+                            let Some((row, ch)) = src else {
+                                return Ok(None);
+                            };
+                            let raw = vertex_raw(l, row, ch, vertex_id)?;
+                            let f = l.as_float(raw);
+                            Ok(Some(l.f16_nearest(f)))
+                        };
+                        let h = 2 * attribute.channel;
+                        let z = self.s.m.i32(0);
+                        let lo = half(self, h)?.unwrap_or(z);
+                        let hi = half(self, h + 1)?.unwrap_or(z);
+                        let k16 = self.s.m.i32(16);
+                        let hi = self.s.m.bin(c, Bin::Shl, hi, k16);
+                        self.s.m.bin(c, Bin::Or, lo, hi)
+                    }
+                }
+            }
+            "v_interp_p1_f32" | "v_interp_p1ll_f16" => {
+                let src_i = match &inst.fields {
+                    Fields::Vintrp {
+                        src: Operand::Vector { reg: r, .. },
+                        ..
+                    } => inst.read(Reg::V(*r)).ok_or("an unread operand")?,
+                    Fields::Valu(v) => match v.src.get(1) {
+                        Some(&Operand::Vector { reg: r, .. }) => {
+                            inst.read(Reg::V(r)).ok_or("an unread operand")?
+                        }
+                        _ => return Err("an interpolation"),
+                    },
+                    _ => return Err("an interpolation"),
+                };
+                let i_val = self.float_of(src_i)?;
+                let p0 = vertex_f32(self, 0)?;
+                let p1 = vertex_f32(self, 1)?;
+                let p10 = self.s.m.bin(c, Bin::Sub, p1, p0);
+                let prod = self.s.m.bin(c, Bin::Mul, p10, i_val);
+                let res = self.s.m.bin(c, Bin::Add, prod, p0);
+                self.as_int(res)
+            }
+            "v_interp_p2_f32" | "v_interp_p2_f16" => {
+                let (src_j, src_acc) = match &inst.fields {
+                    Fields::Vintrp {
+                        src: Operand::Vector { reg: r, .. },
+                        ..
+                    } => (
+                        inst.read(Reg::V(*r)).ok_or("an unread operand")?,
+                        inst.read(Reg::V(reg)).ok_or("an unread operand")?,
+                    ),
+                    Fields::Valu(v) => {
+                        let read_v = |idx: usize| match v.src.get(idx) {
+                            Some(&Operand::Vector { reg: r, .. }) => {
+                                inst.read(Reg::V(r)).ok_or("an unread operand")
+                            }
+                            _ => Err("an interpolation"),
+                        };
+                        (read_v(1)?, read_v(2)?)
+                    }
+                    _ => return Err("an interpolation"),
+                };
+                let j_val = self.float_of(src_j)?;
+                let acc = self.float_of(src_acc)?;
+                let p0 = vertex_f32(self, 0)?;
+                let p2 = vertex_f32(self, 2)?;
+                let p20 = self.s.m.bin(c, Bin::Sub, p2, p0);
+                let prod = self.s.m.bin(c, Bin::Mul, p20, j_val);
+                let res = self.s.m.bin(c, Bin::Add, prod, acc);
+                if f16 {
+                    let lo = self.f16_nearest(res);
+                    self.low_half(inst, reg, lo)
+                } else {
+                    self.as_int(res)
+                }
+            }
+            _ => return Err("an interpolation form"),
         };
         // A pixel interpolates in every lane; guards only hide inactive ones.
         self.write(inst, Reg::V(reg), x, None);

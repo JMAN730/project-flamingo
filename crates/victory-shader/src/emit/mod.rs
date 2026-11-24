@@ -77,6 +77,8 @@
 //!   DXIL byte limit, the pipeline keeps only the varyings its pixel shader
 //!   declares and the rasterizer system values.
 
+#[cfg(test)]
+mod barycentric_tests;
 mod bitcode;
 mod container;
 #[cfg(all(test, windows))]
@@ -1385,15 +1387,10 @@ mod tests {
         // An extra first half into v3 that nothing reads still lowers.
         let unread = [&[0xC808_0000, 0xC80C_0000, 0xC809_0001][..], &export].concat();
         assert_eq!(lower(&unread), Ok(()));
-        // A first half exported without its second half is refused.
+        // A first half exported without its second half lowers by hand via
+        // `attributeAtVertex` and `SV_Barycentrics` (never exported as zero).
         let lone = [&[0xC808_0000][..], &export].concat();
-        let refused = lower(&lone).unwrap_err();
-        assert!(
-            refused
-                .to_string()
-                .contains("the first half of an interpolation"),
-            "{refused}"
-        );
+        assert_eq!(lower(&lone), Ok(()));
     }
 
     /// A pixel shader reading channel z of an input whose element starts at
