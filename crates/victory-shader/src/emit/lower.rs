@@ -1055,6 +1055,7 @@ pub(super) fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
     })
 }
 
+<<<<<<< HEAD
 /// The parameters packing 16-bit rows two per dword and where each lays
 /// its elements out: (first row, [(dword, register, column, columns)]).
 ///
@@ -1071,6 +1072,8 @@ pub(super) fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
 /// parameter 3, after TEXCOORD5 and TEXCOORD7, while the high half of
 /// TEXCOORD4's second dword stays zero.
 type PackedLayout = Vec<(u8, Vec<(u8, u8, u8, u8)>)>;
+
+
 
 fn packed_layout(elements: &[SigElement], packs: &[(u8, Option<u8>)]) -> PackedLayout {
     let of_row = |r: u8| {
@@ -3720,6 +3723,43 @@ impl<'a> Lower<'a> {
         let t = self.s.m.bin(at, Bin::And, t, one);
         self.s.m.cmp(at, pred::NE, t, z)
     }
+
+    /// The condition a select or a carry-in takes from a scalar mask
+    /// operand: the mask the structure pass followed, this lane's bit of
+    /// the register it holds, or an inline 0 or -1 (no lane, every lane).
+    fn select_condition(&mut self, inst: &Inst, mask: Option<&Operand>) -> Result<V, Why> {
+        const UNTRACKED: Why = "a select on an untracked mask";
+        if let Some(&m) = inst.writes.first().and_then(|&(_, v)| self.x.st.select_masks.get(&v)) {
+            return self.boolean(m, self.cur);
+        }
+        // Inline 0 and -1: no lane or every lane.
+        match mask {
+            Some(&Operand::Const(128)) => return Ok(self.s.m.bool(false)),
+            Some(&Operand::Const(193)) => return Ok(self.s.m.bool(true)),
+            _ => {}
+        }
+        let Some(&Operand::Scalar { code, .. }) = mask else {
+            return Err(UNTRACKED);
+        };
+        if code == NULL {
+            return Ok(self.s.m.bool(false));
+        }
+        // A mask the code holds as a number: this lane's bit of it. Exact
+        // where host lanes are the console's.
+        if self.mask_data != MaskData::Console || self.local {
+            return Err(UNTRACKED);
+        }
+        let lo = self.i32_of(inst.read(Reg::S(code)).ok_or(UNTRACKED)?)?;
+        let hi = if self.x.native.wave64 {
+            // wave64: the register after it holds lanes 32-63.
+            Some(self.i32_of(inst.read(Reg::S(code + 1)).ok_or(UNTRACKED)?)?)
+        } else {
+            None
+        };
+        self.cross_lane(false)?;
+        Ok(self.lane_bit(self.cur, lo, hi))
+    }
+
 
     /// The value of the high dword of the wave64 register pair whose low
     /// dword holds `lo` (none in wave32).
@@ -7163,10 +7203,11 @@ impl<'a> Lower<'a> {
                         Some(&Operand::Scalar { code, .. }) => inst.read(Reg::S(code)),
                         _ => None,
                     };
-                    let m = m
-                        .and_then(|m| self.x.st.masks.get(&m).copied())
-                        .ok_or("a carry-in from an untracked mask")?;
-                    Some(self.boolean(m, c)?)
+                    Some(match m.and_then(|m| self.x.st.masks.get(&m).copied()) {
+                        Some(m) => self.boolean(m, c)?,
+                        // Not followed by structure: this lane's bit of the register.
+                        None => self.select_condition(inst, v.src.get(2))?,
+                    })
                 } else {
                     None
                 };
