@@ -71,14 +71,70 @@ thread_local! {
 }
 
 /// Textures the host GPU wrote by a copy or resolve: their contents are on
-/// the host, not in title memory, which stays as it was.
-static HOST_WRITTEN: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
+/// the host, not in title memory, which stays as it was. Each with the
+/// write-watch asking at the copy (0: its memory is not watched).
+static HOST_WRITTEN: Mutex<Option<HashMap<usize, u64>>> = Mutex::new(None);
+
+/// A texture's title memory, `[start, end)`.
+fn memory_range(resource: This) -> Option<(usize, usize)> {
+    let (memory, desc) = crate::resource::texture_memory(resource)?;
+    let size = crate::resource::texture_layout(&desc)?.planes[0]
+        .layout
+        .size;
+    let start = memory as usize;
+    Some((start, start.checked_add(usize::try_from(size).ok()?)?))
+}
 
 /// A host copy or resolve writes `resource`.
 pub(crate) fn host_written(resource: This) {
-    let mut set = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
-    set.get_or_insert_with(Default::default)
-        .insert(resource as usize);
+    let asked = memory_range(resource)
+        .and_then(|(start, end)| crate::watch::writes(start, end, false))
+        .map_or(0, |(now, _)| now);
+    let mut map = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+    map.get_or_insert_with(Default::default)
+        .insert(resource as usize, asked);
+}
+
+/// Whether the title wrote a texture's memory `[start, end)` again after
+/// the host copied into it at write-watch asking `copied`, given the
+/// watch's `(page, asking)` answer. Only watch pages wholly inside the
+/// texture count: a neighbour written in a shared page must not send stale
+/// memory over the copy. A texture never watched (`copied` 0) keeps the
+/// copy.
+fn rewritten_since(start: usize, end: usize, copied: u64, written: &[(usize, u64)]) -> bool {
+    use crate::watch::PAGE;
+    let (first, last) = (start.div_ceil(PAGE), end / PAGE);
+    copied != 0
+        && written
+            .iter()
+            .any(|&(page, asking)| (first..last).contains(&page) && asking > copied)
+}
+
+/// Whether `resource`'s host copy keeps what the host GPU wrote into it:
+/// a copy or resolve did, and the title has not written its memory since
+/// (upstream #758: a texture copied into once ignored later streaming).
+fn keeps_host_contents(resource: This) -> bool {
+    let copied = {
+        let map = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+        match map.as_ref().and_then(|map| map.get(&(resource as usize))) {
+            Some(&copied) => copied,
+            None => return false,
+        }
+    };
+    if copied == 0 {
+        return true;
+    }
+    let rewritten = memory_range(resource).is_some_and(|(start, end)| {
+        crate::watch::writes(start, end, false)
+            .is_some_and(|(_, written)| rewritten_since(start, end, copied, &written))
+    });
+    if rewritten {
+        let mut map = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(map) = map.as_mut() {
+            map.remove(&(resource as usize));
+        }
+    }
+    !rewritten
 }
 
 /// The title released a resource.
@@ -87,9 +143,9 @@ pub(crate) fn forget(resource: usize) {
     if let Some(map) = map.as_mut() {
         map.remove(&resource);
     }
-    let mut set = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(set) = set.as_mut() {
-        set.remove(&resource);
+    let mut map = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(map) = map.as_mut() {
+        map.remove(&resource);
     }
 }
 
@@ -106,14 +162,9 @@ pub(crate) fn title_written(texture: &ID3D12Resource) -> bool {
 /// submission if the memory changed. Leaves the texture in the copy
 /// destination state.
 pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) {
-    let host_written = HOST_WRITTEN
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .as_ref()
-        .is_some_and(|set| set.contains(&(resource as usize)));
-    // shortcut: a texture the host copied into keeps the host's contents
-    // even if the title later writes its memory too.
-    if host_written || !list.first_use(resource as usize) {
+    // A texture the host copied into keeps the host's contents until the
+    // title writes its memory again (only noticed where it is watched).
+    if !list.first_use(resource as usize) || keeps_host_contents(resource) {
         return;
     }
     let Some(staging) = staging(resource, texture) else {
@@ -375,6 +426,23 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A copied texture uploads again only once the title writes a watch
+    /// page wholly its own after the copy (upstream #758).
+    #[test]
+    fn copied_texture_uploads_again_after_the_title_rewrites_it() {
+        use crate::watch::PAGE;
+        let (start, end) = (4 * PAGE, 8 * PAGE);
+        assert!(!rewritten_since(start, end, 7, &[(4, 6), (5, 7)]));
+        assert!(rewritten_since(start, end, 7, &[(4, 6), (6, 8)]));
+        // Never watched: the copy is kept.
+        assert!(!rewritten_since(start, end, 0, &[(5, 9)]));
+        // Pages shared with neighbours do not count.
+        let (start, end) = (4 * PAGE + 256, 6 * PAGE + 256);
+        assert!(!rewritten_since(start, end, 7, &[(4, 9), (6, 9)]));
+        assert!(rewritten_since(start, end, 7, &[(5, 9)]));
+        assert!(!rewritten_since(PAGE + 16, PAGE + 4096, 1, &[(1, 9)]));
+    }
 
     #[test]
     fn watched_texture_reads_reuse_space_and_expose_only_current_bytes() {
