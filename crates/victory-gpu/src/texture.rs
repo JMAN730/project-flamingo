@@ -46,6 +46,9 @@ pub(crate) struct Staging {
     /// The staging buffer's bytes (counted in `STAGED` while it lives).
     bytes: u64,
     memory: *const u8,
+    /// The resource the staging buffer is of, for the resident mip window
+    /// its views are narrowed to ([`note_resident`]).
+    resource: This,
     last: Mutex<Last>,
     /// Whether the staging buffer was detiled since a submitted list last
     /// uploaded it, and whether one has uploaded it at all: a list records
@@ -683,6 +686,17 @@ impl Staging {
             // shortcut: read again at most every 30 frames (reading around
             // unmapped pages is slow, and nothing tells us when pages
             // arrive): a mip that streams in shows up to 30 frames late.
+            // What of it is there, as a mip window: the views of it are
+            // narrowed to it while it lasts (a streamed texture's mips
+            // arrive from the smallest, at the start of each slice).
+            let window = resident_mips(self.memory, &self.layout);
+            note_resident(self.resource, window, false);
+            #[cfg(feature = "diagnostics")]
+            if window.1 > 0 && window.0 > 0 {
+                crate::copystat::add(crate::copystat::C::ResidentNarrowed, 1);
+            } else if window.1 == 0 {
+                crate::copystat::add(crate::copystat::C::ResidentNone, 1);
+            }
             let frame = crate::frame::current();
             if last.partial.is_some_and(|at| frame < at + 30) {
                 return 0;
@@ -710,6 +724,8 @@ impl Staging {
             let _ = changed;
             return size;
         }
+        // All of it is there: no view of it is narrowed any more.
+        note_resident(self.resource, (0, 0), true);
         if through_copy() {
             return with_title(self.memory, size, |tiled| {
                 let hash = blake3::hash(tiled);
@@ -981,6 +997,82 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
     there
 }
 
+/// The mips of a title texture whose memory is all there: `(first, count)`,
+/// `(0, 0)` if none is.
+///
+/// A streamed texture's pages arrive a few blocks at a time, and its
+/// smallest mips lie at the start of each slice (`Layout::mip_extents`), so
+/// what is there is a suffix of the mip chain: the memory below `mapped`
+/// holds every mip from `first` on. A view over that range samples what the
+/// console's residency clamp would have it sample, instead of reading zeros
+/// for the mips that have not arrived.
+pub(crate) fn resident_suffix(extents: &[(u64, u64)], mapped: u64) -> (u32, u32) {
+    let n = extents.len();
+    let mut first = n;
+    while first > 0 {
+        if extents[first - 1].1 > mapped {
+            break;
+        }
+        first -= 1;
+    }
+    (first as u32, (n - first) as u32)
+}
+
+/// [`resident_suffix`] of the texture at `memory`: the mips all of whose
+/// bytes are mapped now.
+pub(crate) fn resident_mips(memory: *const u8, layout: &victory_formats::texture::Layout) -> (u32, u32) {
+    if layout.size == 0 || layout.mips.is_empty() {
+        return (0, 0);
+    }
+    let mapped = mapped_bytes(memory, layout.size as usize);
+    if mapped >= layout.size {
+        return (0, layout.mips.len() as u32);
+    }
+    if mapped == 0 {
+        return (0, 0);
+    }
+    resident_suffix(&layout.mip_extents(), mapped)
+}
+
+/// The resident mip window `(first, count)` of a texture a view is made on:
+/// what [`resident_mips`] found at its last upload. `None` while it is all
+/// there (or nothing is known: no staging buffer, no view to narrow).
+pub(crate) fn resident(resource: This) -> Option<(u32, u32)> {
+    static RESIDENT: Mutex<Option<HashMap<usize, (u32, u32)>>> = Mutex::new(None);
+    let map = RESIDENT.lock().unwrap_or_else(|e| e.into_inner());
+    map.as_ref()?.get(&(resource as usize)).copied()
+}
+
+/// Notes the resident mip window of `resource` (`(0, 0)` when none of its
+/// mips is there): a view of it is narrowed to it while it stands, and
+/// widened when more has arrived.
+pub(crate) fn note_resident(resource: This, window: (u32, u32), whole: bool) {
+    static RESIDENT: Mutex<Option<HashMap<usize, (u32, u32)>>> = Mutex::new(None);
+    let mut map = RESIDENT.lock().unwrap_or_else(|e| e.into_inner());
+    let map = map.get_or_insert_with(HashMap::new);
+    if whole {
+        map.remove(&(resource as usize));
+    } else {
+        map.insert(resource as usize, window);
+    }
+}
+
+/// The mips a view asks for, `(MostDetailedMip, MipLevels or 0 for the
+/// rest)`, narrowed to the resident ones: what the view should name so that
+/// every mip it can sample is there.
+pub(crate) fn narrowed(asked: (u32, u32), resident: (u32, u32), mips: u32) -> (u32, u32) {
+    let (first, levels) = asked;
+    let end = if levels == 0 { mips } else { first.saturating_add(levels).min(mips) };
+    let (rfirst, rcount) = resident;
+    let rend = rfirst.saturating_add(rcount).min(mips);
+    let start = first.max(rfirst).min(rend.saturating_sub(1));
+    let stop = end.min(rend);
+    // Nothing the view asked for is there: its most detailed resident mip
+    // alone (the picture is the smallest mip, not black).
+    let count = stop.saturating_sub(start).max(1);
+    (start, count)
+}
+
 /// The staging state of a title texture, made on first use.
 fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
@@ -1046,6 +1138,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         mips: u32::from(d.MipLevels),
         bytes: total,
         memory,
+        resource,
         last: Mutex::default(),
         dirty: std::sync::atomic::AtomicBool::new(true),
         uploaded: std::sync::atomic::AtomicBool::new(false),
@@ -1163,5 +1256,58 @@ mod title_memory_tests {
                 assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod resident_tests {
+    use super::{narrowed, resident_suffix};
+
+    /// A 9-mip chain as the console lays it out: the tail block first, then
+    /// mip 4 to 0 (each twice the one after), in bytes.
+    fn chain() -> Vec<(u64, u64)> {
+        vec![
+            (16384, 32768),   // mip 0
+            (8192, 16384),    // mip 1
+            (4096, 8192),     // mip 2
+            (2048, 4096),     // mip 3
+            (1024, 2048),     // mip 4
+            (0, 1024),        // mips 5 to 8 in the tail block
+            (0, 1024),
+            (0, 1024),
+            (0, 1024),
+        ]
+    }
+
+    #[test]
+    fn only_the_tail_arrived_so_only_the_tail_is_sampled() {
+        assert_eq!(resident_suffix(&chain(), 1024), (5, 4));
+        assert_eq!(resident_suffix(&chain(), 2048), (4, 5));
+        assert_eq!(resident_suffix(&chain(), 32768), (0, 9));
+    }
+
+    #[test]
+    fn a_hole_stops_the_suffix() {
+        // Mip 2 arrived, mip 1 and 0 did not: the suffix starts at 2.
+        assert_eq!(resident_suffix(&chain(), 8192), (2, 7));
+        // Nothing at all.
+        assert_eq!(resident_suffix(&chain(), 0), (9, 0));
+    }
+
+    #[test]
+    fn a_view_is_narrowed_to_what_it_asked_and_what_is_there() {
+        // A view of every mip, only the tail there: the tail's first mip.
+        assert_eq!(narrowed((0, 0), (5, 4), 9), (5, 4));
+        // A view of the top four, of which none is there: the smallest
+        // resident mip alone.
+        assert_eq!(narrowed((0, 4), (6, 3), 9), (6, 1));
+        // Asking for mips 0 to 2, of which only mip 2 is there: the one it
+        // has (a narrow view is better than zeros).
+        assert_eq!(narrowed((0, 3), (2, 7), 9), (2, 1));
+        // A view that starts inside the resident range keeps the overlap of
+        // the two (mips 5 and 6 of the 3..7 it asked for).
+        assert_eq!(narrowed((3, 4), (5, 4), 9), (5, 2));
+        // Everything there: unchanged (0 levels means the rest).
+        assert_eq!(narrowed((0, 0), (0, 9), 9), (0, 9));
     }
 }

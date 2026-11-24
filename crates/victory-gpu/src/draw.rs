@@ -339,6 +339,16 @@ pub(crate) static HEAP_TEXTURES_AWAY: AtomicU64 = AtomicU64::new(0);
 /// Slots the pass found up to date already: their texture is uploaded by
 /// the draws that read it through a table (it has a staging buffer).
 pub(crate) static HEAP_TEXTURES_TABLED: AtomicU64 = AtomicU64::new(0);
+/// Times a placed texture's slot was kept as it was because its memory was
+/// unmapped and it showed a texture already ([`keep_contents`]).
+pub(crate) static HEAP_TEXTURES_KEPT: AtomicU64 = AtomicU64::new(0);
+
+/// Whether a slot whose texture's memory was unmapped keeps the texture it
+/// shows (`VICTORY_TEXTURE_KEEP=0` nulls it: it draws black).
+fn keep_contents() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_KEEP").is_none_or(|v| v != "0"))
+}
 /// The queue of textures picked by index at the last pass
 /// (`TextureQueue::census`): slots in it, due, waiting for their memory,
 /// uploaded in part, and the frames the oldest due one has waited.
@@ -1523,6 +1533,17 @@ impl State {
                 let mapped = crate::texture::mapped_bytes(address as *const u8, len as usize);
                 if mapped == 0 {
                     HEAP_TEXTURES_AWAY.fetch_add(1, Ordering::Relaxed);
+                    // Its memory went away. A slot that shows a texture
+                    // already keeps it: the title streams a texture out of
+                    // that address only until it streams the next one in,
+                    // and a slot left as it was shows the texture that was
+                    // there (stale for a moment) where a null slot draws
+                    // black (`VICTORY_TEXTURE_KEEP=0` nulls it, as before).
+                    if keep_contents() && host.texture_slot_has_contents(index) {
+                        HEAP_TEXTURES_KEPT.fetch_add(1, Ordering::Relaxed);
+                        host.texture_slot_later(index, write, frame, most);
+                        continue;
+                    }
                     // Streamed out: what the slot showed is let go.
                     host.texture_slot_gone(index);
                     host.texture_slot_later(index, write, frame, most);

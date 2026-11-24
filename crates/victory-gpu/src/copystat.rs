@@ -127,8 +127,15 @@ pub(crate) enum C {
     WaitsForGroups,
     WaitsForBuffers,
     IndirectBounded,
+    /// Uploads of a texture only part of which is mapped: those where the
+    /// views were narrowed to the resident mips, and those where no mip at
+    /// all was there.
+    ResidentNarrowed,
+    ResidentNone,
+    /// Shader resource views narrowed to their texture's resident mips.
+    ViewNarrowed,
 }
-const COUNTERS: usize = 80;
+const COUNTERS: usize = 83;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -1148,6 +1155,17 @@ pub(crate) fn log(frames: f64) {
         c[C::HostListNs as usize] / 1e6,
         c[C::PartsTogether as usize],
     );
+    // A texture only part of which is mapped: the views of it name the
+    // mips that are there, and how many were narrowed.
+    let narrowed = c[C::ResidentNarrowed as usize];
+    let nothing = c[C::ResidentNone as usize];
+    let views_narrowed = c[C::ViewNarrowed as usize];
+    if narrowed + nothing + views_narrowed > 0.0 {
+        tracing::info!(
+            "resident mips per frame: {narrowed:.1} uploads narrowed to what is there, {nothing:.1} \
+             with no mip there; {views_narrowed:.1} shader resource views narrowed"
+        );
+    }
     // What is copied whole, largest first: memory nobody tells us about.
     let whole = WHOLE.lock().unwrap_or_else(|e| e.into_inner()).take();
     let mut whole: Vec<_> = whole.into_iter().flatten().collect();
