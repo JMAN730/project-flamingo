@@ -175,6 +175,8 @@ pub(crate) struct State {
     scissors: Vec<RECT>,
     blend: Option<[f32; 4]>,
     stencil: Option<u32>,
+    /// The title's depth bounds (`OMSetDepthBounds`), set again after a cut.
+    depth_bounds: Option<(f32, f32)>,
     /// The indirect records clamped last, if later draws may still read
     /// them ([`windows`]).
     window: Option<Window>,
@@ -601,6 +603,11 @@ impl State {
         crate::draw::stencil_ref(list, reference);
     }
 
+    pub(crate) fn set_depth_bounds(&mut self, list: &HostList, min: f32, max: f32) {
+        self.depth_bounds = Some((min, max));
+        crate::draw::depth_bounds(list, min, max);
+    }
+
     /// `list` is a new host list that continues the title's list (it was
     /// cut at a wait for a memory value, `crate::list::cut`): a new host
     /// list has nothing set, so what the title set so far is set again.
@@ -636,6 +643,9 @@ impl State {
         }
         if let Some(reference) = self.stencil {
             crate::draw::stencil_ref(list, reference);
+        }
+        if let Some((min, max)) = self.depth_bounds {
+            crate::draw::depth_bounds(list, min, max);
         }
     }
 
@@ -2742,6 +2752,42 @@ pub(crate) fn scissors(list: &HostList, rects: &[RECT]) {
 pub(crate) fn blend_factor(list: &HostList, factor: Option<&[f32; 4]>) {
     // SAFETY: an open list.
     unsafe { list.list.OMSetBlendFactor(factor) };
+}
+
+/// `OMSetDepthBounds`, if the host has the test: bounds in 0..=1, the low
+/// one first, as the host requires (its debug layer refuses others).
+/// Ideas from upstream #849 (Xvania7 c47632fc, Raxstreams 520d629e).
+pub(crate) fn depth_bounds(list: &HostList, min: f32, max: f32) {
+    if !crate::pipeline::host::depth_bounds_supported() {
+        return;
+    }
+    let (min, max) = depth_range(min, max);
+    if let Ok(list1) = list.list.cast::<ID3D12GraphicsCommandList1>() {
+        // SAFETY: an open list.
+        unsafe { list1.OMSetDepthBounds(min, max) };
+    }
+}
+
+/// Depth bounds the host takes: NaN as the full range, each in 0..=1, in
+/// order.
+fn depth_range(min: f32, max: f32) -> (f32, f32) {
+    let unit = |x: f32, nan: f32| if x.is_nan() { nan } else { x.clamp(0.0, 1.0) };
+    let (min, max) = (unit(min, 0.0), unit(max, 1.0));
+    (min.min(max), max)
+}
+
+#[cfg(test)]
+mod depth_bounds_tests {
+    use super::depth_range;
+
+    /// Depth bounds reach the host in 0..=1 and in order.
+    #[test]
+    fn depth_bounds_are_clamped_and_ordered() {
+        assert_eq!(depth_range(0.25, 0.75), (0.25, 0.75));
+        assert_eq!(depth_range(-1.0, 2.0), (0.0, 1.0));
+        assert_eq!(depth_range(f32::NAN, f32::NAN), (0.0, 1.0));
+        assert_eq!(depth_range(0.9, 0.1), (0.1, 0.1));
+    }
 }
 
 pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
