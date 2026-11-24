@@ -7179,7 +7179,11 @@ impl<'a> Lower<'a> {
             "image_get_lod" if self.s.pixel => (81, true),
             // Implicit derivatives: pixel shaders only.
             "image_sample_c" | "image_sample_c_cl" if self.s.pixel => (64, true),
-            "image_gather4" | "image_gather4_lz" | "image_gather4_lz_o" => (73, true),
+            // The LOD of `_l` is not read: DXIL gathers from level 0, the
+            // one a title's gathers of shadow maps and G-buffers name.
+            // shortcut: a gather of a lower level reads level 0.
+            "image_gather4" | "image_gather4_lz" | "image_gather4_lz_o" | "image_gather4_l"
+            | "image_gather4_l_o" => (73, true),
             "image_load" | "image_load_mip" => (66, false),
             "image_get_resinfo" => (72, false),
             _ => return Err(name),
@@ -8584,6 +8588,68 @@ mod tests {
     /// Lowers a compute program of constants: whether it translates.
     fn lowers(words: &[u32]) -> Result<(), crate::ShaderError> {
         lower_words(words).map(|_| ())
+    }
+
+    /// image_sample_d_cl and image_gather4_l translate (upstream #694:
+    /// #293, #653), with the image table in user data 8, the sampler's in 9.
+    #[test]
+    fn image_sample_d_cl_and_gather4_l_translate() {
+        use crate::native::{RootParam, RootType};
+        let param = |user_data: u8| RootParam {
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data,
+            slot: 0,
+        };
+        let run = |image: [u32; 2]| {
+            let words = [
+                0xBE82_0309, // s_mov_b32 s2, s9
+                0xBE89_0380, // s_mov_b32 s9, 0
+                0xBE83_0380, // s_mov_b32 s3, 0
+                0xF408_0204,
+                0xFA00_0000, // s_load_dwordx4 s[8:11], s[8:9], null
+                0xF40C_0001,
+                0xFA00_0000, // s_load_dwordx8 s[0:7], s[2:3], null
+                image[0],
+                image[1],
+                S_ENDPGM,
+            ];
+            let native = NativeProgram {
+                stage: HwStage::Cs,
+                wave64: false,
+                vgprs: 256,
+                layout: vec![param(8), param(9)],
+                used: vec![],
+                io: StageIo::Cs(ComputeIo {
+                    rsrc2: 0,
+                    threads: [1, 1, 1],
+                }),
+                code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+            };
+            let p = ir::build(&native.code, false, 256).unwrap();
+            let st = structure::structure(&p).unwrap();
+            let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+            let io = io::raise(&p, &native).unwrap();
+            lower(&Parts {
+                native: &native,
+                p: &p,
+                st: &st,
+                io: &io,
+                res: &res,
+                inputs: vec![],
+                outputs: vec![],
+                prims: vec![],
+                mesh_stride: 0,
+                host_wave64: true,
+            })
+            .map(|_| ())
+        };
+        // image_sample_d_cl v[0:3], v[2:8], s[0:7], s[8:11]
+        run([0xF08C_0F08, 0x0040_0002]).unwrap();
+        // image_gather4_l v[0:3], v[2:4], s[0:7], s[8:11]
+        run([0xF110_0108, 0x0040_0002]).unwrap();
     }
 
     #[test]

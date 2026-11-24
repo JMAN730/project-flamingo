@@ -1202,6 +1202,7 @@ mod tests {
             let res = resource::track(&p, &native.layout, native.stage, None).unwrap();
             let io = io::raise(&p, &native).unwrap();
             let st = structure::structure(&p).unwrap();
+            #[cfg_attr(not(windows), allow(unused_mut, unused_variables))]
             let mut host = emit(&c, &native, &p, &st, &io, &res).unwrap();
             #[cfg(windows)]
             if let Ok(mut v) = super::validator::Validator::load(
