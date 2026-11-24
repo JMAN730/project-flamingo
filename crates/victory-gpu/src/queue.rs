@@ -291,6 +291,15 @@ extern "system" fn present(
 ) -> HRESULT {
     // Read now: the parameters are the title's, maybe on its stack. The
     // frame is shown in the queue's order, after the work before it.
+    if planes > 1 {
+        // A console can put a UI plane over a scene plane (Series S: a
+        // 1080p scene under a 4K UI); only the first is shown here. Once,
+        // so a run shows whether a title needs the planes composited.
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            tracing::warn!(planes, "a present with several planes: only the first is shown");
+        });
+    }
     let plane = if planes > 0 {
         // SAFETY: the title passes `planes` plane descriptions.
         unsafe { plane_parameters.as_ref() }
