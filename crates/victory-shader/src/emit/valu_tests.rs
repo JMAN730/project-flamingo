@@ -1259,3 +1259,42 @@ fn v_cmp_class_f16_matches_rdna2() {
         );
     });
 }
+
+/// A carry-in whose mask is a plain SGPR (a root constant) the structure pass
+/// does not follow: this lane adds its own bit of the number.
+#[test]
+fn v_add_co_ci_on_an_untracked_mask_adds_this_lanes_bit() {
+    // v_add_co_ci_u32_e64 v0, s12, v1, v2, s3 (VOP3B 0x128; s12 takes the carry out).
+    let mut op = vop3(0x128, 0, vgpr(1), vgpr(2), sgpr(3));
+    op[0] |= 12 << 8;
+    let shader = build_valu_cs(&op);
+    run_cases_on(
+        &shader,
+        &[
+            [10, 20, 0, 0],
+            [10, 20, 0, 1],
+            [10, 20, 0, 2],
+            [10, 20, 0, !0],
+        ],
+        &[("hardware", false)],
+        |label, i, inp, got| {
+            assert_eq!(got, inp[0] + inp[1] + (inp[3] & 1), "{label} case {i}");
+        },
+    );
+}
+
+/// A select on an inline 0 or -1 mask picks src0 or src1 in every lane.
+#[test]
+fn v_cndmask_on_an_inline_mask_picks_one_side() {
+    for (mask, pick) in [(128u16, 0usize), (193, 1)] {
+        let k = build_valu_cs(&vop3(0x101, 0, vgpr(1), vgpr(2), mask));
+        run_cases_on(
+            &k,
+            &[[10, 20, 0, 0]],
+            &[("hardware", false)],
+            |label, _, inp, got| {
+                assert_eq!(got, inp[pick], "{label} inline {mask}");
+            },
+        );
+    }
+}
