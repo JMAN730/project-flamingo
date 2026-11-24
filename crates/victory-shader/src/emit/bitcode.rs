@@ -97,12 +97,18 @@ pub(crate) enum Cast {
 
 /// Compare predicates: floats 0-15, integers 32-41.
 pub(crate) mod pred {
+    // FALSE and TRUE are not emitted: WARP removes its device on them (and
+    // DXC folds them away), so constant compares lower as constants.
+    #[allow(dead_code)]
     pub const FALSE: u8 = 0;
     pub const OEQ: u8 = 1;
     pub const OGT: u8 = 2;
     pub const OGE: u8 = 3;
     pub const OLT: u8 = 4;
     pub const OLE: u8 = 5;
+    // Not emitted: the AMD D3D12 driver treats it as UNE, so `v_cmp_lg`
+    // lowers as OLT | OGT instead.
+    #[allow(dead_code)]
     pub const ONE: u8 = 6;
     pub const ORD: u8 = 7;
     pub const UNO: u8 = 8;
@@ -112,6 +118,7 @@ pub(crate) mod pred {
     pub const ULT: u8 = 12;
     pub const ULE: u8 = 13;
     pub const UNE: u8 = 14;
+    #[allow(dead_code)]
     pub const TRUE: u8 = 15;
     pub const EQ: u8 = 32;
     pub const NE: u8 = 33;
@@ -208,6 +215,12 @@ pub(crate) struct Module {
 }
 
 impl Module {
+    /// The names of the declared and defined functions.
+    #[cfg(test)]
+    pub fn func_names(&self) -> Vec<String> {
+        self.funcs.iter().map(|f| f.name.clone()).collect()
+    }
+
     fn ty(&mut self, def: TypeDef) -> Ty {
         if let Some(&t) = self.type_ids.get(&def) {
             return Ty(t);
@@ -289,6 +302,17 @@ impl Module {
             })
             .collect();
         self.constant(ty, Const::Aggregate(ids))
+    }
+
+    /// The value of an integer constant; `None` for anything else.
+    pub fn int_value(&self, v: V) -> Option<i64> {
+        match v {
+            V::Const(i) => match self.consts[i as usize].1 {
+                Const::Int(x) => Some(x),
+                _ => None,
+            },
+            _ => None,
+        }
     }
 
     /// Gives constant `old` the content of `new` (both stay valid).

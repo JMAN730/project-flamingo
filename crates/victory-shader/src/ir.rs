@@ -354,7 +354,13 @@ pub fn build_with(
                 Flow::Stop => Exit::End,
             };
         }
-        if let Some((reads, writes)) = effects(&machine, &fields, name, lanes, vgprs)? {
+        if let Some((mut reads, writes)) = effects(&machine, &fields, name, lanes, vgprs)? {
+            // Lanes disabled in EXEC keep the old value.
+            for w in writes.iter().filter(|w| matches!(w, Reg::V(_))) {
+                if !reads.contains(w) {
+                    reads.push(*w);
+                }
+            }
             let unset = |regs: Vec<Reg>| regs.into_iter().map(|r| (r, NONE)).collect();
             blocks[b].insts.push(Inst {
                 machine,
@@ -407,8 +413,17 @@ fn rename(mut blocks: Vec<Block>, wave64: bool, vgprs: u16) -> Program {
         }
         for inst in &mut block.insts {
             for (reg, v) in &mut inst.reads {
-                *v = current[index(*reg)];
-                debug_assert_ne!(*v, NONE, "{reg:?} read at {:#x}", inst.machine.offset);
+                let mut value = current[index(*reg)];
+                if value == NONE {
+                    // No reaching definition: the hardware's registers start
+                    // at zero (Leonida tools/rdna2spirv.py:15973). Give the
+                    // read a zero-valued entry input instead of leaking NONE
+                    // into the emitter as "a value defined after its use".
+                    value = new_value();
+                    inputs.push((*reg, value));
+                    current[index(*reg)] = value;
+                }
+                *v = value;
             }
             for (reg, v) in &mut inst.writes {
                 *v = new_value();
@@ -863,6 +878,16 @@ const DROPPED: &[&str] = &[
 /// Registers read, registers written.
 type Effects = (Vec<Reg>, Vec<Reg>);
 
+/// The registers `inst` of `p` reads as operands: its reads without the old
+/// value of a VGPR it only writes.
+pub(crate) fn operand_reads(p: &Program, inst: &Inst) -> Vec<Reg> {
+    let lanes = 1 + u8::from(p.wave64);
+    effects(&inst.machine, &inst.fields, inst.name(), lanes, p.vgprs)
+        .ok()
+        .flatten()
+        .map_or_else(Vec::new, |e| e.0)
+}
+
 /// Registers an instruction reads and writes, one per dword, or `None` if
 /// the IR drops it.
 fn effects(
@@ -1131,8 +1156,6 @@ fn effects(
     }
     if vector {
         r.extend(mask(EXEC));
-        // Lanes disabled in EXEC keep the old value.
-        r.extend(w.iter().filter(|w| matches!(w, Reg::V(_))));
     }
     let mut seen = Vec::with_capacity(r.len());
     r.retain(|reg| {
@@ -1232,6 +1255,199 @@ fn add_regs(op: &Operand, lanes: u8, out: &mut Vec<Reg>) -> Result<(), ()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::{HashMap, HashSet};
+
+    /// Dominators of every block, by the naive iterative algorithm: for each
+    /// block, the intersection of its predecessors' sets plus itself, until
+    /// nothing changes. Slow, but independent of the code under test.
+    fn reference_dominators(blocks: &[Block]) -> Vec<Vec<usize>> {
+        let n = blocks.len();
+        let mut dom: Vec<Vec<usize>> = vec![(0..n).collect(); n];
+        let mut reachable = vec![false; n];
+        reachable[0] = true;
+        let mut work = vec![0];
+        while let Some(b) = work.pop() {
+            for s in blocks[b].exit.successors() {
+                if !reachable[s] {
+                    reachable[s] = true;
+                    work.push(s);
+                }
+            }
+        }
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for b in 1..n {
+                if !reachable[b] {
+                    continue;
+                }
+                let mut d: Option<Vec<usize>> = None;
+                for &q in &blocks[b].preds {
+                    if !reachable[q] {
+                        continue;
+                    }
+                    d = Some(match d {
+                        None => dom[q].clone(),
+                        Some(acc) => acc.iter().copied().filter(|x| dom[q].contains(x)).collect(),
+                    });
+                }
+                let mut d = d.unwrap_or_default();
+                d.push(b);
+                d.sort_unstable();
+                if d != dom[b] {
+                    dom[b] = d;
+                    changed = true;
+                }
+            }
+        }
+        dom
+    }
+
+    /// One word per instruction the decoder accepts, for programs built at
+    /// random: every opcode of every encoding, with a few operand patterns.
+    fn decodable_words() -> Vec<u32> {
+        let mut out = Vec::new();
+        let mut push = |w: u32, second: u32| {
+            let code: Vec<u8> = [w, second, 0xBF81_0000]
+                .iter()
+                .flat_map(|x| x.to_le_bytes())
+                .collect();
+            if crate::gfx10::decode(&code).is_ok() {
+                out.push(w);
+            }
+        };
+        for op in 0..128u32 {
+            for rest in [0, 0x1FF, 0x3FFFF, 0xFFFF] {
+                push(op << 25 | rest, 0); // VOP2
+                push(0x7E00_0000 | (op << 9) | rest, 0); // VOP1
+                push(0x7C00_0000 | (op << 17) | rest, 0); // VOPC
+            }
+        }
+        for op in 0..128u32 {
+            for rest in [0, 0xFF, 0xFFFF] {
+                push(0x8000_0000 | (op << 23) | rest, 0); // SOP2
+                push(0xB000_0000 | (op << 23) | rest, 0); // SOPK
+                push(0xBF00_0000 | (op << 16) | rest, 0); // SOPC
+                push(0xBF80_0000 | (op << 16) | rest, 0); // SOPP
+            }
+            push(0xBE80_0000 | (op << 8) | 0xFF, 0); // SOP1
+        }
+        for op in 0..1024u32 {
+            push(0xD000_0000 | (op << 16), 0x0000_01FF); // VOP3
+        }
+        for op in 0..256u32 {
+            push(0xD800_0000 | (op << 18), 0); // DS
+            push(0xF400_0000 | (op << 18), 0); // SMEM
+            push(0xDC00_0000 | (op << 18), 0); // FLAT
+        }
+        for op in 0..128u32 {
+            push(0xCC00_0000 | (op << 16), 0x0000_01FF); // VOP3P
+            push(0xE000_0000 | (op << 18), 0); // MUBUF
+            push(0xF000_0000 | (op << 18), 0); // MIMG
+        }
+        for op in 0..16u32 {
+            push(0xC800_0000 | (op << 16), 0); // VINTRP
+            push(0xE800_0000 | (op << 16), 0); // MTBUF
+        }
+        push(0xF800_0000, 0); // EXP
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
+    /// Every value is written once, and every read of it is in a block its
+    /// definition dominates (a phi's argument in that predecessor), so the
+    /// emitter can hand each read a value that already exists.
+    #[test]
+    fn built_programs_are_ssa_and_dominated() {
+        let words = decodable_words();
+        assert!(words.len() > 1000, "only {} words decode", words.len());
+        // xorshift, so the corpus is the same on every run and host.
+        let mut rng = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        let mut built = 0usize;
+        for _ in 0..20_000 {
+            let n = (next() % 12) as usize + 1;
+            let mut code: Vec<u32> = (0..n)
+                .map(|_| words[(next() as usize) % words.len()])
+                .collect();
+            code.push(0xBF81_0000);
+            let bytes: Vec<u8> = code.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let wave64 = next() % 2 == 0;
+            let Ok(p) = build(&bytes, wave64, 256) else {
+                continue;
+            };
+            built += 1;
+            let dom = reference_dominators(&p.blocks);
+            let mut defined: HashMap<Value, (usize, Reg)> = HashMap::new();
+            for (b, block) in p.blocks.iter().enumerate() {
+                for phi in &block.phis {
+                    assert_eq!(
+                        phi.args.len(),
+                        block.preds.len(),
+                        "block {b}: phi {:?} has {} arguments for {} predecessors",
+                        phi.value,
+                        phi.args.len(),
+                        block.preds.len()
+                    );
+                    assert!(
+                        defined.insert(phi.value, (b, phi.reg)).is_none(),
+                        "phi {:?} defined twice",
+                        phi.value
+                    );
+                }
+                for inst in &block.insts {
+                    for &(reg, v) in &inst.writes {
+                        let old = defined.insert(v, (b, reg));
+                        assert!(
+                            old.is_none(),
+                            "{v:?} written twice: {old:?} and ({b}, {reg:?})"
+                        );
+                    }
+                }
+            }
+            let inputs: HashSet<Value> = p.inputs.iter().map(|i| i.1).collect();
+            for (b, block) in p.blocks.iter().enumerate() {
+                for phi in &block.phis {
+                    for (n, &arg) in phi.args.iter().enumerate() {
+                        if inputs.contains(&arg) {
+                            continue;
+                        }
+                        let Some(&(d, _)) = defined.get(&arg) else {
+                            panic!("phi {:?} takes {arg:?}, which nothing defines", phi.value);
+                        };
+                        assert!(
+                            dom[block.preds[n]].contains(&d),
+                            "phi {:?} takes {arg:?} from block {d}, which does not dominate \
+                             predecessor {}",
+                            phi.value,
+                            block.preds[n]
+                        );
+                    }
+                }
+                for inst in &block.insts {
+                    for &(_, v) in &inst.reads {
+                        if inputs.contains(&v) {
+                            continue;
+                        }
+                        let Some(&(d, _)) = defined.get(&v) else {
+                            panic!("{v:?} is read in block {b} but never written");
+                        };
+                        assert!(
+                            dom[b].contains(&d),
+                            "{v:?} is written in block {d}, which does not dominate block {b}"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(built > 500, "only {built} programs built");
+    }
 
     fn reference_postorder(blocks: &[Block]) -> Vec<usize> {
         let mut seen = vec![false; blocks.len()];

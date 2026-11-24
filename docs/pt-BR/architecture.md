@@ -39,7 +39,7 @@ só como aquecimento.
 | `victory-hle` | implementações das APIs do console, política de repasse ao host |
 | `victory-gpu` | objetos D3D12.X, command lists e memória de GPU → D3D12 do host |
 | `victory-shader` | containers de shader do Xbox → shaders do host |
-| `victory-formats` | layouts de textura da GPU (tamanhos, tiling, detiling), codecs de áudio; planejado: BCPack |
+| `victory-formats` | layouts de textura da GPU (tamanhos, tiling, detiling), decodificação BCPack, codecs de áudio |
 | `victory-pipeline` | trait de conversor, cache endereçado por conteúdo |
 | `victory-game` | formatos, identidades de build e hooks específicos de Grand Theft Auto VI |
 | `apps/victory` | interface de linha de comando |

@@ -340,6 +340,10 @@ struct State {
     pending: Vec<Event>,
     /// Device callbacks running now: token and thread.
     running: Vec<(u64, ThreadId)>,
+    /// Host slots that have reported input at least once. A wireless receiver
+    /// answers for its pad while the pad is off, with an all-zero report; that
+    /// slot is not a pad until something is actually pressed.
+    seen_input: [bool; PADS],
 }
 
 pub struct Hub {
@@ -384,6 +388,7 @@ impl Hub {
                 callbacks: Vec::new(),
                 pending: Vec::new(),
                 running: Vec::new(),
+                seen_input: [false; PADS],
             }),
             returned: Condvar::new(),
         }));
@@ -469,6 +474,16 @@ impl State {
     ) -> Vec<Event> {
         let now = now();
         let mut events = std::mem::take(&mut self.pending);
+        // A slot that has never reported input is not a pad: a wireless receiver keeps
+        // answering for a pad that is switched off, and its all-zero report used to hide the
+        // keyboard's stand-in, leaving the keyboard dead with no pad in hand.
+        let pads: [Option<PadState>; PADS] = std::array::from_fn(|slot| {
+            let pad = pads[slot]?;
+            if pad != PadState::default() {
+                self.seen_input[slot] = true;
+            }
+            self.seen_input[slot].then_some(pad)
+        });
         let any_pad = pads.iter().any(Option::is_some);
         for (slot, pad) in pads.into_iter().enumerate() {
             self.update(devices, slot, pad.map(Value::Pad), now, &mut events);
@@ -1105,7 +1120,8 @@ mod host {
 
     use windows_sys::Win32::System::Threading::GetCurrentProcessId;
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-        GetAsyncKeyState, MAPVK_VK_TO_VSC_EX, MapVirtualKeyW,
+        GetAsyncKeyState, GetKeyState, GetKeyboardLayout, HKL, MAPVK_VK_TO_VSC_EX, MapVirtualKeyW,
+        ToUnicodeEx,
     };
     use windows_sys::Win32::UI::Input::XboxController::{
         XINPUT_GAMEPAD, XINPUT_GAMEPAD_A, XINPUT_GAMEPAD_B, XINPUT_GAMEPAD_BACK,
@@ -1208,14 +1224,19 @@ mod host {
                     .collect();
                 down.extend(held);
             }
-            down.into_iter()
-                .map(|vk| KeyState {
+            let state = keyboard_state(&down, caps_lock());
+            let layout = layout();
+            down.iter()
+                .map(|&vk| {
                     // SAFETY: plain query.
-                    scan_code: unsafe { MapVirtualKeyW(u32::from(vk), MAPVK_VK_TO_VSC_EX) },
-                    virtual_key: vk,
-                    // shortcut: no characters (code point 0); Grand Theft
-                    // Auto VI reads scan codes and virtual keys only.
-                    ..Default::default()
+                    let scan_code = unsafe { MapVirtualKeyW(u32::from(vk), MAPVK_VK_TO_VSC_EX) };
+                    let (code_point, dead_key) = character(vk, scan_code, &state, layout);
+                    KeyState {
+                        scan_code,
+                        code_point,
+                        virtual_key: vk,
+                        dead_key,
+                    }
                 })
                 .collect()
         }
@@ -1273,6 +1294,82 @@ mod host {
             .collect()
     }
 
+    /// The keyboard state `ToUnicodeEx` reads with the keys `held` down:
+    /// each held key, the generic Shift, Ctrl and Alt from either side's key
+    /// (devices report sides only), and Caps Lock's toggle.
+    fn keyboard_state(held: &[u8], caps_lock: bool) -> [u8; 256] {
+        const DOWN: u8 = 0x80;
+        const TOGGLED: u8 = 1;
+        let mut state = [0u8; 256];
+        for &vk in held {
+            state[usize::from(vk)] = DOWN;
+            let generic = match vk {
+                0xA0 | 0xA1 => Some(0x10), // shift
+                0xA2 | 0xA3 => Some(0x11), // control
+                0xA4 | 0xA5 => Some(0x12), // alt
+                _ => None,
+            };
+            if let Some(g) = generic {
+                state[g] = DOWN;
+            }
+        }
+        if caps_lock {
+            state[0x14] |= TOGGLED;
+        }
+        state
+    }
+
+    fn caps_lock() -> bool {
+        // SAFETY: plain query.
+        let state = unsafe { GetKeyState(0x14) };
+        state & 1 != 0
+    }
+
+    /// The foreground window's keyboard layout (the title's while it has
+    /// focus; this thread's when there is no foreground window).
+    fn layout() -> HKL {
+        // SAFETY: plain queries; a null window gives thread 0, this thread.
+        unsafe {
+            GetKeyboardLayout(GetWindowThreadProcessId(
+                GetForegroundWindow(),
+                std::ptr::null_mut(),
+            ))
+        }
+    }
+
+    /// The character key `vk` types in `layout` with `state`: its code point
+    /// (0 when it types none, or several at once), and whether it is a dead
+    /// key, whose code point is then the accent's spacing form. Pending dead
+    /// keys are not combined: the thread's keyboard state is left alone.
+    fn character(vk: u8, scan_code: u32, state: &[u8; 256], layout: HKL) -> (u32, bool) {
+        /// `ToUnicodeEx` flag: keep the keyboard state (Windows 10 1607 on).
+        const KEEP_STATE: u32 = 4;
+        let mut text = [0u16; 8];
+        // SAFETY: the state is the 256 bytes the call reads; the buffer's
+        // length is passed with it.
+        let n = unsafe {
+            ToUnicodeEx(
+                u32::from(vk),
+                scan_code & 0xFF,
+                state.as_ptr(),
+                text.as_mut_ptr(),
+                text.len() as i32,
+                KEEP_STATE,
+                layout,
+            )
+        };
+        let units = match n {
+            0 => return (0, false),
+            ..0 => &text[..1],
+            n => &text[..(n as usize).min(text.len())],
+        };
+        let mut chars = char::decode_utf16(units.iter().copied());
+        match (chars.next(), chars.next()) {
+            (Some(Ok(c)), None) => (u32::from(c), n < 0),
+            _ => (0, false),
+        }
+    }
+
     /// The foreground window is one of ours (the title's or our fallback).
     fn focused() -> bool {
         let mut process = 0;
@@ -1303,6 +1400,32 @@ mod host {
             ),
             (1.0, -1.0, 1.0, 0.0)
         );
+    }
+
+    #[test]
+    fn either_sides_modifier_holds_the_generic_one() {
+        let state = keyboard_state(&[0xA1, 0xA2, 0x41], false);
+        for vk in [0xA1, 0x10, 0xA2, 0x11, 0x41] {
+            assert_eq!(state[vk], 0x80, "{vk:#x}");
+        }
+        for vk in [0xA0, 0xA3, 0x12, 0x14] {
+            assert_eq!(state[vk], 0, "{vk:#x}");
+        }
+        assert_eq!(keyboard_state(&[], true)[0x14], 1);
+    }
+
+    #[test]
+    fn keys_type_their_characters() {
+        // Space and Enter type the same in every layout; F1 types nothing.
+        let layout = layout();
+        let typed = |vk: u8, held: &[u8]| {
+            // SAFETY: plain query.
+            let scan = unsafe { MapVirtualKeyW(u32::from(vk), MAPVK_VK_TO_VSC_EX) };
+            character(vk, scan, &keyboard_state(held, false), layout)
+        };
+        assert_eq!(typed(0x20, &[0x20]), (0x20, false));
+        assert_eq!(typed(0x0D, &[0x0D]), (0x0D, false));
+        assert_eq!(typed(0x70, &[0x70]), (0, false));
     }
 }
 
@@ -1541,7 +1664,11 @@ mod tests {
         let stand_in = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
         let no_keys = current(hub, KEYBOARD_KIND, KEYBOARD).unwrap();
         tick();
-        host.lock().unwrap().pads[1] = Some(PadState::default());
+        // A slot that has never reported input is not a pad: press A.
+        host.lock().unwrap().pads[1] = Some(PadState {
+            buttons: A,
+            ..Default::default()
+        });
         hub.poll();
         let pad_a = current(hub, GAMEPAD_KIND, 1).unwrap();
         tick();
@@ -1569,6 +1696,50 @@ mod tests {
         for r in order {
             release(r);
         }
+    }
+
+    #[test]
+    fn a_receiver_with_a_switched_off_pad_does_not_hide_the_keyboard_stand_in() {
+        let (hub, host) = fake();
+        let log = Log::default();
+        register(hub, GAMEPAD_KIND, 2, &log);
+        assert_eq!(*log.lock().unwrap(), [(FALLBACK, STATUS_CONNECTED, 0)]);
+
+        // A wireless receiver answers for a pad that is switched off: the slot reads
+        // connected with an all-zero report. That is not a pad, and it must not take the
+        // stand-in away - the keyboard would be dead with nothing in the player's hands.
+        host.lock().unwrap().pads[0] = Some(PadState::default());
+        hub.poll();
+        assert_eq!(
+            *log.lock().unwrap(),
+            [(FALLBACK, STATUS_CONNECTED, 0)],
+            "an all-zero slot is not a pad"
+        );
+        assert_eq!(current(hub, GAMEPAD_KIND, 0), Err(DEVICE_DISCONNECTED));
+
+        // The first real press turns the slot into a pad, and the stand-in steps aside.
+        host.lock().unwrap().pads[0] = Some(PadState {
+            buttons: A,
+            ..Default::default()
+        });
+        hub.poll();
+        assert_eq!(
+            log.lock().unwrap()[1..],
+            [(0, STATUS_CONNECTED, 0), (FALLBACK, 0, STATUS_CONNECTED)]
+        );
+        let pressed = current(hub, GAMEPAD_KIND, 0).unwrap();
+        assert_eq!(pad(pressed).buttons, A);
+        release(pressed);
+
+        // Back at rest it stays a pad: a pad that has been used does not connect and
+        // disconnect on every button release.
+        host.lock().unwrap().pads[0] = Some(PadState::default());
+        hub.poll();
+        assert_eq!(log.lock().unwrap().len(), 3, "no churn while the pad rests");
+        let rest = current(hub, GAMEPAD_KIND, 0).unwrap();
+        assert_eq!(pad(rest), PadState::default());
+        release(rest);
+        assert_eq!(current(hub, GAMEPAD_KIND, FALLBACK), Err(DEVICE_DISCONNECTED));
     }
 
     #[test]
@@ -1674,7 +1845,12 @@ mod tests {
             ),
             S_OK
         );
-        host.lock().unwrap().pads[1] = Some(PadState::default());
+        // A slot that has never reported input is not a pad, so the callback test
+        // presses a button to make this one appear.
+        host.lock().unwrap().pads[1] = Some(PadState {
+            buttons: A,
+            ..Default::default()
+        });
         let poller = std::thread::spawn(|| hub.poll());
         while !INSIDE.load(Ordering::SeqCst) {
             std::thread::sleep(Duration::from_millis(1));
@@ -1699,7 +1875,11 @@ mod tests {
     #[test]
     fn devices_are_found_by_id_and_rumble_reaches_the_host() {
         let (hub, host) = fake();
-        host.lock().unwrap().pads[2] = Some(PadState::default());
+        // A slot is a pad once it has reported input.
+        host.lock().unwrap().pads[2] = Some(PadState {
+            buttons: A,
+            ..Default::default()
+        });
         hub.poll();
         let device = &hub.devices[2] as *const Device;
         let info = slot::<extern "system" fn(*const Device) -> *const u8, _>(device, 0x18);
@@ -1735,7 +1915,11 @@ mod tests {
     #[test]
     fn trigger_rumble_reaches_the_host() {
         let (hub, host) = fake();
-        host.lock().unwrap().pads[1] = Some(PadState::default());
+        // A slot is a pad once it has reported input.
+        host.lock().unwrap().pads[1] = Some(PadState {
+            buttons: A,
+            ..Default::default()
+        });
         hub.poll();
         let device = &hub.devices[1] as *const Device;
         type Rumble = extern "system" fn(*const Device, *const [f32; 4]);

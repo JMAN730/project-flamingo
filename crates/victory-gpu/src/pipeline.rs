@@ -109,13 +109,25 @@ impl Shader {
             .get_or_init(|| {
                 let done = translate(&self.container);
                 match &done {
-                    Ok(t) => tracing::info!(
-                        stage = self.stage,
-                        hash = %self.hash,
-                        user_data = t.host.user_data.len(),
-                        samplers = t.host.samplers.len(),
-                        "shader translated"
-                    ),
+                    Ok(t) => {
+                        // `VICTORY_DUMP_SHADERS=<dir>`: the emitted DXIL, to read
+                        // with a disassembler (`dxc -dumpbin`).
+                        #[cfg(feature = "diagnostics")]
+                        if let Some(dir) = std::env::var_os("VICTORY_DUMP_SHADERS") {
+                            let file = std::path::Path::new(&dir)
+                                .join(format!("{}-{}.dxil", self.stage, self.hash));
+                            if let Err(e) = std::fs::write(&file, &t.host.dxil) {
+                                tracing::warn!(error = %e, file = %file.display(), "shader not dumped");
+                            }
+                        }
+                        tracing::info!(
+                            stage = self.stage,
+                            hash = %self.hash,
+                            user_data = t.host.user_data.len(),
+                            samplers = t.host.samplers.len(),
+                            "shader translated"
+                        )
+                    }
                     Err(e) => tracing::warn!(
                         stage = self.stage,
                         hash = %self.hash,

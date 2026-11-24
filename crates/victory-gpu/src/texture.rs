@@ -71,14 +71,70 @@ thread_local! {
 }
 
 /// Textures the host GPU wrote by a copy or resolve: their contents are on
-/// the host, not in title memory, which stays as it was.
-static HOST_WRITTEN: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
+/// the host, not in title memory, which stays as it was. Each with the
+/// write-watch asking at the copy (0: its memory is not watched).
+static HOST_WRITTEN: Mutex<Option<HashMap<usize, u64>>> = Mutex::new(None);
+
+/// A texture's title memory, `[start, end)`.
+fn memory_range(resource: This) -> Option<(usize, usize)> {
+    let (memory, desc) = crate::resource::texture_memory(resource)?;
+    let size = crate::resource::texture_layout(&desc)?.planes[0]
+        .layout
+        .size;
+    let start = memory as usize;
+    Some((start, start.checked_add(usize::try_from(size).ok()?)?))
+}
 
 /// A host copy or resolve writes `resource`.
 pub(crate) fn host_written(resource: This) {
-    let mut set = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
-    set.get_or_insert_with(Default::default)
-        .insert(resource as usize);
+    let asked = memory_range(resource)
+        .and_then(|(start, end)| crate::watch::writes(start, end, false))
+        .map_or(0, |(now, _)| now);
+    let mut map = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+    map.get_or_insert_with(Default::default)
+        .insert(resource as usize, asked);
+}
+
+/// Whether the title wrote a texture's memory `[start, end)` again after
+/// the host copied into it at write-watch asking `copied`, given the
+/// watch's `(page, asking)` answer. Only watch pages wholly inside the
+/// texture count: a neighbour written in a shared page must not send stale
+/// memory over the copy. A texture never watched (`copied` 0) keeps the
+/// copy.
+fn rewritten_since(start: usize, end: usize, copied: u64, written: &[(usize, u64)]) -> bool {
+    use crate::watch::PAGE;
+    let (first, last) = (start.div_ceil(PAGE), end / PAGE);
+    copied != 0
+        && written
+            .iter()
+            .any(|&(page, asking)| (first..last).contains(&page) && asking > copied)
+}
+
+/// Whether `resource`'s host copy keeps what the host GPU wrote into it:
+/// a copy or resolve did, and the title has not written its memory since
+/// (upstream #758: a texture copied into once ignored later streaming).
+fn keeps_host_contents(resource: This) -> bool {
+    let copied = {
+        let map = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+        match map.as_ref().and_then(|map| map.get(&(resource as usize))) {
+            Some(&copied) => copied,
+            None => return false,
+        }
+    };
+    if copied == 0 {
+        return true;
+    }
+    let rewritten = memory_range(resource).is_some_and(|(start, end)| {
+        crate::watch::writes(start, end, false)
+            .is_some_and(|(_, written)| rewritten_since(start, end, copied, &written))
+    });
+    if rewritten {
+        let mut map = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(map) = map.as_mut() {
+            map.remove(&(resource as usize));
+        }
+    }
+    !rewritten
 }
 
 /// The title released a resource.
@@ -87,9 +143,9 @@ pub(crate) fn forget(resource: usize) {
     if let Some(map) = map.as_mut() {
         map.remove(&resource);
     }
-    let mut set = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(set) = set.as_mut() {
-        set.remove(&resource);
+    let mut map = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(map) = map.as_mut() {
+        map.remove(&resource);
     }
 }
 
@@ -106,14 +162,9 @@ pub(crate) fn title_written(texture: &ID3D12Resource) -> bool {
 /// submission if the memory changed. Leaves the texture in the copy
 /// destination state.
 pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) {
-    let host_written = HOST_WRITTEN
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .as_ref()
-        .is_some_and(|set| set.contains(&(resource as usize)));
-    // shortcut: a texture the host copied into keeps the host's contents
-    // even if the title later writes its memory too.
-    if host_written || !list.first_use(resource as usize) {
+    // A texture the host copied into keeps the host's contents until the
+    // title writes its memory again (only noticed where it is watched).
+    if !list.first_use(resource as usize) || keeps_host_contents(resource) {
         return;
     }
     let Some(staging) = staging(resource, texture) else {
@@ -204,7 +255,14 @@ impl Staging {
             crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
             return size;
         }
-        if !committed(self.memory, size) {
+        // A streamed texture can be partly resident: its pool maps the mips
+        // it has loaded and leaves the others unmapped, as tiled resources
+        // on the console (reads of an unmapped tile give zero, and titles
+        // clamp their level of detail to what is resident). Uploading only a
+        // fully committed texture left such textures as they were made,
+        // black, until every mip was in. A texture with nothing committed
+        // keeps what it had.
+        if !any_committed(self.memory, size) {
             #[cfg(feature = "diagnostics")]
             tracing::debug!(
                 memory = ?self.memory,
@@ -216,10 +274,13 @@ impl Staging {
         }
         // Read through the kernel, as above: the title may unmap the pages
         // (evicting a texture a big table lists) while we read them, and a
-        // direct read would fault. The copy is reused, not kept per texture.
+        // direct read would fault; unmapped pages read as zeros. The copy is
+        // reused, not kept per texture.
         SCRATCH.with_borrow_mut(|tiled| {
             tiled.resize(size, 0);
-            crate::host::copy_mapped(tiled.as_mut_ptr(), self.memory, size, false);
+            if !crate::host::read_into(self.memory, &mut tiled[..size]) {
+                read_resident(self.memory, &mut tiled[..size]);
+            }
             self.changed(last, tiled)
         })
     }
@@ -304,6 +365,59 @@ pub(crate) fn committed(at: *const u8, len: usize) -> bool {
     true
 }
 
+/// Reads the committed regions of `[src, src + dst.len())` into `dst`,
+/// zeros elsewhere: one query per region, not a failed read per page, for
+/// a streamed texture most of which is not resident.
+fn read_resident(src: *const u8, dst: &mut [u8]) {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    let base = src as usize;
+    let end = base.saturating_add(dst.len());
+    let mut p = base;
+    while p < end {
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        let n = unsafe { VirtualQuery(p as *const _, &mut info, size_of_val(&info)) };
+        let stop = if n == 0 {
+            end
+        } else {
+            (info.BaseAddress as usize)
+                .saturating_add(info.RegionSize)
+                .clamp(p + 1, end)
+        };
+        let piece = &mut dst[p - base..stop - base];
+        if n != 0 && info.State == MEM_COMMIT {
+            // Through the kernel: a page unmapped since the query reads as
+            // zeros instead of faulting.
+            crate::host::copy_mapped(piece.as_mut_ptr(), p as *const u8, piece.len(), false);
+        } else {
+            piece.fill(0);
+        }
+        p = stop;
+    }
+}
+
+/// Whether any page of `[at, at + len)` is committed.
+fn any_committed(at: *const u8, len: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    let mut p = at as usize;
+    let end = p.saturating_add(len);
+    while p < end {
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        let n = unsafe { VirtualQuery(p as *const _, &mut info, size_of_val(&info)) };
+        if n == 0 {
+            return false;
+        }
+        if info.State == MEM_COMMIT {
+            return true;
+        }
+        p = info.BaseAddress as usize + info.RegionSize;
+    }
+    false
+}
+
 /// The staging state of a title texture, made on first use.
 fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
@@ -374,7 +488,55 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
 
 #[cfg(test)]
 mod tests {
+
+    /// A texture half of whose pages are committed reads those pages and
+    /// zeros for the rest; one with none committed is not read at all.
+    #[cfg(windows)]
+    #[test]
+    fn partly_resident_textures_read_what_is_mapped() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        const PAGE: usize = 64 << 10;
+        // SAFETY: a fresh reservation, released below.
+        let base = unsafe { VirtualAlloc(std::ptr::null(), 4 * PAGE, MEM_RESERVE, PAGE_READWRITE) };
+        assert!(!base.is_null());
+        let base = base.cast::<u8>();
+        assert!(!any_committed(base, 4 * PAGE));
+        // SAFETY: inside the reservation.
+        let second = unsafe { base.add(PAGE) };
+        // SAFETY: inside the reservation.
+        assert!(!unsafe { VirtualAlloc(second.cast(), PAGE, MEM_COMMIT, PAGE_READWRITE) }.is_null());
+        // SAFETY: committed above.
+        unsafe { second.write_bytes(0xAB, PAGE) };
+        assert!(any_committed(base, 4 * PAGE));
+        assert!(!committed(base, 4 * PAGE));
+        let mut out = vec![0x55; 4 * PAGE];
+        read_resident(base, &mut out);
+        assert!(out[..PAGE].iter().all(|&b| b == 0));
+        assert!(out[PAGE..2 * PAGE].iter().all(|&b| b == 0xAB));
+        assert!(out[2 * PAGE..].iter().all(|&b| b == 0));
+        // SAFETY: the reservation made above.
+        unsafe { VirtualFree(base.cast(), 0, MEM_RELEASE) };
+    }
     use super::*;
+
+    /// A copied texture uploads again only once the title writes a watch
+    /// page wholly its own after the copy (upstream #758).
+    #[test]
+    fn copied_texture_uploads_again_after_the_title_rewrites_it() {
+        use crate::watch::PAGE;
+        let (start, end) = (4 * PAGE, 8 * PAGE);
+        assert!(!rewritten_since(start, end, 7, &[(4, 6), (5, 7)]));
+        assert!(rewritten_since(start, end, 7, &[(4, 6), (6, 8)]));
+        // Never watched: the copy is kept.
+        assert!(!rewritten_since(start, end, 0, &[(5, 9)]));
+        // Pages shared with neighbours do not count.
+        let (start, end) = (4 * PAGE + 256, 6 * PAGE + 256);
+        assert!(!rewritten_since(start, end, 7, &[(4, 9), (6, 9)]));
+        assert!(rewritten_since(start, end, 7, &[(5, 9)]));
+        assert!(!rewritten_since(PAGE + 16, PAGE + 4096, 1, &[(1, 9)]));
+    }
 
     #[test]
     fn watched_texture_reads_reuse_space_and_expose_only_current_bytes() {

@@ -235,7 +235,7 @@ fn create() -> windows::core::Result<Host> {
         // Diagnostics: the software adapter, on which a shader's wild access
         // is an access violation in this process (a crash report with the
         // address and instruction) instead of a GPU fault and driver reset.
-        if cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_WARP").is_some() {
+        if warp_on() {
             let adapter = warp_adapter()?;
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");
@@ -255,6 +255,27 @@ fn create() -> windows::core::Result<Host> {
             }
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
+        // Lane counts: without 64-lane waves (NVIDIA, Intel) the translation
+        // runs the console's 64-lane waves through group-shared memory where
+        // it can (victory_shader::emit::host_wave64). Set before the first
+        // translation, which the shader cache's key includes.
+        let mut lanes = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+        if device
+            .CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS1,
+                (&raw mut lanes).cast(),
+                size_of_val(&lanes) as u32,
+            )
+            .is_ok()
+        {
+            victory_shader::emit::set_host_wave64(lanes.WaveLaneCountMin, lanes.WaveLaneCountMax);
+            tracing::info!(
+                min = lanes.WaveLaneCountMin,
+                max = lanes.WaveLaneCountMax,
+                wave64 = victory_shader::emit::host_wave64(),
+                "host wave lanes"
+            );
+        }
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
             .flatten();
@@ -367,6 +388,9 @@ pub(crate) struct HostList {
     /// expanded vertices, rewritten draw arguments and per-draw atomic
     /// counters, reused across draws and across resets.
     rect_scratch: Mutex<RectScratch>,
+    /// A CPU-only heap of one UAV slot, for the CPU descriptor of a UAV
+    /// clear, made on first use.
+    clear_uav_cpu: OnceLock<Option<ID3D12DescriptorHeap>>,
     /// The texts of the markers `note_op` set, in order (for device-removed
     /// data without marker texts), with the host GPU range a copy reads.
     #[cfg(feature = "diagnostics")]
@@ -409,6 +433,21 @@ pub(crate) fn dred_on() -> bool {
     *ON.get_or_init(|| {
         cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_DRED").is_some()
     })
+}
+
+/// Whether the host device is the software adapter (`VICTORY_D3D12_WARP`,
+/// diagnostics builds). The variable is set to `1` to compare a run with
+/// WARP, so `0` has to turn it off again: a `0` left in the shell (or in a
+/// `.bat` that sets it for one command) used to pick WARP as well.
+fn warp_on() -> bool {
+    cfg!(feature = "diagnostics") && warp_switch(std::env::var_os("VICTORY_D3D12_WARP").as_deref())
+}
+
+/// The `VICTORY_D3D12_WARP` switch, by its value: on when the variable is
+/// set to anything but `0`. An empty value counts as on, like every other
+/// switch in the README's table.
+fn warp_switch(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_some_and(|value| value != "0")
 }
 
 /// Whether each list of a submission runs and is timed on its own, slow
@@ -632,6 +671,7 @@ impl Host {
                 pipelines: Mutex::default(),
                 budget: OnceLock::new(),
                 rect_scratch: Mutex::default(),
+                clear_uav_cpu: OnceLock::new(),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
@@ -663,38 +703,42 @@ impl Host {
         }
         batch.flush();
         let prepared = std::time::Instant::now();
-        // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`).
+        // Each run's lists go to the queue on their own, one submission
+        // each. The host resets a device whose submission runs for about
+        // 2 s (TDR); with the world streaming, one submission of every list
+        // comes close to that (0.5 to 1.8 s seen), while the lists are each
+        // well under it. They are waited for once, after the last; with
+        // diagnostics timing (`VICTORY_GPU_TIMING`) each on its own.
+        let groups: Vec<&[Option<ID3D12CommandList>]> = firsts
+            .iter()
+            .zip(firsts.iter().skip(1).chain([&lists.len()]))
+            .map(|(&a, &b)| &lists[a..b])
+            .collect();
         #[cfg(feature = "diagnostics")]
-        let groups: Vec<&[Option<ID3D12CommandList>]> = if timing() {
-            firsts
-                .iter()
-                .zip(firsts.iter().skip(1).chain([&lists.len()]))
-                .map(|(&a, &b)| &lists[a..b])
-                .collect()
-        } else {
-            vec![&lists[..]]
-        };
+        let wait_each = timing();
         #[cfg(not(feature = "diagnostics"))]
-        let groups = [&lists[..]];
+        let wait_each = false;
         for (i, group) in groups.iter().enumerate() {
-            *submitted += 1;
             let started = std::time::Instant::now();
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
                 self.queue.ExecuteCommandLists(group);
-                let waited = self
-                    .queue
-                    .Signal(&self.fence, *submitted)
-                    .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
-                match waited {
-                    Ok(()) => {
-                        WaitForSingleObject(self.event, INFINITE);
+                if wait_each || i + 1 == groups.len() {
+                    *submitted += 1;
+                    let waited = self
+                        .queue
+                        .Signal(&self.fence, *submitted)
+                        .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
+                    match waited {
+                        Ok(()) => {
+                            WaitForSingleObject(self.event, INFINITE);
+                        }
+                        Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
                     }
-                    Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
                 }
             }
             #[cfg(feature = "diagnostics")]
-            if groups.len() > 1 && started.elapsed() > std::time::Duration::from_millis(50) {
+            if wait_each && started.elapsed() > std::time::Duration::from_millis(50) {
                 // SAFETY: a plain query.
                 let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
                 let commands = runs[i]
@@ -1178,6 +1222,19 @@ impl HostList {
         }
     }
 
+    /// The current state established by this list. A texture the list has
+    /// never used can arrive in a different state at submission.
+    pub(crate) fn tracked_texture_state(
+        &self,
+        copy: &std::sync::Arc<crate::resource::HostTexture>,
+    ) -> Option<u32> {
+        self.states
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&(std::sync::Arc::as_ptr(copy) as usize))
+            .map(|&(_, last, _)| last)
+    }
+
     /// At submission: the list that moves each texture this list uses from
     /// its real state to the one the list starts with; the textures' real
     /// states become those the list ends with.
@@ -1396,6 +1453,29 @@ impl HostList {
         Some((gpu + at, (data + at as usize) as *mut u8))
     }
 
+    /// The CPU-only UAV slot used when recording a clear. D3D12 uses
+    /// this descriptor during recording, so the next clear may reuse it.
+    pub(crate) fn clear_uav_cpu(&self) -> Option<D3D12_CPU_DESCRIPTOR_HANDLE> {
+        let heap = self
+            .clear_uav_cpu
+            .get_or_init(|| {
+                // SAFETY: plain allocation of a CPU-only view heap.
+                unsafe {
+                    host()?
+                        .device
+                        .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                            Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                            NumDescriptors: 1,
+                            ..Default::default()
+                        })
+                }
+                .ok()
+            })
+            .as_ref()?;
+        // SAFETY: the list owns this heap until it is dropped.
+        Some(unsafe { heap.GetCPUDescriptorHandleForHeapStart() })
+    }
+
     /// The host address of the list's indirect-work budget, zeroed at each
     /// submission of the list from the first use after a reset on.
     pub(crate) fn budget(&self) -> Option<u64> {
@@ -1410,9 +1490,10 @@ impl HostList {
         if !deferred.budget_zeroed {
             deferred.budget_zeroed = true;
             let at = *data;
-            // SAFETY: the list's own mapped word, written before it runs.
+            // SAFETY: the list's own mapped budget words (work, mesh
+            // groups), written before it runs.
             deferred.copies.push(Step::Host(Box::new(move || unsafe {
-                (at as *mut u32).write_volatile(0)
+                (at as *mut u64).write_volatile(0)
             })));
         }
         // SAFETY: a live buffer.
@@ -2761,6 +2842,20 @@ mod tests {
         let raw = [b'R' as u16, b'T' as u16, b'X' as u16, 0, b'X' as u16];
         assert_eq!(adapter_name(&raw), "RTX");
         assert_eq!(adapter_name(&[b'X' as u16, b'e' as u16]), "Xe");
+    }
+
+    #[test]
+    fn warp_switch_takes_zero_as_off() {
+        use std::ffi::OsStr;
+        // Unset, `0`, `1`, empty, and a value the README does not name.
+        assert!(!warp_switch(None), "unset");
+        assert!(!warp_switch(Some(OsStr::new("0"))), "`0` turns it off");
+        assert!(warp_switch(Some(OsStr::new("1"))));
+        assert!(warp_switch(Some(OsStr::new(""))), "empty is set");
+        assert!(
+            warp_switch(Some(OsStr::new("yes"))),
+            "any other value is on"
+        );
     }
 
     #[test]

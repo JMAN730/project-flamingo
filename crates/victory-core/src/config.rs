@@ -1598,6 +1598,16 @@ mod tests {
         assert!(cfg.cache_subdir("x").is_err());
     }
 
+    #[test]
+    fn data_inside_repo_is_refused() {
+        let inside = Path::new(env!("CARGO_MANIFEST_DIR")).join("data");
+        let cfg = Config {
+            data_dir: inside,
+            ..Default::default()
+        };
+        assert!(cfg.data_subdir("x").is_err());
+    }
+
     /// A path that is absolute on the host (`/x` is not absolute on Windows).
     #[test]
     fn folder_overlap_folds_case_only_when_asked() {

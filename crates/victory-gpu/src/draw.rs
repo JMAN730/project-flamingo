@@ -63,6 +63,12 @@ struct DepthTarget {
     state: u32,
 }
 
+/// A UAV clear's value, as the title's call gives it.
+pub(crate) enum UavClear {
+    Uint([u32; 4]),
+    Float([f32; 4]),
+}
+
 /// What one title list has set, and what its host list was last given.
 #[derive(Default)]
 pub(crate) struct State {
@@ -88,6 +94,9 @@ pub(crate) struct State {
     /// Tables made afresh in this list: (table, what it holds) → first
     /// dynamic slot.
     fresh_tables: std::collections::HashMap<(u64, u64), u32>,
+    /// Root SRV views made in this list: (title heap, title address) →
+    /// dynamic slot (see [`State::bind_root_srv`]).
+    root_srv_slots: std::collections::HashMap<(usize, u64), u32>,
     /// The dynamic slots the list holds: title heap, first, count; given
     /// back when the list is reset or released.
     dynamic: Vec<(usize, u32, u32)>,
@@ -150,9 +159,7 @@ pub(crate) fn dispatched() -> u64 {
 /// other views as 1 MiB (both cut at their buffer's end).
 fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
     let shadow = crate::shadow::find(address, 1)?;
-    let len = shadow
-        .left(address)
-        .min(if srv { 1 << 20 } else { 1 << 16 });
+    let len = root_view_len(&shadow, address, srv);
     let gpu = shadow.gpu(address);
     if srv || gpu % 256 == 0 {
         shadow.refresh(list, address, len);
@@ -161,6 +168,14 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
     let (gpu, to) = list.scratch(len)?;
     list.defer_fill(to, address as *const u8, len as usize);
     Some(gpu)
+}
+
+/// The bytes of title memory at `address` a root view binds (and shaders
+/// may read: see [`State::root_view_bytes`]).
+fn root_view_len(shadow: &crate::shadow::Shadow, address: u64, srv: bool) -> u64 {
+    shadow
+        .left(address)
+        .min(if srv { 1 << 20 } else { 1 << 16 })
 }
 
 macro_rules! once {
@@ -189,6 +204,16 @@ impl State {
         self.pipeline = pipeline as usize;
     }
 
+    /// `ClearState`: every binding back to its default as at a reset, with
+    /// `pipeline` set. The list keeps its dynamic descriptor slots: draws
+    /// recorded before the clear still read them.
+    pub(crate) fn clear(&mut self, pipeline: This) {
+        let dynamic = std::mem::take(&mut self.dynamic);
+        *self = State::default();
+        self.dynamic = dynamic;
+        self.pipeline = pipeline as usize;
+    }
+
     /// Takes the dynamic descriptor slots held by this recording, so a
     /// pending host list can keep them alive until its submission finishes.
     pub(crate) fn take_dynamic(&mut self) -> Vec<(usize, u32, u32)> {
@@ -201,11 +226,8 @@ impl State {
         self.topology = topology;
         let host = match topology {
             RECTANGLES => 4,
-            TRIANGLE_FAN | LINE_LOOP | QUADS | QUAD_STRIP => {
-                once!(topology, "console topology drawn as a triangle list");
-                4
-            }
-            t => t,
+            t => crate::primitive::ExpandedTopology::from_console(t)
+                .map_or(t, crate::primitive::ExpandedTopology::host_topology),
         };
         // SAFETY: an open list.
         unsafe {
@@ -264,6 +286,17 @@ impl State {
             if let Some(slot) = self.vertex.get_mut(start as usize + i) {
                 *slot = *v;
             }
+        }
+    }
+
+    pub(crate) fn clear_vertex_buffers(&mut self, start: u32, count: u32) {
+        for slot in self
+            .vertex
+            .iter_mut()
+            .skip(start as usize)
+            .take(count as usize)
+        {
+            *slot = VertexView::default();
         }
     }
 
@@ -351,6 +384,21 @@ impl State {
                 0
             }
         }
+    }
+
+    /// The bytes root view `slot` holds from its start, as [`root_view`]
+    /// binds it. Shaders check their accesses against it: a root view has
+    /// no bounds on the host, and an access past the memory it maps is a
+    /// GPU page fault, which some hosts stall on until the driver resets
+    /// the device. 0 for a root view the title did not set.
+    fn root_view_bytes(&self, compute: bool, slot: u8, srv: bool) -> u32 {
+        let Some(&Root::View(address)) = self.roots_ref(compute).get(usize::from(slot)) else {
+            return 0;
+        };
+        let Some(shadow) = crate::shadow::find(address, 1) else {
+            return 0;
+        };
+        u32::try_from(root_view_len(&shadow, address, srv)).unwrap_or(u32::MAX)
     }
 
     /// The bound heap holding `handle`.
@@ -453,13 +501,8 @@ impl State {
             .map(|depth| depth.resource)
     }
 
-    /// A descriptor a shader reads through a table: its host slot made if
-    /// it changed, constant data copied, textures made readable.
-    /// What draws and dispatches share: heaps, our root signature, the
-    /// pipeline, and per stage the user data, root views and the
-    /// descriptors its tables hold.
-    fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) {
-        self.depth_sampled = false;
+    /// Binds the title's shader-visible heaps when they change.
+    fn bind_heaps(&mut self, list: &HostList) {
         let l = &list.list;
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
@@ -477,6 +520,75 @@ impl State {
             self.host_heaps = self.heaps;
             self.host_roots = [0; 2];
         }
+    }
+
+    /// Records a clear of a resource-backed texture UAV in the bound heap.
+    pub(crate) fn clear_texture_uav(
+        &mut self,
+        list: &HostList,
+        gpu: u64,
+        cpu: u64,
+        resource: This,
+        value: UavClear,
+        rects: &[RECT],
+    ) {
+        let heap_id = self.heaps[0];
+        if heap_id == 0 {
+            return;
+        }
+        let heap = crate::descriptor::heap(heap_id as This);
+        if heap.index(gpu).is_none() {
+            return;
+        }
+        let (
+            Some(View::Unordered(cpu_resource, _, words)),
+            Some(View::Unordered(gpu_resource, _, _)),
+        ) = (crate::descriptor::view(cpu), crate::descriptor::view(gpu))
+        else {
+            return;
+        };
+        if cpu_resource != resource as usize || gpu_resource != cpu_resource {
+            return;
+        }
+        let (Some(texture), Some(native_heap)) =
+            (crate::resource::host_resource(resource), heap.host())
+        else {
+            return;
+        };
+        let Some((slot, gpu, cpu)) = native_heap.clear_texture_uav(list, texture, words.as_ref())
+        else {
+            return;
+        };
+        self.dynamic.push((heap_id, slot, 1));
+        self.bind_heaps(list);
+        crate::list::ensure_state(
+            list,
+            resource,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS.0 as u32,
+        );
+        // SAFETY: matched views, a live texture in UAV state, and the
+        // shader-visible descriptor's heap is bound on this list.
+        unsafe {
+            match value {
+                UavClear::Uint(values) => {
+                    list.list
+                        .ClearUnorderedAccessViewUint(gpu, cpu, texture, &values, rects);
+                }
+                UavClear::Float(values) => {
+                    list.list
+                        .ClearUnorderedAccessViewFloat(gpu, cpu, texture, &values, rects);
+                }
+            }
+        }
+    }
+
+    /// What draws and dispatches share: heaps, our root signature, the
+    /// pipeline, and per stage the user data, root views and the
+    /// descriptors its tables hold.
+    fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) {
+        self.depth_sampled = false;
+        let l = &list.list;
+        self.bind_heaps(list);
         let root = p.root.as_raw() as usize;
         if self.host_roots[usize::from(compute)] != root {
             // SAFETY: an open list and a live root signature.
@@ -511,20 +623,51 @@ impl State {
                         .find(|m| m.0 == u.slot && u.root == RootType::Table);
                     values[u.index as usize] = match fresh {
                         Some(&(_, offset)) => offset,
+                        None if u.root == RootType::Descriptor => {
+                            let srv = stage.root_srvs.iter().any(|r| r.0 == u.slot);
+                            self.root_view_bytes(compute, u.slot, srv)
+                        }
                         None => self.user_value(compute, u.slot, u.root, u.dword),
                     };
                 }
-                // SAFETY: an open list; `values` covers the parameter.
-                unsafe {
-                    if compute {
-                        l.SetComputeRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
+                if stage.user_data_cbv {
+                    // Spilled (see the host root signature): the values in
+                    // upload memory the list keeps until it is reset.
+                    if let Some((gpu, to)) = list.scratch(u64::from(dwords) * 4) {
+                        // SAFETY: `to` is at least `dwords` mapped dwords.
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(values.as_ptr(), to.cast(), values.len())
+                        };
+                        // SAFETY: an open list; a 256-byte aligned live address.
+                        unsafe {
+                            if compute {
+                                l.SetComputeRootConstantBufferView(param, gpu);
+                            } else {
+                                l.SetGraphicsRootConstantBufferView(param, gpu);
+                            }
+                        }
                     } else {
-                        l.SetGraphicsRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
+                        once!("no upload memory for user data: left unset");
+                    }
+                } else {
+                    // SAFETY: an open list; `values` covers the parameter.
+                    unsafe {
+                        if compute {
+                            l.SetComputeRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
+                        } else {
+                            l.SetGraphicsRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
+                        }
                     }
                 }
             }
             for (views, srv) in [(&stage.root_cbvs, false), (&stage.root_srvs, true)] {
                 for &(slot, param) in views {
+                    // Root SRVs are bounded one-view tables (see the host
+                    // root signature).
+                    if srv {
+                        self.bind_root_srv(list, compute, slot, param);
+                        continue;
+                    }
                     let Some(Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))
                     else {
                         once!(slot, "a shader reads a root view the title did not set");
@@ -543,6 +686,70 @@ impl State {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    /// Binds the title's root SRV `slot` as the one-view table `param` (see
+    /// the host root signature): a raw view of the rest of the title
+    /// buffer's host copy, in a dynamic slot of the bound view heap, so
+    /// reads past the copy return zeros rather than fault. Zeros (our null
+    /// buffer) if the title set none or it lies outside every buffer.
+    fn bind_root_srv(&mut self, list: &HostList, compute: bool, slot: u8, param: u32) {
+        let l = &list.list;
+        let heap = self.heaps[0];
+        if heap == 0 {
+            once!("a root SRV with no view heap bound: left unset");
+            return;
+        }
+        let title_heap = crate::descriptor::heap(heap as This);
+        let Some(host) = title_heap.host() else { return };
+        let address = match self.roots_ref(compute).get(usize::from(slot)) {
+            Some(Root::View(address)) => *address,
+            _ => 0,
+        };
+        let shadow = crate::shadow::find(address, 1).filter(|_| address != 0).map(|s| (s, address));
+        // The same buffer again in this list: its slot, refreshed again.
+        if let Some(&index) = self.root_srv_slots.get(&(heap, address)) {
+            if let Some((shadow, address)) = &shadow {
+                shadow.refresh(list, *address, shadow.left(*address).min(1 << 20));
+            }
+            let table = host.gpu_handle(index);
+            // SAFETY: an open list; the slot is held by this list.
+            unsafe {
+                if compute {
+                    l.SetComputeRootDescriptorTable(param, table);
+                } else {
+                    l.SetGraphicsRootDescriptorTable(param, table);
+                }
+            }
+            return;
+        }
+        let Some(index) = host.dynamic(1) else {
+            once!("no free dynamic slot for a root SRV: left unset");
+            return;
+        };
+        self.dynamic.push((heap, index, 1));
+        self.root_srv_slots.insert((heap, address), index);
+        match shadow {
+            Some((shadow, address)) => {
+                let len = shadow.left(address);
+                shadow.refresh(list, address, len.min(1 << 20));
+                host.raw_srv_at(index, &shadow.buffer, shadow.offset(address), len);
+            }
+            None => {
+                once!(slot, "a root SRV the title did not set, or outside every buffer: reads zeros");
+                host.make_null(index);
+            }
+        }
+        let table = host.gpu_handle(index);
+        // SAFETY: an open list; the slot is in the bound heap and held by
+        // this list until it is reset.
+        unsafe {
+            if compute {
+                l.SetComputeRootDescriptorTable(param, table);
+            } else {
+                l.SetGraphicsRootDescriptorTable(param, table);
             }
         }
     }
@@ -859,11 +1066,12 @@ impl State {
                         let handle = table + u64::from(u.table_offset_dwords) * 4;
                         describe(crate::descriptor::view(handle).as_ref())
                     }
+                    (RootType::Descriptor, bound) => describe_root_view(bound),
                     (root, _) => format!("{root:?}"),
                 };
                 out.push(format!(
-                    "{} {:?} s{}+{}: {what}",
-                    stage.shader.hash, u.kind, u.slot, u.table_offset_dwords
+                    "{} {} {:?} s{}+{}: {what}",
+                    stage.shader.stage, stage.shader.hash, u.kind, u.slot, u.table_offset_dwords
                 ));
             }
         }
@@ -881,28 +1089,195 @@ impl State {
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
         let rects = self.topology == RECTANGLES;
+        let expanded = crate::primitive::ExpandedTopology::from_console(self.topology);
         let ran = self.prepare(list, false) && (!rects || self.rectangles(list, vertices, first));
         if ran {
-            // Rectangles were expanded into their own vertex buffers.
-            let (count, from) = if rects {
-                (vertices / 3 * 6, 0)
+            if let Some(kind) = expanded {
+                if let Some((count, base)) = self.expand_non_indexed(list, kind, vertices, first) {
+                    if count > 0 {
+                        #[cfg(feature = "diagnostics")]
+                        list.note_op(|| {
+                            self.op_text(format!("draw {kind:?} {count}x{instances}"), false)
+                        });
+                        // SAFETY: an open list with expanded scratch index buffer bound.
+                        unsafe {
+                            list.list
+                                .DrawIndexedInstanced(count, instances, 0, base, first_instance)
+                        };
+                        DRAWN.fetch_add(1, Ordering::Relaxed);
+                    }
+                    return;
+                }
             } else {
-                (vertices, first)
-            };
-            #[cfg(feature = "diagnostics")]
-            list.note_op(|| self.op_text(format!("draw {count}x{instances}"), false));
-            // SAFETY: an open list with everything set.
-            unsafe {
-                list.list
-                    .DrawInstanced(count, instances, from, first_instance)
-            };
-            DRAWN.fetch_add(1, Ordering::Relaxed);
+                // Rectangles were expanded into their own vertex buffers.
+                let (count, from) = if rects {
+                    (vertices / 3 * 6, 0)
+                } else {
+                    (vertices, first)
+                };
+                #[cfg(feature = "diagnostics")]
+                list.note_op(|| self.op_text(format!("draw {count}x{instances}"), false));
+                // SAFETY: an open list with everything set.
+                unsafe {
+                    list.list
+                        .DrawInstanced(count, instances, from, first_instance)
+                };
+                DRAWN.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
         }
-        if !ran {
-            DROPPED.fetch_add(1, Ordering::Relaxed);
-            #[cfg(feature = "diagnostics")]
-            dropped(self.pipeline);
+        DROPPED.fetch_add(1, Ordering::Relaxed);
+        #[cfg(feature = "diagnostics")]
+        dropped(self.pipeline);
+    }
+
+    /// Binds a synthesized scratch index buffer expanding a non-indexed
+    /// console-only topology draw into a host triangle or line list.
+    fn expand_non_indexed(
+        &self,
+        list: &HostList,
+        kind: crate::primitive::ExpandedTopology,
+        vertices: u32,
+        first: u32,
+    ) -> Option<(u32, i32)> {
+        let out_count = kind.max_output_indices(vertices);
+        if out_count == 0 {
+            return Some((0, 0));
         }
+        let strip_cut = crate::pipeline::host_pipeline(self.pipeline as This)
+            .map_or(D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED, |p| p.strip_cut);
+        let use_u16 = strip_cut == D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFF;
+        if use_u16 {
+            if vertices > u32::from(u16::MAX) {
+                once!(
+                    vertices,
+                    "non-indexed console topology exceeds 16-bit strip-cut index range"
+                );
+                return None;
+            }
+            let base = i32::try_from(first).ok()?;
+            let bytes = u64::from(out_count).checked_mul(2)?;
+            let size_bytes = u32::try_from(bytes).ok()?;
+            let (gpu, to) = list.scratch(bytes)?;
+            // SAFETY: `to` points to `out_count` writable `u16` elements in scratch upload memory.
+            let dst = unsafe { std::slice::from_raw_parts_mut(to.cast::<u16>(), out_count as usize) };
+            kind.expand_non_indexed_u16(vertices, 0, dst);
+            let view = D3D12_INDEX_BUFFER_VIEW {
+                BufferLocation: gpu,
+                SizeInBytes: size_bytes,
+                Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16_UINT,
+            };
+            // SAFETY: an open list; the view names live scratch upload memory.
+            unsafe { list.list.IASetIndexBuffer(Some(&view)) };
+            return Some((out_count, base));
+        }
+        let (start, base) = match i32::try_from(first) {
+            Ok(base) => (0u32, base),
+            Err(_) => {
+                first.checked_add(vertices)?;
+                (first, 0)
+            }
+        };
+        let bytes = u64::from(out_count).checked_mul(4)?;
+        let size_bytes = u32::try_from(bytes).ok()?;
+        let (gpu, to) = list.scratch(bytes)?;
+        // SAFETY: `to` points to `out_count` writable `u32` elements in scratch upload memory.
+        let dst = unsafe { std::slice::from_raw_parts_mut(to.cast::<u32>(), out_count as usize) };
+        kind.expand_non_indexed_u32(vertices, start, dst);
+        let view = D3D12_INDEX_BUFFER_VIEW {
+            BufferLocation: gpu,
+            SizeInBytes: size_bytes,
+            Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_UINT,
+        };
+        // SAFETY: an open list; the view names live scratch upload memory.
+        unsafe { list.list.IASetIndexBuffer(Some(&view)) };
+        Some((out_count, base))
+    }
+
+    /// Binds a submission-filled scratch index buffer expanding an indexed
+    /// console-only topology draw into a host triangle or line list, preserving
+    /// index format (`R16_UINT`/`R32_UINT`) and strip-cut semantics.
+    fn expand_indexed(
+        &self,
+        list: &HostList,
+        kind: crate::primitive::ExpandedTopology,
+        indices: u32,
+        first: u32,
+        base: i32,
+    ) -> Option<u32> {
+        const R32_UINT: u32 = 42;
+        const R16_UINT: u32 = 57;
+        let v = self.index;
+        let is_u16 = match v.format {
+            R16_UINT => true,
+            R32_UINT => false,
+            _ => {
+                once!(format = v.format, "unsupported index format for console topology");
+                return None;
+            }
+        };
+        if v.address == 0 || v.size == 0 {
+            return None;
+        }
+        let elem_bytes: u64 = if is_u16 { 2 } else { 4 };
+        let avail = (u64::from(v.size) / elem_bytes).saturating_sub(u64::from(first));
+        let count = u64::from(indices).min(avail) as u32;
+        let max_out = kind.max_output_indices(count);
+        if max_out == 0 {
+            return Some(0);
+        }
+        let src_addr = v.address.checked_add(u64::from(first).checked_mul(elem_bytes)?)?;
+        let src_bytes = usize::try_from(u64::from(count).checked_mul(elem_bytes)?).ok()?;
+        let out_bytes = u64::from(max_out).checked_mul(elem_bytes)?;
+        let out_bytes_u32 = u32::try_from(out_bytes).ok()?;
+        let (gpu, to) = list.scratch(out_bytes)?;
+        let strip_cut = crate::pipeline::host_pipeline(self.pipeline as This)
+            .map_or(D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED, |p| p.strip_cut);
+        let to_addr = to as usize;
+        let fallback_pad = (-i64::from(base)).max(0) as u32;
+        if is_u16 {
+            let cut = (strip_cut == D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFF).then_some(u16::MAX);
+            let pad = fallback_pad.min(u32::from(u16::MAX)) as u16;
+            list.defer_host(move || {
+                let mut src = vec![0u16; count as usize];
+                crate::host::copy_mapped(
+                    src.as_mut_ptr().cast::<u8>(),
+                    src_addr as *const u8,
+                    src_bytes,
+                    false,
+                );
+                // SAFETY: `to_addr` points to `max_out` writable `u16` slots owned by this list.
+                let dst = unsafe {
+                    std::slice::from_raw_parts_mut(to_addr as *mut u16, max_out as usize)
+                };
+                kind.expand_indexed_u16(&src, cut, pad, dst);
+            });
+        } else {
+            let cut =
+                (strip_cut == D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFFFFFF).then_some(u32::MAX);
+            list.defer_host(move || {
+                let mut src = vec![0u32; count as usize];
+                crate::host::copy_mapped(
+                    src.as_mut_ptr().cast::<u8>(),
+                    src_addr as *const u8,
+                    src_bytes,
+                    false,
+                );
+                // SAFETY: `to_addr` points to `max_out` writable `u32` slots owned by this list.
+                let dst = unsafe {
+                    std::slice::from_raw_parts_mut(to_addr as *mut u32, max_out as usize)
+                };
+                kind.expand_indexed_u32(&src, cut, fallback_pad, dst);
+            });
+        }
+        let view = D3D12_INDEX_BUFFER_VIEW {
+            BufferLocation: gpu,
+            SizeInBytes: out_bytes_u32,
+            Format: DXGI_FORMAT(v.format as i32),
+        };
+        // SAFETY: an open list; the view names live scratch upload memory.
+        unsafe { list.list.IASetIndexBuffer(Some(&view)) };
+        Some(max_out)
     }
 
     /// Binds vertex buffers holding the rectangles of vertices `first..first
@@ -974,28 +1349,47 @@ impl State {
         if self.topology == RECTANGLES {
             once!("indexed rectangles not drawn");
         }
-        let ran = self.topology != RECTANGLES && self.prepare(list, true);
+        let expanded = crate::primitive::ExpandedTopology::from_console(self.topology);
+        let ran = self.topology != RECTANGLES && self.prepare(list, expanded.is_none());
         if ran {
-            #[cfg(feature = "diagnostics")]
-            list.note_op(|| self.op_text(format!("indexed {indices}x{instances}"), false));
-            // SAFETY: an open list with everything set.
-            unsafe {
-                list.list
-                    .DrawIndexedInstanced(indices, instances, first, base, first_instance)
-            };
-            DRAWN.fetch_add(1, Ordering::Relaxed);
+            if let Some(kind) = expanded {
+                if let Some(count) = self.expand_indexed(list, kind, indices, first, base) {
+                    if count > 0 {
+                        #[cfg(feature = "diagnostics")]
+                        list.note_op(|| {
+                            self.op_text(format!("indexed {kind:?} {count}x{instances}"), false)
+                        });
+                        // SAFETY: an open list with expanded scratch index buffer bound.
+                        unsafe {
+                            list.list
+                                .DrawIndexedInstanced(count, instances, 0, base, first_instance)
+                        };
+                        DRAWN.fetch_add(1, Ordering::Relaxed);
+                    }
+                    return;
+                }
+            } else {
+                #[cfg(feature = "diagnostics")]
+                list.note_op(|| self.op_text(format!("indexed {indices}x{instances}"), false));
+                // SAFETY: an open list with everything set.
+                unsafe {
+                    list.list
+                        .DrawIndexedInstanced(indices, instances, first, base, first_instance)
+                };
+                DRAWN.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
         }
-        if !ran {
-            DROPPED.fetch_add(1, Ordering::Relaxed);
-            #[cfg(feature = "diagnostics")]
-            dropped(self.pipeline);
-        }
+        DROPPED.fetch_add(1, Ordering::Relaxed);
+        #[cfg(feature = "diagnostics")]
+        dropped(self.pipeline);
     }
 }
 
 impl State {
-    /// Indirect execution of a one-argument signature of `kind` (PC
-    /// numbering: 0 draw, 1 indexed draw, 2 dispatch, 10 mesh dispatch) with
+    /// Indirect execution of the title command signature `title_args`
+    /// (PC numbering of the last argument: 0 draw, 1 indexed draw, 2
+    /// dispatch, 10 mesh dispatch; root constants may come before it) with
     /// records `stride` bytes apart at title address `arguments`, and the
     /// record count at `count` if the title gives one: the GPU reads them
     /// from the buffer's host copy, where earlier dispatches may have
@@ -1003,7 +1397,9 @@ impl State {
     pub(crate) fn execute_indirect(
         &mut self,
         list: &HostList,
-        (kind, stride, max): (u32, u32, u32),
+        stride: u32,
+        title_args: &[[u32; 4]],
+        max: u32,
         arguments: u64,
         count: Option<u64>,
     ) -> bool {
@@ -1017,6 +1413,33 @@ impl State {
         const INDEXED: u32 = 1;
         const DISPATCH: u32 = 2;
         const MESH: u32 = 10;
+        let pipeline = crate::pipeline::host_pipeline(self.pipeline as This);
+        // Root constants land in the user data of the stage that reads
+        // them; a spilled stage's user data is a root view (no dwords).
+        let stages: Vec<crate::indirect_plan::StageUserData<'_>> = pipeline
+            .map(|p| {
+                p.stages
+                    .iter()
+                    .filter_map(|s| {
+                        let (param, dwords) = s.user_data?;
+                        Some(crate::indirect_plan::StageUserData {
+                            param,
+                            dwords: if s.user_data_cbv { 0 } else { dwords },
+                            entries: &s.translated().host.user_data,
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let Some(plan) = crate::indirect_plan::plan_indirect(stride, title_args, &stages) else {
+            #[cfg(feature = "diagnostics")]
+            crate::pipeline::note_why(format!(
+                "indirect signature {title_args:?}: cannot map onto the host pipeline"
+            ));
+            return false;
+        };
+        let kind = plan.kind;
+        let multi = plan.args.len() > 1;
         #[cfg(feature = "diagnostics")]
         let why = |what: &str| crate::pipeline::note_why(format!("indirect kind {kind}: {what}"));
         #[cfg(not(feature = "diagnostics"))]
@@ -1036,6 +1459,11 @@ impl State {
             },
             None => None,
         };
+        if multi && self.topology == RECTANGLES {
+            once!("indirect rectangles with root constants not drawn");
+            why("rectangles with root constants not supported");
+            return false;
+        }
         if kind == INDEXED && self.topology == RECTANGLES {
             once!("indirect indexed rectangles not drawn");
             why("indexed rectangles not supported");
@@ -1105,10 +1533,14 @@ impl State {
             DRAWN.fetch_add(1, Ordering::Relaxed);
             return true;
         }
-        let Some(signature) = matches!(kind, DRAW | INDEXED | DISPATCH | MESH)
-            .then(|| host_signature(kind, stride))
-            .flatten()
-        else {
+        let signature = if multi {
+            pipeline.and_then(|p| pipeline_signature(p, &plan.args, stride))
+        } else {
+            matches!(kind, DRAW | INDEXED | DISPATCH | MESH)
+                .then(|| host_signature(kind, stride))
+                .flatten()
+        };
+        let Some(signature) = signature else {
             why("no host signature");
             return false;
         };
@@ -1117,7 +1549,10 @@ impl State {
             s.refresh(list, *at, 4);
         }
         // Bounded first: the clamp binds a compute pipeline of its own.
-        if !crate::indirect::bound(list, &args.buffer, args.gpu(arguments), (kind, stride, max)) {
+        // The clamp's view starts at the draw or dispatch argument of the
+        // first record (a root view has no bounds to shift).
+        let at = args.gpu(arguments) + u64::from(plan.arg_offset);
+        if !crate::indirect::bound(list, &args.buffer, at, (kind, stride, max)) {
             why("not bounded (no clamp, or arguments not 4-byte aligned)");
             return false;
         }
@@ -1126,7 +1561,7 @@ impl State {
         let ran = match kind {
             DRAW | INDEXED => self.prepare(list, kind == INDEXED),
             MESH => self.prepare_for(list, false, true),
-            DISPATCH => match crate::pipeline::host_pipeline(self.pipeline as This) {
+            DISPATCH => match pipeline {
                 Some(p) if p.compute => {
                     self.bind(list, p, true);
                     true
@@ -1135,6 +1570,13 @@ impl State {
             },
             _ => false,
         };
+        // A signature with root arguments needs the root signature it was
+        // made for bound.
+        let ran = ran
+            && (!multi
+                || pipeline.is_some_and(|p| {
+                    self.host_roots[usize::from(kind == DISPATCH)] == p.root.as_raw() as usize
+                }));
         if !ran {
             crate::indirect::done(list, &args.buffer);
             #[cfg(feature = "diagnostics")]
@@ -1146,6 +1588,9 @@ impl State {
                 )),
             }
             return false;
+        }
+        if multi {
+            list.keep(&signature);
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| {
@@ -1174,6 +1619,40 @@ impl State {
         }
         true
     }
+}
+
+/// A multi-argument host command signature for `p`'s root signature,
+/// made once per argument layout and stride.
+fn pipeline_signature(
+    p: &HostPipeline,
+    args: &[crate::indirect_plan::HostIndirectArg],
+    stride: u32,
+) -> Option<ID3D12CommandSignature> {
+    let mut cache = p.signatures.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, _, s)) = cache.iter().find(|(a, st, _)| *st == stride && a == args) {
+        return Some(s.clone());
+    }
+    let descs = crate::indirect::to_d3d12_descs(args);
+    let desc = D3D12_COMMAND_SIGNATURE_DESC {
+        ByteStride: stride,
+        NumArgumentDescs: descs.len() as u32,
+        pArgumentDescs: descs.as_ptr(),
+        NodeMask: 0,
+    };
+    let mut signature: Option<ID3D12CommandSignature> = None;
+    // SAFETY: `descs` lives through the call; `p.root` is a live root signature.
+    let result = unsafe {
+        crate::host::host()?
+            .device
+            .CreateCommandSignature(&desc, Some(&p.root), &mut signature)
+    };
+    if let Err(e) = result {
+        once!(error = %e, ?args, stride, "host multi-argument command signature refused");
+        return None;
+    }
+    let signature = signature?;
+    cache.push((args.to_vec(), stride, signature.clone()));
+    Some(signature)
 }
 
 /// The host command signature for one argument of `kind` with records
@@ -1316,7 +1795,11 @@ fn describe(view: Option<&View>) -> String {
         None => "no view".into(),
         Some(v @ View::Shader(r, _)) => texture(*r as This)
             .unwrap_or_else(|| format!("buffer {:?}", crate::descriptor::host::buffer_range(v))),
-        Some(View::Unordered(r, ..)) => format!("uav {:?}", texture(*r as This)),
+        // A buffer has no host texture: its title range, as for a shader view.
+        Some(v @ View::Unordered(r, ..)) => texture(*r as This).map_or_else(
+            || format!("uav buffer {:?}", crate::descriptor::host::buffer_range(v)),
+            |t| format!("uav {t}"),
+        ),
         Some(View::Placed(u, r, d)) => format!(
             "placed uav={u} dim {} {}x{} f{} layout {:#x} at {:#x}",
             r[0],
@@ -1338,12 +1821,46 @@ fn describe(view: Option<&View>) -> String {
     }
 }
 
-/// The console's own primitive topologies.
-const TRIANGLE_FAN: u32 = 6;
+/// Reports the guest argument before host binding.
+#[cfg(feature = "diagnostics")]
+fn describe_root_view(bound: Option<&Root>) -> String {
+    match bound {
+        Some(Root::View(address)) => format!("Descriptor(guest address {address:#x})"),
+        Some(Root::Table(_)) => "Descriptor(table supplied)".into(),
+        Some(Root::Constants(_)) => "Descriptor(constants supplied)".into(),
+        Some(Root::None) | None => "Descriptor(unset)".into(),
+    }
+}
+
+#[cfg(all(test, feature = "diagnostics"))]
+mod trace_tests {
+    use super::*;
+
+    #[test]
+    fn root_view_trace_distinguishes_zero_unset_and_wrong_argument_kinds() {
+        assert_eq!(describe_root_view(None), "Descriptor(unset)");
+        assert_eq!(describe_root_view(Some(&Root::None)), "Descriptor(unset)");
+        assert_eq!(
+            describe_root_view(Some(&Root::View(0))),
+            "Descriptor(guest address 0x0)"
+        );
+        assert_eq!(
+            describe_root_view(Some(&Root::View(42))),
+            "Descriptor(guest address 0x2a)"
+        );
+        assert_eq!(
+            describe_root_view(Some(&Root::Table(42))),
+            "Descriptor(table supplied)"
+        );
+        assert_eq!(
+            describe_root_view(Some(&Root::Constants(vec![42]))),
+            "Descriptor(constants supplied)"
+        );
+    }
+}
+
+/// Console rectangle list topology (expanded on vertex inputs in [`crate::primitive`]).
 const RECTANGLES: u32 = 17;
-const LINE_LOOP: u32 = 18;
-const QUADS: u32 = 19;
-const QUAD_STRIP: u32 = 20;
 
 /// Fixed-function state, straight onto the host list.
 pub(crate) fn viewports(list: &HostList, viewports: &[D3D12_VIEWPORT]) {
@@ -1523,8 +2040,52 @@ mod depth_tests {
     }
 }
 
+#[cfg(test)]
+mod clear_state_tests {
+    use super::*;
+
+    #[test]
+    fn clear_resets_bindings_but_keeps_dynamic_slots() {
+        // A synthetic slot record: no registered heap, so giving it back
+        // does nothing.
+        let dynamic = (0, 64, 3);
+        let mut state = State::default();
+        state.pipeline = 1;
+        state.heaps = [2, 3];
+        state.targets = vec![8];
+        state.topology = 4;
+        state.host_pipeline = 10;
+        state.host_roots = [11, 12];
+        state.host_heaps = [13, 14];
+        state.fresh_tables = [((4, 15), dynamic.1)].into();
+        state.dynamic = vec![dynamic];
+        let pipeline: This = std::ptr::dangling();
+        state.clear(pipeline);
+        assert_eq!(state.pipeline, pipeline as usize);
+        assert_eq!(state.heaps, [0; 2]);
+        assert!(state.targets.is_empty());
+        assert_eq!(state.topology, 0);
+        assert_eq!(state.host_pipeline, 0);
+        assert_eq!(state.host_roots, [0; 2]);
+        assert_eq!(state.host_heaps, [0; 2]);
+        assert!(state.fresh_tables.is_empty());
+        assert_eq!(state.dynamic, [dynamic]);
+        state.reset(std::ptr::null());
+        assert!(state.dynamic.is_empty());
+    }
+}
+
 #[cfg(all(test, feature = "diagnostics"))]
 mod tests {
+
+    /// Depth bounds reach the host in 0..=1 and in order.
+    #[test]
+    fn depth_bounds_are_clamped_and_ordered() {
+        assert_eq!(depth_range(0.25, 0.75), (0.25, 0.75));
+        assert_eq!(depth_range(-1.0, 2.0), (0.0, 1.0));
+        assert_eq!(depth_range(f32::NAN, f32::NAN), (0.0, 1.0));
+        assert_eq!(depth_range(0.9, 0.1), (0.1, 0.1));
+    }
     use super::*;
 
     #[test]
@@ -1732,3 +2293,25 @@ mod tests {
         assert_eq!(pixels, [[0, 255, 0, 255]; (SIDE * SIDE) as usize]);
     }
 }
+
+/// `OMSetDepthBounds`, if the host has the test: bounds in 0..=1, the low
+/// one first, as the host requires (its debug layer refuses others).
+pub(crate) fn depth_bounds(list: &HostList, min: f32, max: f32) {
+    if !crate::pipeline::host::depth_bounds_supported() {
+        return;
+    }
+    let (min, max) = depth_range(min, max);
+    if let Ok(list1) = list.list.cast::<ID3D12GraphicsCommandList1>() {
+        // SAFETY: an open list.
+        unsafe { list1.OMSetDepthBounds(min, max) };
+    }
+}
+
+/// Depth bounds the host takes: NaN as the full range, each in 0..=1, in
+/// order.
+fn depth_range(min: f32, max: f32) -> (f32, f32) {
+    let unit = |x: f32, nan: f32| if x.is_nan() { nan } else { x.clamp(0.0, 1.0) };
+    let (min, max) = (unit(min, 0.0), unit(max, 1.0));
+    (min.min(max), max)
+}
+

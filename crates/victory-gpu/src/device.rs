@@ -373,6 +373,18 @@ fn feature_levels(data: *mut c_void) -> HRESULT {
     }
 }
 
+/// The host device's state: the console's device is removed when the host's is.
+extern "system" fn removed_reason(_: This) -> HRESULT {
+    #[cfg(windows)]
+    if let Some(host) = crate::host::host() {
+        // SAFETY: a plain query.
+        if let Err(e) = unsafe { host.device.GetDeviceRemovedReason() } {
+            return e.code().0;
+        }
+    }
+    S_OK
+}
+
 /// IUnknown 3, object methods 4, device methods 76 (0x18-0x290), then the
 /// methods `ID3D12Device1` to `ID3D12Device8` add, in order: 3, 1, 3, 6, 9,
 /// 1, 2, 9 (0x298-0x3a0, the console's own among them), then those of
@@ -405,6 +417,7 @@ static FUNCTIONS: Table<160> = {
     f[28] = resource::create_heap as *const (); // 0xe0
     f[29] = resource::create_placed as *const (); // 0xe8
     f[36] = fence::create as *const (); // 0x120
+    f[37] = removed_reason as *const (); // 0x128
     f[38] = resource::copyable_footprints as *const (); // 0x130
     f[39] = query::create as *const (); // 0x138
     f[41] = signature::create as *const (); // 0x148
@@ -589,5 +602,62 @@ mod tests {
         assert_eq!(info[0], OPTIONS[9], "resource bits agree with OPTIONS");
         assert_eq!(info[1], 48);
         assert_eq!(check(device(), 6, (&raw mut info).cast(), 4), E_INVALIDARG);
+    }
+
+    #[test]
+    fn feature_options_report_the_rdna2_tiers() {
+        type Check = extern "system" fn(This, u32, *mut c_void, u32) -> HRESULT;
+        let device = device();
+        let check = slot::<Check>(device, 0x68);
+        let mut options = [0u32; 16];
+        assert_eq!(check(device, 0, options.as_mut_ptr().cast(), 64), S_OK);
+        assert_eq!(options, OPTIONS);
+        assert_eq!(
+            (options[3], options[4], options[8], options[9], options[15]),
+            (3, 3, 3, 40, 2)
+        );
+        assert_eq!(
+            check(device, 0, options.as_mut_ptr().cast(), 60),
+            E_INVALIDARG
+        );
+        assert_eq!(check(device, 0, std::ptr::null_mut(), 64), E_INVALIDARG);
+    }
+
+    #[test]
+    fn feature_architecture_is_unified_and_coherent() {
+        type Check = extern "system" fn(This, u32, *mut c_void, u32) -> HRESULT;
+        let device = device();
+        let check = slot::<Check>(device, 0x68);
+        let mut arch = [0u32; 4];
+        assert_eq!(check(device, 1, arch.as_mut_ptr().cast(), 16), S_OK);
+        assert_eq!(arch, [0, 0, 1, 1]);
+        arch[0] = 1;
+        assert_eq!(check(device, 1, arch.as_mut_ptr().cast(), 16), E_INVALIDARG);
+    }
+
+    #[test]
+    fn feature_multisample_has_one_level_for_the_hardware_counts() {
+        type Check = extern "system" fn(This, u32, *mut c_void, u32) -> HRESULT;
+        let device = device();
+        let check = slot::<Check>(device, 0x68);
+        let levels = |samples: u32| {
+            // Format, sample count, flags in; quality levels out.
+            let mut query = [28, samples, 0, 99];
+            assert_eq!(check(device, 4, query.as_mut_ptr().cast(), 16), S_OK);
+            query[3]
+        };
+        for samples in [1, 2, 4, 8] {
+            assert_eq!(levels(samples), 1, "{samples} samples");
+        }
+        for samples in [0, 3, 16] {
+            assert_eq!(levels(samples), 0, "{samples} samples");
+        }
+    }
+
+    #[test]
+    fn a_healthy_device_reports_no_removal() {
+        let device = device();
+        let reason = slot::<extern "system" fn(This) -> HRESULT>(device, 0x128);
+        assert_eq!(reason(device), S_OK);
     }
 }

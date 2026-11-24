@@ -165,13 +165,15 @@ pub extern "system" fn GetProcAddress(module: *mut c_void, name: *const u8) -> *
         return host_override(module, name).unwrap_or_else(|| host::get_proc_address(module, name));
     };
     // Values below 0x10000 are ordinals. Our export table names ordinal
-    // exports `#n`, the same form the import binder looks up.
+    // exports `#n`, the same form the import binder looks up. A miss fails
+    // as the host's does, with the last error set.
     if (name as usize) < 0x1_0000 {
         let ordinal = format!("#{}", name as usize);
         return match m.exports.iter().find(|e| e.name == ordinal) {
             Some(e) => e.address as *mut c_void,
             None => {
                 tracing::warn!(module = m.name, %ordinal, "GetProcAddress: not implemented");
+                host::set_last_error(ERROR_PROC_NOT_FOUND);
                 std::ptr::null_mut()
             }
         };
@@ -182,6 +184,7 @@ pub extern "system" fn GetProcAddress(module: *mut c_void, name: *const u8) -> *
         Some(e) => e.address as *mut c_void,
         None => {
             tracing::warn!(module = m.name, %name, "GetProcAddress: not implemented");
+            host::set_last_error(ERROR_PROC_NOT_FOUND);
             std::ptr::null_mut()
         }
     }
@@ -363,6 +366,7 @@ fn refuse(file: &str) {
 }
 
 const ERROR_MOD_NOT_FOUND: u32 = 126;
+const ERROR_PROC_NOT_FOUND: u32 = 127;
 
 pub(crate) fn module() -> HleModule {
     HleModule {
@@ -776,6 +780,28 @@ mod tests {
             // SAFETY: reads this thread's last error.
             let last = unsafe { windows_sys::Win32::Foundation::GetLastError() };
             assert_eq!(last, ERROR_INSUFFICIENT_BUFFER);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_missing_export_of_our_modules_sets_the_last_error() {
+        use windows_sys::Win32::Foundation::{GetLastError, SetLastError};
+        // SAFETY: sets and reads this thread's last error.
+        let clear = || unsafe { SetLastError(0) };
+        // SAFETY: as above.
+        let last = || unsafe { GetLastError() };
+        // The host's own modules, for comparison.
+        let kernel32 = GetModuleHandleW(w("kernel32.dll").as_ptr());
+        clear();
+        assert!(GetProcAddress(kernel32, c"NotAnExport".as_ptr().cast()).is_null());
+        assert_eq!(last(), ERROR_PROC_NOT_FOUND);
+        // Ours, by name and by ordinal.
+        let runtime = LoadLibraryA(c"xgameruntime.dll".as_ptr().cast());
+        for name in [c"NotAnExport".as_ptr().cast(), 9999 as *const u8] {
+            clear();
+            assert!(GetProcAddress(runtime, name).is_null());
+            assert_eq!(last(), ERROR_PROC_NOT_FOUND, "{name:?}");
         }
     }
 }

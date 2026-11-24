@@ -19,7 +19,8 @@ pub(crate) struct HostHeap {
     step: u32,
     /// Slots mirroring the title's; `spare` more follow them.
     count: u32,
-    /// Dynamic slots past the title's: [`DYNAMIC`] in a view heap,
+    /// Dynamic slots past the title's: [`DYNAMIC`] in a view heap (or
+    /// [`MIN_DYNAMIC`] where the host refused that heap),
     /// [`SAMPLER_DYNAMIC`] in a capped sampler heap, none in another.
     spare: u32,
     sampler: bool,
@@ -62,14 +63,58 @@ pub(crate) fn near_heaps(va: u64) -> String {
     text
 }
 
-/// The host's limit for shader-visible view heaps on resource binding
-/// tiers 1 and 2; tier 3 hardware may take more.
+/// The host's limit for shader-visible view heaps on every resource
+/// binding tier, unless the device reports a larger one
+/// ([`max_view_heap`]). NVIDIA creates a larger heap without an error,
+/// but the runtime refuses it (debug layer #645) and the device is removed
+/// once it is used (upstream #735).
 const PORTABLE_VIEWS: u32 = 1_000_000;
+
+/// The largest shader-visible view heap the device takes: what
+/// `D3D12_OPTIONS19` reports (Agility runtimes), else [`PORTABLE_VIEWS`].
+fn max_view_heap(host: &Host) -> u32 {
+    let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS19::default();
+    // SAFETY: the query writes its own structure of the given size.
+    let asked = unsafe {
+        host.device.CheckFeatureSupport(
+            D3D12_FEATURE_D3D12_OPTIONS19,
+            (&raw mut options).cast(),
+            size_of_val(&options) as u32,
+        )
+    };
+    match asked {
+        Ok(()) => options.MaxViewDescriptorHeapSize.max(PORTABLE_VIEWS),
+        Err(_) => PORTABLE_VIEWS,
+    }
+}
+
+/// The view heaps to try for `count` title slots on a device that takes
+/// `limit` views, in order: (heap size, title slots, dynamic slots). The
+/// full dynamic range always: on top of every title slot where that fits,
+/// else the title's slots are cut to make room for it (shortcut:
+/// descriptors past the host's limit are left out; a title that reaches
+/// them needs remapping). A capped heap with 2^16 dynamic slots ran dry in
+/// every world submission and dropped most indirect draws, where 2^18
+/// dropped none (upstream #747: RTX 4070 Ti, 5060 Ti, 5070 Ti). Then, if
+/// the host refuses that, the smaller range. None is over `limit`.
+fn view_heap_sizes(count: u32, limit: u32) -> Vec<(u32, u32, u32)> {
+    let planned = |extra: u32| match count.checked_add(extra) {
+        Some(size) if size <= limit => (size, count, extra),
+        _ => (limit, limit.saturating_sub(extra), extra),
+    };
+    vec![planned(DYNAMIC), planned(MIN_DYNAMIC)]
+}
 
 /// Slots past the title's in a view heap, for tables a draw needs made
 /// afresh (constant buffers copied per draw). A list holds the slots it
 /// took until it is reset (its submissions have run) or released.
-const DYNAMIC: u32 = 1 << 16;
+/// 2^16 ran out seconds into the world (every world run on an RX 9070 XT,
+/// each a device removal shortly after; upstream #59).
+const DYNAMIC: u32 = 1 << 18;
+
+/// The dynamic slots of a view heap the host refused with [`DYNAMIC`]: a
+/// last resort, too few for the world (upstream #747).
+const MIN_DYNAMIC: u32 = 1 << 16;
 
 /// The host's limit for shader-visible sampler heaps, on every binding
 /// tier.
@@ -118,15 +163,29 @@ impl HostHeap {
                 SAMPLER_DYNAMIC,
             );
         }
-        let extra = if sampler { 0 } else { DYNAMIC };
-        let (heap, count) = match make(count + extra) {
-            Ok(heap) => (heap, count),
-            Err(e) if !sampler && count + extra > PORTABLE_VIEWS => {
-                // shortcut: descriptors past the host's limit are left out;
-                // a title that reaches them needs remapping.
-                tracing::warn!(error = %e, count, "host view heap capped at {PORTABLE_VIEWS}");
-                (make(PORTABLE_VIEWS).ok()?, PORTABLE_VIEWS - extra)
+        let made = if sampler {
+            make(count).map(|heap| (heap, count, 0))
+        } else {
+            let limit = max_view_heap(host);
+            let mut tried = view_heap_sizes(count, limit).into_iter();
+            // Never empty: the last size fits `limit` by construction.
+            let (size, titles, extra) = tried.next()?;
+            let mut made = make(size).map(|heap| (heap, titles, extra));
+            for (size, titles, extra) in tried {
+                if made.is_ok() {
+                    break;
+                }
+                made = make(size).map(|heap| (heap, titles, extra));
             }
+            if let Ok((_, titles, extra)) = &made
+                && *titles < count
+            {
+                tracing::warn!(count, limit, "host view heap capped at {}", titles + extra);
+            }
+            made
+        };
+        let (heap, count, extra) = match made {
+            Ok(made) => made,
             Err(e) => {
                 tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
                 return None;
@@ -329,6 +388,50 @@ impl HostHeap {
         }
     }
 
+    /// Makes a matched native UAV pair from the CPU view. The GPU slot is
+    /// held until list reset like the descriptors in a fresh table.
+    pub(crate) fn clear_texture_uav(
+        &self,
+        list: &crate::host::HostList,
+        texture: &ID3D12Resource,
+        words: Option<&[u32; 10]>,
+    ) -> Option<(
+        u32,
+        D3D12_GPU_DESCRIPTOR_HANDLE,
+        D3D12_CPU_DESCRIPTOR_HANDLE,
+    )> {
+        let mut desc = words.map(uav_desc);
+        if !fits(texture, desc.as_mut().map(|d| &mut d.Format), true) {
+            return None;
+        }
+        let device = &host()?.device;
+        let cpu = list.clear_uav_cpu()?;
+        let slot = self.dynamic(1)?;
+        // SAFETY: both handles name live heap slots. Copy from the
+        // CPU-only heap to the shader-visible heap.
+        let gpu = unsafe {
+            device.CreateUnorderedAccessView(
+                texture,
+                None::<&ID3D12Resource>,
+                desc.as_ref().map(std::ptr::from_ref),
+                cpu,
+            );
+            device.CopyDescriptorsSimple(
+                1,
+                self.cpu(slot),
+                cpu,
+                D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+            );
+            D3D12_GPU_DESCRIPTOR_HANDLE {
+                ptr: self.heap.GetGPUDescriptorHandleForHeapStart().ptr
+                    + u64::from(slot) * u64::from(self.step),
+            }
+        };
+        // The list's texture state retains the resource through execution.
+        self.keep(slot, None);
+        Some((slot, gpu, cpu))
+    }
+
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
     /// host cannot.
     pub(crate) fn make_at(&self, index: u32, view: &View) {
@@ -363,6 +466,39 @@ impl HostHeap {
                 crate::host::retire(old);
             }
         }
+    }
+
+    /// The shader-visible handle of slot `index`.
+    pub(crate) fn gpu_handle(&self, index: u32) -> D3D12_GPU_DESCRIPTOR_HANDLE {
+        // SAFETY: a live shader-visible heap.
+        let start = unsafe { self.heap.GetGPUDescriptorHandleForHeapStart().ptr };
+        D3D12_GPU_DESCRIPTOR_HANDLE { ptr: start + u64::from(index) * u64::from(self.step) }
+    }
+
+    /// Makes slot `index` (a dynamic one) a raw buffer view of `len` bytes
+    /// of `buffer` from byte `offset` (4-byte units, rounded down), holding
+    /// the buffer while the slot does.
+    pub(crate) fn raw_srv_at(&self, index: u32, buffer: &ID3D12Resource, offset: u64, len: u64) {
+        let Some(host) = host() else { return };
+        let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R32_TYPELESS,
+            ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Buffer: D3D12_BUFFER_SRV {
+                    FirstElement: offset / 4,
+                    NumElements: (len / 4).clamp(1, u64::from(u32::MAX)) as u32,
+                    StructureByteStride: 0,
+                    Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+                },
+            },
+        };
+        // SAFETY: a live buffer and a slot of our heap; the range lies in it.
+        unsafe {
+            host.device
+                .CreateShaderResourceView(buffer, Some(&desc), self.cpu(index))
+        };
+        self.keep(index, Some(buffer.clone()));
     }
 
     /// Makes slot `index` (a dynamic one) a constant buffer view of host
@@ -755,6 +891,50 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
     true
 }
 
+/// A shader view of a typeless depth texture names the readable aspect.
+/// For a 2D view D3D12 also requires the plane index to match that format.
+fn texture_srv_desc(
+    resource: &D3D12_RESOURCE_DESC,
+    words: &[u32; 10],
+) -> D3D12_SHADER_RESOURCE_VIEW_DESC {
+    let mut view = srv_desc(words);
+    if !resource
+        .Flags
+        .contains(D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)
+    {
+        return view;
+    }
+    let (dsv, depth, stencil) = match resource.Format {
+        DXGI_FORMAT_R32G8X24_TYPELESS => (
+            DXGI_FORMAT_D32_FLOAT_S8X24_UINT,
+            DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS,
+            Some(DXGI_FORMAT_X32_TYPELESS_G8X24_UINT),
+        ),
+        DXGI_FORMAT_R24G8_TYPELESS => (
+            DXGI_FORMAT_D24_UNORM_S8_UINT,
+            DXGI_FORMAT_R24_UNORM_X8_TYPELESS,
+            Some(DXGI_FORMAT_X24_TYPELESS_G8_UINT),
+        ),
+        DXGI_FORMAT_R32_TYPELESS => (DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_R32_FLOAT, None),
+        DXGI_FORMAT_R16_TYPELESS => (DXGI_FORMAT_D16_UNORM, DXGI_FORMAT_R16_UNORM, None),
+        _ => return view,
+    };
+    let plane = if Some(view.Format) == stencil {
+        1
+    } else if [DXGI_FORMAT_UNKNOWN, resource.Format, dsv, depth].contains(&view.Format) {
+        view.Format = depth;
+        0
+    } else {
+        return view;
+    };
+    match view.ViewDimension {
+        D3D12_SRV_DIMENSION_TEXTURE2D => view.Anonymous.Texture2D.PlaneSlice = plane,
+        D3D12_SRV_DIMENSION_TEXTURE2DARRAY => view.Anonymous.Texture2DArray.PlaneSlice = plane,
+        _ => {}
+    }
+    view
+}
+
 /// Makes the host descriptor for `view` at `at`: the host resource it
 /// views, or `None` if it cannot.
 fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
@@ -782,7 +962,9 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
         View::Shader(resource, desc) => {
             let resource = *resource as crate::object::This;
             if let Some(texture) = crate::resource::host_resource(resource) {
-                let mut desc = desc.as_ref().map(srv_desc);
+                // SAFETY: a live host texture.
+                let info = unsafe { texture.GetDesc() };
+                let mut desc = desc.as_ref().map(|words| texture_srv_desc(&info, words));
                 if !fits(texture, desc.as_mut().map(|d| &mut d.Format), false) {
                     return None;
                 }
@@ -889,14 +1071,18 @@ pub(crate) fn placed_texture(view: &View) -> Option<View> {
 }
 
 /// A null view of the kind `view` is, for a slot whose view the host
-/// cannot make: unordered access (to a buffer or a 2D texture) or a shader
-/// view. Writes to it are dropped, reads give zeros.
+/// cannot make: unordered access (to a buffer or a texture of the title's
+/// dimension) or a shader view. Writes to it are dropped, reads give zeros.
 fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     let Some(host) = host() else { return };
     let is_buffer = |r: &usize| crate::resource::buffer_bytes(*r as crate::object::This).is_some();
-    let buffer = match view {
-        View::Unordered(r, _, desc) => is_buffer(r) || desc.is_some_and(|d| d[1] == 1),
-        View::Placed(true, resource, _) => resource[0] == 1,
+    // Unordered views: whether a buffer, and the title's view dimension.
+    let (buffer, dimension) = match view {
+        View::Unordered(r, _, desc) => (
+            is_buffer(r) || desc.is_some_and(|d| d[1] == 1),
+            desc.map(|d| d[1]),
+        ),
+        View::Placed(true, resource, desc) => (resource[0] == 1, Some(desc[1])),
         // Shader views of buffers read nothing through a null buffer view:
         // a null 2D view where the shader expects a buffer is a mismatch
         // the hardware does not survive in general (GPU-based validation
@@ -918,14 +1104,14 @@ fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
         }
         _ => return null_view(at),
     };
-    let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
-        Format: DXGI_FORMAT_R32_UINT,
-        ViewDimension: if buffer {
-            D3D12_UAV_DIMENSION_BUFFER
-        } else {
-            D3D12_UAV_DIMENSION_TEXTURE2D
-        },
-        ..Default::default()
+    let desc = if buffer {
+        D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            Format: DXGI_FORMAT_R32_UINT,
+            ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+            ..Default::default()
+        }
+    } else {
+        null_uav_desc(dimension)
     };
     // SAFETY: a slot of our heap; a null resource is allowed with a desc.
     unsafe {
@@ -936,6 +1122,46 @@ fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
             at,
         )
     };
+}
+
+/// A null texture UAV of the title's view dimension (1D, 1D or 2D arrays,
+/// 3D), 2D if it names none: a 2D null view where the shader writes a 3D
+/// texture is a mismatch GPU-based validation reports (the world's wind
+/// field update, 2026-11-24).
+fn null_uav_desc(dimension: Option<u32>) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
+    let mut desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+        Format: DXGI_FORMAT_R32_UINT,
+        ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
+        ..Default::default()
+    };
+    match dimension.map(|d| D3D12_UAV_DIMENSION(d as i32)) {
+        Some(D3D12_UAV_DIMENSION_TEXTURE1D) => {
+            desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE1D;
+        }
+        Some(D3D12_UAV_DIMENSION_TEXTURE1DARRAY) => {
+            desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE1DARRAY;
+            desc.Anonymous.Texture1DArray = D3D12_TEX1D_ARRAY_UAV {
+                ArraySize: 1,
+                ..Default::default()
+            };
+        }
+        Some(D3D12_UAV_DIMENSION_TEXTURE2DARRAY) => {
+            desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2DARRAY;
+            desc.Anonymous.Texture2DArray = D3D12_TEX2D_ARRAY_UAV {
+                ArraySize: 1,
+                ..Default::default()
+            };
+        }
+        Some(D3D12_UAV_DIMENSION_TEXTURE3D) => {
+            desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE3D;
+            desc.Anonymous.Texture3D = D3D12_TEX3D_UAV {
+                WSize: u32::MAX,
+                ..Default::default()
+            };
+        }
+        _ => {}
+    }
+    desc
 }
 
 /// A buffer view that reads zeros (raw, as translated shaders mostly read
@@ -1016,6 +1242,41 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 mod tests {
     use super::*;
 
+    /// A null texture UAV keeps the title's dimension (3D for the world's
+    /// wind field), and is 2D when the title names none.
+    #[test]
+    fn null_uavs_keep_the_titles_dimension() {
+        let d = null_uav_desc(Some(8));
+        assert_eq!(d.ViewDimension, D3D12_UAV_DIMENSION_TEXTURE3D);
+        // SAFETY: the member the dimension names.
+        assert_eq!(unsafe { d.Anonymous.Texture3D.WSize }, u32::MAX);
+        let d = null_uav_desc(Some(5));
+        assert_eq!(d.ViewDimension, D3D12_UAV_DIMENSION_TEXTURE2DARRAY);
+        // SAFETY: the member the dimension names.
+        assert_eq!(unsafe { d.Anonymous.Texture2DArray.ArraySize }, 1);
+        let dimension = |d| null_uav_desc(d).ViewDimension;
+        assert_eq!(dimension(Some(2)), D3D12_UAV_DIMENSION_TEXTURE1D);
+        assert_eq!(dimension(Some(4)), D3D12_UAV_DIMENSION_TEXTURE2D);
+        assert_eq!(dimension(None), D3D12_UAV_DIMENSION_TEXTURE2D);
+        // Multisampled UAVs need a cap; they stay 2D.
+        assert_eq!(dimension(Some(6)), D3D12_UAV_DIMENSION_TEXTURE2D);
+    }
+
+    /// A null 3D UAV made on the real device leaves it alive.
+    #[test]
+    fn null_3d_uav_is_accepted_by_the_device() {
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return;
+        };
+        let view = View::Unordered(0, 0, Some([28, 8, 0, 0, 0, 0, 0, 0, 0, 0]));
+        null_for(&view, heap.cpu(0));
+        // SAFETY: a plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
     /// The CPU-side block used to initialize null samplers must fit the
     /// same portable sampler limit as the shader-visible heap.
     #[test]
@@ -1034,20 +1295,61 @@ mod tests {
         );
     }
 
+    /// A view heap is never sized past what the device takes: 2^20 title
+    /// slots plus the dynamic range asked for 1,310,720 views on a device
+    /// that takes 1,000,000 (upstream #735).
+    #[test]
+    fn view_heaps_stay_within_the_device_limit() {
+        // 2^20 title slots on a 1M device: the full dynamic range, the
+        // title's slots cut (upstream #735, #747).
+        assert_eq!(
+            view_heap_sizes(1 << 20, PORTABLE_VIEWS),
+            [
+                (PORTABLE_VIEWS, PORTABLE_VIEWS - DYNAMIC, DYNAMIC),
+                (PORTABLE_VIEWS, PORTABLE_VIEWS - MIN_DYNAMIC, MIN_DYNAMIC),
+            ]
+        );
+        assert_eq!(
+            view_heap_sizes(4, PORTABLE_VIEWS),
+            [(4 + DYNAMIC, 4, DYNAMIC), (4 + MIN_DYNAMIC, 4, MIN_DYNAMIC)]
+        );
+        assert_eq!(
+            view_heap_sizes(800_000, PORTABLE_VIEWS),
+            [
+                (PORTABLE_VIEWS, PORTABLE_VIEWS - DYNAMIC, DYNAMIC),
+                (800_000 + MIN_DYNAMIC, 800_000, MIN_DYNAMIC),
+            ]
+        );
+        // A device that reports a larger limit keeps every title slot.
+        assert_eq!(
+            view_heap_sizes(1 << 20, 1 << 21)[0],
+            ((1 << 20) + DYNAMIC, 1 << 20, DYNAMIC)
+        );
+        for count in [0, 1, 999_999, 1_000_000, u32::MAX] {
+            let sizes = view_heap_sizes(count, PORTABLE_VIEWS);
+            assert_eq!(sizes[0].2, DYNAMIC);
+            for (size, titles, extra) in sizes {
+                assert!(size <= PORTABLE_VIEWS && titles + extra == size && titles <= count);
+            }
+        }
+    }
+
     /// Dynamic slots stay taken until given back, and runs do not wrap.
     #[test]
     fn dynamic_slots_are_held_until_released() {
         let Some(heap) = HostHeap::new(false, 4) else {
             return; // no host GPU
         };
-        let a = heap.dynamic(DYNAMIC - 100).unwrap();
+        let spare = heap.spare;
+        assert!(spare == DYNAMIC || spare == MIN_DYNAMIC, "{spare}");
+        let a = heap.dynamic(spare - 100).unwrap();
         let b = heap.dynamic(60).unwrap();
-        assert_eq!((a, b), (4, 4 + DYNAMIC - 100));
+        assert_eq!((a, b), (4, 4 + spare - 100));
         // 40 left at the end: 50 do not fit until something is given back.
         assert_eq!(heap.dynamic(50), None);
         heap.release(a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
-        assert_eq!(heap.dynamic(40), Some(4 + DYNAMIC - 40));
+        assert_eq!(heap.dynamic(40), Some(4 + spare - 40));
     }
 
     /// A sampler heap past the host's limit is capped, not lost, and keeps
@@ -1076,5 +1378,72 @@ mod tests {
         };
         assert_eq!(heap.count(), 16);
         assert_eq!(heap.dynamic(1), None);
+    }
+
+    #[test]
+    fn depth_srv_uses_the_requested_aspect() {
+        for (own, request, expected, plane) in [
+            (19, 20, 21, 0),
+            (19, 22, 22, 1),
+            (44, 45, 46, 0),
+            (44, 47, 47, 1),
+            (44, 120, 47, 1),
+            (44, 119, 46, 0),
+            (39, 40, 41, 0),
+            (53, 55, 56, 0),
+            (19, 0, 21, 0),
+            (44, 44, 46, 0),
+        ] {
+            let resource = D3D12_RESOURCE_DESC {
+                Format: DXGI_FORMAT(own),
+                Flags: D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
+                ..Default::default()
+            };
+            for dim in [
+                D3D12_SRV_DIMENSION_TEXTURE2D,
+                D3D12_SRV_DIMENSION_TEXTURE2DARRAY,
+            ] {
+                let mut words = [0; 10];
+                words[0] = request;
+                words[1] = dim.0 as u32;
+                words[2] = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+                words[4] = 2; // MostDetailedMip
+                words[5] = 3; // MipLevels
+                if dim == D3D12_SRV_DIMENSION_TEXTURE2DARRAY {
+                    words[6] = 1; // FirstArraySlice
+                    words[7] = 2; // ArraySize
+                }
+                let plane_word = if dim == D3D12_SRV_DIMENSION_TEXTURE2DARRAY {
+                    8
+                } else {
+                    6
+                };
+                words[plane_word] = 1 - plane;
+                let view = texture_srv_desc(&resource, &words);
+                assert_eq!(view.Format.0, expected);
+                // SAFETY: read the member selected by the input view dimension.
+                unsafe {
+                    if dim == D3D12_SRV_DIMENSION_TEXTURE2DARRAY {
+                        let a = view.Anonymous.Texture2DArray;
+                        assert_eq!(
+                            (
+                                a.MostDetailedMip,
+                                a.MipLevels,
+                                a.FirstArraySlice,
+                                a.ArraySize,
+                                a.PlaneSlice
+                            ),
+                            (2, 3, 1, 2, plane)
+                        );
+                    } else {
+                        let a = view.Anonymous.Texture2D;
+                        assert_eq!(
+                            (a.MostDetailedMip, a.MipLevels, a.PlaneSlice),
+                            (2, 3, plane)
+                        );
+                    }
+                }
+            }
+        }
     }
 }

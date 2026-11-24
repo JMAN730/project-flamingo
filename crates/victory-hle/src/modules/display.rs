@@ -127,12 +127,28 @@ extern "system" fn acquire_deferral(_: This, out: *mut *mut c_void) -> HRESULT {
     }
     // SAFETY: the request we just created.
     if unsafe { PowerSetRequest(request, PowerRequestDisplayRequired) } == 0 {
-        let hr = last_error();
-        // SAFETY: as above; not handed out.
-        unsafe { windows_sys::Win32::Foundation::CloseHandle(request) };
-        return hr;
+        // SAFETY: no preconditions.
+        let code = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+        if let Some(hr) = refused_request(code) {
+            // SAFETY: as above; not handed out.
+            unsafe { windows_sys::Win32::Foundation::CloseHandle(request) };
+            return hr;
+        }
+        tracing::info!("display deferral: the system holds no display power here (no-op)");
     }
     put(out, request)
+}
+
+/// What a refused display-required request means for the title: `None`
+/// where the deferral still stands, else its error. A system with no
+/// display power to hold (headless, Remote Desktop, some laptops without an
+/// active display route) answers `ERROR_NOT_SUPPORTED`; the deferral is a
+/// power hint, so it succeeds there (upstream #727: the title's acquire
+/// failed with 0x80070032). Closing the request is unchanged.
+#[cfg(windows)]
+fn refused_request(code: u32) -> Option<HRESULT> {
+    const ERROR_NOT_SUPPORTED: u32 = 50;
+    (code != ERROR_NOT_SUPPORTED).then(|| hresult_from_win32(code))
 }
 
 #[cfg(windows)]
@@ -151,7 +167,11 @@ extern "system" fn close_deferral(_: This, handle: *mut c_void) {
 #[cfg(windows)]
 fn last_error() -> HRESULT {
     // SAFETY: no preconditions.
-    let code = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+    hresult_from_win32(unsafe { windows_sys::Win32::Foundation::GetLastError() })
+}
+
+#[cfg(windows)]
+fn hresult_from_win32(code: u32) -> HRESULT {
     (0x8007_0000 | (code & 0xffff)) as i32
 }
 
@@ -229,6 +249,13 @@ mod tests {
         );
         assert!(!handle.is_null());
         method::<Close>(&SHELL_OBJECT, 0x28)(&SHELL_OBJECT, handle);
+    }
+
+    #[test]
+    fn a_system_without_display_power_keeps_the_deferral() {
+        assert_eq!(refused_request(50), None);
+        assert_eq!(refused_request(5), Some(0x8007_0005_u32 as HRESULT));
+        assert_eq!(refused_request(87), Some(0x8007_0057_u32 as HRESULT));
     }
 
     #[test]

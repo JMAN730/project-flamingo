@@ -6,7 +6,7 @@
 //! atomically; an entry that does not read back is translated again.
 //!
 //! The entry is our own encoding of [`HostShader`]: a field added to it
-//! must be added to [`encode`] and [`decode`] too (entries of older builds
+//! must be added to `encode` and `decode` too (entries of older builds
 //! are ignored anyway).
 
 use std::path::PathBuf;
@@ -37,8 +37,10 @@ pub(crate) fn counts() -> (u64, u64) {
 }
 
 /// What identifies this build: the BLAKE3 of our executable file and of
-/// the translation settings it runs with (the loop limit, which a
-/// diagnostics build can change at run time).
+/// the translation settings it runs with (the loop and spin-wait limits,
+/// which `VICTORY_SHADER_LOOP_LIMIT` and `VICTORY_SHADER_SPIN_LIMIT` change
+/// at run time, and whether the host device runs 64-lane waves, known once
+/// it is created).
 fn build() -> &'static [u8; 32] {
     static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
     BUILD.get_or_init(|| {
@@ -50,9 +52,18 @@ fn build() -> &'static [u8; 32] {
                 "VICTORY_SHADER_LOOP_LIMIT: translated loops stop sooner"
             );
         }
+        let spin = victory_shader::emit::spin_limit();
+        if spin != victory_shader::emit::DEFAULT_SPIN_LIMIT {
+            tracing::warn!(
+                spin,
+                "VICTORY_SHADER_SPIN_LIMIT: spin-wait loops stop at this count"
+            );
+        }
         match exe {
             Ok(mut bytes) => {
                 bytes.extend_from_slice(&limit.to_le_bytes());
+                bytes.extend_from_slice(&spin.to_le_bytes());
+                bytes.push(u8::from(victory_shader::emit::host_wave64()));
                 *blake3::hash(&bytes).as_bytes()
             }
             Err(e) => {
