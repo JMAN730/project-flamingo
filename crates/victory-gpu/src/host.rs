@@ -1522,9 +1522,9 @@ fn rehash_runs() -> bool {
 /// (`crate::shadow::hash_spans`). 8 covers 512 KiB of untouched pieces.
 fn hash_span() -> u32 {
     static MOST: OnceLock<u32> = OnceLock::new();
-    *MOST.get_or_init(|| {
-        std::env::var("VICTORY_CARD_HASH_SPAN").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0)
-    })
+    let start = *MOST.get_or_init(|| std::env::var("VICTORY_CARD_HASH_SPAN").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0));
+    // Live (crate::switches): a new pass takes the new gap.
+    crate::switches::u64v("VICTORY_CARD_HASH_SPAN", start as u64) as u32
 }
 
 /// Since the last frame-rate line, of our own passes over copies in the

@@ -441,7 +441,11 @@ fn through_copy() -> bool {
 /// which is what keeps the pages there while we read them.
 fn in_place() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_IN_PLACE").is_none_or(|v| v != "0"))
+    // Live (crate::switches): asked per refresh.
+    crate::switches::b(
+        "VICTORY_TEXTURE_IN_PLACE",
+        *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_IN_PLACE").is_none_or(|v| v != "0")),
+    )
 }
 
 /// The largest texture read in place, MiB (`VICTORY_TEXTURE_INPLACE_MAX_MB`,
@@ -451,12 +455,14 @@ fn in_place() -> bool {
 /// wait (the streaming spikes of `xcl-bin/notes/tex-fx.md` are that wait).
 fn in_place_max() -> usize {
     static MB: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *MB.get_or_init(|| {
-        std::env::var("VICTORY_TEXTURE_INPLACE_MAX_MB")
-            .ok()
-            .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(1)
-    }) << 20
+    // Live (crate::switches): asked per refresh.
+    let mb = crate::switches::u64v(
+        "VICTORY_TEXTURE_INPLACE_MAX_MB",
+        *MB.get_or_init(|| {
+            std::env::var("VICTORY_TEXTURE_INPLACE_MAX_MB").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(1)
+        }) as u64,
+    );
+    (mb as usize) << 20
 }
 
 /// The hash of `[at, at + len)` read in place, twice: `None` when the title
