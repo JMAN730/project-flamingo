@@ -88,6 +88,8 @@ mod threading;
 pub mod validator;
 #[cfg(all(test, windows))]
 mod valu_tests;
+#[cfg(all(test, windows))]
+mod waterfall_tests;
 mod wave;
 
 use crate::dxbc::{Container, FourCC};
@@ -211,9 +213,12 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
             .iter()
             .all(|r| native.stage.user_sgpr(r.user_data) >= 16);
     let p = ir::build_with(&native.patched_code(), native.wave64, native.vgprs, spilled)?;
-    let res = resource::track(&p, &native.layout, native.stage)?;
+    // Structurisation first: tracing per-lane descriptors needs it (its
+    // failure is reported after the earlier stages').
+    let st = structure::structure(&p);
+    let res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok())?;
     let io = io::raise(&p, &native)?;
-    let st = structure::structure(&p)?;
+    let st = st?;
     emit(&c, &native, &p, &st, &io, &res)
 }
 
@@ -239,7 +244,7 @@ pub fn emit(
     let p = ir::thread_edges(p, &edges)?;
     let st = structure::structure(&p)?;
     let io = io::raise(&p, native)?;
-    let res = resource::track(&p, &native.layout, native.stage)?;
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
     emit_program(c, native, &p, &st, &io, &res)
 }
 
@@ -498,9 +503,9 @@ mod tests {
         let bytes = crate::dxbc::build(&[(FourCC::OSG1, &osg1)]);
         let c = Container::parse(&bytes).unwrap();
         let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
-        let res = resource::track(&p, &native.layout, native.stage).unwrap();
-        let io = io::raise(&p, &native).unwrap();
         let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
         let out = emit(&c, &native, &p, &st, &io, &res).unwrap();
         // dxil.dll, where there is one, checks the flags against the module.
         #[cfg(windows)]
@@ -540,9 +545,9 @@ mod tests {
             code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
         };
         let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
-        let res = resource::track(&p, &native.layout, native.stage).unwrap();
-        let io = io::raise(&p, &native).unwrap();
         let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
         let container = crate::dxbc::build(&[]);
         let c = Container::parse(&container).unwrap();
         if let Err(e) = emit(&c, &native, &p, &st, &io, &res) {
@@ -700,9 +705,9 @@ mod tests {
                 crate::dxbc::build(&[(super::FourCC::ISG1, &isg1), (super::FourCC::OSG1, &osg1)]);
             let c = super::Container::parse(&bytes).unwrap();
             let p = crate::ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
-            let res = crate::resource::track(&p, &native.layout, native.stage).unwrap();
-            let io = crate::io::raise(&p, &native).unwrap();
             let st = crate::structure::structure(&p).unwrap();
+            let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+            let io = crate::io::raise(&p, &native).unwrap();
             let out = super::emit(&c, &native, &p, &st, &io, &res).unwrap();
             // dxil.dll, where there is one, checks PSV0 against the module.
             #[cfg(windows)]
@@ -769,9 +774,9 @@ mod tests {
         let bytes = crate::dxbc::build(&[(super::FourCC::ISG1, &isg1)]);
         let c = super::Container::parse(&bytes).unwrap();
         let p = crate::ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
-        let res = crate::resource::track(&p, &native.layout, native.stage).unwrap();
-        let io = crate::io::raise(&p, &native).unwrap();
         let st = crate::structure::structure(&p).unwrap();
+        let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = crate::io::raise(&p, &native).unwrap();
         // Translated or refused with a reason; it must not panic.
         let _ = super::emit(&c, &native, &p, &st, &io, &res);
     }
@@ -852,7 +857,7 @@ mod tests {
             code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
         };
         let p = crate::ir::build(&native.code, native.wave64, native.vgprs).unwrap();
-        let res = crate::resource::track(&p, &native.layout, native.stage).unwrap();
+        let res = crate::resource::track(&p, &native.layout, native.stage, None).unwrap();
         let io = crate::io::raise(&p, &native).unwrap();
         let st = crate::structure::structure(&p).unwrap();
         let l = super::lower::lower(&super::lower::Parts {
@@ -976,7 +981,7 @@ mod atomic_tests {
                 &p,
                 &structure::structure(&p).unwrap(),
                 &io::raise(&p, &native).unwrap(),
-                &resource::track(&p, &native.layout, native.stage).unwrap(),
+                &resource::track(&p, &native.layout, native.stage, None).unwrap(),
             )
             .unwrap();
             let container = Container::parse(&shader.dxil).unwrap();

@@ -41,7 +41,7 @@ fn unrolled_loads(steps: u32, loads_per_step: u32) -> Program {
 #[test]
 fn tracks_every_offset_in_a_shared_address_chain() {
     let program = unrolled_loads(32, 4);
-    let tracked = track(&program, &[TABLE], HwStage::Ps).unwrap();
+    let tracked = track(&program, &[TABLE], HwStage::Ps, None).unwrap();
     let expected: Vec<_> = (1..=32)
         .flat_map(|step| (0..4).map(move |field| (16 * step + 4 * field, None)))
         .collect();
@@ -75,7 +75,7 @@ fn shared_address_keeps_its_dynamic_term_and_wraps_offsets() {
         .find(|(r, _)| *r == Reg::S(9))
         .unwrap()
         .1;
-    let tracked = track(&program, &[TABLE], HwStage::Ps).unwrap();
+    let tracked = track(&program, &[TABLE], HwStage::Ps, None).unwrap();
     assert_eq!(
         tracked.scalar,
         [
@@ -112,7 +112,7 @@ fn shared_sum_with_two_dynamic_terms_stays_opaque() {
         END,
     ]);
     let dynamic = program.blocks[0].insts[1].write(Reg::S(4)).unwrap();
-    let tracked = track(&program, &[TABLE], HwStage::Ps).unwrap();
+    let tracked = track(&program, &[TABLE], HwStage::Ps, None).unwrap();
     assert_eq!(
         tracked.scalar,
         [
@@ -135,7 +135,7 @@ fn shared_sum_with_two_dynamic_terms_stays_opaque() {
         ]
     );
     assert_eq!(
-        track(&program, &[], HwStage::Ps).unwrap_err(),
+        track(&program, &[], HwStage::Ps, None).unwrap_err(),
         ShaderError::Unsupported {
             offset: 12,
             what: "an address not from a root parameter",
@@ -152,14 +152,18 @@ fn bench_unrolled_loads() {
         let program = unrolled_loads(steps, loads);
         let layout = [TABLE];
         assert_eq!(
-            track(&program, &layout, HwStage::Ps).unwrap().scalar.len(),
+            track(&program, &layout, HwStage::Ps, None)
+                .unwrap()
+                .scalar
+                .len(),
             (steps * loads) as usize
         );
         let mut samples = [0.0; 7];
         for sample in &mut samples {
             let start = Instant::now();
             for _ in 0..iterations {
-                let tracked = track(black_box(&program), black_box(&layout), HwStage::Ps).unwrap();
+                let tracked =
+                    track(black_box(&program), black_box(&layout), HwStage::Ps, None).unwrap();
                 black_box(tracked);
             }
             *sample = start.elapsed().as_secs_f64() * 1e6 / f64::from(iterations);
