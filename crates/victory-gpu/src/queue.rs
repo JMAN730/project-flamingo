@@ -779,6 +779,11 @@ extern "system" fn present(
     #[cfg(windows)]
     release_held(forces());
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
+    // The debug tool's control folder: a shot request is remembered here and
+    // saved by the frame's capture, key requests are held now. Nothing
+    // requested costs a few `stat` calls per 250 ms (see `ctl`).
+    #[cfg(all(windows, feature = "diagnostics"))]
+    crate::capture::poll();
     if frame.is_power_of_two() {
         let (draws, dispatches) = crate::list::take_counts();
         #[cfg(windows)]
