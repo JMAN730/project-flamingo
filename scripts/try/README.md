@@ -24,6 +24,23 @@ of the fork, oldest first:
 
 The window lists what was added and what was skipped.
 
+## Keeping itself up to date
+
+From 1.3 on, VIctory Try checks the branch's `scripts/try/try.ps1` each time
+it updates. If that one is newer than the one inside your VIctoryTry.exe, it
+runs the newer one, so fixes to VIctory Try itself need no new download.
+
+## Safety checks
+
+- The game exe can't be VIctoryTry.exe, victory.exe or anything inside
+  `%LOCALAPPDATA%\VIctoryTry`. Choosing VIctoryTry.exe as the "game" made
+  VIctory run VIctory Try, which started itself again in a loop. A saved path
+  like that is rejected and you are asked again.
+- A VIctory Try started from inside a game run stops at once.
+- Only one VIctory Try runs at a time, because two would build in the same
+  folders.
+- When a build fails, the window shows the first error.
+
 ## What it does
 
 1. Asks for the game folder and the game exe, and remembers them. If the

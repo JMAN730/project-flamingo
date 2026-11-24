@@ -15,7 +15,7 @@
 
 $ErrorActionPreference = 'Continue'
 $ProgressPreference = 'SilentlyContinue'
-$TryVersion = '1.2'
+$TryVersion = '1.3'
 $ForkUrl = 'https://github.com/MfDev0/victory.git'
 $Branch = 'arena/59fabb00-victory'
 $UpstreamUrl = 'https://github.com/Marvisak/VIctory.git'
@@ -70,11 +70,35 @@ function Read-Path([string]$prompt) {
     return $in.Trim().Trim('"').Trim("'").Trim()
 }
 
+# Why `exe` cannot be the game, or '' if it can. VIctory Try itself as the
+# "game" made VIctory run VIctory Try, which ran itself again, endlessly.
+function Not-Game([string]$exe) {
+    $name = [IO.Path]::GetFileName($exe)
+    if ($name -like 'VIctoryTry*' -or $name -ieq 'victory.exe' -or $name -ieq 'powershell.exe') {
+        return "$name is not the game (it is VIctory Try or VIctory itself)"
+    }
+    try {
+        $full = (Resolve-Path -LiteralPath $exe).ProviderPath
+        if ($full.StartsWith($TryHome, [StringComparison]::OrdinalIgnoreCase)) { return "keep the game outside $TryHome" }
+        $info = (Get-Item -LiteralPath $full).VersionInfo
+        if ($info.ProductName -eq 'VIctory Try' -or $info.FileDescription -eq 'VIctory Try') {
+            return "$name is VIctory Try itself, not the game"
+        }
+    } catch {}
+    return ''
+}
+
 function Ask-Game([bool]$force) {
     $c = $script:Config
     if (-not $force -and $c.game_exe -and (Test-Path -LiteralPath $c.game_exe -PathType Leaf)) {
-        Say "game: $($c.game_exe)"
-        return $true
+        $why = Not-Game $c.game_exe
+        if (-not $why) {
+            Say "game: $($c.game_exe)"
+            return $true
+        }
+        Bad "the saved game path is wrong: $why"
+        $c.game_exe = ''
+        Save-Config
     }
     Step 'Where is the game?'
     Say 'Paste each path and press Enter (right-click pastes in this window).'
@@ -82,7 +106,11 @@ function Ask-Game([bool]$force) {
     while ($true) {
         $dir = Read-Path '  1) Game files folder'
         if (-not $dir) { continue }
-        if (Test-Path -LiteralPath $dir -PathType Leaf) { $exe = $dir; $dir = Split-Path -Parent $dir; break }
+        if (Test-Path -LiteralPath $dir -PathType Leaf) {
+            $why = Not-Game $dir
+            if ($why) { Bad $why; continue }
+            $exe = (Resolve-Path -LiteralPath $dir).ProviderPath; $dir = Split-Path -Parent $exe; break
+        }
         if (Test-Path -LiteralPath $dir -PathType Container) { break }
         Bad "not found: $dir"
     }
@@ -101,15 +129,26 @@ function Ask-Game([bool]$force) {
         if ($found.Count -eq 1) { $hint = " [Enter = $($found[0].Name)]" }
         elseif ($found.Count -gt 1) { $hint = ' (a number above, or the path)' }
         $in = Read-Path "  2) Game exe file$hint"
+        $pick = ''
+        $n = 0
         if (-not $in) {
-            if ($found.Count -eq 1) { $exe = $found[0].FullName }
+            if ($found.Count -eq 1) { $pick = $found[0].FullName } else { continue }
+        } elseif ([int]::TryParse($in, [ref]$n) -and $n -ge 1 -and $n -le $found.Count) {
+            $pick = $found[$n - 1].FullName
+        }
+        if ($pick) {
+            $why = Not-Game $pick
+            if ($why) { Bad $why; Say 'pick the game''s own exe (the Xbox title, usually next to MicrosoftGame.config)' }
+            else { $exe = $pick }
             continue
         }
-        $n = 0
-        if ([int]::TryParse($in, [ref]$n) -and $n -ge 1 -and $n -le $found.Count) { $exe = $found[$n - 1].FullName; continue }
         if (-not [IO.Path]::IsPathRooted($in)) { $in = Join-Path $dir $in }
         if (Test-Path -LiteralPath $in -PathType Leaf) { $exe = (Resolve-Path -LiteralPath $in).ProviderPath }
         else { Bad "not found: $in" }
+        if ($exe) {
+            $why = Not-Game $exe
+            if ($why) { Bad $why; Say 'pick the game''s own exe (the Xbox title, usually next to MicrosoftGame.config)'; $exe = '' }
+        }
     }
     $c.game_dir = $dir
     $c.game_exe = $exe
@@ -213,15 +252,16 @@ function Update-Source {
 }
 
 # Puts the fork in the source folder, then upstream's commits that came after
-# what the fork has (scripts/try/upstream.txt). Returns the added subjects.
+# what the fork has (scripts/try/upstream.txt). The added subjects land in
+# $script:Added (returned arrays: an empty one counted as one fix).
 function Prepare-Source([bool]$withUpstream) {
     $null = G cherry-pick --abort
     $null = G checkout -q -f -B try refs/remotes/origin/fork
     $null = G clean -fdq
     $added = @()
-    if (-not $withUpstream) { return , $added }
+    if (-not $withUpstream) { $script:Added = $added; return }
     $up = (G rev-parse -q --verify refs/remotes/upstream/main) | Select-Object -First 1
-    if (-not $up) { return , $added }
+    if (-not $up) { $script:Added = $added; return }
     $marker = Join-Path $Src 'scripts\try\upstream.txt'
     $synced = ''; $have = @{}
     if (Test-Path $marker) {
@@ -230,11 +270,11 @@ function Prepare-Source([bool]$withUpstream) {
             elseif ($line -match '^\s*have\s+([0-9a-f]{7,40})') { $have[$Matches[1]] = $true }
         }
     }
-    if (-not $synced) { Say 'the fork does not say which upstream commits it has: not adding any'; return , $added }
+    if (-not $synced) { Say 'the fork does not say which upstream commits it has: not adding any'; $script:Added = $added; return }
     $null = G merge-base --is-ancestor $synced $up
-    if ($script:GCode -ne 0) { Say 'upstream history changed: not adding its commits this time'; return , $added }
+    if ($script:GCode -ne 0) { Say 'upstream history changed: not adding its commits this time'; $script:Added = $added; return }
     $new = @(G rev-list --reverse --first-parent "$synced..$up")
-    if ($new.Count -eq 0) { Say 'upstream VIctory has nothing new beyond this fork'; return , $added }
+    if ($new.Count -eq 0) { Say 'upstream VIctory has nothing new beyond this fork'; $script:Added = $added; return }
     Say "upstream VIctory has $($new.Count) new commit(s) beyond this fork"
     foreach ($sha in $new) {
         $known = $false
@@ -252,7 +292,7 @@ function Prepare-Source([bool]$withUpstream) {
         if ($conflict) { Say "  skipped (clashes with this fork's changes): $subject" }
         else { Say "  have already: $subject" }
     }
-    return , $added
+    $script:Added = $added; return
 }
 
 function Victory-Exe { return Join-Path $Target 'release\victory.exe' }
@@ -278,6 +318,12 @@ function Build {
     } finally { Pop-Location }
     if ($code -ne 0 -or -not (Test-Path (Victory-Exe))) {
         Bad "the build failed (code $code). The full output is in $log"
+        $lines = @(Get-Content -LiteralPath $log -ErrorAction SilentlyContinue)
+        $first = -1
+        for ($i = 0; $i -lt $lines.Count; $i++) { if ($lines[$i] -match '^error') { $first = $i; break } }
+        if ($first -lt 0) { $first = [Math]::Max(0, $lines.Count - 25) }
+        Say 'the first error (paste this when reporting it):'
+        $lines[$first..([Math]::Min($lines.Count - 1, $first + 24))] | ForEach-Object { Write-Host ('    ' + $_) }
         return $false
     }
     Say 'build finished'
@@ -286,7 +332,8 @@ function Build {
 
 # The fork with upstream's new fixes; if that does not build, the fork alone.
 function Build-All {
-    $added = @(Prepare-Source $true)
+    $null = Prepare-Source $true
+    $added = @($script:Added | Where-Object { $_ })
     $ok = Build
     if (-not $ok -and $added.Count -gt 0) {
         Bad "the build failed with upstream's new fixes added: building this fork without them"
@@ -337,11 +384,51 @@ Say 'Builds the newest VIctory from MfDev0/victory, with upstream VIctory''s new
 Say 'fixes added by themselves, on this PC and runs your game.'
 Say 'Nothing is uploaded or reported anywhere.'
 
+# Started from inside a game run (the game path pointed at VIctory Try, or a
+# title started it): stop instead of running again inside it.
+if ($env:VICTORY_TRY_RUNNING -eq '1' -and $env:VICTORY_TRY_HANDOFF -ne '1') {
+    Bad 'VIctory Try was started from inside a game run: stopping this copy.'
+    Bad 'If this repeats, press G in the first VIctory Try window and give the game''s own exe.'
+    exit 3
+}
+$handoff = $env:VICTORY_TRY_HANDOFF -eq '1'
+$env:VICTORY_TRY_HANDOFF = ''
+$env:VICTORY_TRY_RUNNING = '1'
+
+# One VIctory Try at a time: two would build in the same folders.
+$script:Lock = New-Object System.Threading.Mutex($false, 'Local\VIctoryTry')
+$owned = $false
+# An abandoned lock (a copy that was killed) is ours now.
+try { $owned = $script:Lock.WaitOne(0) } catch { $owned = $true }
+if (-not $owned) {
+    Bad 'VIctory Try is already running in another window: use that one, or close it first.'
+    exit 4
+}
+
+# A newer VIctory Try on the branch than this one: run that instead, so its
+# fixes need no new download of VIctoryTry.exe.
+function Run-Newer {
+    if ($handoff) { return }
+    $text = (G show refs/remotes/origin/fork:scripts/try/try.ps1) -join "`r`n"
+    if ($script:GCode -ne 0 -or $text -notmatch "\`$TryVersion = '([0-9.]+)'") { return }
+    $theirs = $Matches[1]
+    try { if ([version]$theirs -le [version]$TryVersion) { return } } catch { return }
+    Step "Starting VIctory Try $theirs (newer than this $TryVersion)"
+    $newer = Join-Path $TryHome 'try-latest.ps1'
+    Set-Content -LiteralPath $newer -Value $text -Encoding ASCII
+    $script:Lock.ReleaseMutex()
+    $env:VICTORY_TRY_HANDOFF = '1'
+    $ps = (Get-Process -Id $PID).Path
+    & $ps -NoProfile -ExecutionPolicy Bypass -File $newer
+    exit $LASTEXITCODE
+}
+
 $script:Config = Load-Config
 while (-not (Ask-Game $false)) {}
 if (-not (Ensure-Tools)) { exit 1 }
 $changed = Update-Source
 if ($null -eq $changed) { Bad 'no source to build: check the internet connection'; exit 1 }
+Run-Newer
 if ($changed -or -not (Test-Path (Victory-Exe))) { if (-not (Build-All)) { exit 1 } }
 
 while ($true) {
