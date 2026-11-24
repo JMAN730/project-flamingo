@@ -369,9 +369,16 @@ impl Layout {
         };
         let slices = d.depth.next_multiple_of(block[2]);
         let three_d = d.dimension == Dimension::Tex3d;
-        // Mip depths placed by a thick layout (thin ones store depth as
-        // slices).
-        let mip_depth = |i: u32| if thick { padded_dim(d.depth, i, 1) } else { 1 };
+        // A thin volume allocates the full mip chain in each depth slice.
+        let padded_depth = |i: u32| {
+            if thick {
+                padded_dim(d.depth, i, 1)
+            } else if three_d {
+                d.depth
+            } else {
+                1
+            }
+        };
         let depth_of = |i: u32| if three_d { dim(d.depth, i, 1) } else { 1 };
         let (width, height) = (|i| dim(d.width, i, d.block), |i| dim(d.height, i, d.block));
         let padded = |i| {
@@ -437,7 +444,6 @@ impl Layout {
                 }
                 let pitch = w.next_multiple_of(block[0]);
                 let rows = h.next_multiple_of(block[1]);
-                let depth = mip_depth(i).next_multiple_of(block[2]);
                 let one = u64::from(pitch) * u64::from(rows) * bpe;
                 slice_size += one;
                 sizes.push(one * u64::from(block[2]));
@@ -447,7 +453,7 @@ impl Layout {
                     depth: depth_of(i),
                     pitch,
                     rows,
-                    depth_pitch: if three_d { depth } else { 1 },
+                    depth_pitch: padded_depth(i).next_multiple_of(block[2]),
                     offset: 0,
                     tail: None,
                 });
@@ -489,9 +495,9 @@ impl Layout {
                     pitch,
                     rows,
                     depth_pitch: if thick {
-                        mip_depth(i).next_multiple_of(BLOCK_256_3D[element_log2 as usize][2])
+                        padded_depth(i).next_multiple_of(BLOCK_256_3D[element_log2 as usize][2])
                     } else {
-                        1
+                        padded_depth(i)
                     },
                     offset: 0,
                     tail: Some(Tail {
@@ -1174,6 +1180,24 @@ mod tests {
         assert_eq!(l.mips[2].offset, 4096);
         assert_eq!(l.mips[1].offset, 8192);
         assert_eq!(l.mips[0].offset, 8192 + 16384);
+    }
+
+    #[test]
+    fn thin_volume_mips_report_the_depth_allocated_per_chain() {
+        let d = Desc {
+            dimension: Dimension::Tex3d,
+            depth: 8,
+            ..desc(128, 128, 4, 4, Swizzle::SW_64KB_R_X)
+        };
+        let layout = Layout::new(&d).unwrap();
+        assert!(!layout.thick);
+        assert_eq!(layout.slices, 8);
+        assert_eq!(layout.size, layout.slice_size * 8);
+        assert!(layout.first_tail_mip > 0 && layout.first_tail_mip < d.mips);
+        for (i, mip) in layout.mips.iter().enumerate() {
+            assert_eq!(mip.depth, d.depth >> i);
+            assert_eq!(mip.depth_pitch, d.depth);
+        }
     }
 
     #[test]
