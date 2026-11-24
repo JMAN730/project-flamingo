@@ -1262,7 +1262,6 @@ impl<'a> Lower<'a> {
                 let n = i.name();
                 n.starts_with("ds_swizzle")
                     || n.contains("permute")
-                    || n.starts_with("v_permlane")
                     || n.starts_with("v_mbcnt")
                     || matches!(n, "v_readlane_b32" | "v_writelane_b32")
                     || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
@@ -7417,39 +7416,6 @@ impl<'a> Lower<'a> {
                 }
                 Ok(())
             }
-            "v_permlane16_b32" | "v_permlanex16_b32" => {
-                // Each lane reads a lane of its row of 16 (`x16`: of the
-                // other row of its 32), the one its nibble of the two
-                // scalars names: lane j of a row takes nibble j of src1 for
-                // j < 8, of src2 after. Rows stay inside 32-lane halves, so a
-                // host wave of 32 holding one half runs it as the console.
-                // shortcut: a source lane outside EXEC is read as the host
-                // has it; the console (without FI) keeps the old value.
-                self.cross_lane(false)?;
-                let (x, lo, hi) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
-                let lane = self.lane_index();
-                let k = |l: &mut Self, v: u32| l.s.m.i32(v);
-                let (k15, k7, k2, k8) = (k(self, 15), k(self, 7), k(self, 2), k(self, 8));
-                let j = self.s.m.bin(c, Bin::And, lane, k15);
-                let jl = self.s.m.bin(c, Bin::And, j, k7);
-                let sh = self.s.m.bin(c, Bin::Shl, jl, k2);
-                let from_lo = self.s.m.bin(c, Bin::LShr, lo, sh);
-                let from_hi = self.s.m.bin(c, Bin::LShr, hi, sh);
-                let low_half = self.s.m.cmp(c, pred::IULT, j, k8);
-                let sel = self.s.m.select(c, low_half, from_lo, from_hi);
-                let sel = self.s.m.bin(c, Bin::And, sel, k15);
-                let not15 = k(self, !15);
-                let row = self.s.m.bin(c, Bin::And, lane, not15);
-                let row = if name == "v_permlanex16_b32" {
-                    let k16 = k(self, 16);
-                    self.s.m.bin(c, Bin::Xor, row, k16)
-                } else {
-                    row
-                };
-                let src = self.s.m.bin(c, Bin::Or, row, sel);
-                let r = self.read_lane(x, src);
-                int(self, r)
-            }
             "v_readlane_b32" => {
                 let (a, lane) = (s(self, 0)?, s(self, 1)?);
                 // A computed lane in a pixel or vertex program is a host lane
@@ -11347,32 +11313,6 @@ mod tests {
             mesh_stride: 0,
         })
         .map(|_| ())
-    }
-
-    /// `v_permlane16_b32` and `v_permlanex16_b32` (a world compute program,
-    /// a929109552ce1e84, was dropped for want of the second) lower to lane
-    /// reads.
-    #[test]
-    fn row_permutes_lower() {
-        const S_ENDPGM: u32 = 0xBF81_0000;
-        for op in [0x377u32, 0x378] {
-            // v_permlane(x)16_b32 v3, v0, s0, s1; the result stored to LDS
-            // to keep it live.
-            let words = [
-                0xBE80_03FF,
-                0x7654_3210, // s_mov_b32 s0, 0x76543210
-                0xBE81_03FF,
-                0xFEDC_BA98, // s_mov_b32 s1, 0xfedcba98
-                0xD400_0003 | op << 16,
-                0x0004_0100,
-                0x3408_0082, // v_lshlrev_b32 v4, 2, v0
-                0xD834_0000,
-                0x0000_0304, // ds_write_b32 v4, v3
-                S_ENDPGM,
-            ];
-            // 512 bytes of LDS.
-            lowers(&words, 1 << 15).unwrap_or_else(|e| panic!("op {op:#x}: {e}"));
-        }
     }
 
     /// Lowers a compute program with the root parameters `layout` (in user
