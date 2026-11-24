@@ -1,4 +1,4 @@
-use std::io::Write;
+use std::io::{ErrorKind, Write};
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
@@ -66,10 +66,12 @@ impl Cache {
         // Write to a temporary file on the same filesystem and then publish.
         let mut file = tempfile::NamedTempFile::new_in(dir)?;
         file.write_all(&output)?;
-        file.persist(&path)
-            .map_err(|err| err.error)
-            .with_context(|| format!("publishing {}", path.display()))?;
-        Ok(path)
+        // A writer that already published this content-addressed key won.
+        match file.persist_noclobber(&path) {
+            Ok(_) => Ok(path),
+            Err(err) if err.error.kind() == ErrorKind::AlreadyExists && path.is_file() => Ok(path),
+            Err(err) => Err(err.error).with_context(|| format!("publishing {}", path.display())),
+        }
     }
 }
 
@@ -176,6 +178,54 @@ mod tests {
         assert_eq!(a, b);
         assert_eq!(std::fs::read(&a).unwrap(), b"ABC");
         assert_eq!(conv.runs.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn keeps_an_entry_published_during_conversion() {
+        struct RacingConverter {
+            path: PathBuf,
+            modified: std::time::SystemTime,
+        }
+
+        impl Converter for RacingConverter {
+            fn id(&self) -> &'static str {
+                "test.race"
+            }
+
+            fn version(&self) -> u32 {
+                1
+            }
+
+            fn convert(&self, input: &[u8]) -> Result<Vec<u8>> {
+                // Simulate another writer finishing after our cache miss.
+                let entry = std::fs::File::create(&self.path)?;
+                let output = input.to_ascii_uppercase();
+                (&entry).write_all(&output)?;
+                entry.set_times(std::fs::FileTimes::new().set_modified(self.modified))?;
+                Ok(output)
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = Cache::open(tmp.path().join("cache")).unwrap();
+        let mut converter = RacingConverter {
+            path: PathBuf::new(),
+            modified: std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000),
+        };
+        converter.path = cache.path_for(&CacheKey::new(&converter, b"abc"));
+        std::fs::create_dir_all(converter.path.parent().unwrap()).unwrap();
+
+        let path = cache.get_or_convert(&converter, b"abc").unwrap();
+        assert_eq!(path, converter.path);
+        assert_eq!(std::fs::read(&path).unwrap(), b"ABC");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            converter.modified
+        );
+        assert_eq!(
+            std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
+            1
+        );
     }
 
     #[test]
