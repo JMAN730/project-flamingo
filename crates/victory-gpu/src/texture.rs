@@ -255,7 +255,14 @@ impl Staging {
             crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
             return size;
         }
-        if !committed(self.memory, size) {
+        // A streamed texture can be partly resident: its pool maps the mips
+        // it has loaded and leaves the others unmapped, as tiled resources
+        // on the console (reads of an unmapped tile give zero, and titles
+        // clamp their level of detail to what is resident). Uploading only a
+        // fully committed texture left such textures as they were made,
+        // black, until every mip was in. A texture with nothing committed
+        // keeps what it had.
+        if !any_committed(self.memory, size) {
             #[cfg(feature = "diagnostics")]
             tracing::debug!(
                 memory = ?self.memory,
@@ -267,10 +274,13 @@ impl Staging {
         }
         // Read through the kernel, as above: the title may unmap the pages
         // (evicting a texture a big table lists) while we read them, and a
-        // direct read would fault. The copy is reused, not kept per texture.
+        // direct read would fault; unmapped pages read as zeros. The copy is
+        // reused, not kept per texture.
         SCRATCH.with_borrow_mut(|tiled| {
             tiled.resize(size, 0);
-            crate::host::copy_mapped(tiled.as_mut_ptr(), self.memory, size, false);
+            if !crate::host::read_into(self.memory, &mut tiled[..size]) {
+                read_resident(self.memory, &mut tiled[..size]);
+            }
             self.changed(last, tiled)
         })
     }
@@ -355,6 +365,59 @@ pub(crate) fn committed(at: *const u8, len: usize) -> bool {
     true
 }
 
+/// Reads the committed regions of `[src, src + dst.len())` into `dst`,
+/// zeros elsewhere: one query per region, not a failed read per page, for
+/// a streamed texture most of which is not resident.
+fn read_resident(src: *const u8, dst: &mut [u8]) {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    let base = src as usize;
+    let end = base.saturating_add(dst.len());
+    let mut p = base;
+    while p < end {
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        let n = unsafe { VirtualQuery(p as *const _, &mut info, size_of_val(&info)) };
+        let stop = if n == 0 {
+            end
+        } else {
+            (info.BaseAddress as usize)
+                .saturating_add(info.RegionSize)
+                .clamp(p + 1, end)
+        };
+        let piece = &mut dst[p - base..stop - base];
+        if n != 0 && info.State == MEM_COMMIT {
+            // Through the kernel: a page unmapped since the query reads as
+            // zeros instead of faulting.
+            crate::host::copy_mapped(piece.as_mut_ptr(), p as *const u8, piece.len(), false);
+        } else {
+            piece.fill(0);
+        }
+        p = stop;
+    }
+}
+
+/// Whether any page of `[at, at + len)` is committed.
+fn any_committed(at: *const u8, len: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    let mut p = at as usize;
+    let end = p.saturating_add(len);
+    while p < end {
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        let n = unsafe { VirtualQuery(p as *const _, &mut info, size_of_val(&info)) };
+        if n == 0 {
+            return false;
+        }
+        if info.State == MEM_COMMIT {
+            return true;
+        }
+        p = info.BaseAddress as usize + info.RegionSize;
+    }
+    false
+}
+
 /// The staging state of a title texture, made on first use.
 fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
@@ -425,6 +488,37 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
 
 #[cfg(test)]
 mod tests {
+
+    /// A texture half of whose pages are committed reads those pages and
+    /// zeros for the rest; one with none committed is not read at all.
+    #[cfg(windows)]
+    #[test]
+    fn partly_resident_textures_read_what_is_mapped() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        const PAGE: usize = 64 << 10;
+        // SAFETY: a fresh reservation, released below.
+        let base = unsafe { VirtualAlloc(std::ptr::null(), 4 * PAGE, MEM_RESERVE, PAGE_READWRITE) };
+        assert!(!base.is_null());
+        let base = base.cast::<u8>();
+        assert!(!any_committed(base, 4 * PAGE));
+        // SAFETY: inside the reservation.
+        let second = unsafe { base.add(PAGE) };
+        // SAFETY: inside the reservation.
+        assert!(!unsafe { VirtualAlloc(second.cast(), PAGE, MEM_COMMIT, PAGE_READWRITE) }.is_null());
+        // SAFETY: committed above.
+        unsafe { second.write_bytes(0xAB, PAGE) };
+        assert!(any_committed(base, 4 * PAGE));
+        assert!(!committed(base, 4 * PAGE));
+        let mut out = vec![0x55; 4 * PAGE];
+        read_resident(base, &mut out);
+        assert!(out[..PAGE].iter().all(|&b| b == 0));
+        assert!(out[PAGE..2 * PAGE].iter().all(|&b| b == 0xAB));
+        assert!(out[2 * PAGE..].iter().all(|&b| b == 0));
+        // SAFETY: the reservation made above.
+        unsafe { VirtualFree(base.cast(), 0, MEM_RELEASE) };
+    }
     use super::*;
 
     /// A copied texture uploads again only once the title writes a watch
