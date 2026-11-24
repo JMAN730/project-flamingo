@@ -1110,3 +1110,73 @@ fn v_cmp_class_f16_matches_rdna2() {
         );
     });
 }
+
+/// VOP3B `op vdst, sdst, src0, src1, src2` (no modifiers).
+const fn vop3b(op: u16, vdst: u8, sdst: u8, src0: u16, src1: u16, src2: u16) -> [u32; 2] {
+    let [w0, w1] = vop3(op, vdst, src0, src1, src2);
+    [w0 | (sdst as u32 & 0x7F) << 8, w1]
+}
+
+/// 32 × 32-bit inputs where the product or the 64-bit addend reach their
+/// extremes, so both the multiply and the add wrap.
+const MAD64_CASES: &[[u32; 4]] = &[
+    [0, 0, 0, 0],
+    [1, 1, 0, 0],
+    [0xffff_ffff, 0xffff_ffff, 0, 0],
+    [0xffff_ffff, 0xffff_ffff, 0xffff_ffff, 0xffff_ffff],
+    [0xffff_ffff, 0xffff_ffff, 0x0000_0002, 0],
+    [0x8000_0000, 0x8000_0000, 0, 0x8000_0000],
+    [0x8000_0000, 0x7fff_ffff, 0x1234_5678, 0x9abc_def0],
+    [0x7fff_ffff, 0x7fff_ffff, 0xffff_ffff, 0x7fff_ffff],
+    [0xffff_fffe, 3, 1, 0],
+    [0x0001_0000, 0x0001_0000, 0xffff_ffff, 0xffff_ffff],
+    [0xdead_beef, 0x1337_c0de, 0x0bad_f00d, 0xfeed_face],
+];
+
+/// The 64-bit result and the carry out of the addition (unsigned form).
+fn mad64(inp: [u32; 4], signed: bool) -> (u64, bool) {
+    let addend = u64::from(inp[2]) | u64::from(inp[3]) << 32;
+    let product = if signed {
+        (i64::from(inp[0] as i32) * i64::from(inp[1] as i32)) as u64
+    } else {
+        u64::from(inp[0]) * u64::from(inp[1])
+    };
+    product.overflowing_add(addend)
+}
+
+#[test]
+fn v_mad_u64_u32_and_v_mad_i64_i32_match_rdna2() {
+    // v_mad_{u64_u32,i64_i32} v[5:6], vcc_lo, v1, v2, v[3:4] (VOP3B 0x176,
+    // 0x177), then v_mov_b32 v0, v5 (low dword) or v6 (high dword).
+    for (op, signed, form) in [
+        (0x176, false, "v_mad_u64_u32"),
+        (0x177, true, "v_mad_i64_i32"),
+    ] {
+        let mad = vop3b(op, 5, 106, vgpr(1), vgpr(2), vgpr(3));
+        for (half, reg) in [("low", 5), ("high", 6)] {
+            let shader = build_valu_cs(&[mad[0], mad[1], vop1(0x001, 0, vgpr(reg))]);
+            run_cases(&shader, MAD64_CASES, |backend, _, inp, got| {
+                let r = mad64(inp, signed).0;
+                let want = if reg == 5 { r as u32 } else { (r >> 32) as u32 };
+                assert_eq!(
+                    got, want,
+                    "{backend}: {form}({:#x}, {:#x}, {:#x}{:08x}) {half} = {got:#010x}, \
+                     want {want:#010x}",
+                    inp[0], inp[1], inp[3], inp[2],
+                );
+            });
+        }
+    }
+    // The unsigned form's carry out: v_cndmask_b32 v0, 0, 1, vcc_lo.
+    let mad = vop3b(0x176, 5, 106, vgpr(1), vgpr(2), vgpr(3));
+    let pick = vop3(0x101, 0, 128, 129, 106);
+    let shader = build_valu_cs(&[mad[0], mad[1], pick[0], pick[1]]);
+    run_cases(&shader, MAD64_CASES, |backend, _, inp, got| {
+        let want = u32::from(mad64(inp, false).1);
+        assert_eq!(
+            got, want,
+            "{backend}: v_mad_u64_u32({:#x}, {:#x}, {:#x}{:08x}) carry = {got}, want {want}",
+            inp[0], inp[1], inp[3], inp[2],
+        );
+    });
+}

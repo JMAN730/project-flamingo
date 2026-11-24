@@ -4837,6 +4837,44 @@ impl<'a> Lower<'a> {
                 }
                 Ok(())
             }
+            "v_mad_u64_u32" | "v_mad_i64_i32" => {
+                // D.64 = S0.32 * S1.32 + S2.64. The 32 × 32-bit product
+                // always fits in 64 bits, so only the addition wraps.
+                let signed = name == "v_mad_i64_i32";
+                let (a, bb) = (s(self, 0)?, s(self, 1)?);
+                let addend = self.src64(inst, 2)?;
+                let i64t = self.s.m.int(64);
+                let ext = if signed { Cast::SExt } else { Cast::ZExt };
+                let a = self.s.m.cast(c, ext, a, i64t);
+                let bb = self.s.m.cast(c, ext, bb, i64t);
+                let product = self.s.m.bin(c, Bin::Mul, a, bb);
+                let r = self.s.m.bin(c, Bin::Add, product, addend);
+                if v.clamp {
+                    return Err("a clamped 64-bit multiply-add");
+                }
+                let Some(Operand::Vector { reg, .. }) = v.dst else {
+                    return Err("a 64-bit result");
+                };
+                let (lo, hi) = self.split64(r);
+                self.write(inst, Reg::V(reg), lo, guard);
+                self.write(inst, Reg::V(reg + 1), hi, guard);
+                // The carry out of the unsigned addition, a lane mask: this
+                // lane's bit. Left untracked for the signed form, whose
+                // carry nothing documents.
+                if !signed
+                    && let Some(Operand::Scalar { code, .. }) = v.carry
+                    && let Some(w) = inst.write(Reg::S(code))
+                {
+                    let carry = self.s.m.cmp(c, pred::IULT, r, addend);
+                    self.lane_bits.insert(w, carry);
+                }
+                for &(_, w) in &inst.writes {
+                    self.vals
+                        .entry(w)
+                        .or_insert(Val::Missing("a lane mask read as data"));
+                }
+                Ok(())
+            }
             "v_readlane_b32" => {
                 let (a, lane) = (s(self, 0)?, s(self, 1)?);
                 // A computed lane in a pixel or vertex program is a host lane
