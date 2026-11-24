@@ -63,9 +63,50 @@ pub(crate) fn near_heaps(va: u64) -> String {
     text
 }
 
-/// The host's limit for shader-visible view heaps on resource binding
-/// tiers 1 and 2; tier 3 hardware may take more.
+/// The host's limit for shader-visible view heaps on every resource
+/// binding tier, unless the device reports a larger one
+/// ([`max_view_heap`]). NVIDIA creates a larger heap without an error,
+/// but the runtime refuses it (debug layer #645) and the device is removed
+/// once it is used (upstream #735).
 const PORTABLE_VIEWS: u32 = 1_000_000;
+
+/// The largest shader-visible view heap the device takes: what
+/// `D3D12_OPTIONS19` reports (Agility runtimes), else [`PORTABLE_VIEWS`].
+fn max_view_heap(host: &Host) -> u32 {
+    let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS19::default();
+    // SAFETY: the query writes its own structure of the given size.
+    let asked = unsafe {
+        host.device.CheckFeatureSupport(
+            D3D12_FEATURE_D3D12_OPTIONS19,
+            (&raw mut options).cast(),
+            size_of_val(&options) as u32,
+        )
+    };
+    match asked {
+        Ok(()) => options.MaxViewDescriptorHeapSize.max(PORTABLE_VIEWS),
+        Err(_) => PORTABLE_VIEWS,
+    }
+}
+
+/// The view heaps to try for `count` title slots on a device that takes
+/// `limit` views, in order: (heap size, title slots, dynamic slots). The
+/// larger dynamic range where it fits on top of every title slot, else the
+/// smaller one, else the title's slots are cut so that the smaller one
+/// still fits (shortcut: descriptors past the host's limit are left out; a
+/// title that reaches them needs remapping). None is over `limit`.
+fn view_heap_sizes(count: u32, limit: u32) -> Vec<(u32, u32, u32)> {
+    let mut sizes: Vec<(u32, u32, u32)> = [DYNAMIC, MIN_DYNAMIC]
+        .into_iter()
+        .filter_map(|extra| {
+            let size = count.checked_add(extra)?;
+            (size <= limit).then_some((size, count, extra))
+        })
+        .collect();
+    if count.saturating_add(MIN_DYNAMIC) > limit {
+        sizes.push((limit, limit.saturating_sub(MIN_DYNAMIC), MIN_DYNAMIC));
+    }
+    sizes
+}
 
 /// Slots past the title's in a view heap, for tables a draw needs made
 /// afresh (constant buffers copied per draw). A list holds the slots it
@@ -125,25 +166,26 @@ impl HostHeap {
                 SAMPLER_DYNAMIC,
             );
         }
-        // View heaps: the larger dynamic range only where the host takes it
-        // on top of every title slot; else the smaller one, and the cap
-        // after that.
         let made = if sampler {
             make(count).map(|heap| (heap, count, 0))
-        } else if let Ok(heap) = make(count.saturating_add(DYNAMIC)) {
-            Ok((heap, count, DYNAMIC))
         } else {
-            match make(count.saturating_add(MIN_DYNAMIC)) {
-                Ok(heap) => Ok((heap, count, MIN_DYNAMIC)),
-                Err(e) if count.saturating_add(MIN_DYNAMIC) > PORTABLE_VIEWS => {
-                    // shortcut: descriptors past the host's limit are left
-                    // out; a title that reaches them needs remapping.
-                    tracing::warn!(error = %e, count, "host view heap capped at {PORTABLE_VIEWS}");
-                    make(PORTABLE_VIEWS)
-                        .map(|heap| (heap, PORTABLE_VIEWS - MIN_DYNAMIC, MIN_DYNAMIC))
+            let limit = max_view_heap(host);
+            let mut tried = view_heap_sizes(count, limit).into_iter();
+            // Never empty: the last size fits `limit` by construction.
+            let (size, titles, extra) = tried.next()?;
+            let mut made = make(size).map(|heap| (heap, titles, extra));
+            for (size, titles, extra) in tried {
+                if made.is_ok() {
+                    break;
                 }
-                Err(e) => Err(e),
+                made = make(size).map(|heap| (heap, titles, extra));
             }
+            if let Ok((_, titles, extra)) = &made
+                && *titles < count
+            {
+                tracing::warn!(count, limit, "host view heap capped at {}", titles + extra);
+            }
+            made
         };
         let (heap, count, extra) = match made {
             Ok(made) => made,
@@ -1131,6 +1173,39 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    /// A view heap is never sized past what the device takes: 2^20 title
+    /// slots plus the dynamic range asked for 1,310,720 views on a device
+    /// that takes 1,000,000 (upstream #735).
+    #[test]
+    fn view_heaps_stay_within_the_device_limit() {
+        let capped = view_heap_sizes(1 << 20, PORTABLE_VIEWS);
+        assert_eq!(
+            capped,
+            [(PORTABLE_VIEWS, PORTABLE_VIEWS - MIN_DYNAMIC, MIN_DYNAMIC)]
+        );
+        assert_eq!(
+            view_heap_sizes(4, PORTABLE_VIEWS),
+            [(4 + DYNAMIC, 4, DYNAMIC), (4 + MIN_DYNAMIC, 4, MIN_DYNAMIC)]
+        );
+        let only_small = PORTABLE_VIEWS - DYNAMIC + 1;
+        assert_eq!(
+            view_heap_sizes(only_small, PORTABLE_VIEWS),
+            [(only_small + MIN_DYNAMIC, only_small, MIN_DYNAMIC)]
+        );
+        // A device that reports a larger limit gets the larger range.
+        assert_eq!(
+            view_heap_sizes(1 << 20, 1 << 21)[0],
+            ((1 << 20) + DYNAMIC, 1 << 20, DYNAMIC)
+        );
+        for count in [0, 1, 999_999, 1_000_000, u32::MAX] {
+            let sizes = view_heap_sizes(count, PORTABLE_VIEWS);
+            assert!(!sizes.is_empty());
+            for (size, titles, extra) in sizes {
+                assert!(size <= PORTABLE_VIEWS && titles + extra == size && titles <= count);
+            }
+        }
     }
 
     /// Dynamic slots stay taken until given back, and runs do not wrap.
