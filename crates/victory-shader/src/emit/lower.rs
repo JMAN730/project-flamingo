@@ -56,6 +56,9 @@ pub(crate) struct Lowered {
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
+    /// The functions the module declares.
+    #[cfg(test)]
+    pub funcs: Vec<String>,
     /// Mesh primitive exports bounded by the declared vertex count.
     #[cfg(test)]
     pub bounded_prims: u32,
@@ -1254,6 +1257,8 @@ impl<'a> Lower<'a> {
             heap_props: std::mem::take(&mut self.s.heap_props),
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
+            #[cfg(test)]
+            funcs: self.s.m.func_names(),
             #[cfg(test)]
             bounded_prims: self.s.bounded_prims,
             #[cfg(test)]
@@ -5629,7 +5634,7 @@ impl<'a> Lower<'a> {
                     return int(self, r);
                 }
                 self.s.flags |= flags::WAVE_OPS;
-                let r = self.s.op(
+                let first = self.s.op(
                     c,
                     "waveReadLaneFirst.i32",
                     Attr::NoUnwind,
@@ -5637,6 +5642,23 @@ impl<'a> Lower<'a> {
                     118,
                     &[a],
                 );
+                let r = if self.s.pixel {
+                    // The host's waveReadLaneFirst skips helper lanes, which
+                    // the console's WQM keeps in EXEC: a waterfall loop on a
+                    // helper lane would never match the value it reads and
+                    // spin to the loop limit. A helper lane takes its own.
+                    let helper = self.s.op(
+                        c,
+                        "isHelperLane.i1",
+                        Attr::ReadOnly,
+                        self.s.t.i1,
+                        221,
+                        &[],
+                    );
+                    self.s.m.select(c, helper, a, first)
+                } else {
+                    first
+                };
                 int(self, r)
             }
             _ => {
@@ -9162,6 +9184,11 @@ mod tests {
 
     /// Lowers a pixel program with one target: whether it translates.
     fn lowers_ps(words: &[u32]) -> Result<(), crate::ShaderError> {
+        lower_ps(words).map(|_| ())
+    }
+
+    /// Lowers a pixel program with one target.
+    fn lower_ps(words: &[u32]) -> Result<super::Lowered, crate::ShaderError> {
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let native = NativeProgram {
             stage: HwStage::Ps,
@@ -9205,7 +9232,36 @@ mod tests {
             mesh_stride: 0,
             host_wave64: true,
         })
-        .map(|_| ())
+    }
+
+    /// A pixel waterfall loop: each pass reads the first lane's v0 and
+    /// retires the lanes holding the same value. The host's
+    /// waveReadLaneFirst skips helper lanes, so a helper lane takes its own
+    /// value instead (else it never matches and spins to the loop limit).
+    #[test]
+    fn pixel_read_first_lane_gives_helper_lanes_their_own_value() {
+        let waterfall = [
+            0xD765_0000,
+            0x0001_00C1, // v_mbcnt_lo_u32_b32 v0, -1, 0
+            0x7E02_0280, // v_mov_b32 v1, 0
+            0xBE97_037E, // s_mov_b32 s23, exec_lo
+            0x7E18_0500, // v_readfirstlane_b32 s12, v0
+            0x7D84_000C, // v_cmp_eq_u32 vcc, s12, v0
+            0xBE95_3C6A, // s_and_saveexec_b32 s21, vcc_lo
+            0xBF80_0000, // s_nop 0
+            0x7E02_02FF,
+            0x3F80_0000, // v_mov_b32 v1, 1.0f
+            0x897E_157E, // s_xor_b32 exec_lo, exec_lo, s21
+            0xBF89_FFF8, // s_cbranch_execnz -> loop
+            0xBEFE_0317, // s_mov_b32 exec_lo, s23
+            0xF800_180F,
+            0x0101_0101, // exp mrt0, v1, v1, v1, v1 done vm
+            S_ENDPGM,
+        ];
+        let l = lower_ps(&waterfall).unwrap();
+        let has = |name: &str| l.funcs.iter().any(|f| f == name);
+        assert!(has("dx.op.waveReadLaneFirst.i32"), "{:?}", l.funcs);
+        assert!(has("dx.op.isHelperLane.i1"), "{:?}", l.funcs);
     }
 
     /// Lowers a compute program of constants that allocates 512 bytes of LDS
