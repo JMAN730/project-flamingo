@@ -2011,6 +2011,15 @@ impl<'a> Lower<'a> {
             all_lane_blocks(self.x.st).is_some_and(|all| all.get(self.cur_ir).copied().unwrap_or(false))
         };
         if !every {
+            // shortcut: the console's own order needs every lane it reads to
+            // exist. Where the wave does not run whole (the code's branching
+            // leaves lanes out, which no other form of the program makes
+            // whole), the sum is taken the host's way: the lanes' low halves
+            // widened to f32, one wave sum, rounded once to 16 bits. That
+            // differs from the console's balanced f16 tree by one partial
+            // sum's rounding, and it lets the program translate where it was
+            // refused ("a wave sum of 16-bit floats where not every lane runs": 28
+            // compute_graph_ops:CS_TransposeVecMatMulAlignedOperation).
             if halves {
                 need(self.cur_ir);
             }
@@ -10996,17 +11005,25 @@ mod tests {
 
     /// Whether a synthetic compute program translates with these input registers.
     fn lowers(words: &[u32], rsrc2: u32) -> Result<(), crate::ShaderError> {
+        lowers_cs(words, rsrc2, false, [1, 1, 1]).map(|_| ())
+    }
+
+    /// [`lowers`] with the wave size and the group's threads given.
+    #[allow(dead_code)]
+    fn lowers_cs(
+        words: &[u32],
+        rsrc2: u32,
+        wave64: bool,
+        threads: [u32; 3],
+    ) -> Result<Lowered, crate::ShaderError> {
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let native = NativeProgram {
             stage: HwStage::Cs,
-            wave64: false,
+            wave64,
             vgprs: 256,
             layout: vec![],
             used: vec![],
-            io: StageIo::Cs(ComputeIo {
-                rsrc2,
-                threads: [1, 1, 1],
-            }),
+            io: StageIo::Cs(ComputeIo { rsrc2, threads }),
             code,
         };
         let p = ir::build(&native.code, false, 256).unwrap();
@@ -11024,8 +11041,8 @@ mod tests {
             prims: vec![],
             mesh_stride: 0,
         })
-        .map(|_| ())
     }
+
 
     /// Lowers a compute program with the root parameters `layout` (in user
     /// SGPRs from s0 on) and the used resources `used`.
