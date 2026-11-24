@@ -137,6 +137,13 @@ pub enum Interp {
         barycentric: Barycentric,
         first: Vec<Site>,
     },
+    /// This site (`v_interp_p2*`) completes `first` (`v_interp_p1*`), but
+    /// with computed or non-matching barycentrics that must be evaluated
+    /// by hand from per-vertex values.
+    Computed {
+        attribute: Attribute,
+        first: Vec<Site>,
+    },
     /// One vertex's value (`v_interp_mov_f32`), as encoded: 0 for P10,
     /// 1 for P20, 2 for P0 (the provoking vertex).
     Vertex { attribute: Attribute, vertex: u8 },
@@ -459,18 +466,51 @@ fn ps_vgprs(addr: u32) -> Vec<(u8, Input)> {
 
 /// An interpolation before its attribute is known.
 struct Pair {
-    barycentric: Barycentric,
+    barycentric: Option<Barycentric>,
     first: Vec<Site>,
 }
 
 impl Pair {
     fn with(self, attribute: Attribute) -> Interp {
-        Interp::Interpolated {
-            attribute,
-            barycentric: self.barycentric,
-            first: self.first,
+        match self.barycentric {
+            Some(barycentric) => Interp::Interpolated {
+                attribute,
+                barycentric,
+                first: self.first,
+            },
+            None => Interp::Computed {
+                attribute,
+                first: self.first,
+            },
         }
     }
+}
+
+/// Resolves an interpolation instruction's `Operand::Attr` against pixel
+/// stage inputs (`None` if the stage is not a pixel shader or lacks `attr`).
+pub(crate) fn interp_attribute(
+    inst: &crate::ir::Inst,
+    attr: &Operand,
+    native: &NativeProgram,
+) -> Option<Attribute> {
+    let StageIo::Ps { inputs, .. } = &native.io else {
+        return None;
+    };
+    let Operand::Attr {
+        index: slot,
+        chan: channel,
+        high,
+    } = *attr
+    else {
+        return None;
+    };
+    let _ = inst;
+    inputs.iter().find(|i| i.attr == slot).map(|i| Attribute {
+        usage: i.usage,
+        row: i.row,
+        channel,
+        high,
+    })
 }
 
 /// Finds the first halves of interpolations.
@@ -525,9 +565,7 @@ impl<'a> Halves<'a> {
             &mut Vec::new(),
             &mut first,
         )?;
-        let Some((kind, 1)) = barycentric(j) else {
-            return Err("an interpolation with computed barycentrics");
-        };
+        let mut kind = barycentric(j).and_then(|(k, index)| (index == 1).then_some(k));
         for &(b, i) in &first {
             let inst = &self.p.blocks[b].insts[i];
             let (a, i) = match &inst.fields {
@@ -545,8 +583,10 @@ impl<'a> Halves<'a> {
             if a != *attr {
                 return Err("interpolation halves of different attributes");
             }
-            if barycentric(i) != Some((kind, 0)) {
-                return Err("an interpolation with computed barycentrics");
+            if let Some(k) = kind
+                && barycentric(i) != Some((k, 0))
+            {
+                kind = None;
             }
         }
         Ok(Pair {
