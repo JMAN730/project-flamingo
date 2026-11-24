@@ -3823,22 +3823,39 @@ impl<'a> Lower<'a> {
             };
             (first, src, props, image, uav)
         } else {
-            // An image the program only measures (it reads the size bits and
-            // samples the image in other programs): eight dwords are an image
-            // descriptor, taken here as a 2D texture.
-            // shortcut: a 3D or array image would report depth or layers 1.
+            // Read as data and never used: the table's range says what
+            // the entry is, and an entry no range names (one a run-time
+            // index into the heap reaches) is an image if eight dwords.
+            // shortcut: an image is taken for 2D (its other kinds have
+            // other sizes) and a buffer for raw or structured; a view of
+            // another shape reads sizes of the wrong rank. Upgrade by
+            // looking up a sibling entry's use.
+            const NONE: Why = "a descriptor read only as data";
             let src = Source::Loaded {
                 load: site,
                 first: 0,
             };
-            if count != 8
-                || self
-                    .used_kind(&src)
-                    .is_some_and(|u| u.kind != ResourceType::Srv)
-            {
-                return Err("a descriptor read only as data");
-            }
-            (0, src, (2, 0x409), Some(2), false)
+            let used = self.used_kind(&src);
+            let in_views = self
+                .scalar
+                .get(&site)
+                .and_then(|a| self.x.native.layout.get(a.param))
+                .is_some_and(|rp| matches!(rp.root, RootType::Table | RootType::ResourceHeap));
+            let (uav, dwords, stride) = match used {
+                Some(u) if matches!(u.kind, ResourceType::Srv | ResourceType::Uav) => {
+                    (u.kind == ResourceType::Uav, u.dwords, u.stride)
+                }
+                None if in_views => (false, count as u8, 0),
+                _ => return Err(NONE),
+            };
+            let u = if uav { 0x1000 } else { 0 };
+            let (props, image) = match dwords {
+                8 => ((2 | u, 0x409), Some(2)),
+                4 if stride >= 4 && stride.is_multiple_of(4) => ((12 | u, stride), None),
+                4 if used.is_some() => ((11 | u, 0), None),
+                _ => return Err(NONE),
+            };
+            (0, src, props, image, uav)
         };
         let h = self.handle(site, &src, false, props)?;
         let c = self.cur;

@@ -335,6 +335,37 @@ const GATHER4_L_WAVE32: &[u32] = &[
     0xBF81_0000, // s_endpgm
 ];
 
+/// The console waterfall of [`resource::tests::WATERFALL_INDEXED_WAVE32`]
+/// whose loaded descriptor is only read as numbers, never sampled (the
+/// ray-tracing resolve reads an image's size that way): the loop ends in
+/// `v_alignbit_b32 v1, s14, s13, 30`, which is the width - 1 and, from bit
+/// 16, the height - 1 of the image descriptor's dwords 1 and 2.
+const WATERFALL_SIZE_ONLY_WAVE32: &[u32] = &[
+    0xBE84_0300, // s_mov_b32 s4, s0
+    0xBE85_0380, // s_mov_b32 s5, 0
+    0xF408_0A02,
+    0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
+    0x3420_0082, // v_lshlrev_b32 v16, 2, v0
+    0x360E_0081, // v_and_b32 v7, 1, v0
+    0x340E_0E85, // v_lshlrev_b32 v7, 5, v7
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0xBE97_037E, // s_mov_b32 s23, exec_lo
+    0xBE95_037E, // s_mov_b32 s21, exec_lo
+    0x7E28_0507, // 0x20: v_readfirstlane_b32 s20, v7
+    0x7DA4_0E14, // v_cmpx_eq_u32 exec_lo, s20, v7
+    0xF40C_0302,
+    0x2800_0000, // s_load_dwordx8 s[12:19], s[4:5], s20
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0xD54E_0001,
+    0x0278_1A0E, // v_alignbit_b32 v1, s14, s13, 30
+    0xBE95_4715, // s_andn2_wrexec_b32 s21, s21
+    0xBF89_FFF7, // s_cbranch_execnz -> 0x20
+    0xBEFE_0317, // s_mov_b32 exec_lo, s23
+    0xE070_1000,
+    0x800A_0110, // buffer_store_dword v1, v16, s[40:43], 0 offen
+    0xBF81_0000, // s_endpgm
+];
+
 #[test]
 fn gather4_with_a_level_returns_the_four_texels_of_that_level_in_gather_order() {
     let (shader, _) = build_any(GATHER4_L_WAVE32, false);
@@ -389,5 +420,28 @@ fn gather4_with_a_level_far_outside_the_view_reads_the_nearest_edge() {
             let got: Vec<f32> = words.into_iter().map(f32::from_bits).collect();
             assert_eq!(got, vec![texel; 32], "{label}: ({u}, {v})");
         }
+    }
+}
+
+#[test]
+fn a_descriptor_only_read_as_data_gives_its_views_size() {
+    // Without a use no instruction names the view's kind; the table's range
+    // does (an image: taken for 2D). The lowering used to refuse.
+    let (shader, lowered) = build_any(WATERFALL_SIZE_ONLY_WAVE32, false);
+    // No access proves the loop a waterfall, so its first-lane read is a wave operation.
+    assert_eq!(lowered.nonuniform_handles, 0);
+    assert!(lowered.wave_ops);
+    let (a, b) = ([[0.0f32; 4]; 8 * 4], [[0.0f32; 4]; 4 * 2]);
+    let views = [
+        View::Texture(8, 4, &a),
+        View::Texture(4, 2, &b),
+        View::RawUav(32),
+    ];
+    for (label, got) in run(&shader, &views) {
+        // Even lanes hold entry 0's offset (8 x 4), odd lanes entry 1's (4 x 2).
+        let want: Vec<u32> = (0..32)
+            .map(|l| if l & 1 == 0 { 7 | 3 << 16 } else { 3 | 1 << 16 })
+            .collect();
+        assert_eq!(got, want, "{label}");
     }
 }
