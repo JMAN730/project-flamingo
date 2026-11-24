@@ -587,8 +587,9 @@ pub struct Structured {
     /// Wave64 masks: low dword's value by the high dword's.
     pub highs: HashMap<Value, Value>,
     /// Masks (low dwords) set only in lanes whose EXEC bit is set where
-    /// they are written: every such lane reaches the writing block, so a
-    /// ballot there gives the mask as data.
+    /// they are written, or for a join only in lanes that reach it: every
+    /// such lane reaches the writing block, so a ballot there gives the
+    /// mask as data.
     pub active: HashSet<Value>,
     /// Per block and instruction: the lane's EXEC bit at each vector
     /// instruction, whatever path the lane took (`None` for scalar ones).
@@ -605,6 +606,10 @@ pub struct Structured {
     /// values: the halves of a mask held as a number need not come from
     /// one instruction.
     pub pairs: HashMap<Value, Value>,
+    /// Masks (low dwords) set in every lane that does not run where they
+    /// are written (EXEC clear there, or not reaching a join): a ballot
+    /// there, with every lane it leaves out set, gives the mask as data.
+    pub outside: HashSet<Value>,
 }
 
 impl Structured {
@@ -685,6 +690,8 @@ struct Lanes<'a> {
     when: Vec<Option<Bool>>,
     /// See [`Structured::active`].
     active: HashSet<Value>,
+    /// See [`Structured::outside`].
+    outside: HashSet<Value>,
 }
 
 /// A mask join taken as `value` in every lane that reaches `block`: each
@@ -751,6 +758,7 @@ impl<'a> Lanes<'a> {
             first: vec![Bool::FALSE; blocks.len()],
             when: vec![None; blocks.len()],
             active: HashSet::new(),
+            outside: HashSet::new(),
         })
     }
 
@@ -764,6 +772,7 @@ impl<'a> Lanes<'a> {
         self.first.fill(Bool::FALSE);
         self.when.fill(None);
         self.active.clear();
+        self.outside.clear();
     }
 
     /// Lane masks, branch conditions and forward-edge knowledge, block by
@@ -857,11 +866,86 @@ impl<'a> Lanes<'a> {
         wrong
     }
 
+    /// Mask joins read per lane: a ballot in the join's block sees the
+    /// lanes that reach it. Only before the first loop, where what a lane
+    /// knows on entering a block is exactly whether it gets there, and only
+    /// joins whose lanes all see the wave's value (`per_lane`).
+    fn joined_masks(&mut self, cond: &[Bool]) {
+        let first_loop = (0..self.order.len())
+            .find(|&i| {
+                let s = self.order[i];
+                self.incoming[s].iter().any(|&(q, _)| self.index[q] >= i)
+            })
+            .unwrap_or(usize::MAX);
+        let joins: Vec<(Key, usize, Bool)> = self
+            .masks
+            .iter()
+            .filter_map(|(&k, &m)| {
+                let &(block, _) = self.phis.get(&k.0).or_else(|| self.phis.get(&k.1))?;
+                (self.index[block] < first_loop).then_some((k, block, m))
+            })
+            .collect();
+        for (k, block, m) in joins {
+            if self.active.contains(&k.0)
+                || self.outside.contains(&k.0)
+                || !self.per_lane(k, block, cond)
+            {
+                continue;
+            }
+            let there = cond[block];
+            let away = self.b.not(there);
+            if self.b.implies(m, there) {
+                self.active.insert(k.0);
+            } else if self.b.implies(away, m) {
+                self.outside.insert(k.0);
+            }
+        }
+    }
+
+    /// Whether every lane's own incoming mask at join `k` is the wave's.
+    /// The wave arrives from the last predecessor, in program order, that
+    /// any lane reaches; so a lane arriving over an edge must find there
+    /// the mask of every edge from that one on (`s20 = 0; if (..) s20 = vcc`
+    /// holds, where vcc is clear in the lanes that skip; `s20 = -1` before
+    /// it does not).
+    fn per_lane(&mut self, k: Key, block: usize, cond: &[Bool]) -> bool {
+        let p = self.p;
+        let target = &p.blocks[block];
+        let (lo, hi) = (self.phis.get(&k.0).copied(), self.phis.get(&k.1).copied());
+        let arg = |phi: Option<(usize, usize)>, own: Value, n: usize| {
+            phi.map_or(own, |(_, i)| target.phis[i].args[n])
+        };
+        let mut edges = Vec::new();
+        for n in 0..target.preds.len() {
+            let (q, taken) = self.incoming[block][n];
+            if p.blocks[q].offset >= target.offset {
+                return false;
+            }
+            let e = self.edge(cond[q], q, taken);
+            let m = self.mask((arg(lo, k.0, n), arg(hi, k.1, n))).0;
+            edges.push((p.blocks[q].offset, e, m));
+        }
+        for &(at, e, m) in &edges {
+            for &(from, _, other) in &edges {
+                if from < at {
+                    continue;
+                }
+                let differ = self.b.xor(m, other);
+                let same = self.b.not(differ);
+                if !self.b.implies(e, same) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
     fn finish(
         mut self,
         execs: &[Vec<Option<Bool>>],
         cond: &[Bool],
     ) -> Result<Structured, ShaderError> {
+        self.joined_masks(cond);
         let blocks = &self.p.blocks;
         // Test the incoming edges before the loop-header path calculation
         // forgets the atoms defined in the loop. A scalar phi on a divergent
@@ -929,6 +1013,7 @@ impl<'a> Lanes<'a> {
                 .collect(),
             select_masks: self.select_masks,
             active: self.active,
+            outside: self.outside,
             bools: self.b,
             exits,
             divergent_joins,
@@ -1295,6 +1380,13 @@ impl<'a> Lanes<'a> {
                             || exec.is_some_and(|e| self.b.implies(m, e))
                         {
                             self.active.insert(k.0);
+                        } else if let Some(e) = exec {
+                            // Set wherever EXEC is clear (`s_not` of a compare,
+                            // the lanes a branch left out).
+                            let off = self.b.not(e);
+                            if self.b.implies(off, m) {
+                                self.outside.insert(k.0);
+                            }
                         }
                     }
                     if let (Some(scc), Some(m)) = (inst.write(Reg::Scc), r.scc) {
@@ -1342,6 +1434,17 @@ impl<'a> Lanes<'a> {
                     let (mask, derived) = self.mask(k);
                     if derived {
                         self.select_masks.insert(dst, mask);
+                    }
+                }
+                // So is a join read as a number (`v_mov_b32 v1, s20` after
+                // a branch that wrote a compare to s20).
+                for op in &v.src {
+                    if let Operand::Scalar { code, .. } = *op
+                        && code != NULL
+                        && let Some(k) = self.key(|r| inst.read(r), code)
+                        && (self.phis.contains_key(&k.0) || self.phis.contains_key(&k.1))
+                    {
+                        self.mask(k);
                     }
                 }
                 if name.starts_with("v_cmpx") {

@@ -1902,7 +1902,13 @@ impl<'a> Lower<'a> {
         if self.split {
             return Err("a lane mask read whole in a wave64 program split in halves");
         }
-        if !self.x.st.active.contains(&lo) {
+        // A mask also set in every lane that does not run where it is
+        // written: the ballot leaves those lanes out, so they are added.
+        // Compute only, where host lane n is console lane n.
+        let outside = !self.x.st.active.contains(&lo)
+            && self.x.st.outside.contains(&lo)
+            && matches!(self.x.native.io, StageIo::Cs(_));
+        if !self.x.st.active.contains(&lo) && !outside {
             return Err("a lane mask holding lanes elsewhere read as data");
         }
         let (x, y) = match self.ballots.get(&lo) {
@@ -1926,7 +1932,20 @@ impl<'a> Lower<'a> {
                     .s
                     .op(at, "waveActiveBallot", Attr::NoUnwind, four, 116, &[bit]);
                 self.s.flags |= flags::WAVE_OPS;
-                let xy = (self.s.m.extract(at, r, 0), self.s.m.extract(at, r, 1));
+                let mut xy = (self.s.m.extract(at, r, 0), self.s.m.extract(at, r, 1));
+                if outside {
+                    let t = self.s.m.bool(true);
+                    let here = self
+                        .s
+                        .op(at, "waveActiveBallot", Attr::NoUnwind, four, 116, &[t]);
+                    let ones = self.s.m.i32(u32::MAX);
+                    let mut add = |word: V, n: u32| {
+                        let present = self.s.m.extract(at, here, n);
+                        let away = self.s.m.bin(at, Bin::Xor, present, ones);
+                        self.s.m.bin(at, Bin::Or, word, away)
+                    };
+                    xy = (add(xy.0, 0), add(xy.1, 1));
+                }
                 self.ballots.insert(lo, xy);
                 xy
             }
@@ -9424,12 +9443,18 @@ impl<'a> Lower<'a> {
                 let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
                 // Console flow: every lane arrives by every edge, so a join
                 // also takes masks that are constants or built from scalars.
+                // Else a number joined in (a constant before a branch) only
+                // where the join was checked to hold per lane.
                 let arg = &phi.args[n];
-                let others = self.console_cf.then(|| self.x.st.others.get(arg)).flatten();
-                let m =
-                    *self.x.st.masks.get(arg).or(others).ok_or_else(|| {
-                        unsupported(offset, "a lane-mask join of an untracked mask")
-                    })?;
+                let st = self.x.st;
+                let checked = self.console_cf
+                    || st.active.contains(&phi.value)
+                    || st.outside.contains(&phi.value);
+                let m = *st
+                    .masks
+                    .get(arg)
+                    .or_else(|| st.others.get(arg).filter(|_| checked))
+                    .ok_or_else(|| unsupported(offset, "a lane-mask join of an untracked mask"))?;
                 let x = self.boolean(m, qb).map_err(|w| unsupported(offset, w))?;
                 incoming.push((x, qb));
             }
