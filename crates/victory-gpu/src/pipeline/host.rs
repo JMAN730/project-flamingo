@@ -583,6 +583,7 @@ impl HostPipeline {
                 Err(e) => {
                     tracing::warn!(error = %e, ?shaders, "host pipeline refused");
                     host.log_messages();
+                    dump_refused(shaders, &[code_bytes(&code(0))], &root_blob);
                     return None;
                 }
             };
@@ -621,6 +622,7 @@ impl HostPipeline {
                 Err(e) => {
                     tracing::warn!(error = %e, ?shaders, "host mesh pipeline refused");
                     host.log_messages();
+                    dump_refused(shaders, &[code_bytes(&code(0)), code_bytes(&code(1))], &root_blob);
                     return None;
                 }
             };
@@ -724,6 +726,7 @@ impl HostPipeline {
             Err(e) => {
                 tracing::warn!(error = %e, ?shaders, "host pipeline refused");
                 host.log_messages();
+                dump_refused(shaders, &[code_bytes(&desc.VS), code_bytes(&desc.PS)], &root_blob);
                 return None;
             }
         };
@@ -853,6 +856,32 @@ fn mesh_pipeline(
 }
 
 /// The bytes of shader code (none for an absent stage).
+/// With `VICTORY_DUMP_FAILED=<dir>`: a pipeline the host refused goes to
+/// `<dir>/refused/`, the host DXIL of each stage and the root signature
+/// (`{first hash}-{n}.dxil`, `{first hash}.rootsig`), so the refusal can be
+/// replayed against the debug layer offline (`dxc -dumpbin`, a small
+/// D3D12 program). The world's refusals are E_INVALIDARG without the
+/// debug layer, which says nothing more.
+fn dump_refused(shaders: &[Arc<Shader>], codes: &[Vec<u8>], root_blob: &[u8]) {
+    let Some(dir) = std::env::var_os("VICTORY_DUMP_FAILED") else {
+        return;
+    };
+    let dir = std::path::PathBuf::from(dir).join("refused");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let Some(first) = shaders.first() else {
+        return;
+    };
+    for (i, code) in codes.iter().enumerate() {
+        if !code.is_empty() {
+            let _ = std::fs::write(dir.join(format!("{}-{i}.dxil", first.hash)), code);
+        }
+    }
+    let _ = std::fs::write(dir.join(format!("{}.rootsig", first.hash)), root_blob);
+    let _ = std::fs::write(dir.join(format!("{}.txt", first.hash)), format!("{shaders:?}\n"));
+}
+
 fn code_bytes(code: &D3D12_SHADER_BYTECODE) -> Vec<u8> {
     if code.pShaderBytecode.is_null() {
         return Vec::new();
