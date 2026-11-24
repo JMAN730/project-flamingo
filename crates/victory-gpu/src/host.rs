@@ -1830,7 +1830,7 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     }
     #[cfg(feature = "diagnostics")]
     let moved = std::time::Instant::now();
-    let whole = read(src, dst, len);
+    let whole = read_parallel(src, dst, len);
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(
         crate::copystat::C::MoveUs,
@@ -1916,6 +1916,34 @@ fn for_regions(start: usize, len: usize, write: bool, mut f: impl FnMut(usize, u
 /// readable.
 pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
     read(src, dst.as_mut_ptr(), dst.len())
+}
+
+/// [`read`], cut into up to four pieces on as many threads for a copy of
+/// 8 MB or more: the world copies 160-360 MB of title memory a frame, which
+/// one thread did at about 1.2 GB/s (90-290 ms a frame on an i5-12400F).
+fn read_parallel(src: *const u8, dst: *mut u8, len: usize) -> bool {
+    const PIECE: usize = 4 << 20;
+    static THREADS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let threads = *THREADS.get_or_init(|| {
+        std::thread::available_parallelism().map_or(1, |n| (n.get() / 3).clamp(1, 4))
+    });
+    let pieces = threads.min(len / PIECE);
+    if pieces < 2 {
+        return read(src, dst, len);
+    }
+    // Page-aligned pieces: an unmapped page fails one piece, not two.
+    let piece = (len.div_ceil(pieces) + 0xfff) & !0xfff;
+    let (s, d) = (src as usize, dst as usize);
+    std::thread::scope(|scope| {
+        let rest: Vec<_> = (1..pieces)
+            .map(|i| {
+                let (at, end) = (i * piece, ((i + 1) * piece).min(len));
+                scope.spawn(move || at >= end || read((s + at) as *const u8, (d + at) as *mut u8, end - at))
+            })
+            .collect();
+        let first = read(src, dst, piece.min(len));
+        rest.into_iter().fold(first, |whole, h| h.join().unwrap_or(false) && whole)
+    })
 }
 
 /// Copies `len` bytes from `src` to `dst` in the kernel: false if a source
