@@ -925,14 +925,21 @@ fn pooled(n: usize) -> Vec<u8> {
     v
 }
 
-/// Returns a snapshot buffer to the pool: at most 8 kept, the largest, and
-/// of those the largest one and the next ones up to `KEPT` bytes in all.
+/// Snapshot buffers the pool keeps: as many as copies a frame can hold at
+/// once (27 copies a frame in the steady state, one buffer each), so a copy
+/// takes a touched buffer back instead of allocating a fresh one whose
+/// pages fault as the snapshot is written.
+const POOL_MAX: usize = 32;
+
+/// Returns a snapshot buffer to the pool: at most [`POOL_MAX`] kept, the
+/// largest, and of those the largest one and the next ones up to `KEPT`
+/// bytes in all.
 fn give_back(v: Vec<u8>) {
     const KEPT: usize = 512 << 20;
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
     pool.push(v);
     pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
-    pool.truncate(8);
+    pool.truncate(POOL_MAX);
     let (mut seen, mut total) = (0, 0usize);
     pool.retain(|v| {
         seen += 1;
@@ -3185,6 +3192,47 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     note(&shadow);
     map.insert((start, len), shadow.clone());
     Some(shadow)
+}
+
+#[cfg(test)]
+mod pool_tests {
+    use super::{POOL, give_back, pooled};
+
+    /// A frame's copies hold a snapshot each at once (27 copies a frame in
+    /// fx-d3dc-1), and their buffers come back to be reused: the pool keeps
+    /// as many as that, where eight made 19 of the 27 allocate a fresh buffer
+    /// every frame, whose pages fault as the snapshot is written.
+    #[test]
+    fn a_frame_of_copies_finds_a_reused_buffer_each() {
+        let saved = std::mem::take(&mut *POOL.lock().unwrap_or_else(|e| e.into_inner()));
+        let n = 2 << 20;
+        // One frame: 27 live copies take their snapshot buffer.
+        let mut live: Vec<Vec<u8>> = (0..27)
+            .map(|_| {
+                let mut v = pooled(n);
+                assert!(v.capacity() >= n && v.capacity() <= n * 4, "a fitting buffer");
+                v.resize(n, 0);
+                v
+            })
+            .collect();
+        for v in live.drain(..) {
+            give_back(v);
+        }
+        let held = POOL.lock().unwrap_or_else(|e| e.into_inner()).len();
+        assert_eq!(held, 27, "one per copy, kept for the next frame");
+        // The next frame's copies take the same buffers back untouched.
+        let mut again: Vec<Vec<u8>> = (0..27).map(|_| pooled(n)).collect();
+        assert_eq!(POOL.lock().unwrap_or_else(|e| e.into_inner()).len(), 0);
+        assert!(again.iter().all(|v| v.capacity() == n), "reused, not fresh");
+        for v in again.drain(..) {
+            give_back(v);
+        }
+        // The smallest buffer that holds the ask is the one taken.
+        let v = pooled(1 << 20);
+        assert_eq!(v.capacity(), n);
+        give_back(v);
+        *POOL.lock().unwrap_or_else(|e| e.into_inner()) = saved;
+    }
 }
 
 #[cfg(test)]
