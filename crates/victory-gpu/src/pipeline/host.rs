@@ -310,6 +310,8 @@ pub(crate) struct HostPipeline {
     /// The vertex buffer slots it reads (bit per slot).
     pub(crate) slots: u32,
     pub(crate) inputs: Vec<Input>,
+    /// Index buffer strip-cut value for graphics pipelines.
+    pub(crate) strip_cut: D3D12_INDEX_BUFFER_STRIP_CUT_VALUE,
     /// Its shaders, for reports of slow submissions.
     pub(crate) name: String,
 }
@@ -527,6 +529,7 @@ impl HostPipeline {
                 name: format!("{shaders:?}"),
                 slots: 0,
                 inputs: Vec::new(),
+                strip_cut: D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED,
             });
         }
         let Some(g) = g else {
@@ -563,6 +566,7 @@ impl HostPipeline {
                 name: format!("{shaders:?}"),
                 slots: 0,
                 inputs: Vec::new(),
+                strip_cut: D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED,
             });
         }
 
@@ -637,6 +641,7 @@ impl HostPipeline {
             name: format!("{shaders:?}"),
             slots: g.slots(),
             inputs: g.elements(),
+            strip_cut: g.strip_cut,
         })
     }
 }
