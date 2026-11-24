@@ -72,6 +72,12 @@ pub enum Input {
     MeshGroup,
     /// Mesh: s3, the wave's index in the group in bits 24-27.
     MergedWaveInfo,
+    /// Pixel: the SGPR after the user data, the LDS offset of the
+    /// primitive's parameters (M0 for `v_interp`).
+    PrimMask,
+    /// Pixel: the POPS collision wave id SGPR after the primitive mask
+    /// ([`PsRsrc2::collision_wave_id_sgpr`](crate::native::PsRsrc2::collision_wave_id_sgpr)).
+    CollisionWaveId,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -185,7 +191,8 @@ pub struct Io {
     pub interps: Vec<(Site, Interp)>,
     pub exports: Vec<Export>,
     /// Compute: how many SGPRs the hardware initializes
-    /// ([`ComputeIo::initialized_sgprs`](crate::native::ComputeIo::initialized_sgprs)).
+    /// ([`ComputeIo::initialized_sgprs`](crate::native::ComputeIo::initialized_sgprs),
+    /// [`PsRsrc2::initialized_sgprs`](crate::native::PsRsrc2::initialized_sgprs)).
     pub initialized_sgprs: Option<u8>,
 }
 
@@ -196,15 +203,25 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
     let (loaded, ps_inputs, params) = match (&native.io, native.stage) {
         (
             StageIo::Ps {
-                inputs, input_addr, ..
+                inputs,
+                input_addr,
+                rsrc2,
+                ..
             },
             HwStage::Ps,
         ) => {
             // A pixel shader exports no parameters; `[]` never reaches `Unread`.
-            let loaded = ps_vgprs(*input_addr)
+            let mut loaded: Vec<(Reg, Input)> = ps_vgprs(*input_addr)
                 .into_iter()
                 .map(|(r, i)| (Reg::V(r), i))
                 .collect();
+            // The SGPRs after the user data.
+            loaded.push((Reg::S(rsrc2.prim_mask_sgpr()), Input::PrimMask));
+            loaded.extend(
+                rsrc2
+                    .collision_wave_id_sgpr()
+                    .map(|s| (Reg::S(s), Input::CollisionWaveId)),
+            );
             (loaded, &inputs[..], &[][..])
         }
         (StageIo::Vs { inputs, outputs }, HwStage::Vs) => {
@@ -333,6 +350,7 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
         inputs: inputs.clone(),
         initialized_sgprs: match &native.io {
             StageIo::Cs(cs) => Some(cs.initialized_sgprs()),
+            StageIo::Ps { rsrc2, .. } => Some(rsrc2.initialized_sgprs()),
             _ => None,
         },
         ..Io::default()
@@ -605,6 +623,7 @@ mod tests {
             io: StageIo::Ps {
                 inputs,
                 input_addr,
+                rsrc2: Default::default(),
                 db_shader_control: 0,
                 patches: Vec::<ExportPatch>::new(),
             },

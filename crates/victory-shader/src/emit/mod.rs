@@ -964,6 +964,7 @@ mod tests {
             io: StageIo::Ps {
                 inputs: vec![],
                 input_addr: 0,
+                rsrc2: Default::default(),
                 db_shader_control: 0,
                 patches: vec![],
             },
@@ -1001,6 +1002,129 @@ mod tests {
         let sfi0 = host.part(FourCC::SFI0).unwrap().data;
         let features = u64::from_le_bytes(sfi0.try_into().unwrap());
         assert_ne!(features & 0x200, 0, "SFI0 {features:#x}: no StencilRef");
+    }
+
+    /// A pixel program with one user SGPR (s0, a descriptor table) that
+    /// stores `body`'s s4 to the table's buffer UAV. `rsrc2` places the
+    /// primitive mask in s1 and, with bit 25, the POPS collision wave id in
+    /// s2. Returns the emitted container.
+    fn pixel_uav_store(rsrc2: u32, body: &[u32]) -> Result<Vec<u8>, ShaderError> {
+        use crate::native::{PsRsrc2, ResourceType, RootParam, RootType, UsedResource};
+        let mut words = vec![
+            0xBE86_0300, // s_mov_b32 s6, s0
+            0xBE87_0380, // s_mov_b32 s7, 0
+            0xF408_0203,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[6:7], 0x0
+        ];
+        words.extend_from_slice(body);
+        words.extend_from_slice(&[
+            0x7E00_0204, // v_mov_b32 v0, s4
+            0xE070_0000,
+            0x8002_0000, // buffer_store_dword v0, off, s[8:11], 0
+            0xBF81_0000, // s_endpgm
+        ]);
+        let native = NativeProgram {
+            stage: HwStage::Ps,
+            wave64: false,
+            vgprs: 1,
+            layout: vec![RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            }],
+            used: vec![UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 0,
+                slot: 0,
+            }],
+            io: StageIo::Ps {
+                inputs: vec![],
+                input_addr: 0,
+                rsrc2: PsRsrc2(rsrc2),
+                db_shader_control: 0,
+                patches: vec![],
+            },
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let bytes = crate::dxbc::build(&[
+            (FourCC::ISG1, &container::signature(&[], true)),
+            (FourCC::OSG1, &container::signature(&[], false)),
+        ]);
+        let c = Container::parse(&bytes).unwrap();
+        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let out = emit(&c, &native, &p, &st, &io, &res)?;
+        // dxil.dll, where there is one, checks the flags against the module.
+        #[cfg(windows)]
+        if let Ok(mut v) = super::validator::Validator::load(
+            super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut out.dxil.clone()).unwrap();
+        }
+        Ok(out.dxil)
+    }
+
+    fn sfi0_features(dxil: &[u8]) -> u64 {
+        let host = Container::parse(dxil).unwrap();
+        let sfi0 = host.part(FourCC::SFI0).unwrap().data;
+        u64::from_le_bytes(sfi0.try_into().unwrap())
+    }
+
+    /// A POPS pixel program (`LOAD_COLLISION_WAVEID`) reads the collision
+    /// wave id SGPR after the primitive mask and compares its fields with
+    /// `src_pops_exiting_wave_id` to wait for the earlier waves that cover
+    /// its pixels. Both translate as a wave that overlaps none, and the UAV
+    /// is rasterizer ordered (D3D_SHADER_FEATURE_ROVS, 0x1000, in SFI0).
+    #[test]
+    fn a_pops_pixel_program_orders_its_uavs_on_the_host() {
+        let body = [
+            0x9003_9F02, // s_lshr_b32 s3, s2, 31 (the wave overlaps another)
+            0x8104_03EF, // s_add_i32 s4, src_pops_exiting_wave_id, s3
+            0xBF90_0007, // s_sendmsg sendmsg(MSG_ORDERED_PS_DONE)
+        ];
+        let dxil = pixel_uav_store(1 << 1 | 1 << 25, &body).unwrap();
+        let features = sfi0_features(&dxil);
+        assert_ne!(features & 0x1000, 0, "SFI0 {features:#x}: no ROVs");
+    }
+
+    /// The primitive mask (s1 here) arrives in every pixel program. A path
+    /// that reuses its register and one that keeps it join in a phi, which
+    /// the read after them takes only on the reusing path: the phi still
+    /// needs a value for the mask.
+    #[test]
+    fn a_primitive_mask_joined_with_a_reused_register_translates() {
+        let body = [
+            0xBE84_0380, // s_mov_b32 s4, 0
+            0xBF06_8000, // s_cmp_eq_u32 s0, 0
+            0xBF85_0001, // s_cbranch_scc1 +1
+            0xBE81_0387, // s_mov_b32 s1, 7
+            0xBF85_0001, // s_cbranch_scc1 +1 (the same condition)
+            0xBE84_0301, // s_mov_b32 s4, s1 (only where s1 is 7)
+        ];
+        pixel_uav_store(1 << 1, &body).unwrap();
+    }
+
+    /// Without `LOAD_COLLISION_WAVEID` the same store is no ROV, and s2,
+    /// above the SGPRs the hardware initializes, reads zero.
+    #[test]
+    fn a_pixel_program_without_pops_keeps_plain_uavs() {
+        let body = [0x9004_9F02]; // s_lshr_b32 s4, s2, 31
+        let dxil = pixel_uav_store(1 << 1, &body).unwrap();
+        let features = sfi0_features(&dxil);
+        assert_eq!(features & 0x1000, 0, "SFI0 {features:#x}: ROVs");
+        // src_pops_exiting_wave_id has no value there.
+        let body = [0x8104_03EF]; // s_add_i32 s4, src_pops_exiting_wave_id, s3
+        assert!(pixel_uav_store(1 << 1, &body).is_err());
     }
 
     /// A wave64 compute program that writes only EXEC's high dword
@@ -1284,6 +1408,7 @@ mod tests {
                         row2: 0,
                     }],
                     input_addr,
+                    rsrc2: Default::default(),
                     db_shader_control: 0,
                     patches: vec![],
                 },
@@ -1423,6 +1548,7 @@ mod tests {
                     row2: 0,
                 }],
                 input_addr: 0,
+                rsrc2: Default::default(),
                 db_shader_control: 0,
                 patches: vec![],
             },

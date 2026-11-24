@@ -20,6 +20,7 @@ pub(crate) mod flags {
     pub const VIEWPORT_RT_INDEX: u64 = 1 << 9;
     pub const STENCIL_REF: u64 = 1 << 11;
     pub const TYPED_UAV_LOADS: u64 = 1 << 13;
+    pub const ROVS: u64 = 1 << 18;
     pub const WAVE_OPS: u64 = 1 << 19;
     pub const INT64: u64 = 1 << 20;
     pub const ATOMIC_TYPED64: u64 = 1 << 27;
@@ -101,6 +102,8 @@ pub(crate) struct Shader {
     pub nonuniform_handles: u32,
     /// Heap handles annotated as constant buffers.
     pub cbuffer_handles: u32,
+    /// UAV heap handles are rasterizer ordered (`RasterizerOrdered*`).
+    pub rov: bool,
     /// A compute shader with this thread-group size.
     pub threads: Option<[u32; 3]>,
     /// The wave size a compute shader requires (`WaveSize`).
@@ -163,6 +166,7 @@ impl Shader {
             flags: 0,
             nonuniform_handles: 0,
             cbuffer_handles: 0,
+            rov: false,
             threads: None,
             wave_size: None,
             compute_derivatives: false,
@@ -381,6 +385,13 @@ impl Shader {
         let index = self.m.select(block, in_bounds, index, zero);
         self.nonuniform_handles += u32::from(nonuniform);
         self.cbuffer_handles += u32::from(props.0 == 13);
+        // Resource properties: bit 12 a UAV, bit 13 rasterizer ordered.
+        let props = if self.rov && props.0 & 0x1000 != 0 {
+            self.flags |= flags::ROVS;
+            (props.0 | 0x2000, props.1)
+        } else {
+            props
+        };
         let (s, n) = (self.m.bool(sampler), self.m.bool(nonuniform));
         let h = self.op(
             block,
@@ -750,6 +761,9 @@ impl Shader {
         }
         if self.flags & flags::VIEWPORT_RT_INDEX != 0 {
             features |= 0x2000;
+        }
+        if self.flags & flags::ROVS != 0 {
+            features |= 0x1000;
         }
         if self.flags & flags::WAVE_OPS != 0 {
             features |= 0x4000;
