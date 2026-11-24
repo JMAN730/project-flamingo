@@ -15,7 +15,7 @@
 
 $ErrorActionPreference = 'Continue'
 $ProgressPreference = 'SilentlyContinue'
-$TryVersion = '2.0'
+$TryVersion = '2.1'
 $ForkUrl = 'https://github.com/MfDev0/victory.git'
 $Branch = 'arena/59fabb00-victory'
 # Other places the fork may live (renamed to CAtez, or a backup copy), tried
@@ -444,11 +444,15 @@ function Run-Game {
     $env:VICTORY_GAME_DIR = $c.game_dir
     $env:RUST_BACKTRACE = '1'
     # Long shader loops hang the GPU (device hung about 40 s into the world):
-    # leave a loop after 1024 turns unless set already (64 if it still hangs).
-    if (-not $env:VICTORY_SHADER_LOOP_LIMIT) { $env:VICTORY_SHADER_LOOP_LIMIT = '1024' }
+    # leave a loop after 64 turns unless set already (held 30 fps longest).
+    if (-not $env:VICTORY_SHADER_LOOP_LIMIT) { $env:VICTORY_SHADER_LOOP_LIMIT = '64' }
     # Series X draws the world at 2560x1440 and its 4K upscale stays black:
     # show the 1440p picture instead (set VICTORY_PRESENT_1440P=0 to turn off).
-    if ($c.console -eq 'series-x' -and -not $env:VICTORY_PRESENT_1440P) { $env:VICTORY_PRESENT_1440P = '1' }
+    # Series S: the world's own target, picked in frames of the world (menus
+    # keep the title's picture).
+    if (-not $env:VICTORY_PRESENT_1440P) {
+        if ($c.console -eq 'series-x') { $env:VICTORY_PRESENT_1440P = '1' } else { $env:VICTORY_PRESENT_1440P = 'auto' }
+    }
     Say "shader loop limit: $($env:VICTORY_SHADER_LOOP_LIMIT)$(if ($env:VICTORY_PRESENT_1440P) { "   world view: $($env:VICTORY_PRESENT_1440P)" })"
     $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
     $log = Join-Path $LogDir "game-$stamp.log"
