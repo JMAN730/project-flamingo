@@ -15,7 +15,7 @@
 
 $ErrorActionPreference = 'Continue'
 $ProgressPreference = 'SilentlyContinue'
-$TryVersion = '1.3'
+$TryVersion = '1.4'
 $ForkUrl = 'https://github.com/MfDev0/victory.git'
 $Branch = 'arena/59fabb00-victory'
 $UpstreamUrl = 'https://github.com/Marvisak/VIctory.git'
@@ -94,6 +94,7 @@ function Ask-Game([bool]$force) {
         $why = Not-Game $c.game_exe
         if (-not $why) {
             Say "game: $($c.game_exe)"
+            if ($c.game_dir) { Say "game files: $($c.game_dir)" }
             return $true
         }
         Bad "the saved game path is wrong: $why"
@@ -102,22 +103,33 @@ function Ask-Game([bool]$force) {
     }
     Step 'Where is the game?'
     Say 'Paste each path and press Enter (right-click pastes in this window).'
+    Say 'The game files folder is the one with the game''s .rpf archives; the exe may be elsewhere.'
     $dir = ''; $exe = ''
     while ($true) {
-        $dir = Read-Path '  1) Game files folder'
+        $dir = Read-Path '  1) Game files folder (with the .rpf files)'
         if (-not $dir) { continue }
         if (Test-Path -LiteralPath $dir -PathType Leaf) {
+            # The exe was given first: keep it, and still ask for the files.
             $why = Not-Game $dir
             if ($why) { Bad $why; continue }
-            $exe = (Resolve-Path -LiteralPath $dir).ProviderPath; $dir = Split-Path -Parent $exe; break
+            $exe = (Resolve-Path -LiteralPath $dir).ProviderPath
+            $exeDir = Split-Path -Parent $exe
+            Say "game exe: $exe"
+            $dir = Read-Path "  1) Game files folder (with the .rpf files) [Enter = $exeDir]"
+            if (-not $dir) { $dir = $exeDir }
         }
         if (Test-Path -LiteralPath $dir -PathType Container) { break }
         Bad "not found: $dir"
+        $exe = ''
     }
     $dir = (Resolve-Path -LiteralPath $dir).ProviderPath.TrimEnd('\')
     if ($dir.StartsWith($TryHome, [StringComparison]::OrdinalIgnoreCase)) {
         Bad "keep the game outside $TryHome"
         return $false
+    }
+    $rpfs = @(Get-ChildItem -LiteralPath $dir -Filter '*.rpf' -File -ErrorAction SilentlyContinue)
+    if ($rpfs.Count -eq 0) {
+        Say 'note: no .rpf files in that folder. If it is not the game files folder, press G later to change it.'
     }
     while (-not $exe) {
         $found = @(Get-ChildItem -LiteralPath $dir -Filter '*.exe' -File -ErrorAction SilentlyContinue | Select-Object -First 9)
@@ -153,8 +165,8 @@ function Ask-Game([bool]$force) {
     $c.game_dir = $dir
     $c.game_exe = $exe
     Save-Config
-    Say "game folder: $dir"
-    Say "game exe:    $exe"
+    Say "game files: $dir"
+    Say "game exe:   $exe"
     return $true
 }
 

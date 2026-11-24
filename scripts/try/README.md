@@ -43,7 +43,9 @@ runs the newer one, so fixes to VIctory Try itself need no new download.
 
 ## What it does
 
-1. Asks for the game folder and the game exe, and remembers them. If the
+1. Asks for the game files folder (the one with the `.rpf` archives) and the
+   game exe, which may be in another folder, and remembers them. VIctory uses
+   the folder holding the game's archives as the console's `G:` drive. If the
    folder holds several exe files, it lists them so you can pick one by number.
 2. Installs Rust and the C++ Build Tools if they are missing.
 3. Downloads the newest source, adds upstream's new fixes, and builds `victory.exe`. The first build takes

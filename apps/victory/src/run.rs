@@ -61,16 +61,29 @@ pub fn run(
     let prepared = victory_loader::prepare(&original)?;
     let hash = prepared.original_hash.to_hex();
     let title_dir = exe.parent().unwrap_or(Path::new("."));
-    match victory_game::identify(&hash) {
+    // The package (the console's `G:`): the exe's folder, unless the game
+    // files lie in the configured game folder and the exe elsewhere.
+    let mut dirs = vec![title_dir];
+    dirs.extend(cfg.game_dir.as_deref());
+    let package = match victory_game::identify(&hash) {
         Some(build) => {
             println!("build          {} ({hash})", build.label);
+            let found = find_in(&dirs, build.startup_archive);
+            #[cfg(windows)]
             if execute {
-                let mut dirs = vec![title_dir];
-                dirs.extend(cfg.game_dir.as_deref());
-                check_startup_archive(&dirs, build.startup_archive);
+                check_startup_archive(&dirs, build.startup_archive, found.as_deref());
             }
+            found
+                .and_then(|f| f.parent().map(Path::to_path_buf))
+                .unwrap_or_else(|| package_dir(&dirs))
         }
-        None => println!("build          unknown ({hash})"),
+        None => {
+            println!("build          unknown ({hash})");
+            package_dir(&dirs)
+        }
+    };
+    if package != title_dir {
+        println!("game files     {}", package.display());
     }
 
     let images = cfg.cache_subdir("images")?;
@@ -90,8 +103,9 @@ pub fn run(
     });
     let wanted = |dll: &str| title_dll(&resolver.host, dll);
     // A missing manifest leaves id 0 and no storage quota.
-    let manifest =
-        std::fs::read_to_string(title_dir.join("MicrosoftGame.config")).unwrap_or_default();
+    let manifest = std::fs::read_to_string(title_dir.join("MicrosoftGame.config"))
+        .or_else(|_| std::fs::read_to_string(package.join("MicrosoftGame.config")))
+        .unwrap_or_default();
     let title = victory_hle::runtime::Title::from_manifest(&manifest);
     let storage = cfg.data_subdir(&format!("{:08X}/storage", title.id))?;
     println!(
@@ -101,7 +115,7 @@ pub fn run(
         title.storage_bytes >> 20
     );
     // The console's fixed drives: the package as `G:`, temporary files `T:`.
-    victory_hle::modules::files::mount_at('G', title_dir);
+    victory_hle::modules::files::mount_at('G', &package);
     let temp = cfg.data_subdir(&format!("{:08X}/temp", title.id))?;
     victory_hle::modules::files::mount_at('T', &temp);
     victory_hle::runtime::set_title(victory_hle::runtime::Title { storage, ..title });
@@ -170,15 +184,10 @@ pub fn run(
     Ok(())
 }
 
-/// Checks that the build's startup archive is there before running it, in
-/// the exe's folder or the game folder (any letter case). Only a warning:
-/// a stop here kept titles from starting whose packages lay the archive
-/// out differently, and the title reports a missing archive itself.
-#[cfg(windows)]
-fn check_startup_archive(dirs: &[&Path], name: &str) {
-    use std::io::Read;
-
-    let found = dirs.iter().find_map(|dir| {
+/// The file `name` in the first of `dirs` that holds it, in any letter case.
+#[cfg(any(windows, test))]
+fn find_in(dirs: &[&Path], name: &str) -> Option<std::path::PathBuf> {
+    dirs.iter().find_map(|dir| {
         let exact = dir.join(name);
         if exact.is_file() {
             return Some(exact);
@@ -188,17 +197,40 @@ fn check_startup_archive(dirs: &[&Path], name: &str) {
                 && p.file_name()
                     .is_some_and(|f| f.to_string_lossy().eq_ignore_ascii_case(name))
         })
-    });
+    })
+}
+
+/// The `.rpf` archives directly in `dir`, by name.
+#[cfg(any(windows, test))]
+fn archives(dir: &Path) -> Vec<String> {
+    std::fs::read_dir(dir)
+        .into_iter()
+        .flat_map(|r| r.flatten())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|f| f.to_ascii_lowercase().ends_with(".rpf"))
+        .collect()
+}
+
+/// The package folder of a build whose startup archive was not found: the
+/// first of `dirs` holding archives, else the exe's folder (`dirs[0]`).
+#[cfg(any(windows, test))]
+fn package_dir(dirs: &[&Path]) -> std::path::PathBuf {
+    dirs.iter()
+        .find(|d| !archives(d).is_empty())
+        .unwrap_or(&dirs[0])
+        .to_path_buf()
+}
+
+/// Warns when the build's startup archive is missing or damaged. Only a
+/// warning: a stop here kept titles from starting whose packages lay the
+/// archive out differently, and the title reports a missing archive itself.
+#[cfg(windows)]
+fn check_startup_archive(dirs: &[&Path], name: &str, found: Option<&Path>) {
+    use std::io::Read;
+
     let Some(path) = found else {
         let looked: Vec<String> = dirs.iter().map(|d| d.display().to_string()).collect();
-        let rpfs: Vec<String> = dirs
-            .iter()
-            .filter_map(|d| std::fs::read_dir(d).ok())
-            .flat_map(|r| r.flatten())
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .filter(|f| f.to_ascii_lowercase().ends_with(".rpf"))
-            .take(12)
-            .collect();
+        let rpfs: Vec<String> = dirs.iter().flat_map(|d| archives(d)).take(12).collect();
         eprintln!(
             "warning: startup archive {name} not found in {}; archives there: {}. \
              Starting anyway; if the title stops, give the folder that holds {name} as the game folder.",
@@ -208,7 +240,7 @@ fn check_startup_archive(dirs: &[&Path], name: &str) {
         return;
     };
     let mut magic = [0; 4];
-    let read = std::fs::File::open(&path).and_then(|mut file| file.read_exact(&mut magic));
+    let read = std::fs::File::open(path).and_then(|mut file| file.read_exact(&mut magic));
     match read {
         Err(e) => eprintln!("warning: cannot read startup archive {}: {e}", path.display()),
         Ok(()) if magic != *b"9FPR" => eprintln!(
@@ -216,6 +248,25 @@ fn check_startup_archive(dirs: &[&Path], name: &str) {
             path.display()
         ),
         Ok(()) => {}
+    }
+}
+
+#[cfg(test)]
+mod package_tests {
+    use super::*;
+
+    #[test]
+    fn the_package_is_the_folder_holding_the_archives() {
+        let exe = tempfile::tempdir().unwrap();
+        let game = tempfile::tempdir().unwrap();
+        std::fs::write(game.path().join("AppData0.RPF"), b"9FPR").unwrap();
+        let dirs = [exe.path(), game.path()];
+        let found = find_in(&dirs, "appdata0.rpf").unwrap();
+        assert_eq!(found.parent().unwrap(), game.path());
+        assert_eq!(package_dir(&dirs), game.path());
+        assert_eq!(package_dir(&[exe.path()]), exe.path());
+        std::fs::write(exe.path().join("x.rpf"), b"").unwrap();
+        assert_eq!(package_dir(&dirs), exe.path());
     }
 }
 
