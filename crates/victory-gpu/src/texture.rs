@@ -56,6 +56,151 @@ pub(crate) struct Staging {
     uploaded: std::sync::atomic::AtomicBool,
     /// When a list last recorded a use of it (`crate::host::moment`).
     used: std::sync::atomic::AtomicU64,
+    /// Which of the title's contents each copy and each present carries,
+    /// and in what order ([`present_order`]).
+    present: Present,
+}
+
+/// What a title texture's copies and presents have carried, so that a frame
+/// shown out of order is read off the log rather than argued about: every
+/// detiling of the staging buffer is a content generation (the movie's
+/// frame, when the texture is a movie), the content a list's copy was
+/// queued with is noted when that list runs, and each present says which
+/// content its copy carries beside the newest one the staging buffer holds.
+#[derive(Default)]
+struct Present {
+    /// Contents found (one per detiling), and detilings.
+    contents: std::sync::atomic::AtomicU64,
+    writes: std::sync::atomic::AtomicU64,
+    /// The generation of the copy a list last queued, the detilings there
+    /// had been, and the frame it was queued in.
+    queued: std::sync::atomic::AtomicU64,
+    queued_writes: std::sync::atomic::AtomicU64,
+    queued_in: std::sync::atomic::AtomicU64,
+    /// The generations presented, in order (the newest `SHOWN` of them).
+    #[cfg(feature = "diagnostics")]
+    shown: Mutex<Vec<u64>>,
+    /// Each generation's bytes: (generation, the frame it was found in, a
+    /// label of the bytes), the newest `HISTORY` of them.
+    #[cfg(feature = "diagnostics")]
+    history: Mutex<Vec<(u64, u64, u64)>>,
+}
+
+/// Which content a present of a title texture showed.
+#[cfg(feature = "diagnostics")]
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct Order {
+    /// The content the copy queued for this present carries.
+    pub(crate) content: u64,
+    /// The frame that copy was queued in.
+    pub(crate) queued_in: u64,
+    /// A label of that content's bytes.
+    pub(crate) label: u64,
+    /// The newest content the staging buffer holds, and the frame it was
+    /// found in.
+    pub(crate) staged: u64,
+    pub(crate) staged_in: u64,
+    /// Detilings of the staging buffer since the copy was queued: its
+    /// bytes may be newer than the list that queued it saw.
+    pub(crate) overwritten: u64,
+    /// Presents of this texture, this one included.
+    pub(crate) presents: u64,
+    /// A content no older than this one was shown already: the frame is
+    /// out of the order the title wrote (or the same frame again).
+    pub(crate) back: bool,
+}
+
+impl Present {
+    #[cfg(feature = "diagnostics")]
+    const HISTORY: usize = 16;
+    #[cfg(feature = "diagnostics")]
+    const SHOWN: usize = 32;
+
+    /// A new content was detiled into the staging buffer.
+    fn detiled(&self, tiled: &[u8]) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.contents.fetch_add(1, Relaxed);
+        self.writes.fetch_add(1, Relaxed);
+        #[cfg(feature = "diagnostics")]
+        {
+            let bytes = blake3::hash(tiled);
+            let mut label = [0u8; 8];
+            label.copy_from_slice(&bytes.as_bytes()[..8]);
+            let frame = crate::frame::current();
+            let written = self.contents.load(Relaxed);
+            let mut history = self.history.lock().unwrap_or_else(|e| e.into_inner());
+            history.push((written, frame, u64::from_le_bytes(label)));
+            if history.len() > Self::HISTORY {
+                history.remove(0);
+            }
+        }
+        #[cfg(not(feature = "diagnostics"))]
+        let _ = tiled;
+    }
+
+    /// A list queued a copy of the content now in the staging buffer.
+    fn queued(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.queued_writes.store(self.writes.load(Relaxed), Relaxed);
+        self.queued_in.store(crate::frame::current(), Relaxed);
+        self.queued.store(self.contents.load(Relaxed), Relaxed);
+    }
+
+    /// Whether the title's newest content is one no submitted list uploaded:
+    /// what a present must put up itself, or show a copy behind.
+    fn behind(&self) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.queued.load(Relaxed) != self.contents.load(Relaxed)
+    }
+
+    /// What the present now shows (`filled`: the present put up the newest
+    /// content itself), and how it compares with what was shown before.
+    #[cfg(feature = "diagnostics")]
+    fn order(&self, filled: bool) -> Order {
+        use std::sync::atomic::Ordering::Relaxed;
+        let staged = self.contents.load(Relaxed);
+        let content = if filled {
+            staged
+        } else {
+            self.queued.load(Relaxed)
+        };
+        let (staged_in, label) = {
+            let history = self.history.lock().unwrap_or_else(|e| e.into_inner());
+            history
+                .iter()
+                .find(|&&(g, _, _)| g == content)
+                .map_or((0, 0), |&(_, frame, label)| (frame, label))
+        };
+        let mut shown = self.shown.lock().unwrap_or_else(|e| e.into_inner());
+        let back = shown.iter().any(|&g| g >= content);
+        let presents = shown.len() as u64 + 1;
+        shown.push(content);
+        if shown.len() > Self::SHOWN {
+            shown.remove(0);
+        }
+        Order {
+            content,
+            queued_in: self.queued_in.load(Relaxed),
+            label,
+            staged,
+            staged_in,
+            overwritten: self
+                .writes
+                .load(Relaxed)
+                .saturating_sub(self.queued_writes.load(Relaxed)),
+            presents,
+            back,
+        }
+    }
+}
+
+/// Whether a present's content is logged frame by frame
+/// (`VICTORY_TEXTURE_ORDER=1`): the order of the movie's frames, from the
+/// run itself.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn order_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_ORDER").is_some_and(|v| v == "1"))
 }
 
 /// What a texture's staging buffer holds: the hash of the memory detiled
@@ -66,7 +211,42 @@ struct Last {
     asked: u64,
     /// The frame a partly mapped texture was last read in.
     partial: Option<u64>,
+    /// The guard said "not written" and this check hashed anyway (the
+    /// texture's turn); a changed hash then is a write the guard missed.
+    checked: bool,
+    /// A write the guard missed was found: the texture is hashed at every
+    /// check from then on. A movie's frames, written by the title into view
+    /// memory every frame, were refreshed one frame in eight (older frames
+    /// shown again and again).
+    missed: bool,
 }
+
+impl Last {
+    /// `hash` is not the hash of the last read: what the guard let pass
+    /// as unwritten was written.
+    fn changed(&mut self, hash: blake3::Hash) {
+        if self.checked && self.hash.is_some() && !self.missed {
+            self.missed = true;
+            // Told once per texture, so a run says whether the guard misses
+            // writes at all (the intro: the movie's frames) and what it
+            // costs to stop trusting it there.
+            static SAID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = MISSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+                tracing::warn!(
+                    n,
+                    "a texture was written while the view guard said it was not: hashed at every check from now on (VICTORY_TEXTURE_GUARD_TRUST=1 does not learn this)"
+                );
+            }
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::TexGuardMissed, 1);
+        }
+        self.hash = Some(hash);
+    }
+}
+
+/// Textures found written while the guard said they were not.
+pub(crate) static MISSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 // SAFETY: the staging mapping is written only at submission, under
 // `last`'s lock; the title memory is only read.
@@ -615,8 +795,8 @@ pub(crate) fn title_written(texture: &ID3D12Resource) -> bool {
 /// Records, once per list, the copy of `resource`'s staging buffer into
 /// its host copy, and the detiling that refreshes the staging buffer at
 /// submission if the memory changed. Leaves the texture in the copy
-/// destination state.
-pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) {
+/// destination state. Whether a copy was recorded.
+pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) -> bool {
     let host_written = HOST_WRITTEN
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -625,10 +805,10 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     // shortcut: a texture the host copied into keeps the host's contents
     // even if the title later writes its memory too.
     if host_written || !list.first_use(resource as usize) {
-        return;
+        return false;
     }
     let Some(staging) = staging(resource, texture) else {
-        return;
+        return false;
     };
     use std::sync::atomic::Ordering::Relaxed;
     staging.used.store(crate::host::moment(), Relaxed);
@@ -640,7 +820,7 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexSkipped, 1);
         list.defer_texture(staging);
-        return;
+        return false;
     }
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::TexUploads, 1);
@@ -706,7 +886,14 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
         });
     }
     // Once per submission however many of its lists sample the texture.
-    list.defer_texture(staging);
+    list.defer_texture(staging.clone());
+    // Diagnostics: when this list runs, its copy carries whatever content
+    // the refresh above just found -- noted after that refresh, so a
+    // present can say which content it shows and whether a detiling has
+    // replaced those bytes since.
+    #[cfg(feature = "diagnostics")]
+    list.defer_host(move || staging.present.queued());
+    true
 }
 
 impl Staging {
@@ -772,7 +959,11 @@ impl Staging {
             let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
             last.asked = now;
             let turn = crate::frame::current().wrapping_add((start >> 16) as u64).is_multiple_of(HASH_EVERY);
-            if unwritten && !turn {
+            last.checked = unwritten && turn;
+            // `VICTORY_TEXTURE_GUARD_TRUST=1`: a missed write is not learnt from.
+            static TRUST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            let trust = *TRUST.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_GUARD_TRUST").is_some_and(|v| v == "1"));
+            if unwritten && !turn && (trust || !last.missed) {
                 return 0;
             }
         }
@@ -821,7 +1012,7 @@ impl Staging {
                 if last.hash == Some(hash) {
                     return false;
                 }
-                last.hash = Some(hash);
+                last.changed(hash);
                 if read.iter().all(|&b| b == 0) {
                     return false;
                 }
@@ -845,7 +1036,7 @@ impl Staging {
                 if last.hash == Some(hash) {
                     return size;
                 }
-                last.hash = Some(hash);
+                last.changed(hash);
                 self.detile(tiled);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
@@ -904,7 +1095,8 @@ impl Staging {
             if last.hash == Some(hash) {
                 return false;
             }
-            last.hash = Some(hash);
+            // Learnt from a write the guard missed (`intro-fix`), and counted.
+            last.changed(hash);
             self.detile(tiled);
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
@@ -946,6 +1138,8 @@ impl Staging {
     /// Detiles `tiled` (the texture's memory) into the staging buffer.
     fn detile(&self, tiled: &[u8]) {
         self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+        #[cfg(feature = "diagnostics")]
+        self.present.detiled(tiled);
         #[cfg(feature = "diagnostics")]
         if tiled.iter().all(|&b| b == 0) {
             tracing::debug!(
@@ -1154,6 +1348,70 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
     there
 }
 
+/// Whether the texture the title is about to show has the title's newer
+/// bytes still to be put up: `Some(true)` if a staging for it exists and
+/// holds bytes no submitted list uploaded yet (`dirty` since the last
+/// upload), `Some(false)` if it exists and is up to date, `None` if its
+/// contents never come from title memory (the host renders to it). For the
+/// present, which shows our copy of it either way: the run's
+/// "written behind the guard" and the present line say whether a movie's
+/// frames are ever a submission late.
+pub(crate) fn present_pending(resource: This) -> Option<bool> {
+    let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+    let staging = map.as_ref()?.get(&(resource as usize))?;
+    use std::sync::atomic::Ordering::Relaxed;
+    Some(staging.dirty.load(Relaxed) && !staging.uploaded.load(Relaxed))
+}
+
+/// Which content a present of `resource` shows beside the newest the
+/// title's memory holds (`None` if its contents never come from title
+/// memory): logged frame by frame with `VICTORY_TEXTURE_ORDER=1`, and
+/// counted in the frame line whether it was shown out of order or with the
+/// staging rewritten since its copy was queued.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn present_order(resource: This, filled: bool) -> Option<Order> {
+    let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+    let staging = map.as_ref()?.get(&(resource as usize))?.clone();
+    drop(map);
+    Some(staging.present.order(filled))
+}
+
+/// `VICTORY_PRESENT_FILL=0` leaves the present showing what the title's
+/// lists uploaded (the run then measures the old path).
+fn fill_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PRESENT_FILL").is_none_or(|v| v != "0"))
+}
+
+/// Whether the present of `resource` must put the title's newest content up
+/// itself: its staging holds a content no submitted list uploaded (the
+/// list that sampled it was recorded before the refresh found it, so what
+/// the title's lists uploaded is a frame behind -- with two textures taking
+/// turns, frames out of order).
+pub(crate) fn present_fill_pending(resource: This) -> bool {
+    if !fill_on() {
+        return false;
+    }
+    let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+    map.as_ref()
+        .and_then(|map| map.get(&(resource as usize)))
+        .is_some_and(|staging| staging.present.behind())
+}
+
+/// Records in the present's own list (in order with the copy to the back
+/// buffer, and before it) the refresh of `resource`'s staging buffer and
+/// the copy of it into the host copy: what [`present_fill_pending`] asked
+/// for. `texture` must be in the copy destination state; the caller moves
+/// it on to the copy source state, as [`upload`] leaves it.
+pub(crate) fn present_fill(list: &HostList, resource: This, texture: &ID3D12Resource) -> bool {
+    let filled = upload(list, resource, texture);
+    #[cfg(feature = "diagnostics")]
+    if filled {
+        crate::copystat::add(crate::copystat::C::PresentRefilled, 1);
+    }
+    filled
+}
+
 /// The staging state of a title texture, made on first use.
 fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
@@ -1223,6 +1481,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         dirty: std::sync::atomic::AtomicBool::new(true),
         uploaded: std::sync::atomic::AtomicBool::new(false),
         used: std::sync::atomic::AtomicU64::new(crate::host::moment()),
+        present: Present::default(),
     });
     map.insert(resource as usize, s.clone());
     Some(s)
@@ -1380,5 +1639,88 @@ mod title_memory_tests {
                 assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod guard_tests {
+    use super::Last;
+
+    #[test]
+    fn a_change_the_guard_let_pass_makes_the_texture_hashed_every_check() {
+        let (a, b) = (blake3::hash(b"a"), blake3::hash(b"b"));
+        let mut last = Last::default();
+        last.changed(a);
+        assert!(!last.missed);
+        // A turn's hash that finds a change after the guard said unwritten.
+        last.checked = true;
+        last.changed(b);
+        assert!(last.missed);
+        assert_eq!(last.hash, Some(b));
+    }
+
+    #[test]
+    fn a_first_read_or_a_checked_turn_without_a_change_is_not_a_miss() {
+        let mut last = Last {
+            checked: true,
+            ..Default::default()
+        };
+        last.changed(blake3::hash(b"a"));
+        assert!(!last.missed);
+    }
+}
+
+#[cfg(test)]
+mod present_tests {
+    use super::Present;
+
+    /// The content a copy queued is behind the staging buffer's once the
+    /// title writes again and it is detiled: what the present must put up
+    /// itself.
+    #[test]
+    fn a_detiling_after_a_copy_leaves_it_behind() {
+        let p = Present::default();
+        assert!(
+            !p.behind(),
+            "no copy queued and no content: nothing to put up"
+        );
+        p.detiled(b"frame 1");
+        assert!(p.behind(), "a content no copy carries yet");
+        p.queued();
+        assert!(!p.behind());
+        p.detiled(b"frame 2");
+        assert!(p.behind(), "the title wrote the next frame");
+        p.queued();
+        assert!(!p.behind());
+    }
+
+    /// A content shown when a newer one was shown already is out of order;
+    /// a film shown in order never goes back.
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn shown_content_that_goes_back_is_counted() {
+        let p = Present::default();
+        let mut order = Vec::new();
+        for (i, bytes) in [b"1", b"2", b"3"].iter().enumerate() {
+            p.detiled(*bytes);
+            p.queued();
+            let o = p.order(false);
+            assert_eq!(o.content, i as u64 + 1);
+            assert_eq!(o.staged, o.content);
+            assert!(!o.back, "in order");
+            order.push(o.presents);
+        }
+        assert_eq!(order, [1, 2, 3]);
+        // The second frame shown again, as a copy a submission behind
+        // would: the content goes back.
+        p.queued();
+        let o = p.order(false);
+        assert!(o.back);
+        // And one the present put up itself is the newest, never back.
+        p.detiled(b"4");
+        let o = p.order(true);
+        assert_eq!(o.content, 4);
+        assert_eq!(o.staged, 4);
+        assert!(!o.back);
     }
 }

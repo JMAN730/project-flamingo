@@ -176,12 +176,19 @@ pub(crate) extern "system" fn wait(
     // tick that passed: sleeping on to the next one cost 17 ms of every
     // 730 ms frame (run 58: "2.0 frame waits sleeping 16.8 ms"). Polls (a
     // time-out shorter than a tick) answer as before.
+    // Not the origin wait: it hands out the frame's token, and ending two
+    // of them on one passed tick starts two frames together, whose work
+    // (the intro's movie uploads among it) then interleaves -- jman's
+    // `fe1e6caf` ends a late wait on the tick it missed for the flip and
+    // the vblank only, and the frame waits sleep to the next tick as
+    // before.
     // `VICTORY_LATE_WAITS=1` sleeps to the next tick, as before.
     static SLEEP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if !crate::switches::b(
         "VICTORY_LATE_WAITS",
         *SLEEP.get_or_init(|| std::env::var_os("VICTORY_LATE_WAITS").is_some_and(|v| v == "1")),
-    ) && limit >= wait
+    ) && !origin
+        && limit >= wait
         && tick > last(kind).load(Ordering::Relaxed) + 1
     {
         tick -= 1;
