@@ -15,9 +15,12 @@
 
 $ErrorActionPreference = 'Continue'
 $ProgressPreference = 'SilentlyContinue'
-$TryVersion = '1.9'
+$TryVersion = '2.0'
 $ForkUrl = 'https://github.com/MfDev0/victory.git'
 $Branch = 'arena/59fabb00-victory'
+# Other places the fork may live (renamed to CAtez, or a backup copy), tried
+# when the fork itself cannot be reached.
+$MirrorUrls = @('https://github.com/MfDev0/CAtez.git', 'https://github.com/MfDev0/CAtez-backup.git')
 $UpstreamUrl = 'https://github.com/Marvisak/VIctory.git'
 $MinGitUrl = 'https://github.com/git-for-windows/git/releases/download/v2.56.1.windows.1/MinGit-2.56.1-64-bit.zip'
 $TryHome = Join-Path $env:LOCALAPPDATA 'VIctoryTry'
@@ -25,6 +28,7 @@ $Src = Join-Path $TryHome 'victory'
 $Target = Join-Path $TryHome 'target'
 $ConfigPath = Join-Path $TryHome 'config.json'
 $LogDir = Join-Path $TryHome 'logs'
+$BackupDir = Join-Path $TryHome 'backup'
 New-Item -ItemType Directory -Force -Path $TryHome, $LogDir | Out-Null
 try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
 try { $Host.UI.RawUI.WindowTitle = 'VIctory Try' } catch {}
@@ -247,10 +251,36 @@ function Update-Source {
     if ((Test-Path $Src) -and -not (Test-Path (Join-Path $Src '.git'))) { Remove-Item -Recurse -Force $Src }
     if (-not (Test-Path $Src)) {
         & $script:Git -c core.autocrlf=false clone -q --single-branch --branch $Branch $ForkUrl $Src
-        if ($LASTEXITCODE -ne 0) { Bad 'could not download the source: check the internet connection'; return $null }
+        if ($LASTEXITCODE -ne 0) {
+            # The fork is gone or unreachable: a mirror, else the newest backup.
+            $sources = @($MirrorUrls)
+            if (Test-Path $BackupDir) {
+                $sources += @(Get-ChildItem -Path $BackupDir -Filter 'catez-*.bundle' |
+                    Sort-Object LastWriteTime -Descending | ForEach-Object { $_.FullName })
+            }
+            foreach ($from in $sources) {
+                if (Test-Path $Src) { Remove-Item -Recurse -Force $Src }
+                if ($from -like '*.bundle') {
+                    & $script:Git init -q $Src
+                    & $script:Git -C $Src remote add origin $ForkUrl
+                    & $script:Git -C $Src fetch -q $from '+refs/remotes/origin/fork:refs/remotes/origin/fork'
+                } else {
+                    & $script:Git -c core.autocrlf=false clone -q --single-branch --branch $Branch $from $Src
+                }
+                if ($LASTEXITCODE -eq 0) { Say "the source came from $from"; break }
+            }
+            if ($LASTEXITCODE -ne 0) { Bad 'could not download the source: check the internet connection'; return $null }
+        }
     }
     $null = G fetch -q origin "+refs/heads/${Branch}:refs/remotes/origin/fork"
-    if ($script:GCode -ne 0) { Say 'could not reach the fork: using what was downloaded before' }
+    if ($script:GCode -ne 0) {
+        foreach ($m in $MirrorUrls) {
+            $null = G fetch -q $m "+refs/heads/${Branch}:refs/remotes/origin/fork"
+            if ($script:GCode -eq 0) { Say "the fork came from $m"; break }
+        }
+        if ($script:GCode -ne 0) { Say 'could not reach the fork: using what was downloaded before (and the backups in backup)' }
+    }
+    Save-Backup
     $null = G fetch -q $UpstreamUrl '+refs/heads/main:refs/remotes/upstream/main'
     if ($script:GCode -ne 0) { Say 'could not reach upstream VIctory: building the fork without its new fixes' }
     $fork = (G rev-parse -q --verify refs/remotes/origin/fork) | Select-Object -First 1
@@ -263,6 +293,28 @@ function Update-Source {
     }
     $script:Key = $key
     return $true
+}
+
+# Keeps a copy of the whole fork history on this PC, one file per version
+# (backup\catez-<commit>.bundle, the newest 5), so the fork survives even if
+# GitHub loses it: `git clone catez-<commit>.bundle CAtez` gives it back.
+function Save-Backup {
+    $fork = (G rev-parse -q --short=10 --verify refs/remotes/origin/fork) | Select-Object -First 1
+    if (-not $fork) { return }
+    New-Item -ItemType Directory -Force -Path $BackupDir | Out-Null
+    $file = Join-Path $BackupDir "catez-$fork.bundle"
+    if (-not (Test-Path $file)) {
+        $tmp = "$file.part"
+        $null = G bundle create -q $tmp "refs/remotes/origin/fork"
+        if ($script:GCode -eq 0 -and (Test-Path $tmp)) {
+            Move-Item -Force $tmp $file
+            Say "fork backed up: $file"
+        } else {
+            Remove-Item -Force -ErrorAction SilentlyContinue $tmp
+        }
+    }
+    Get-ChildItem -Path $BackupDir -Filter 'catez-*.bundle' | Sort-Object LastWriteTime -Descending |
+        Select-Object -Skip 5 | Remove-Item -Force -ErrorAction SilentlyContinue
 }
 
 # Puts the fork in the source folder, then upstream's commits that came after
