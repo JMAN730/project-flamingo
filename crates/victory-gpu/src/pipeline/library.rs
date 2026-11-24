@@ -207,8 +207,9 @@ pub(crate) fn name(kind: &str, root: &[u8], code: &[&[u8]], state: &str) -> Stri
 pub(crate) fn pipeline(
     name: &str,
     load: impl FnOnce(&ID3D12PipelineLibrary1, PCWSTR) -> windows::core::Result<ID3D12PipelineState>,
-    create: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
+    create: impl Fn() -> windows::core::Result<ID3D12PipelineState>,
 ) -> windows::core::Result<ID3D12PipelineState> {
+    let create = || retry_out_of_memory(&create);
     let wide = HSTRING::from(name);
     let Some(library) = library() else {
         MADE.fetch_add(1, Ordering::Relaxed);
@@ -237,6 +238,32 @@ pub(crate) fn pipeline(
         l.added += 1;
     }
     Ok(pso)
+}
+
+/// `create`, again (one worker at a time, after a pause) while the driver
+/// answers E_OUTOFMEMORY: with a thousand pipelines compiling on every
+/// worker at once the driver's compiler runs out of memory for some (4 of
+/// 1,100 in the world on an RTX 4060), which then dropped their draws for
+/// the whole run.
+fn retry_out_of_memory(
+    create: &impl Fn() -> windows::core::Result<ID3D12PipelineState>,
+) -> windows::core::Result<ID3D12PipelineState> {
+    const E_OUTOFMEMORY: windows::core::HRESULT = windows::core::HRESULT(0x8007_000E_u32 as i32);
+    static ALONE: Mutex<()> = Mutex::new(());
+    let mut made = create();
+    for pause in [100, 400, 1600] {
+        match &made {
+            Err(e) if e.code() == E_OUTOFMEMORY => {}
+            _ => break,
+        }
+        let _alone = ALONE.lock().unwrap_or_else(|e| e.into_inner());
+        std::thread::sleep(std::time::Duration::from_millis(pause));
+        made = create();
+        if made.is_ok() {
+            tracing::info!(pause, "a host pipeline made on a retry after running out of memory");
+        }
+    }
+    made
 }
 
 /// Writes the library and the early list if pipelines were added since the

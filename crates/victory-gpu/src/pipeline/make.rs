@@ -105,12 +105,31 @@ static DONE: (Mutex<()>, Condvar) = (Mutex::new(()), Condvar::new());
 /// `VICTORY_PIPELINE_WAIT_MS` says otherwise (0: never wait, a draw whose
 /// pipeline is not made yet is dropped until it is; one-off passes such as
 /// a colour-grading bake may then be lost).
+///
+/// Without the variable, a long backlog (the world's first frames queue
+/// over a thousand) cuts the budget to [`BACKLOG_BUDGET_MS`]: waiting does
+/// not make the workers faster, and half a second per frame held the world
+/// at 1 fps for minutes while they caught up (RTX 4060, 955-1,101 being
+/// made). Frames go on with what is made; the rest comes in as it is.
 fn budget() -> Duration {
-    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    Duration::from_millis(*MS.get_or_init(|| {
-        std::env::var("VICTORY_PIPELINE_WAIT_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(500)
+    static MS: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    let set = *MS.get_or_init(|| {
+        std::env::var("VICTORY_PIPELINE_WAIT_MS").ok().and_then(|v| v.trim().parse().ok())
+    });
+    Duration::from_millis(set.unwrap_or_else(|| {
+        if REQUESTED_WAITING.load(Ordering::Relaxed) > BACKLOG { BACKLOG_BUDGET_MS } else { 500 }
     }))
 }
+
+/// Pipelines a draw or dispatch asked for and not made yet (those queued
+/// early, at creation, during loading, do not count: the menus' one-off
+/// passes keep their whole budget then).
+static REQUESTED_WAITING: AtomicU64 = AtomicU64::new(0);
+
+/// Requested pipelines waiting past which the budget is [`BACKLOG_BUDGET_MS`].
+const BACKLOG: u64 = 64;
+/// The budget per frame while the backlog is long.
+const BACKLOG_BUDGET_MS: u64 = 33;
 
 /// Pipelines queued and not made yet.
 static WAITING: AtomicU64 = AtomicU64::new(0);
@@ -194,6 +213,7 @@ impl Queue {
         }
         p.queue_state.store(priority, Ordering::Relaxed);
         if priority == REQUESTED {
+            REQUESTED_WAITING.fetch_add(1, Ordering::Relaxed);
             self.requested.push_back(p.clone());
         } else {
             self.early.push_back(p.clone());
@@ -202,7 +222,10 @@ impl Queue {
     }
 
     fn pop(&mut self) -> Option<Arc<Pending>> {
-        let p = self.requested.pop_front().or_else(|| {
+        let p = self.requested.pop_front().inspect(|_| {
+            REQUESTED_WAITING.fetch_sub(1, Ordering::Relaxed);
+        });
+        let p = p.or_else(|| {
             // An early entry can have been promoted and claimed already.
             std::iter::from_fn(|| self.early.pop_front())
                 .find(|p| p.queue_state.load(Ordering::Relaxed) == EARLY)
