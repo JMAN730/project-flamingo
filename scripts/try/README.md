@@ -6,16 +6,30 @@ two paths: the game files folder and the game's exe. That's all.
 
 It doesn't sign in to anything and doesn't send anything anywhere. It only
 downloads things anonymously:
-- this fork's source code, as a zip;
-- the first time only, the two tools building needs: Rust and Microsoft's
-  C++ Build Tools (a few GB; Windows asks for permission once).
+- this fork's source code, and upstream VIctory's new commits;
+- the first time only, the tools building needs: Git (a portable copy if you
+  have none), Rust and Microsoft's C++ Build Tools (a few GB; Windows asks
+  for permission once).
+
+## Upstream's new fixes, added by themselves
+
+Each time it updates, VIctory Try also fetches upstream VIctory
+(Marvisak/VIctory). [`upstream.txt`](upstream.txt) names the last upstream
+commit this fork already has. Every later upstream commit is applied on top
+of the fork, oldest first:
+- a fix the fork already has applies as an empty change and is skipped;
+- a fix that clashes with the fork's changes is skipped;
+- if the build fails with the new fixes added, the fork is built alone, so
+  you always get a working build.
+
+The window lists what was added and what was skipped.
 
 ## What it does
 
 1. Asks for the game folder and the game exe, and remembers them. If the
    folder holds several exe files, it lists them so you can pick one by number.
 2. Installs Rust and the C++ Build Tools if they are missing.
-3. Downloads the newest source and builds `victory.exe`. The first build takes
+3. Downloads the newest source, adds upstream's new fixes, and builds `victory.exe`. The first build takes
    a while; after that it only rebuilds when the source changed.
 4. Runs `victory.exe run <game exe> --execute` and shows the output.
 5. When the game stops, you choose what's next:

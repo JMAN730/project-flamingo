@@ -1,0 +1,12 @@
+# Upstream VIctory (Marvisak/VIctory, main) as this branch has it. VIctory Try
+# reads this to add only upstream's NEW fixes to what it builds:
+#
+#   synced <commit>   everything on upstream main up to this commit is in
+#                     this branch already (merged, cherry-picked or ported);
+#   have <commit>     a later upstream commit that is in this branch already.
+#
+# Each upstream commit after "synced" that is not a "have" is applied on top
+# of this branch, oldest first. One already here applies as an empty change
+# and is skipped; one that conflicts is skipped too. Update this file when
+# upstream work is brought into the branch.
+synced ffe310eb2098e52169f4c44db5ffdabf43a72622

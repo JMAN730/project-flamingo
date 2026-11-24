@@ -2,15 +2,24 @@
 # it. Started by VIctoryTry.exe (see scripts/try/README.md).
 #
 # Nothing is sent anywhere: no sign-in, no reports, no accounts. It only
-# downloads (anonymously) the fork's source as a zip and, the first time, Rust
-# and Microsoft's C++ build tools, which building needs.
+# downloads (anonymously) the fork's source, upstream VIctory's new commits
+# and, the first time, Git, Rust and Microsoft's C++ build tools.
+#
+# Upstream's new fixes are added by themselves: the branch's
+# scripts/try/upstream.txt names the last upstream commit the fork already
+# has; each later one is applied on top, oldest first. Ones already in the
+# fork (empty) or conflicting are skipped, and if the build fails with them
+# the fork is built alone.
 #
 # ASCII only: Windows PowerShell 5.1 reads a script without a BOM as ANSI.
 
 $ErrorActionPreference = 'Continue'
 $ProgressPreference = 'SilentlyContinue'
-$TryVersion = '1.0'
-$SourceZip = 'https://codeload.github.com/MfDev0/victory/zip/refs/heads/arena/59fabb00-victory'
+$TryVersion = '1.1'
+$ForkUrl = 'https://github.com/MfDev0/victory.git'
+$Branch = 'arena/59fabb00-victory'
+$UpstreamUrl = 'https://github.com/Marvisak/VIctory.git'
+$MinGitUrl = 'https://github.com/git-for-windows/git/releases/download/v2.56.1.windows.1/MinGit-2.56.1-64-bit.zip'
 $TryHome = Join-Path $env:LOCALAPPDATA 'VIctoryTry'
 $Src = Join-Path $TryHome 'victory'
 $Target = Join-Path $TryHome 'target'
@@ -25,11 +34,11 @@ function Step([string]$msg) { Write-Host ''; Write-Host ('== ' + $msg) -Foregrou
 function Bad([string]$msg) { Write-Host ('  ' + $msg) -ForegroundColor Red }
 
 function Load-Config {
-    $c = @{ game_dir = ''; game_exe = ''; source_hash = '' }
+    $c = @{ game_dir = ''; game_exe = ''; built_key = ''; added = '' }
     if (Test-Path $ConfigPath) {
         try {
             $j = Get-Content -Path $ConfigPath -Raw | ConvertFrom-Json
-            foreach ($k in @('game_dir', 'game_exe', 'source_hash')) { if ($j.$k) { $c[$k] = [string]$j.$k } }
+            foreach ($k in @('game_dir', 'game_exe', 'built_key', 'added')) { if ($j.$k) { $c[$k] = [string]$j.$k } }
         } catch {}
     }
     return $c
@@ -119,6 +128,32 @@ function Has-Msvc {
     return [bool]$found
 }
 
+# Git, to fetch the fork and upstream and apply upstream's new commits: the
+# installed one, else a portable MinGit kept in our folder.
+function Ensure-Git {
+    $sys = Find-Exe 'git'
+    if ($sys) { $script:Git = $sys; return $true }
+    $mine = Join-Path $TryHome 'mingit\cmd\git.exe'
+    if (-not (Test-Path $mine)) {
+        Step 'Getting a portable Git (first time only, about 40 MB)'
+        $zip = Join-Path $TryHome 'mingit.zip'
+        if (Download $MinGitUrl $zip) {
+            try { Expand-Archive -LiteralPath $zip -DestinationPath (Join-Path $TryHome 'mingit') -Force } catch { Bad "could not unpack Git: $_" }
+            Remove-Item -Force $zip -ErrorAction SilentlyContinue
+        }
+    }
+    if (Test-Path $mine) { $script:Git = $mine; return $true }
+    Bad 'Git is missing and could not be downloaded. Check the internet connection and start again.'
+    return $false
+}
+
+# Runs git in the source folder; the exit code lands in $script:GCode.
+function G {
+    $out = @(& $script:Git -C $Src -c core.autocrlf=false -c advice.detachedHead=false @args 2>&1 | ForEach-Object { "$_" })
+    $script:GCode = $LASTEXITCODE
+    return $out
+}
+
 function Ensure-Tools {
     Refresh-Path
     if (-not (Has-Msvc)) {
@@ -134,6 +169,7 @@ function Ensure-Tools {
             return $false
         }
     }
+    if (-not (Ensure-Git)) { return $false }
     if (-not (Find-Exe 'rustup')) {
         Step 'Installing Rust (first time only)'
         $ri = Join-Path $TryHome 'rustup-init.exe'
@@ -151,32 +187,72 @@ function Ensure-Tools {
 
 # ------------------------------------------------------------- build
 
-# Downloads the newest source; returns $true when it changed (or is new).
+# Fetches the fork and upstream; returns $true when there is something new to
+# build, $false when not, $null when there is no source at all.
 function Update-Source {
-    Step 'Getting the newest VIctory source'
-    $zip = Join-Path $TryHome 'source.zip'
-    if (-not (Download $SourceZip $zip)) {
-        if (Test-Path (Join-Path $Src 'Cargo.toml')) { Say 'using the source downloaded last time'; return $false }
-        return $null
+    Step 'Getting the newest VIctory (this fork, plus upstream''s new fixes)'
+    if ((Test-Path $Src) -and -not (Test-Path (Join-Path $Src '.git'))) { Remove-Item -Recurse -Force $Src }
+    if (-not (Test-Path $Src)) {
+        & $script:Git -c core.autocrlf=false clone -q --single-branch --branch $Branch $ForkUrl $Src
+        if ($LASTEXITCODE -ne 0) { Bad 'could not download the source: check the internet connection'; return $null }
     }
-    $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $zip).Hash
-    if (($hash -eq $script:Config.source_hash) -and (Test-Path (Join-Path $Src 'Cargo.toml'))) {
+    $null = G fetch -q origin "+refs/heads/${Branch}:refs/remotes/origin/fork"
+    if ($script:GCode -ne 0) { Say 'could not reach the fork: using what was downloaded before' }
+    $null = G fetch -q $UpstreamUrl '+refs/heads/main:refs/remotes/upstream/main'
+    if ($script:GCode -ne 0) { Say 'could not reach upstream VIctory: building the fork without its new fixes' }
+    $fork = (G rev-parse -q --verify refs/remotes/origin/fork) | Select-Object -First 1
+    if (-not $fork) { Bad "the source download is broken: delete the victory folder in $TryHome and start again"; return $null }
+    $up = (G rev-parse -q --verify refs/remotes/upstream/main) | Select-Object -First 1
+    $key = "$fork+$up"
+    if (($key -eq $script:Config.built_key) -and (Test-Path (Victory-Exe))) {
         Say 'no changes since last time'
         return $false
     }
-    $tmp = Join-Path $TryHome 'unpack'
-    if (Test-Path $tmp) { Remove-Item -Recurse -Force $tmp }
-    try { Expand-Archive -LiteralPath $zip -DestinationPath $tmp -Force }
-    catch { Bad "could not unpack the source: $_"; return $null }
-    $top = Get-ChildItem -LiteralPath $tmp -Directory | Select-Object -First 1
-    if (-not $top) { Bad 'the source zip is empty'; return $null }
-    if (Test-Path $Src) { Remove-Item -Recurse -Force $Src }
-    Move-Item -LiteralPath $top.FullName -Destination $Src
-    Remove-Item -Recurse -Force $tmp
-    $script:Config.source_hash = $hash
-    Save-Config
-    Say 'new source unpacked'
+    $script:Key = $key
     return $true
+}
+
+# Puts the fork in the source folder, then upstream's commits that came after
+# what the fork has (scripts/try/upstream.txt). Returns the added subjects.
+function Prepare-Source([bool]$withUpstream) {
+    $null = G cherry-pick --abort
+    $null = G checkout -q -f -B try refs/remotes/origin/fork
+    $null = G clean -fdq
+    $added = @()
+    if (-not $withUpstream) { return , $added }
+    $up = (G rev-parse -q --verify refs/remotes/upstream/main) | Select-Object -First 1
+    if (-not $up) { return , $added }
+    $marker = Join-Path $Src 'scripts\try\upstream.txt'
+    $synced = ''; $have = @{}
+    if (Test-Path $marker) {
+        foreach ($line in Get-Content -LiteralPath $marker) {
+            if ($line -match '^\s*synced\s+([0-9a-f]{7,40})') { $synced = $Matches[1] }
+            elseif ($line -match '^\s*have\s+([0-9a-f]{7,40})') { $have[$Matches[1]] = $true }
+        }
+    }
+    if (-not $synced) { Say 'the fork does not say which upstream commits it has: not adding any'; return , $added }
+    $null = G merge-base --is-ancestor $synced $up
+    if ($script:GCode -ne 0) { Say 'upstream history changed: not adding its commits this time'; return , $added }
+    $new = @(G rev-list --reverse --first-parent "$synced..$up")
+    if ($new.Count -eq 0) { Say 'upstream VIctory has nothing new beyond this fork'; return , $added }
+    Say "upstream VIctory has $($new.Count) new commit(s) beyond this fork"
+    foreach ($sha in $new) {
+        $known = $false
+        foreach ($h in $have.Keys) { if ($sha.StartsWith($h)) { $known = $true } }
+        $subject = (G log -1 --format=%s $sha) | Select-Object -First 1
+        if ($known) { Say "  have already: $subject"; continue }
+        $parents = @(((G rev-list --parents -n 1 $sha) | Select-Object -First 1) -split ' ').Count - 1
+        $pick = @('-c', 'user.name=VIctory Try', '-c', 'user.email=try@localhost', 'cherry-pick', '-x')
+        if ($parents -gt 1) { $pick += @('-m', '1') }
+        $null = G @pick $sha
+        if ($script:GCode -eq 0) { Say "  added: $subject"; $added += $subject; continue }
+        $conflict = @(G diff --name-only --diff-filter=U).Count -gt 0
+        $null = G cherry-pick --abort
+        $null = G reset -q --hard
+        if ($conflict) { Say "  skipped (clashes with this fork's changes): $subject" }
+        else { Say "  have already: $subject" }
+    }
+    return , $added
 }
 
 function Victory-Exe { return Join-Path $Target 'release\victory.exe' }
@@ -208,12 +284,34 @@ function Build {
     return $true
 }
 
+# The fork with upstream's new fixes; if that does not build, the fork alone.
+function Build-All {
+    $added = @(Prepare-Source $true)
+    $ok = Build
+    if (-not $ok -and $added.Count -gt 0) {
+        Bad "the build failed with upstream's new fixes added: building this fork without them"
+        $added = @()
+        $null = Prepare-Source $false
+        $ok = Build
+    }
+    if ($ok) {
+        $script:Config.built_key = $script:Key
+        $script:Config.added = ($added -join "`n")
+        Save-Config
+        if ($added.Count -gt 0) { Say "this build includes $($added.Count) new upstream fix(es)" }
+    }
+    return $ok
+}
+
 # ------------------------------------------------------------- run
 
 function Run-Game {
     $c = $script:Config
     Step 'Running the game with VIctory'
     Say "game: $($c.game_exe)"
+    $build = (G log -1 --format='%h %s' refs/remotes/origin/fork) | Select-Object -First 1
+    if ($build) { Say "VIctory: fork at $build" }
+    if ($c.added) { Say "plus upstream: $(@($c.added -split "`n").Count) new fix(es) on top" }
     Say 'To stop: close the game window. (Ctrl+C closes VIctory Try too.)'
     $env:VICTORY_GAME_DIR = $c.game_dir
     $env:RUST_BACKTRACE = '1'
@@ -235,7 +333,8 @@ function Run-Game {
 
 Write-Host ''
 Write-Host "  VIctory Try $TryVersion" -ForegroundColor Green
-Say 'Builds the newest VIctory from MfDev0/victory on this PC and runs your game.'
+Say 'Builds the newest VIctory from MfDev0/victory, with upstream VIctory''s new'
+Say 'fixes added by themselves, on this PC and runs your game.'
 Say 'Nothing is uploaded or reported anywhere.'
 
 $script:Config = Load-Config
@@ -243,7 +342,7 @@ while (-not (Ask-Game $false)) {}
 if (-not (Ensure-Tools)) { exit 1 }
 $changed = Update-Source
 if ($null -eq $changed) { Bad 'no source to build: check the internet connection'; exit 1 }
-if ($changed -or -not (Test-Path (Victory-Exe))) { if (-not (Build)) { exit 1 } }
+if ($changed -or -not (Test-Path (Victory-Exe))) { if (-not (Build-All)) { exit 1 } }
 
 while ($true) {
     Run-Game
@@ -255,6 +354,6 @@ while ($true) {
     if ($k -eq 'G') { while (-not (Ask-Game $true)) {} }
     if ($k -eq 'U') {
         $changed = Update-Source
-        if ($changed -or -not (Test-Path (Victory-Exe))) { if (-not (Build)) { Say 'keeping the last working build' } }
+        if ($changed -or -not (Test-Path (Victory-Exe))) { if (-not (Build-All)) { Say 'keeping the last working build' } }
     }
 }
