@@ -1009,6 +1009,13 @@ thread_local! {
     pub(super) static TEST_F16_NEAREST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
+/// `VICTORY_F16_SUM_WIDE=0`: a wave sum of 16-bit floats where not every lane of the wave
+/// runs is refused, as before [`Lower::half_sum_wide`] gave it a widened f32 sum.
+fn f16_sum_wide_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_F16_SUM_WIDE").is_none_or(|v| v != "0"))
+}
+
 /// `VICTORY_WAVE_OWN_BITS=0`: a wave OR where not every lane runs is refused as before
 /// ([`super::own_bits`]).
 fn own_bits_on() -> bool {
@@ -1997,6 +2004,11 @@ impl<'a> Lower<'a> {
             if halves {
                 need(self.cur_ir);
             }
+            // The console's sum is exact only over every lane's term; here some lanes of
+            // the wave do not run on the host (they are inside a branch of their own).
+            if f16_sum_wide_on() {
+                return self.half_sum_wide(x, halves);
+            }
             return Err(WHERE);
         }
         let c = self.cur;
@@ -2023,6 +2035,48 @@ impl<'a> Lower<'a> {
         let total = self.s.m.bin(c, Bin::And, total, low);
         let first = self.s.m.bin(c, Bin::And, lo, high);
         Ok(self.s.m.bin(c, Bin::Or, first, total))
+    }
+
+    /// [`Self::half_sum`] where not every lane of the wave runs: the sum of the terms of
+    /// the lanes that do, added as f32 (`waveActiveOp.f32`, the low half of each lane's term
+    /// widened first) and rounded to 16 bits once at the end.
+    ///
+    /// shortcut: this is not the console's sum. The console adds 16-bit floats in its
+    /// tree order and rounds to 16 bits at every step ([`Self::half_sum`] does that where
+    /// every lane runs); here there is one rounding at the end, of a 24-bit-odd sum, so a
+    /// total that lands between two halves rounds once where the console's rounded many
+    /// times, and the terms of the lanes that do not run are missing altogether (the
+    /// console's whole-wave section keeps every lane's term in its register). Both differ
+    /// only in the last places of the 16-bit result: for a sum small enough not to round at
+    /// all they agree. `VICTORY_F16_SUM_WIDE=0` refuses this case as before.
+    ///
+    /// The high half of the result is lane 0's term's, as in the exact path (no `v_add_f16`
+    /// writes it).
+    fn half_sum_wide(&mut self, x: V, halves: bool) -> Result<V, Why> {
+        let c = self.cur;
+        let f32t = self.s.t.f32;
+        let low = self.s.m.i32(0xFFFF);
+        let high = self.s.m.i32(0xFFFF_0000);
+        let zero = self.s.m.i32(0);
+        let term = self.s.m.bin(c, Bin::And, x, low);
+        let term = self.s.op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[term]);
+        let (k, u) = (self.s.m.i8(0), self.s.m.i8(0));
+        let mut total = self.s.op(c, "waveActiveOp.f32", Attr::NoUnwind, f32t, 119, &[term, k, u]);
+        if halves {
+            // two host waves of 32 hold the console's 64 lanes: the second half's sum is
+            // read where the first holds it and added (the exchange of [`Self::half_sum`]).
+            let c = self.cur;
+            let bits = self.as_int(total);
+            let (lo, hi) = self.exchange_halves(c, bits);
+            let (lo, hi) = (self.as_float(lo), self.as_float(hi));
+            total = self.s.m.bin(self.cur, Bin::Add, lo, hi);
+        }
+        let sum = self.f16_nearest(total);
+        let c = self.cur;
+        let sum = self.s.m.bin(c, Bin::And, sum, low);
+        let lane0 = self.read_lane(x, zero);
+        let first = self.s.m.bin(c, Bin::And, lane0, high);
+        Ok(self.s.m.bin(c, Bin::Or, first, sum))
     }
 
     fn run(mut self) -> Result<Lowered, Stop> {
