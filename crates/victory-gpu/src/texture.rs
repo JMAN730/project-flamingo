@@ -430,6 +430,56 @@ fn through_copy() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_COPY").is_some_and(|v| v == "1"))
 }
 
+/// Whether a refresh hashes and detiles a texture's bytes where they are when
+/// the whole texture is mapped, instead of copying them out first
+/// (`VICTORY_TEXTURE_IN_PLACE`; on unless 0). idea from xcl-dev/xcl#602
+/// (dns54).
+///
+/// The copy is what the refresh of an unchanged texture paid for nothing: its
+/// hash, and the detile only when it changed, are read from title memory
+/// under the remap lock the refresh already holds (`title_memory_reading`),
+/// which is what keeps the pages there while we read them.
+fn in_place() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_IN_PLACE").is_none_or(|v| v != "0"))
+}
+
+/// The largest texture read in place, MiB (`VICTORY_TEXTURE_INPLACE_MAX_MB`,
+/// default 1). Past it the copy is made under the lock and the detile
+/// outside it, as before: the runtime waits for every reader while it
+/// remaps, so a long detile under the lock lengthens the next refreshes'
+/// wait (the streaming spikes of `xcl-bin/notes/tex-fx.md` are that wait).
+fn in_place_max() -> usize {
+    static MB: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MB.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_INPLACE_MAX_MB")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(1)
+    }) << 20
+}
+
+/// The hash of `[at, at + len)` read in place, twice: `None` when the title
+/// moved the bytes between the two reads (it writes where the write watch
+/// cannot see it, through another view), in which case this refresh decides
+/// nothing and the next one looks again. `Some` is a hash of one stable
+/// reading, equal to the hash of a copy taken at that moment.
+///
+/// SAFETY: `at` must be readable for `len` bytes for the whole call (the
+/// caller holds the mapping, [`crate::watch::title_memory_reading`]).
+unsafe fn stable_hash(at: *const u8, len: usize) -> Option<blake3::Hash> {
+    // SAFETY: the caller's contract.
+    let bytes = unsafe { std::slice::from_raw_parts(at, len) };
+    settled(blake3::hash(bytes), blake3::hash(bytes))
+}
+
+/// [`stable_hash`]'s decision: two hashings of the same bytes that agree are
+/// one reading of them; two that do not are a title writing while we read,
+/// and nothing is decided on a mix.
+fn settled(first: blake3::Hash, second: blake3::Hash) -> Option<blake3::Hash> {
+    (first == second).then_some(first)
+}
+
 /// Calls `f` with the `size` bytes of title memory at `memory`, read
 /// through the kernel into this thread's read buffer; pages that are not
 /// there read as zeros. The bytes are those a read in place would see.
@@ -796,6 +846,40 @@ impl Staging {
                 size
             });
         }
+        // The whole texture is mapped: hash it where it is, and detile it
+        // where it is unless it is big (`in_place`). An unchanged texture then
+        // costs one reading of it, not a copy and a reading.
+        if in_place() && size <= in_place_max() {
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
+            // SAFETY: `committed` said every page is there and `_mapped` keeps
+            // it there.
+            let hash = unsafe { stable_hash(self.memory, size) };
+            match hash {
+                Some(hash) if last.hash == Some(hash) => {
+                    // Nothing changed: no copy, no detile, nothing at all.
+                    drop(_mapped);
+                    return size;
+                }
+                Some(hash) => {
+                    last.hash = Some(hash);
+                    // SAFETY: as above.
+                    let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
+                    self.detile(tiled);
+                    #[cfg(feature = "diagnostics")]
+                    crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
+                    drop(_mapped);
+                    return size;
+                }
+                // The title wrote it while we read it (the write watch cannot
+                // see every write): this refresh decides nothing, the next one
+                // looks again, and the texture shows what it showed.
+                None => {
+                    drop(_mapped);
+                    return size;
+                }
+            }
+        }
         // Only the copy is done under the lock (`_mapped` says the pages are
         // there): the hash and the detile are the biggest part of a refresh,
         // and the runtime waits for every reader while it remaps, so neither
@@ -1136,6 +1220,50 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     });
     map.insert(resource as usize, s.clone());
     Some(s)
+}
+
+#[cfg(test)]
+mod in_place_tests {
+    use super::{in_place, in_place_max, stable_hash};
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
+
+    /// The hash of a stable range read in place is the hash of a copy of it,
+    /// and a range the title moves under the reader is not decided on.
+    #[test]
+    fn the_live_hash_is_the_copy_of_it_and_a_moving_one_is_none() {
+        // SAFETY: two pages of private memory, freed at the end.
+        let at = unsafe {
+            VirtualAlloc(std::ptr::null(), 2 * 4096, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)
+        } as usize;
+        assert_ne!(at, 0);
+        // SAFETY: our memory.
+        let bytes = unsafe { std::slice::from_raw_parts_mut(at as *mut u8, 2 * 4096) };
+        for (i, b) in bytes.iter_mut().enumerate() {
+            *b = (i * 31 + 7) as u8;
+        }
+        // SAFETY: the range is ours and stays mapped for the call.
+        let live = unsafe { stable_hash(at as *const u8, 2 * 4096) }.expect("a range nobody writes");
+        assert_eq!(live, blake3::hash(bytes), "in place and through a copy are the same bytes");
+        // A title writing the bytes while they are read: the two hashings
+        // disagree, and no decision is made on the mix (the next refresh
+        // looks again).
+        assert_eq!(super::settled(live, live), Some(live));
+        let moved = blake3::hash(b"the title wrote this in between");
+        assert_eq!(super::settled(live, moved), None);
+        // SAFETY: the memory allocated above.
+        unsafe { VirtualFree(at as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// The switch is on unless asked off, and the size limit has a default.
+    #[test]
+    fn the_switch_and_the_limit_have_defaults() {
+        if std::env::var_os("VICTORY_TEXTURE_IN_PLACE").is_none() {
+            assert!(in_place());
+        }
+        if std::env::var_os("VICTORY_TEXTURE_INPLACE_MAX_MB").is_none() {
+            assert_eq!(in_place_max(), 1 << 20);
+        }
+    }
 }
 
 #[cfg(test)]
