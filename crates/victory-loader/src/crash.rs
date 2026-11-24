@@ -588,7 +588,6 @@ unsafe fn report(what: &str, info: *const EXCEPTION_POINTERS, to_file: bool) {
         if let Some(hex) = readable_hex(context.Rsp as usize, 128) {
             line(format!("  [rsp] {hex}"));
         }
-        drop(line);
         eprintln!("{dump}");
         text.push_str(&dump);
         text.push('\n');
