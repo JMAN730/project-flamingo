@@ -344,8 +344,36 @@ fn finished(p: &Pending) {
     }
 }
 
-/// Pipelines waiting past which the workers run at normal priority.
+/// Pipelines waiting past which the workers run above the title's
+/// ordinary threads.
 const BACKLOG: u64 = 64;
+
+/// Pipelines waiting past which half the workers run at the highest
+/// priority short of time-critical.
+const BIG_BACKLOG: u64 = 512;
+
+/// The priority level a worker runs at, 0 to 3 (below normal, normal,
+/// above normal, highest), with `waiting` pipelines queued.
+///
+/// Normal was not enough: the title raises its own threads (it binds
+/// `SetThreadPriority` to the host's), and in a world run on an
+/// i5-12400F and RTX 4060 the workers made 71 pipelines in 9 minutes
+/// (about 7 a minute) while 1,675 waited and 5,000 draws a frame were
+/// dropped for them. With a backlog the workers now go above the
+/// title's ordinary threads, and with a long one half of them go to the
+/// highest priority, the other half staying above normal so the title
+/// keeps running; once the backlog is gone they drop back below normal.
+/// `VICTORY_PIPELINE_BOOST=0`: normal at most, as before.
+fn priority_level(waiting: u64, worker: usize, workers: usize) -> u8 {
+    static BOOST: OnceLock<bool> = OnceLock::new();
+    let boost = *BOOST.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_BOOST").is_none_or(|v| v != "0"));
+    match waiting {
+        w if w <= BACKLOG => 0,
+        _ if !boost => 1,
+        w if w > BIG_BACKLOG && worker < workers.div_ceil(2) => 3,
+        _ => 2,
+    }
+}
 
 /// Starts the workers on first use: two thirds of the logical processors,
 /// 2 to 10, half of them (1 to 3: the driver ran out of memory with six
@@ -367,23 +395,29 @@ fn workers() -> bool {
             let spawned = std::thread::Builder::new()
                 .name(format!("victory-pipelines-{i}"))
                 .stack_size(64 << 20)
-                .spawn(|| {
+                .spawn(move || {
                     let mut raised = None;
                     loop {
                         let p = next();
                         // Below the title's own threads (loading, recording)
-                        // unless a long backlog waits: the title then runs at
+                        // unless a backlog waits: the title then runs at
                         // full load and starved the workers (4-9 pipelines a
-                        // minute in the world on an i5-12400F).
-                        let raise = WAITING.load(Ordering::Relaxed) > BACKLOG;
-                        if raised != Some(raise) {
-                            raised = Some(raise);
+                        // minute in the world on an i5-12400F; see
+                        // `priority_level`).
+                        let level = priority_level(WAITING.load(Ordering::Relaxed), i, workers);
+                        if raised != Some(level) {
+                            raised = Some(level);
                             // SAFETY: a plain call on our own thread.
                             unsafe {
                                 use windows::Win32::System::Threading::*;
                                 let _ = SetThreadPriority(
                                     GetCurrentThread(),
-                                    if raise { THREAD_PRIORITY_NORMAL } else { THREAD_PRIORITY_BELOW_NORMAL },
+                                    match level {
+                                        0 => THREAD_PRIORITY_BELOW_NORMAL,
+                                        1 => THREAD_PRIORITY_NORMAL,
+                                        2 => THREAD_PRIORITY_ABOVE_NORMAL,
+                                        _ => THREAD_PRIORITY_HIGHEST,
+                                    },
                                 );
                             }
                         }
@@ -474,6 +508,19 @@ mod tests {
         assert_eq!(queue.push(&promoted, REQUESTED), None);
         assert!(Arc::ptr_eq(&queue.pop().unwrap(), &earlier));
         assert!(queue.pop().is_none());
+    }
+
+    /// Workers go above the title's threads only with a backlog, and half
+    /// of them to the highest priority only with a long one.
+    #[test]
+    fn workers_rise_with_the_backlog() {
+        assert_eq!(priority_level(0, 0, 8), 0);
+        assert_eq!(priority_level(BACKLOG, 0, 8), 0);
+        assert_eq!(priority_level(BACKLOG + 1, 0, 8), 2);
+        assert_eq!(priority_level(BIG_BACKLOG + 1, 0, 8), 3);
+        assert_eq!(priority_level(BIG_BACKLOG + 1, 3, 8), 3);
+        assert_eq!(priority_level(BIG_BACKLOG + 1, 4, 8), 2);
+        assert_eq!(priority_level(BIG_BACKLOG + 1, 7, 8), 2);
     }
 
     /// Heavy pipelines wait while their slots are taken; light ones and
