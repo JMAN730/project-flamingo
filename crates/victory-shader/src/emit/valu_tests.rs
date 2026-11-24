@@ -1,9 +1,10 @@
-//! End-to-end tests of synthetic GFX10 VALU shaders lowered to DXIL, validated
+//! End-to-end tests of synthetic GFX10 VALU and LDS shaders lowered to DXIL, validated
 //! by `dxil.dll` when present, and executed on the host GPU and WARP.
 //!
 //! Covers RDNA2 hardware semantics that differ from naive DXIL lowering:
 //! `v_med3_f32`/`v_med3_f16` with NaN operands, `v_fract_f32`/`v_fract_f16`
-//! near `1.0`, and turn-range reduction for `v_sin_*`/`v_cos_*`.
+//! near `1.0`, turn-range reduction for `v_sin_*`/`v_cos_*`, and byte and
+//! halfword accesses to group shared memory.
 
 use super::host::{Dispatch, Host, Root, View};
 use super::{HostShader, lower, validator};
@@ -41,6 +42,11 @@ const fn vop1(op: u16, vdst: u8, src0: u16) -> u32 {
     0x7E00_0000 | (vdst as u32) << 17 | (op as u32) << 9 | (src0 as u32 & 0x1FF)
 }
 
+/// VOP2 `op dst, src0, vsrc1`.
+const fn vop2(op: u8, dst: u8, src0: u16, vsrc1: u8) -> u32 {
+    (op as u32) << 25 | (dst as u32) << 17 | (vsrc1 as u32) << 9 | src0 as u32
+}
+
 /// VOP3 `op vdst, src0, src1, src2` (no modifiers).
 const fn vop3(op: u16, vdst: u8, src0: u16, src1: u16, src2: u16) -> [u32; 2] {
     [
@@ -70,20 +76,35 @@ const fn vgpr(n: u8) -> u16 {
 /// `v0`), and stores `v0` to dword 0 of the raw UAV at heap index 0.
 fn build_valu_cs(body: &[u32]) -> HostShader {
     let shader = try_build_valu_cs(body).expect("lower");
-
-    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
-        let mut copy = shader.dxil.clone();
-        let ours = copy[4..20].to_vec();
-        v.validate(&mut copy).expect("DXIL validation failed");
-        assert_eq!(copy[4..20], ours[..], "container hash mismatch");
-    }
-
+    validate_test_shader(&shader, false);
     shader
+}
+
+fn validate_test_shader(shader: &HostShader, required: bool) {
+    let mut validator =
+        match validator::Validator::load(validator::Validator::default_path().as_deref()) {
+            Ok(validator) => validator,
+            Err(error) if required => panic!("could not load configured DXIL validator: {error}"),
+            Err(_) => return,
+        };
+    let mut copy = shader.dxil.clone();
+    validator
+        .validate(&mut copy)
+        .expect("DXIL validation failed");
+    assert_eq!(copy[4..20], shader.dxil[4..20], "container hash mismatch");
 }
 
 /// [`build_valu_cs`] without the validation, returning a refusal instead of
 /// panicking on it.
 fn try_build_valu_cs(body: &[u32]) -> Result<HostShader, ShaderError> {
+    let mut words = test_cs_prelude();
+    words.extend_from_slice(body);
+    words.extend_from_slice(&buffer_store_dword(0, 8, 0));
+    words.push(S_ENDPGM);
+    lower_test_cs(&words, 5 << 1, [1, 1, 1])
+}
+
+fn test_cs_prelude() -> Vec<u32> {
     let mut words = Vec::new();
     // s[4:5] = descriptor table address (heap index 0 -> byte offset 0).
     words.push(s_mov_b32(5, 0x80)); // inline constant 0
@@ -93,10 +114,10 @@ fn try_build_valu_cs(body: &[u32]) -> Result<HostShader, ShaderError> {
     for i in 0..4u8 {
         words.push(vop1(0x001, i + 1, sgpr(i))); // v_mov_b32
     }
-    words.extend_from_slice(body);
-    words.extend_from_slice(&buffer_store_dword(0, 8, 0));
-    words.push(S_ENDPGM);
+    words
+}
 
+fn lower_test_cs(words: &[u32], rsrc2: u32, threads: [u32; 3]) -> Result<HostShader, ShaderError> {
     let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
     let native = NativeProgram {
         stage: HwStage::Cs,
@@ -130,10 +151,7 @@ fn try_build_valu_cs(body: &[u32]) -> Result<HostShader, ShaderError> {
             user_data: 4,
             slot: 1,
         }],
-        io: StageIo::Cs(ComputeIo {
-            rsrc2: 5 << 1, // 5 user SGPRs: s0..s4
-            threads: [1, 1, 1],
-        }),
+        io: StageIo::Cs(ComputeIo { rsrc2, threads }),
         code,
     };
 
@@ -224,13 +242,28 @@ fn run_cases(
     cases: &[[u32; 4]],
     mut check: impl FnMut(&str, usize, [u32; 4], u32),
 ) {
+    let ran = run_compute_cases(shader, cases, 1, |label, i, inputs, result| {
+        check(label, i, inputs, result[0]);
+    });
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
+fn run_compute_cases(
+    shader: &HostShader,
+    cases: &[[u32; 4]],
+    dwords: u32,
+    mut check: impl FnMut(&str, usize, [u32; 4], &[u32]),
+) -> usize {
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let mut ran = 0;
     let force_warp = std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
     for &(label, warp) in backends(force_warp) {
-        let Ok(host) = Host::new(warp) else {
-            eprintln!("no SM 6.6 {label} device; skipped");
-            continue;
+        let host = match Host::new(warp) {
+            Ok(host) => host,
+            Err(error) => {
+                eprintln!("no SM 6.6 {label} device; skipped: {error}");
+                continue;
+            }
         };
         let (root, pso) = host
             .compute_pipeline(shader)
@@ -250,17 +283,242 @@ fn run_cases(
                     &pso,
                     &Dispatch {
                         roots: vec![(0, Root::Constants(ud))],
-                        views: &[View::RawUav(1)],
+                        views: &[View::RawUav(dwords)],
                         samplers: &[],
                         groups: [1, 1, 1],
                     },
                 )
                 .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
-            check(label, i, inputs, out[0][0]);
+            check(label, i, inputs, &out[0]);
         }
         ran += 1;
     }
-    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+    ran
+}
+
+const LDS_THREADS: u16 = 64;
+const S_BARRIER: u32 = 0xBF8A_0000;
+
+const fn ds(op: u16, offset: u16, addr: u8, data: u8, dst: u8) -> [u32; 2] {
+    [
+        0xD800_0000 | (op as u32) << 18 | offset as u32,
+        (dst as u32) << 24 | (data as u32) << 8 | addr as u32,
+    ]
+}
+
+/// Read LDS into v3 (preloaded from v2 for the partial-register forms).
+/// Each read gets a separate UAV row, indexed by the lane byte offset in v6.
+fn lds_results(words: &mut Vec<u32>, first_row: u16, reads: &[(u16, u16, u8)]) {
+    for (row, &(op, offset, addr)) in (first_row..).zip(reads) {
+        words.push(vop1(1, 3, vgpr(2)));
+        words.extend(ds(op, offset, addr, 0, 3));
+        let [w0, w1] = buffer_store_dword(3, 8, row * LDS_THREADS * 4);
+        words.extend([w0 | 0x1000, w1 | 6]); // v6, offen
+    }
+}
+
+fn build_lds_cs(mut words: Vec<u32>) -> HostShader {
+    words.push(S_ENDPGM);
+    // Five user SGPRs and 512 bytes of LDS. A multi-wave group with explicit
+    // barriers can run with the backend's native wave size, including WARP.
+    let shader = lower_test_cs(&words, (5 << 1) | (1 << 15), [LDS_THREADS.into(), 1, 1])
+        .expect("lower LDS compute shader");
+    validate_test_shader(&shader, std::env::var_os("VICTORY_DXIL").is_some());
+    shader
+}
+
+#[test]
+fn lds_adjacent_byte_writes_preserve_each_lanes_data() {
+    let mut words = test_cs_prelude();
+    words.push(vop2(0x1a, 6, 130, 0)); // v6 = tid * 4
+    words.push(vop2(0x1b, 7, 196, 0)); // v7 = tid & !3
+    words.push(vop2(0x1c, 1, vgpr(1), 0)); // v1 = 0x80 | tid
+    words.extend(ds(0x00d, 256, 6, 2, 0)); // initialize all last 64 dwords
+    words.push(S_BARRIER);
+    words.extend(ds(0x01e, 448, 0, 1, 0)); // four lanes write each dword
+    words.push(S_BARRIER);
+    lds_results(
+        &mut words,
+        0,
+        &[
+            (0x03a, 448, 0), // ds_read_u8
+            (0x039, 448, 0), // ds_read_i8
+            (0x036, 448, 7), // ds_read_b32
+        ],
+    );
+    let shader = build_lds_cs(words);
+    run_compute_cases(
+        &shader,
+        &[[0x80, u32::MAX, 0, 0]],
+        3 * u32::from(LDS_THREADS),
+        |backend, _, _, out| {
+            let threads = usize::from(LDS_THREADS);
+            for tid in 0..threads {
+                let byte = 0x80 | tid as u8;
+                let group_byte = byte & !3;
+                assert_eq!(out[tid], u32::from(byte), "{backend}, unsigned byte, {tid}");
+                assert_eq!(
+                    out[threads + tid],
+                    (byte as i8) as u32,
+                    "{backend}, signed byte, {tid}"
+                );
+                assert_eq!(
+                    out[2 * threads + tid],
+                    u32::from_le_bytes([
+                        group_byte,
+                        group_byte + 1,
+                        group_byte + 2,
+                        group_byte + 3
+                    ]),
+                    "{backend}, shared dword, {tid}",
+                );
+            }
+            eprintln!("{backend}: verified adjacent LDS byte writes");
+        },
+    );
+}
+
+#[test]
+fn lds_halfword_offsets_preserve_neighbors_and_d16_register_halves() {
+    let mut words = test_cs_prelude();
+    words.push(vop2(0x1a, 5, 131, 0)); // v5 = tid * 8, an exclusive LDS pair
+    words.push(vop2(0x1a, 6, 130, 0)); // v6 = tid * 4, the UAV row offset
+    words.push(vop2(0x25, 7, vgpr(1), 5)); // v7 = v5 + tested byte offset
+    words.extend(ds(0x00d, 0, 5, 2, 0));
+    words.extend(ds(0x00d, 4, 5, 3, 0));
+    words.extend(ds(0x01f, 0, 7, 4, 0)); // ds_write_b16, low half of v4
+    lds_results(
+        &mut words,
+        0,
+        &[
+            (0x03c, 0, 7), // ds_read_u16
+            (0x03b, 0, 7), // ds_read_i16
+            (0x036, 0, 5), // ds_read_b32, first dword
+            (0x036, 4, 5), // ds_read_b32, second dword
+        ],
+    );
+    words.extend(ds(0x0a1, 0, 7, 4, 0)); // ds_write_b16_d16_hi
+    lds_results(
+        &mut words,
+        4,
+        &[
+            (0x0a6, 0, 7), // ds_read_u16_d16
+            (0x0a7, 0, 7), // ds_read_u16_d16_hi
+            (0x036, 0, 5),
+            (0x036, 4, 5),
+        ],
+    );
+    words.extend(ds(0x0a0, 6, 5, 4, 0)); // ds_write_b8_d16_hi takes 0x80
+    lds_results(
+        &mut words,
+        8,
+        &[
+            (0x0a2, 6, 5), // ds_read_u8_d16
+            (0x0a3, 6, 5), // ds_read_u8_d16_hi
+            (0x0a4, 6, 5), // ds_read_i8_d16
+            (0x0a5, 6, 5), // ds_read_i8_d16_hi
+            (0x036, 4, 5),
+        ],
+    );
+    let shader = build_lds_cs(words);
+    let cases = [0, 1, 2, 3].map(|offset| [offset, 0x4433_2211, 0x8877_6655, 0x8F80_C2D3]);
+    run_compute_cases(
+        &shader,
+        &cases,
+        13 * u32::from(LDS_THREADS),
+        |backend, i, inputs, out| {
+            let [offset, first, second, source] = inputs;
+            let offset = offset as usize;
+            let mut lds = [first.to_le_bytes(), second.to_le_bytes()].concat();
+            let dword_at = |bytes: &[u8], offset: usize| {
+                u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
+            };
+            lds[offset..offset + 2].copy_from_slice(&source.to_le_bytes()[..2]);
+            let low_words = [dword_at(&lds, 0), dword_at(&lds, 4)];
+            lds[offset..offset + 2].copy_from_slice(&source.to_le_bytes()[2..]);
+            let high_words = [dword_at(&lds, 0), dword_at(&lds, 4)];
+            lds[6] = 0x80;
+            let byte_word = dword_at(&lds, 4);
+
+            let expected = [
+                0xC2D3,
+                0xFFFF_C2D3,
+                low_words[0],
+                low_words[1],
+                0x4433_8F80,
+                0x8F80_2211,
+                high_words[0],
+                high_words[1],
+                0x4433_0080,
+                0x0080_2211,
+                0x4433_FF80,
+                0xFF80_2211,
+                byte_word,
+            ];
+            let threads = usize::from(LDS_THREADS);
+            for (row, (results, want)) in out.chunks_exact(threads).zip(expected).enumerate() {
+                for (tid, &got) in results.iter().enumerate() {
+                    assert_eq!(
+                        got, want,
+                        "{backend}, offset {offset}, thread {tid}, result {row}"
+                    );
+                }
+            }
+            if i + 1 == cases.len() {
+                eprintln!("{backend}: verified LDS halfword offsets and d16 forms");
+            }
+        },
+    );
+}
+
+#[test]
+fn lds_halfword_writes_respect_exec_and_the_end_of_lds() {
+    let mut words = test_cs_prelude();
+    words.push(vop2(0x1a, 5, 131, 0)); // v5 = tid * 8, an exclusive LDS pair
+    words.push(vop2(0x1a, 6, 130, 0)); // v6 = tid * 4
+    words.extend(ds(0x00d, 0, 5, 2, 0));
+    words.extend(ds(0x00d, 4, 5, 3, 0));
+    // Make every lane's address straddle, but only let even lanes write.
+    words.push(vop2(0x1b, 7, 129, 0)); // v7 = tid & 1
+    words.extend([
+        0x7D84_0E80, // v_cmp_eq_u32 vcc, 0, v7
+        0xBE90_3C6A, // s_and_saveexec_b32 s16, vcc_lo
+    ]);
+    words.extend(ds(0x01f, 3, 5, 4, 0));
+    words.push(0x887E_107E); // s_or_b32 exec_lo, exec_lo, s16
+    lds_results(&mut words, 0, &[(0x036, 0, 5), (0x036, 4, 5)]);
+    // The final lane's aligned halfword ends exactly at the LDS boundary.
+    words.extend(ds(0x01f, 6, 5, 4, 0));
+    lds_results(&mut words, 2, &[(0x03c, 6, 5), (0x036, 4, 5)]);
+
+    let shader = build_lds_cs(words);
+    let cases = [[0, 0x4433_2211, 0x8877_6655, 0xC2D3]];
+    run_compute_cases(
+        &shader,
+        &cases,
+        4 * u32::from(LDS_THREADS),
+        |backend, _, _, out| {
+            let threads = usize::from(LDS_THREADS);
+            for tid in 0..threads {
+                let (first, second, after_boundary_write) = if tid % 2 == 0 {
+                    (0xD333_2211, 0x8877_66C2, 0xC2D3_66C2)
+                } else {
+                    (0x4433_2211, 0x8877_6655, 0xC2D3_6655)
+                };
+                for (row, want) in [first, second, 0xC2D3, after_boundary_write]
+                    .into_iter()
+                    .enumerate()
+                {
+                    assert_eq!(
+                        out[row * threads + tid],
+                        want,
+                        "{backend}, thread {tid}, result {row}"
+                    );
+                }
+            }
+            eprintln!("{backend}: verified EXEC and LDS boundary");
+        },
+    );
 }
 
 #[test]

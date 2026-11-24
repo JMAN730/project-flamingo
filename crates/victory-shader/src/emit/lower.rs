@@ -2615,8 +2615,9 @@ impl<'a> Lower<'a> {
             return Err("LDS the program does not allocate");
         }
         let a = self.vgprs(inst, addr.as_ref().ok_or("an LDS address")?, 1)?[0];
-        // shortcut: LDS addresses are taken as aligned and in bounds
-        // (out-of-bounds console accesses read 0 and drop writes).
+        // shortcut: LDS accesses assume all addressed bytes are in bounds
+        // (out-of-bounds console accesses read 0 and drop writes). Dword
+        // and wider accesses also assume dword-aligned addresses.
         let byte_addr = |l: &mut Self, bytes: u32| -> V {
             let c = l.cur;
             let o = l.s.m.i32(bytes);
@@ -2649,194 +2650,140 @@ impl<'a> Lower<'a> {
                 (u32::from(*offset1) * scale, w),
             ]
         };
-        // Bytes and halves: the dword holding them, and their bit position
-        // in it (naturally aligned, so they never straddle dwords).
         // `_d16` reads fill a register's low half (`_d16_hi` its high half)
         // and keep the other; `_d16_hi` writes take the data's high half.
-        let base = name.trim_end_matches("_hi").trim_end_matches("_d16");
-        let sub = match base {
-            "ds_read_u8" | "ds_read_i8" | "ds_write_b8" => Some(8u32),
-            "ds_read_u16" | "ds_read_i16" | "ds_write_b16" => Some(16),
+        let sub = match name {
+            "ds_read_u8" | "ds_read_i8" | "ds_write_b8" | "ds_write_b8_d16_hi"
+            | "ds_read_u8_d16" | "ds_read_u8_d16_hi" | "ds_read_i8_d16" | "ds_read_i8_d16_hi" => {
+                Some(8u32)
+            }
+            "ds_read_u16"
+            | "ds_read_i16"
+            | "ds_write_b16"
+            | "ds_write_b16_d16_hi"
+            | "ds_read_u16_d16"
+            | "ds_read_u16_d16_hi" => Some(16),
             _ => None,
         };
-        let sub = sub.filter(|_| {
-            base == name
-                || name.ends_with("_d16") && base.starts_with("ds_read")
-                || name.ends_with("_d16_hi")
-        });
         if let Some(bits) = sub {
-            let p = dword(self, offset);
-            let o = self.s.m.i32(offset);
-            let at = self.s.m.bin(c, Bin::Add, a, o);
+            let at = byte_addr(self, offset);
+            let p = dword_at(self, at);
             let three = self.s.m.i32(3);
             let byte = self.s.m.bin(c, Bin::And, at, three);
             let sh = self.s.m.bin(c, Bin::Shl, byte, three);
             let mask = self.s.m.i32((1u32 << bits) - 1);
+            let straddles = (bits == 16).then(|| self.s.m.cmp(c, pred::EQ, byte, three));
             if name.starts_with("ds_read") {
                 let reg = dst_reg.ok_or("an LDS read result")?;
                 let w = self.s.m.load(c, p);
                 let x = self.s.m.bin(c, Bin::LShr, w, sh);
-                let x = if base.contains("_i") {
+                let x = if let Some(straddles) = straddles {
+                    // At byte 3, at + 1 points to byte 0 of the next dword.
+                    // Otherwise stay in the current dword, which may be the last.
+                    let one = self.s.m.i32(1);
+                    let next = self.s.m.bin(c, Bin::Add, at, one);
+                    let next = self.s.m.select(c, straddles, next, at);
+                    let p = dword_at(self, next);
+                    let w = self.s.m.load(c, p);
+                    let eight = self.s.m.i32(8);
+                    let high = self.s.m.bin(c, Bin::Shl, w, eight);
+                    let zero = self.s.m.i32(0);
+                    let high = self.s.m.select(c, straddles, high, zero);
+                    self.s.m.bin(c, Bin::Or, x, high)
+                } else {
+                    x
+                };
+                let x = if name.starts_with("ds_read_i") {
                     let k = self.s.m.i32(32 - bits);
                     let x = self.s.m.bin(c, Bin::Shl, x, k);
                     self.s.m.bin(c, Bin::AShr, x, k)
                 } else {
                     self.s.m.bin(c, Bin::And, x, mask)
                 };
-                let x = if base == name {
-                    x
+                let x = if name.ends_with("_d16_hi") {
+                    self.high_half(inst, reg, x)
+                } else if name.ends_with("_d16") {
+                    self.low_half(inst, reg, x)
                 } else {
-                    let old = match inst.read(Reg::V(reg)) {
-                        Some(v) => self.i32_of(v)?,
-                        None => self.s.m.i32(0),
-                    };
-                    let half = self.s.m.i32(0xFFFF);
-                    let x = self.s.m.bin(c, Bin::And, x, half);
-                    let (x, keep) = if name.ends_with("_hi") {
-                        let k16 = self.s.m.i32(16);
-                        (self.s.m.bin(c, Bin::Shl, x, k16), half)
-                    } else {
-                        (x, self.s.m.i32(0xFFFF_0000))
-                    };
-                    let old = self.s.m.bin(c, Bin::And, old, keep);
-                    self.s.m.bin(c, Bin::Or, old, x)
+                    x
                 };
                 self.write(inst, Reg::V(reg), x, guard);
             } else {
                 // Clear, then set: two atomics, so lanes writing other
                 // bytes of the dword keep theirs.
                 let mut x = self.vgprs(inst, data.first().ok_or("an LDS write")?, 1)?[0];
-                if name != base {
-                    // The data's high half.
+                if name.ends_with("_d16_hi") {
                     let k16 = self.s.m.i32(16);
                     x = self.s.m.bin(c, Bin::LShr, x, k16);
                 }
                 let x = self.s.m.bin(c, Bin::And, x, mask);
-                let x = self.s.m.bin(c, Bin::Shl, x, sh);
+                let low = self.s.m.bin(c, Bin::Shl, x, sh);
                 let m = self.s.m.bin(c, Bin::Shl, mask, sh);
                 let ones = self.s.m.i32(u32::MAX);
                 let keep = self.s.m.bin(c, Bin::Xor, m, ones);
                 use super::bitcode::Rmw;
-                let at = self.begin_guarded(guard);
+                let exec = self.begin_guarded(guard);
                 self.s.m.atomic(self.cur, Rmw::And, p, keep);
-                self.s.m.atomic(self.cur, Rmw::Or, p, x);
-                self.end_guarded(at, &[]);
+                self.s.m.atomic(self.cur, Rmw::Or, p, low);
+                if let Some(straddles) = straddles {
+                    // Only active lanes whose write crosses the boundary touch
+                    // the next dword, which may not exist for other lanes.
+                    let cross = self.begin_guarded(Some(straddles));
+                    let c = self.cur;
+                    let one = self.s.m.i32(1);
+                    let next = self.s.m.bin(c, Bin::Add, at, one);
+                    let p = dword_at(self, next);
+                    let eight = self.s.m.i32(8);
+                    let high = self.s.m.bin(c, Bin::LShr, x, eight);
+                    let keep = self.s.m.i32(!0xFF);
+                    self.s.m.atomic(c, Rmw::And, p, keep);
+                    self.s.m.atomic(c, Rmw::Or, p, high);
+                    self.end_guarded(cross, &[]);
+                }
+                self.end_guarded(exec, &[]);
             }
             return Ok(());
         }
         if let Some(rest) = name.strip_prefix("ds_read") {
-            let reg = dst_reg.ok_or("an LDS read result")?;
-            if rest.starts_with('2') || matches!(rest, "_b32" | "_b64" | "_b96" | "_b128") {
-                let elements = if rest.starts_with('2') {
-                    pair(name)
-                } else {
-                    vec![(offset, width(name))]
-                };
-                let mut n = 0;
-                for (off, w) in elements {
-                    for k in 0..w {
-                        let p = dword(self, off + 4 * k);
-                        let x = self.s.m.load(self.cur, p);
-                        self.write(inst, Reg::V(reg + n), x, guard);
-                        n += 1;
-                    }
-                }
-                return Ok(());
-            }
-            let (bytes, signed, d16) = match rest {
-                "_u8" => (1u32, false, None),
-                "_i8" => (1, true, None),
-                "_u16" => (2, false, None),
-                "_i16" => (2, true, None),
-                "_u8_d16" => (1, false, Some(false)),
-                "_u8_d16_hi" => (1, false, Some(true)),
-                "_i8_d16" => (1, true, Some(false)),
-                "_i8_d16_hi" => (1, true, Some(true)),
-                "_u16_d16" => (2, false, Some(false)),
-                "_u16_d16_hi" => (2, false, Some(true)),
-                _ => return Err("an LDS read of bytes or halves"),
-            };
-            let at = byte_addr(self, offset);
-            let p = dword_at(self, at);
-            let word = self.s.m.load(self.cur, p);
-            let c = self.cur;
-            let lane_mask = self.s.m.i32(if bytes == 1 { 3 } else { 2 });
-            let three = self.s.m.i32(3);
-            let off_in_word = self.s.m.bin(c, Bin::And, at, lane_mask);
-            let shift = self.s.m.bin(c, Bin::Shl, off_in_word, three);
-            let raw = self.s.m.bin(c, Bin::LShr, word, shift);
-            let ext = if signed {
-                let k = self.s.m.i32(32 - 8 * bytes);
-                let hi = self.s.m.bin(c, Bin::Shl, raw, k);
-                self.s.m.bin(c, Bin::AShr, hi, k)
+            let elements = if rest.starts_with('2') {
+                pair(name)
+            } else if matches!(rest, "_b32" | "_b64" | "_b96" | "_b128") {
+                vec![(offset, width(name))]
             } else {
-                let m = self.s.m.i32(if bytes == 1 { 0xFF } else { 0xFFFF });
-                self.s.m.bin(c, Bin::And, raw, m)
+                return Err("an LDS read of bytes or halves");
             };
-            let x = match d16 {
-                None => ext,
-                Some(false) => self.low_half(inst, reg, ext),
-                Some(true) => self.high_half(inst, reg, ext),
-            };
-            self.write(inst, Reg::V(reg), x, guard);
+            let reg = dst_reg.ok_or("an LDS read result")?;
+            let mut n = 0;
+            for (off, w) in elements {
+                for k in 0..w {
+                    let p = dword(self, off + 4 * k);
+                    let x = self.s.m.load(self.cur, p);
+                    self.write(inst, Reg::V(reg + n), x, guard);
+                    n += 1;
+                }
+            }
             return Ok(());
         }
         if let Some(rest) = name.strip_prefix("ds_write") {
-            if rest.starts_with('2') || matches!(rest, "_b32" | "_b64" | "_b96" | "_b128") {
-                let elements = if rest.starts_with('2') {
-                    pair(name)
-                } else {
-                    vec![(offset, width(name))]
-                };
-                let mut stores = Vec::new();
-                for (e, (off, w)) in elements.into_iter().enumerate() {
-                    let vals = self.vgprs(inst, data.get(e).ok_or("an LDS write")?, w as u8)?;
-                    for (k, x) in vals.into_iter().enumerate() {
-                        stores.push((off + 4 * k as u32, x));
-                    }
-                }
-                let at = self.begin_guarded(guard);
-                for (off, x) in stores {
-                    let p = dword(self, off);
-                    self.s.m.store(self.cur, p, x);
-                }
-                self.end_guarded(at, &[]);
-                return Ok(());
-            }
-            let (bytes, hi_src) = match rest {
-                "_b8" => (1u32, false),
-                "_b16" => (2, false),
-                "_b8_d16_hi" => (1, true),
-                "_b16_d16_hi" => (2, true),
-                _ => return Err("an LDS write of bytes or halves"),
+            let elements = if rest.starts_with('2') {
+                pair(name)
+            } else if matches!(rest, "_b32" | "_b64" | "_b96" | "_b128") {
+                vec![(offset, width(name))]
+            } else {
+                return Err("an LDS write of bytes or halves");
             };
-            let mut val = self.vgprs(inst, data.first().ok_or("an LDS write")?, 1)?[0];
-            let at_bytes = byte_addr(self, offset);
-            let p = dword_at(self, at_bytes);
-            let c = self.cur;
-            if hi_src {
-                let k16 = self.s.m.i32(16);
-                val = self.s.m.bin(c, Bin::LShr, val, k16);
+            let mut stores = Vec::new();
+            for (e, (off, w)) in elements.into_iter().enumerate() {
+                let vals = self.vgprs(inst, data.get(e).ok_or("an LDS write")?, w as u8)?;
+                for (k, x) in vals.into_iter().enumerate() {
+                    stores.push((off + 4 * k as u32, x));
+                }
             }
-            let mask_val = self.s.m.i32(if bytes == 1 { 0xFF } else { 0xFFFF });
-            let val = self.s.m.bin(c, Bin::And, val, mask_val);
-            let lane_mask = self.s.m.i32(if bytes == 1 { 3 } else { 2 });
-            let three = self.s.m.i32(3);
-            let off_in_word = self.s.m.bin(c, Bin::And, at_bytes, lane_mask);
-            let shift = self.s.m.bin(c, Bin::Shl, off_in_word, three);
-            let shifted_mask = self.s.m.bin(c, Bin::Shl, mask_val, shift);
-            let all_ones = self.s.m.i32(!0u32);
-            let clear_mask = self.s.m.bin(c, Bin::Xor, shifted_mask, all_ones);
-            let shifted_val = self.s.m.bin(c, Bin::Shl, val, shift);
-            // Atomic clear + set so concurrent lanes writing adjacent bytes or
-            // halves within the same 32-bit dword do not race.
             let at = self.begin_guarded(guard);
-            self.s
-                .m
-                .atomic(self.cur, super::bitcode::Rmw::And, p, clear_mask);
-            self.s
-                .m
-                .atomic(self.cur, super::bitcode::Rmw::Or, p, shifted_val);
+            for (off, x) in stores {
+                let p = dword(self, off);
+                self.s.m.store(self.cur, p, x);
+            }
             self.end_guarded(at, &[]);
             return Ok(());
         }
