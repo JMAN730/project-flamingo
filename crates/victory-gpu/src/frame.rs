@@ -221,7 +221,11 @@ mod tests {
         // origin poll that times out (and starts the frame), then a
         // blocking flip wait. Each flip ends on a tick of its own.
         const FLIP: u32 = 2;
-        assert_eq!(set_interval(null, null, 5_000, 3, 0), S_OK);
+        const INTERVAL: Duration = Duration::from_millis(5);
+        assert_eq!(
+            set_interval(null, null, INTERVAL.as_micros() as u32, 3, 0),
+            S_OK
+        );
         let mut token = 0;
         let flips: Vec<u64> = (0..4)
             .map(|_| {
