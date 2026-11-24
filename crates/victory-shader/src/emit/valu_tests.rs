@@ -2303,3 +2303,145 @@ fn cmp16_sdwa_preserves_word_selects() {
         }
     }
 }
+
+#[test]
+fn indexed_load_uses_stride_from_built_root_descriptor() {
+    const fn vop2(op: u32, vdst: u8, vsrc1: u8, src0: u16) -> u32 {
+        (op << 25) | ((vdst as u32) << 17) | ((vsrc1 as u32) << 9) | (src0 as u32 & 0x1FF)
+    }
+    let words = [
+        // Table in s[0:1] -> UAV at s[8:11]
+        s_mov_b32(1, 0x80),
+        s_load_dwordx4(8, 0)[0],
+        s_load_dwordx4(8, 0)[1],
+        // Build root SRV descriptor in s[12:15] from s[2:3] with STRIDE = 12 (0xC << 16).
+        0xBE8C_0302, // s_mov_b32 s12, s2
+        0x880D_FF03, // s_or_b32 s13, s3, 0x000C_0000
+        0x000C_0000,
+        0xBE8E_03C1, // s_mov_b32 s14, -1
+        0xBE8F_03FF, // s_mov_b32 s15, 0x11014fac
+        0x1101_4FAC,
+        // buffer_load_dword v1, v0, s[12:15], 0 idxen offset:4
+        0x38 << 26 | 0x0C << 18 | (1 << 13) | 4,
+        0x80 << 24 | ((12 >> 2) << 16) | (1 << 8),
+        // Store v1 to UAV[v0 * 4]
+        vop2(0x01a, 2, 0, 0x82), // v2 = v0 << 2
+        0x38 << 26 | 0x1C << 18 | (1 << 12),
+        0x80 << 24 | ((8 >> 2) << 16) | (1 << 8) | 2,
+        S_ENDPGM,
+    ];
+    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 4,
+        layout: vec![
+            RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            },
+            RootParam {
+                root: RootType::Descriptor,
+                table_offset_dwords: 0,
+                sgprs: 2,
+                base_register: 0,
+                user_data: 2,
+                slot: 1,
+            },
+        ],
+        used: vec![
+            UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 0,
+                slot: 0,
+            },
+            UsedResource {
+                kind: ResourceType::Srv,
+                root: RootType::Descriptor,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 2,
+                slot: 1,
+            },
+        ],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 4 << 1,
+            threads: [3, 1, 1],
+        }),
+        code,
+    };
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let lowered = lower::lower(&lower::Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+        target: crate::emit::Target::ANY,
+        console_cf: false,
+        per_lane_only: false,
+    })
+    .expect("lower");
+    let mut shader = HostShader {
+        stage: HwStage::Cs,
+        dxil: lowered.dxil,
+        user_data: lowered.user_data,
+        samplers: lowered.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: lowered.root_cbvs,
+        root_srvs: lowered.root_srvs,
+        group_waves: 1,
+    };
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut shader.dxil).expect("DXIL validation failed");
+    }
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            continue;
+        };
+        let (root, pso) = host
+            .compute_pipeline(&shader)
+            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        let src_data = vec![10, 100, 20, 30, 200, 40, 50, 300, 60];
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(
+                        1,
+                        Root::View {
+                            srv: true,
+                            data: src_data,
+                        },
+                    )],
+                    views: &[View::RawUav(3)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+        assert_eq!(out[0], [100, 200, 300], "{label}: stride=12 + offset=4");
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP device available");
+}

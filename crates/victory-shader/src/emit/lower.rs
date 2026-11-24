@@ -8205,6 +8205,55 @@ impl<'a> Lower<'a> {
         })
     }
 
+    /// Unambiguously non-zero byte stride from `SQ_BUF_RSRC_WORD1.STRIDE` of
+    /// a `Source::Built` root buffer descriptor.
+    fn built_stride(&self, src: &Source) -> Option<u32> {
+        let mut stride = None;
+        for leaf in src.leaves() {
+            let Source::Built { bits, .. } = *leaf else {
+                return None;
+            };
+            let s = (bits >> 16) & 0x3FFF;
+            if s == 0 || stride.is_some_and(|prev| prev != s) {
+                return None;
+            }
+            stride = Some(s);
+        }
+        stride
+    }
+
+    /// Resolves `(handle, [coord0, coord1])` for a raw or structured buffer
+    /// access: `(12 | u, stride)` for a structured `UsedResource`, or raw
+    /// `(11 | u, 0)` with `index * stride + off` when `Source::Built` encodes
+    /// the stride.
+    fn indexed_buffer_coords(
+        &mut self,
+        site: Site,
+        src: &Source,
+        used: Option<&UsedResource>,
+        u: u32,
+        index: Option<V>,
+        off: V,
+    ) -> Result<(V, [V; 2]), Why> {
+        let iu = self.s.m.undef(self.s.t.i32);
+        let Some(index) = index else {
+            return Ok((self.handle(site, src, false, (11 | u, 0))?, [off, iu]));
+        };
+        let stride = used.map_or(0, |r| r.stride);
+        if stride >= 4 && stride.is_multiple_of(4) {
+            let h = self.handle(site, src, false, (12 | u, stride))?;
+            return Ok((h, [index, off]));
+        }
+        let Some(built) = self.built_stride(src) else {
+            return Err("a structured buffer of unknown stride");
+        };
+        let c = self.cur;
+        let stride_v = self.s.m.i32(built);
+        let elem_off = self.s.m.bin(c, Bin::Mul, index, stride_v);
+        let byte_off = self.s.m.bin(c, Bin::Add, elem_off, off);
+        Ok((self.handle(site, src, false, (11 | u, 0))?, [byte_off, iu]))
+    }
+
     fn buffer(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
         let Fields::Buffer {
             data,
@@ -8365,25 +8414,19 @@ impl<'a> Lower<'a> {
         if let Some(op) = atomic {
             let d = data.as_ref().ok_or("buffer atomic data")?;
             let vals = self.vgprs(inst, d, if op == u32::MAX { 2 } else { 1 })?;
-            let (h, coords) = match index {
-                Some(index) => {
-                    let stride = used.map_or(0, |u| u.stride);
-                    if stride < 4 || !stride.is_multiple_of(4) {
-                        return Err("a structured buffer of unknown stride");
-                    }
+            let (h, coords) = match (index, structured_stride(used)) {
+                (None, Some(stride)) => {
                     let h = self.handle(site, src, false, (12 | u, stride))?;
-                    (h, [index, off, iu])
+                    let sv = self.s.m.i32(stride);
+                    let idx = self.s.m.bin(c, Bin::UDiv, off, sv);
+                    let eoff = self.s.m.bin(c, Bin::URem, off, sv);
+                    (h, [idx, eoff, iu])
                 }
-                None => match structured_stride(used) {
-                    Some(stride) => {
-                        let h = self.handle(site, src, false, (12 | u, stride))?;
-                        let sv = self.s.m.i32(stride);
-                        let idx = self.s.m.bin(c, Bin::UDiv, off, sv);
-                        let eoff = self.s.m.bin(c, Bin::URem, off, sv);
-                        (h, [idx, eoff, iu])
-                    }
-                    None => (self.handle(site, src, false, (11 | u, 0))?, [off, iu, iu]),
-                },
+                _ => {
+                    let (h, [c0, c1]) =
+                        self.indexed_buffer_coords(site, src, used, u, index, off)?;
+                    (h, [c0, c1, iu])
+                }
             };
             let Operand::Vector { reg, .. } = *d else {
                 return Err("buffer atomic data");
@@ -8511,20 +8554,8 @@ impl<'a> Lower<'a> {
                 }
                 (69, "bufferStore.f32")
             } else {
-                match index {
-                    Some(index) => {
-                        let stride = used.map_or(0, |u| u.stride);
-                        if stride < 4 || !stride.is_multiple_of(4) {
-                            return Err("a structured buffer of unknown stride");
-                        }
-                        args.push(self.handle(site, src, false, (12 | u, stride))?);
-                        args.extend([index, off]);
-                    }
-                    None => {
-                        args.push(self.handle(site, src, false, (11 | u, 0))?);
-                        args.extend([off, iu]);
-                    }
-                }
+                let (h, [c0, c1]) = self.indexed_buffer_coords(site, src, used, u, index, off)?;
+                args.extend([h, c0, c1]);
                 args.extend(&vals);
                 args.resize(3 + 4, iu);
                 (140, "rawBufferStore.i32")
@@ -8604,34 +8635,15 @@ impl<'a> Lower<'a> {
         } else {
             let mask = self.s.m.i8((1u8 << count) - 1);
             let align = self.s.m.i32(4);
-            match index {
-                Some(index) => {
-                    let stride = used.map_or(0, |u| u.stride);
-                    if stride < 4 || !stride.is_multiple_of(4) {
-                        return Err("a structured buffer of unknown stride");
-                    }
-                    let h = self.handle(site, src, false, (12 | u, stride))?;
-                    self.s.op(
-                        c,
-                        "rawBufferLoad.f32",
-                        Attr::ReadOnly,
-                        self.s.t.res_ret,
-                        139,
-                        &[h, index, off, mask, align],
-                    )
-                }
-                None => {
-                    let h = self.handle(site, src, false, (11 | u, 0))?;
-                    self.s.op(
-                        c,
-                        "rawBufferLoad.f32",
-                        Attr::ReadOnly,
-                        self.s.t.res_ret,
-                        139,
-                        &[h, off, iu, mask, align],
-                    )
-                }
-            }
+            let (h, [c0, c1]) = self.indexed_buffer_coords(site, src, used, u, index, off)?;
+            self.s.op(
+                c,
+                "rawBufferLoad.f32",
+                Attr::ReadOnly,
+                self.s.t.res_ret,
+                139,
+                &[h, c0, c1, mask, align],
+            )
         };
         let Some(Operand::Vector { reg, .. }) = *data else {
             return Err("a buffer result");
