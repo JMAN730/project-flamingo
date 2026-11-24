@@ -241,6 +241,7 @@ fn encode(s: &HostShader) -> Vec<u8> {
         word(&mut out, slots.len() as u32);
         out.extend(slots);
     }
+    word(&mut out, s.group_waves);
     out
 }
 
@@ -297,6 +298,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
     }
     let root_cbvs = r.list()?;
     let root_srvs = r.list()?;
+    let group_waves = r.word()?;
     r.0.is_empty().then_some(HostShader {
         stage,
         dxil,
@@ -305,6 +307,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         static_samplers,
         root_cbvs,
         root_srvs,
+        group_waves,
     })
 }
 
@@ -331,6 +334,7 @@ mod tests {
             ])],
             root_cbvs: vec![2],
             root_srvs: vec![0, 3],
+            group_waves: 4,
         }
     }
 

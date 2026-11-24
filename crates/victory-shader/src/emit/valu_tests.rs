@@ -188,6 +188,7 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
         static_samplers: Vec::new(),
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
+        group_waves: lowered.group_waves,
     };
 
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
@@ -1694,6 +1695,7 @@ fn try_build_valu_cs(body: &[u32]) -> Result<HostShader, String> {
         static_samplers: Vec::new(),
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
+        group_waves: 1,
     };
 
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
@@ -2121,6 +2123,7 @@ fn root_view_reads_stop_at_the_bound_size() {
         static_samplers: Vec::new(),
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
+        group_waves: 1,
     };
     assert_eq!(shader.root_srvs, [2]);
     assert!(
