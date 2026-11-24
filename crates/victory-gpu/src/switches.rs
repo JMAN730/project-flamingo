@@ -18,7 +18,12 @@
 //!   to the card; copies already there stay until they are let go, which is
 //!   how the run behaves anyway while the budget fills.
 //! - `VICTORY_CARD_REHASH_RUNS` ([`crate::host::rehash_runs`]) picks whether a
-//!   compare pass hashes runs joined; a new pass takes the new value.
+//!   compare pass hashes runs joined, and `VICTORY_CARD_HASH_SPAN`
+//!   ([`crate::host::hash_span`]) the gap a pass bridges; a new pass takes the
+//!   new values.
+//! - `VICTORY_TEXTURE_IN_PLACE` and `VICTORY_TEXTURE_INPLACE_MAX_MB`
+//!   ([`crate::texture`]) decide how the next refresh reads: in place under
+//!   the remap lock, and up to what size. Both are asked per refresh.
 //! - `VICTORY_LATE_WAITS` ([`crate::frame`]) picks how a wait sleeps.
 //! - `VICTORY_RELAY`, `VICTORY_LATE_WAIT`, `VICTORY_ASYNC_WRITEBACK`,
 //!   `VICTORY_QUEUE_WAIT` and `VICTORY_SPLIT_WAITS` change how submissions
@@ -36,13 +41,16 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicI64, Ordering};
 
 /// The switches that may be changed live, in the order they are logged.
-const NAMES: [&str; 13] = [
+const NAMES: [&str; 16] = [
     "VICTORY_ASYNC_WRITEBACK",
     "VICTORY_TEXTURE_WAIT_US",
+    "VICTORY_TEXTURE_IN_PLACE",
+    "VICTORY_TEXTURE_INPLACE_MAX_MB",
     "VICTORY_CARD_BUFFERS",
     "VICTORY_CARD_BUFFERS_MIN_MB",
     "VICTORY_CARD_BUFFERS_MB",
     "VICTORY_CARD_REHASH_RUNS",
+    "VICTORY_CARD_HASH_SPAN",
     "VICTORY_RELAY",
     "VICTORY_LATE_WAIT",
     "VICTORY_LATE_WAIT_LISTS",

@@ -1509,6 +1509,24 @@ fn rehash_runs() -> bool {
     )
 }
 
+/// How many 64 KiB pieces of a gap between the ranges sent up to a copy in
+/// the card's memory one hash pass may cover (`VICTORY_CARD_HASH_SPAN`;
+/// 0, the default, keeps a pass per joined run).
+///
+/// A pass is ours, it runs before every submission's lists, and it takes
+/// the time of one piece however few its pieces: run `fx-d3dc-1` had 473
+/// passes over 1,272 pieces a frame (2.7 pieces a pass), each a dispatch
+/// with its own root arguments. Bridging the gaps of up to this many
+/// pieces cuts them to about one a copy; the pieces bridged are hashed
+/// though nothing changed in them, which costs a hash and nothing else
+/// (`crate::shadow::hash_spans`). 8 covers 512 KiB of untouched pieces.
+fn hash_span() -> u32 {
+    static MOST: OnceLock<u32> = OnceLock::new();
+    let start = *MOST.get_or_init(|| std::env::var("VICTORY_CARD_HASH_SPAN").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0));
+    // Live (crate::switches): a new pass takes the new gap.
+    crate::switches::u64v("VICTORY_CARD_HASH_SPAN", start as u64) as u32
+}
+
 /// Since the last frame-rate line, of our own passes over copies in the
 /// card's memory: hash passes after ranges were sent up, the pieces they
 /// hashed, and compare passes after the lists.
@@ -3124,8 +3142,17 @@ impl Host {
                         } else {
                             ranges.iter().map(|&(a, b)| shadow.card_run(a, b)).collect()
                         };
-                        // The same pieces in fewer passes (`rehash_runs`).
-                        let runs = if rehash_runs() { crate::shadow::joined_piece_runs(runs) } else { runs };
+                        // The same pieces in fewer passes: runs that touch
+                        // as one (`rehash_runs`), and runs a few pieces
+                        // apart bridged (`hash_span`).
+                        let span = hash_span();
+                        let runs = if span > 0 {
+                            crate::shadow::hash_spans(runs, span)
+                        } else if rehash_runs() {
+                            crate::shadow::joined_piece_runs(runs)
+                        } else {
+                            runs
+                        };
                         CARD_PASSES[0].fetch_add(runs.len() as u64, Ordering::Relaxed);
                         CARD_PASSES[1].fetch_add(runs.iter().map(|r| u64::from(r.pieces)).sum::<u64>(), Ordering::Relaxed);
                         for run in runs {
@@ -5827,8 +5854,9 @@ impl Meter {
             if passes + compares > 0.0 {
                 tracing::info!(
                     "our passes over copies in the card's memory per frame: {passes:.0} hash passes over {pieces:.0} pieces after \
-                     ranges were sent up (VICTORY_CARD_REHASH_RUNS=1 joins them: now {}), {compares:.0} compare passes",
-                    if rehash_runs() { "on" } else { "off" }
+                     ranges were sent up (VICTORY_CARD_REHASH_RUNS=1 joins them: {}; VICTORY_CARD_HASH_SPAN: {}), {compares:.0} compare passes",
+                    if rehash_runs() { "on" } else { "off" },
+                    if hash_span() > 0 { format!("bridging {} pieces", hash_span()) } else { "off".into() }
                 );
             }
         }
