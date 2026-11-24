@@ -212,7 +212,13 @@ pub extern "system" fn XApuConnect(
     }
     let event = if input.options & RESULT_EVENT != 0 {
         // SAFETY: plain auto-reset event, no name.
-        unsafe { CreateEventW(std::ptr::null(), 0, 0, std::ptr::null()) }
+        let event = unsafe { CreateEventW(std::ptr::null(), 0, 0, std::ptr::null()) };
+        if event.is_null() {
+            // SAFETY: allocated above with `layout`.
+            unsafe { std::alloc::dealloc(memory, layout) };
+            return E_OUTOFMEMORY;
+        }
+        event
     } else {
         std::ptr::null_mut()
     };
@@ -431,17 +437,27 @@ fn process(decoder: &mut OpusDecoder, options: u32, command: &Process, result: &
         .min(command.frame_count as usize)
         .min(output_length as usize / (4 * channels));
     let kept = &pcm[first * channels..(first + frames) * channels];
-    // SAFETY: the title's output buffer holds `output_length` bytes.
-    let out = unsafe { std::slice::from_raw_parts_mut(output.cast::<f32>(), frames * channels) };
+    // SAFETY: the title's output buffer holds `output_length` bytes, at
+    // least `frames * channels` samples.
+    let out = unsafe { std::slice::from_raw_parts_mut(output, frames * channels * 4) };
     if options & DEINTERLEAVED_OUTPUT != 0 && channels == 2 {
-        for (i, frame) in kept.as_chunks::<2>().0.iter().enumerate() {
-            (out[i], out[frames + i]) = (frame[0], frame[1]);
-        }
+        let (left, right) = out.split_at_mut(frames * 4);
+        let pairs = kept.as_chunks::<2>().0;
+        put_samples(left, pairs.iter().map(|f| f[0]));
+        put_samples(right, pairs.iter().map(|f| f[1]));
     } else {
-        out.copy_from_slice(kept);
+        put_samples(out, kept.iter().copied());
     }
     result.frames = frames as u32;
     result.output_length = (frames * channels * 4) as u32;
+}
+
+/// Writes float samples to the title's output bytes. The title's buffer is a
+/// `*mut u8` with no alignment promise, so it is never viewed as `[f32]`.
+fn put_samples(out: &mut [u8], samples: impl Iterator<Item = f32>) {
+    for (dst, sample) in out.as_chunks_mut::<4>().0.iter_mut().zip(samples) {
+        *dst = sample.to_le_bytes();
+    }
 }
 
 /// Decodes (when the connection decodes) and resamples one command's input
@@ -535,21 +551,15 @@ fn process_convert(
             return;
         }
         // SAFETY: the title's output buffer holds `output_length` bytes.
-        let out = unsafe { std::slice::from_raw_parts_mut(output.cast::<f32>(), len) };
-        for (i, frame) in converted[..frames * 2]
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .enumerate()
-        {
-            out[i] = frame[0];
-            out[midpoint + i] = frame[1];
-        }
+        let out = unsafe { std::slice::from_raw_parts_mut(output, len * 4) };
+        let (left, right) = out.split_at_mut(midpoint * 4);
+        let pairs = converted[..frames * 2].as_chunks::<2>().0;
+        put_samples(left, pairs.iter().map(|f| f[0]));
+        put_samples(right, pairs.iter().map(|f| f[1]));
     } else {
         // SAFETY: the title's output buffer holds `output_length` bytes.
-        let out =
-            unsafe { std::slice::from_raw_parts_mut(output.cast::<f32>(), frames * channels) };
-        out.copy_from_slice(&converted[..frames * channels]);
+        let out = unsafe { std::slice::from_raw_parts_mut(output, frames * channels * 4) };
+        put_samples(out, converted[..frames * channels].iter().copied());
     }
     result.frames = frames as u32;
     result.output_length = (frames * channels * 4) as u32;
@@ -959,5 +969,16 @@ mod tests {
         let energy: f32 = pcm.iter().map(|s| s * s).sum::<f32>() / pcm.len() as f32;
         assert!(energy > 0.01, "converted a tone, energy {energy}");
         assert_eq!(XApuDisconnect(handle), S_OK);
+    }
+
+    #[test]
+    fn samples_go_to_an_unaligned_output_as_bytes() {
+        // One byte past a 4-byte boundary: a `[f32]` view there is UB.
+        let mut buf = [0u8; 13];
+        put_samples(&mut buf[1..], [1.0f32, -2.0, 0.5].into_iter());
+        assert_eq!(buf[0], 0);
+        assert_eq!(buf[1..5], 1.0f32.to_le_bytes());
+        assert_eq!(buf[5..9], (-2.0f32).to_le_bytes());
+        assert_eq!(buf[9..13], 0.5f32.to_le_bytes());
     }
 }
