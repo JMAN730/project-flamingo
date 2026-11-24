@@ -33,6 +33,8 @@ pub(crate) struct Pending {
     /// whether a draw or dispatch has requested it yet.
     key: String,
     used: AtomicBool,
+    /// Whether what it is made from went to the warm-up list.
+    warmed: AtomicBool,
 }
 
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
@@ -56,7 +58,24 @@ impl Pending {
             made: OnceLock::new(),
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
+            warmed: AtomicBool::new(false),
         }
+    }
+
+    pub(crate) fn key(&self) -> &str {
+        &self.key
+    }
+
+    /// What it is made from.
+    pub(crate) fn parts(&self) -> (&[Arc<Shader>], Option<&GraphicsState>) {
+        (&self.shaders, self.graphics.as_deref())
+    }
+
+    /// Makes it on this thread (the warm-up's workers); whether it has a
+    /// host pipeline.
+    pub(crate) fn make_here(&self) -> bool {
+        self.make();
+        self.made.get().is_some_and(|made| made.is_some())
     }
 
     fn make(&self) {
@@ -127,7 +146,13 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
         start(p, REQUESTED);
         wait(p, crate::frame::current());
     }
-    p.made.get()?.as_ref()
+    let made = p.made.get()?.as_ref();
+    // What it is made from, for the next start's warm-up (only one that has
+    // a host pipeline: the list names pipelines to build).
+    if made.is_some() && !p.warmed.swap(true, Ordering::Relaxed) {
+        super::warm::note(p);
+    }
+    made
 }
 
 /// Makes `p` on this thread if it is not made yet (waiting for a worker
