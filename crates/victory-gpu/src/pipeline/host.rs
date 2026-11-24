@@ -149,6 +149,54 @@ fn host_blend(blend: &D3D12_BLEND_DESC, targets: &D3D12_RT_FORMAT_ARRAY) -> D3D1
 }
 
 impl GraphicsState {
+    /// A copy for a derived pipeline; its input elements point into its
+    /// own names.
+    pub(crate) fn derive(&self) -> GraphicsState {
+        let names = self.names.clone();
+        let inputs = self
+            .inputs
+            .iter()
+            .zip(&names)
+            .map(|(e, name)| D3D12_INPUT_ELEMENT_DESC {
+                SemanticName: PCSTR(name.as_ptr().cast()),
+                ..*e
+            })
+            .collect();
+        GraphicsState {
+            blend: self.blend,
+            sample_mask: self.sample_mask,
+            rasterizer: self.rasterizer,
+            depth: self.depth,
+            inputs,
+            names,
+            strip_cut: self.strip_cut,
+            topology: self.topology,
+            targets: self.targets,
+            depth_format: self.depth_format,
+            samples: self.samples,
+        }
+    }
+
+    /// Takes in one part of a derived pipeline (`CreateDerivedGraphicsPipelineStateX`):
+    /// 0 depth and stencil, 1 rasterizer, 2 blend, 3 sample mask; the
+    /// console's own parts are skipped. Returns whether the part is known.
+    ///
+    /// # Safety
+    /// `data` points at the part's description.
+    pub(crate) unsafe fn patch(&mut self, part: u32, data: *const u8) -> bool {
+        // SAFETY: the caller passes a whole part.
+        unsafe {
+            match part {
+                0 => self.depth = data.cast::<D3D12_DEPTH_STENCIL_DESC>().read_unaligned(),
+                1 => self.rasterizer = data.cast::<D3D12_RASTERIZER_DESC>().read_unaligned(),
+                2 => self.blend = data.cast::<D3D12_BLEND_DESC>().read_unaligned(),
+                3 => self.sample_mask = data.cast::<u32>().read_unaligned(),
+                _ => return false,
+            }
+        }
+        true
+    }
+
     /// Takes in one subobject of a stream: its type, then its data at +4
     /// (+8 for those holding pointers).
     ///

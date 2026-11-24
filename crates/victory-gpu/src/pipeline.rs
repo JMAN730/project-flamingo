@@ -603,6 +603,59 @@ pub(crate) extern "system" fn create_compute_x(
     create_compute(this, desc, iid, out)
 }
 
+/// One part of a derived pipeline: which part, then its description, at
+/// the size of the largest (the blend state).
+pub(crate) const DERIVED_PART: usize = 0x14c;
+
+/// Device method 0x1b8, `CreateDerivedGraphicsPipelineStateX(base, part
+/// count, parts, iid, out)`: the base pipeline with some of its state
+/// replaced (depth and stencil, rasterizer, blend, sample mask), each part
+/// a `u32` kind and the description at +4, [`DERIVED_PART`] bytes apart.
+/// The shaders are the base's. Parts only the console's GPU uses are
+/// skipped.
+pub(crate) extern "system" fn create_derived(
+    _: This,
+    base: This,
+    count: u32,
+    parts: *const u8,
+    iid: *const Iid,
+    out: *mut This,
+) -> HRESULT {
+    if base.is_null() || (count != 0 && parts.is_null()) {
+        return E_INVALIDARG;
+    }
+    let base = pipeline(base);
+    #[cfg(windows)]
+    let graphics = base.host.graphics.as_deref().map(|g| {
+        let mut g = g.derive();
+        for i in 0..count as usize {
+            // SAFETY: the title passes `count` parts.
+            let (part, data) = unsafe {
+                let at = parts.add(i * DERIVED_PART);
+                (at.cast::<u32>().read_unaligned(), at.add(4))
+            };
+            // SAFETY: as above.
+            if !unsafe { g.patch(part, data) } {
+                static SKIPPED: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if !SKIPPED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    tracing::info!(part, "derived pipeline part skipped (console only)");
+                }
+            }
+        }
+        Box::new(g)
+    });
+    #[cfg(not(windows))]
+    let _ = (count, parts);
+    hand_out(
+        base.shaders.clone(),
+        #[cfg(windows)]
+        graphics,
+        iid,
+        out,
+    )
+}
+
 /// A pipeline described as a stream: its size and the subobjects, each a
 /// type then its data, padded to 8 bytes.
 #[repr(C)]
@@ -762,6 +815,55 @@ mod tests {
             .iter()
             .map(|s| (s.stage, s.container.clone()))
             .collect()
+    }
+
+    #[test]
+    fn derived_pipelines_keep_the_base_shaders() {
+        let vs = [7u8, 8, 9];
+        let none = || Bytecode {
+            code: std::ptr::null(),
+            size: 0,
+        };
+        let desc = GraphicsHead {
+            root: std::ptr::null(),
+            stages: [
+                Bytecode {
+                    code: vs.as_ptr(),
+                    size: vs.len(),
+                },
+                none(),
+                none(),
+                none(),
+                none(),
+            ],
+        };
+        let mut base = std::ptr::null();
+        create_graphics(std::ptr::null(), &desc, &PIPELINE_IIDS[0], &mut base);
+        // A rasterizer part and one of the console's own.
+        let mut parts = vec![0u8; 2 * DERIVED_PART];
+        parts[0] = 1;
+        parts[DERIVED_PART] = 5;
+        let mut derived = std::ptr::null();
+        let hr = create_derived(
+            std::ptr::null(),
+            base,
+            2,
+            parts.as_ptr(),
+            &PIPELINE_IIDS[0],
+            &mut derived,
+        );
+        assert_eq!(hr, S_OK);
+        assert!(!derived.is_null() && derived != base);
+        assert_eq!(shaders(derived), [("vertex", vs.to_vec())]);
+        let hr = create_derived(
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
+            std::ptr::null(),
+            &PIPELINE_IIDS[0],
+            &mut derived,
+        );
+        assert_eq!(hr, E_INVALIDARG);
     }
 
     #[test]
