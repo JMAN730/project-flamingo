@@ -301,6 +301,10 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
 ///
 /// What changes for the picture: a texture that arrives while the runtime
 /// is remapping may show a frame later. It never shows partly read.
+///
+/// The refresh has waited for this lock only for what is left of its
+/// frame's [`waiting_room`] since; this switch is the same as a budget of
+/// 0 (it is not the whole of it any more).
 fn no_wait() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_NO_WAIT").is_some_and(|v| v == "1"))
@@ -326,6 +330,64 @@ pub(crate) static UNLOCKED: [std::sync::atomic::AtomicU64; 2] = [const { std::sy
 /// its own time a frame beside 1,100-1,800 ms of "textures"): it waits.
 /// These say for what.
 pub(crate) static REFRESH_WAITS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// How many microseconds a thread's texture refreshes may wait for title
+/// memory to hold still in one frame before they read through the kernel
+/// instead (`VICTORY_TEXTURE_WAIT_US`, default 8000).
+///
+/// Waiting for the lock the runtime takes alone while it remaps title
+/// memory was the whole of the streaming spikes: 1,033 ms of one frame's
+/// refreshes in run fx-d3dc-1, 882, 746, 507 in others, against 6-10 ms of
+/// asking the write watch. The wait cannot be shorter than the remapping,
+/// so the budget caps it: past it, a texture is read through the kernel
+/// (`refresh_unlocked`, about 0.6 ms a megabyte against 0.3 in place) and
+/// so shows what it held before at worst a frame late. 0 waits always, as
+/// before; any large value is `VICTORY_TEXTURE_NO_WAIT`'s behaviour.
+fn wait_us() -> u64 {
+    static US: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *US.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_WAIT_US")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8_000)
+    })
+}
+
+thread_local! {
+    /// The frame this thread's [`wait_us`] budget was last reset in, and
+    /// the microseconds it has spent waiting since.
+    static WAITED: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((u64::MAX, 0)) };
+}
+
+/// Waits for title memory to hold still on this refresh's behalf: whatever
+/// is left of this frame's budget (0: no wait at all).
+fn waiting_room() -> u64 {
+    let budget = wait_us();
+    if budget == 0 {
+        return 0;
+    }
+    let frame = crate::frame::current();
+    WAITED.with(|w| {
+        let (at, spent) = w.get();
+        if at != frame {
+            w.set((frame, 0));
+            return budget;
+        }
+        budget.saturating_sub(spent)
+    })
+}
+
+/// Adds `us` to this frame's waiting, for [`waiting_room`].
+fn waited_out(us: u64) {
+    if wait_us() == 0 {
+        return;
+    }
+    let frame = crate::frame::current();
+    WAITED.with(|w| {
+        let (at, spent) = w.get();
+        w.set((frame, if at == frame { spent.saturating_add(us) } else { us }));
+    });
+}
 
 /// `f`'s result, its time added to [`REFRESH_WAITS`]' place `slot`.
 fn waited<T>(slot: usize, f: impl FnOnce() -> T) -> T {
@@ -664,16 +726,21 @@ impl Staging {
         // stays mapped (see `crate::watch::title_memory_reading`; without
         // it a page went between the asking and the read in runs 71 and
         // 74).
-        let _mapped = if no_wait() {
-            // Not waited for: while the runtime remaps title memory the
-            // texture is read through the kernel instead, whole or not at
-            // all (`no_wait`).
-            let Some(mapped) = crate::watch::title_memory_reading_now() else {
-                return self.refresh_unlocked(last, size);
-            };
-            mapped
-        } else {
-            waited(2, crate::watch::title_memory_reading)
+        // Waited for, but only for what is left of this frame's budget
+        // ([`waiting_room`]): past it the texture is read through the
+        // kernel instead, whole or not at all (`refresh_unlocked`), which
+        // is what `VICTORY_TEXTURE_NO_WAIT=1` does always.
+        let Some(_mapped) = waited(2, || {
+            let room = if no_wait() { 0 } else { waiting_room() };
+            if room == 0 {
+                return crate::watch::title_memory_reading_now();
+            }
+            let started = std::time::Instant::now();
+            let got = crate::watch::title_memory_reading_within(std::time::Duration::from_micros(room));
+            waited_out(started.elapsed().as_micros() as u64);
+            got
+        }) else {
+            return self.refresh_unlocked(last, size);
         };
         if !committed(self.memory, size) {
             // Partly mapped: a streamed texture with only some mips' pages
@@ -683,6 +750,8 @@ impl Staging {
             // shortcut: read again at most every 30 frames (reading around
             // unmapped pages is slow, and nothing tells us when pages
             // arrive): a mip that streams in shows up to 30 frames late.
+            // Read through the kernel, which needs no lock over the mapping.
+            drop(_mapped);
             let frame = crate::frame::current();
             if last.partial.is_some_and(|at| frame < at + 30) {
                 return 0;
@@ -711,6 +780,8 @@ impl Staging {
             return size;
         }
         if through_copy() {
+            // A read through the kernel, which needs no lock.
+            drop(_mapped);
             return with_title(self.memory, size, |tiled| {
                 let hash = blake3::hash(tiled);
                 #[cfg(feature = "diagnostics")]
@@ -725,19 +796,31 @@ impl Staging {
                 size
             });
         }
-        // SAFETY: committed memory of the texture's layout size, and it
-        // stays committed while `_mapped` is held.
-        let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
-        let hash = blake3::hash(tiled);
-        #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
-        if last.hash == Some(hash) {
-            return size;
-        }
-        last.hash = Some(hash);
-        self.detile(tiled);
-        #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
+        // Only the copy is done under the lock (`_mapped` says the pages are
+        // there): the hash and the detile are the biggest part of a refresh,
+        // and the runtime waits for every reader while it remaps, so neither
+        // is held under it. The copy stays in this thread's read buffer,
+        // which nothing else touches between the two calls.
+        // SAFETY: `committed` said every page is there and `_mapped` keeps
+        // it there.
+        with_read(size, |read| unsafe {
+            std::ptr::copy_nonoverlapping(self.memory, read.as_mut_ptr(), size);
+        });
+        drop(_mapped);
+        let fresh = with_read(size, |tiled| {
+            let hash = blake3::hash(tiled);
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
+            if last.hash == Some(hash) {
+                return false;
+            }
+            last.hash = Some(hash);
+            self.detile(tiled);
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
+            true
+        });
+        let _ = fresh;
         size
     }
 

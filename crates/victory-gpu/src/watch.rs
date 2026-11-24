@@ -635,6 +635,31 @@ pub fn title_memory_reading_now() -> Option<Reading> {
     }
 }
 
+/// [`title_memory_reading`] if it can be had within `limit`: `None` when the
+/// runtime keeps changing title memory for longer than that.
+///
+/// For a caller that has another way to read (`crate::texture::refresh`):
+/// the runtime's remapping lock is taken again and again while the world
+/// streams in (1,033 ms of one frame's texture refreshes waited for it in
+/// run fx-d3dc-1, 507 in another), and waiting for it can never take less
+/// than the remapping does.
+pub fn title_memory_reading_within(limit: std::time::Duration) -> Option<Reading> {
+    let started = std::time::Instant::now();
+    loop {
+        match MAPPING.try_read() {
+            Ok(guard) => return Some(Reading(guard)),
+            Err(std::sync::TryLockError::Poisoned(e)) => return Some(Reading(e.into_inner())),
+            Err(std::sync::TryLockError::WouldBlock) => {}
+        }
+        if started.elapsed() >= limit {
+            return None;
+        }
+        // Yield, don't sleep: a Windows sleep is 1-15 ms whatever is asked,
+        // which would spend the whole budget at once.
+        std::thread::yield_now();
+    }
+}
+
 /// The runtime mapped or unmapped title memory `[at, at + len)`: what it
 /// shows is new and read-write, so it is no longer guarded (nor known
 /// unmapped).
