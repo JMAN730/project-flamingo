@@ -1,5 +1,5 @@
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 
@@ -60,33 +60,20 @@ impl Cache {
             .with_context(|| format!("converter {} v{}", converter.id(), converter.version()))?;
         let dir = path.parent().expect("hashed path has a parent");
         std::fs::create_dir_all(dir)?;
-        // Write-then-rename so readers never see partial output.
-        let tmp = tempfile_in(dir);
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp)?;
-        let written = file.write_all(&output);
-        drop(file);
-        let published = written.and_then(|()| std::fs::rename(&tmp, &path));
-        if published.is_err() {
-            let _ = std::fs::remove_file(&tmp);
-        }
-        published?;
+        // Write to a temporary file on the same filesystem and then publish.
+        let mut file = tempfile::NamedTempFile::new_in(dir)?;
+        file.write_all(&output)?;
+        file.persist(&path)
+            .map_err(|err| err.error)
+            .with_context(|| format!("publishing {}", path.display()))?;
         Ok(path)
     }
-}
-
-fn tempfile_in(dir: &Path) -> PathBuf {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    dir.join(format!(".tmp-{}-{n}", std::process::id()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct Upper {
@@ -105,6 +92,29 @@ mod tests {
             self.runs.fetch_add(1, Ordering::Relaxed);
             Ok(input.to_ascii_uppercase())
         }
+    }
+
+    #[test]
+    fn recycled_process_id_can_stage_a_new_entry() {
+        // A fresh process starts with the old staging counter at zero.
+        if !in_child("recycled_process_id_can_stage_a_new_entry") {
+            return;
+        }
+
+        let cache = Cache::open("cache").unwrap();
+        let converter = Upper {
+            version: 1,
+            runs: AtomicUsize::new(0),
+        };
+        let path = cache.path_for(&CacheKey::new(&converter, b"abc"));
+        let dir = path.parent().unwrap();
+        std::fs::create_dir_all(dir).unwrap();
+        let stale = dir.join(format!(".tmp-{}-0", std::process::id()));
+        std::fs::write(&stale, b"abandoned").unwrap();
+
+        assert_eq!(cache.get_or_convert(&converter, b"abc").unwrap(), path);
+        assert_eq!(std::fs::read(path).unwrap(), b"ABC");
+        assert_eq!(std::fs::read(stale).unwrap(), b"abandoned");
     }
 
     #[test]
