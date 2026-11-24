@@ -24,6 +24,14 @@ jobs:
       # The version and components pinned in rust-toolchain.toml.
       - run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
+      # The launcher runs on the users' Windows PowerShell 5.1: it must parse there.
+      - name: Try script parses
+        shell: powershell
+        run: |
+          $errors = $null
+          $null = [System.Management.Automation.Language.Parser]::ParseFile("$PWD\scripts\try\try.ps1", [ref]$null, [ref]$errors)
+          if ($errors) { $errors | ForEach-Object { Write-Output "::error::try.ps1 line $($_.Extent.StartLineNumber): $($_.Message)" }; exit 1 }
+          Write-Output 'try.ps1 parses'
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Clippy, diagnostics build

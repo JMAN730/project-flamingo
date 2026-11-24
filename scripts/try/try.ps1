@@ -15,7 +15,7 @@
 
 $ErrorActionPreference = 'Continue'
 $ProgressPreference = 'SilentlyContinue'
-$TryVersion = '3.1'
+$TryVersion = '3.2'
 $ForkUrl = 'https://github.com/MfDev0/victory.git'
 $Branch = 'arena/59fabb00-victory'
 # Other places the fork may live (renamed to CAtez, or a backup copy), tried
@@ -40,11 +40,11 @@ function Bad([string]$msg) { Write-Host ('  ' + $msg) -ForegroundColor Red }
 function Load-Config {
     # console: series-x, the profile the fork's base (fxceless/victory-gta6)
     # renders the world with on NVIDIA (RTX 3080, 3070 Ti, 4070).
-    $c = @{ game_dir = ''; game_exe = ''; built_key = ''; added = ''; console = 'series-x'; base = ''; fast = '' }
+    $c = @{ game_dir = ''; game_exe = ''; built_key = ''; added = ''; console = 'series-x'; base = ''; fast = ''; loop = '' }
     if (Test-Path $ConfigPath) {
         try {
             $j = Get-Content -Path $ConfigPath -Raw | ConvertFrom-Json
-            foreach ($k in @('game_dir', 'game_exe', 'built_key', 'added', 'console', 'base', 'fast')) { if ($j.$k) { $c[$k] = [string]$j.$k } }
+            foreach ($k in @('game_dir', 'game_exe', 'built_key', 'added', 'console', 'base', 'fast', 'loop')) { if ($j.$k) { $c[$k] = [string]$j.$k } }
         } catch {}
     }
     # Try 3.0 moved to the victory-gta6 base: start once on Series X.
@@ -448,7 +448,9 @@ function Run-Game {
     # Long shader loops pass the 2 s driver timeout; 256 turns was the
     # stable middle on an 8 GB RTX 3060 Ti (victory-gta6 #18): 32 makes hair
     # glow and the scene darker, 1024 lost the device after 7 min.
-    if (-not $env:VICTORY_SHADER_LOOP_LIMIT) { $env:VICTORY_SHADER_LOOP_LIMIT = '256' }
+    # 128 once a relay run has lost the card (see Check-Run).
+    $script:LoopFromTry = -not $env:VICTORY_SHADER_LOOP_LIMIT
+    if ($script:LoopFromTry) { $env:VICTORY_SHADER_LOOP_LIMIT = $(if ($c.loop) { $c.loop } else { '256' }) }
     # Speed: results land as the card finishes (2-3 fps and stable on that
     # card). F mode instead sends submissions ahead with card buffers: 4-5 fps
     # on a 12 GB RTX 4070 (victory-gta6 #27), lost the device sooner on an
@@ -486,6 +488,66 @@ function Run-Game {
     Say "its output: $log"
     $crashes = Join-Path $env:LOCALAPPDATA 'victory\data\crashes.log'
     if (Test-Path $crashes) { Say "crash details, if it crashed: $crashes" }
+    try { Check-Run $log $stamp $crashes } catch { Bad "could not summarize the run: $_" }
+}
+
+# After a run: a short summary of its log, the safer setting for next time
+# if the card was lost (only then), and one zip with everything to send.
+function Check-Run([string]$log, [string]$stamp, [string]$crashes) {
+    if (-not (Test-Path $log)) { return }
+    $c = $script:Config
+    $lines = @(Get-Content -LiteralPath $log -ErrorAction SilentlyContinue)
+    $count = { param($pattern) @($lines | Where-Object { $_ -match $pattern }).Count }
+    $fps = @()
+    foreach ($l in $lines) { if ($l -match '([0-9]+\.[0-9]) fps, [0-9.]+ ms/frame') { $fps += [double]$Matches[1] } }
+    Step 'Run summary'
+    if ($fps.Count -gt 0) {
+        $last = @($fps | Select-Object -Last 20 | Sort-Object)
+        $median = $last[[int][math]::Floor($last.Count / 2)]
+        $best = ($fps | Measure-Object -Maximum).Maximum
+        Say "speed: $median fps typical at the end (last $($last.Count) reports), $best fps best"
+    } else {
+        Say 'speed: no frame report in the log (the world was not reached, or the run was short)'
+    }
+    Say "shaders that do not translate: $(& $count 'shader does not translate')"
+    Say "pipelines the card refused: $(& $count 'host pipeline refused')"
+    Say "slow submissions (over 250 ms on the card): $(& $count 'slow host submission')"
+    $lost = & $count 'device removed|DEVICE_REMOVED|DEVICE_HUNG'
+    if ($lost -gt 0) {
+        Bad 'the graphics card was lost (device removed) in this run.'
+        if ($c.fast -eq '1') {
+            $c.fast = ''
+            Say 'next run: back to the stable relay speed mode (F switches again).'
+        } elseif ($script:LoopFromTry -and $c.loop -ne '128') {
+            $c.loop = '128'
+            Say 'next run: shader loop limit 128 instead of 256 (fewer card timeouts; long effects may look a bit off).'
+        }
+        Save-Config
+    }
+    # Everything to send in one file on the Desktop.
+    $desk = [Environment]::GetFolderPath('Desktop')
+    if (-not $desk -or -not (Test-Path $desk)) { $desk = $TryHome }
+    $zip = Join-Path $desk "VIctory-report-$stamp.zip"
+    $stage = Join-Path $TryHome "report-$stamp"
+    try {
+        New-Item -ItemType Directory -Force -Path $stage | Out-Null
+        Copy-Item -LiteralPath $log -Destination $stage
+        if (Test-Path $crashes) { Copy-Item -LiteralPath $crashes -Destination $stage }
+        $buildLog = Join-Path $LogDir 'build.log'
+        if (Test-Path $buildLog) { Copy-Item -LiteralPath $buildLog -Destination $stage }
+        $dump = $env:VICTORY_DUMP_FAILED
+        if ($dump -and (Test-Path $dump)) {
+            $size = (Get-ChildItem -LiteralPath $dump -Recurse -File -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum
+            if ($size -lt 300MB) { Copy-Item -LiteralPath $dump -Destination (Join-Path $stage 'failed-shaders') -Recurse }
+            else { Say "failed shaders left out of the zip ($([int]($size / 1MB)) MB): zip $dump yourself if asked" }
+        }
+        Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $zip -Force
+        Say "everything to send is in one file: $zip"
+    } catch {
+        Bad "could not make the report zip ($_): send $log instead"
+    } finally {
+        Remove-Item -Recurse -Force $stage -ErrorAction SilentlyContinue
+    }
 }
 
 # ------------------------------------------------------------- main

@@ -56,7 +56,14 @@ runs the newer one, so fixes to VIctory Try itself need no new download.
    device before the first frame there). Defaults: shader loop limit 256,
    `VICTORY_RELAY=2`, the two programs known to hang the card skipped, and
    a cache folder of its own.
-5. When the game stops, you choose what's next:
+5. When the game stops (3.2), it prints a short summary (typical and best
+   fps, shaders that did not translate, pipelines the card refused, slow
+   submissions) and puts everything to send in one file on the Desktop,
+   `VIctory-report-<date>.zip` (the game log, crash details, build log and
+   the failed shaders). If the graphics card was lost during the run, the
+   next run is safer by itself: back from F mode to the relay, or else the
+   shader loop limit goes from 256 to 128. Nothing changes after a good run.
+6. Then you choose what's next:
    - **Enter**: run again;
    - **U**: update to the newest version and run;
    - **G**: change the game paths;
