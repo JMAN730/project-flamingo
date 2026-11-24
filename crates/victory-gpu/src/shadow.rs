@@ -156,9 +156,18 @@ pub(crate) fn cards() -> bool {
 /// The smallest title buffer whose copy goes to the card's memory, and the
 /// most bytes of such copies (their "before" twins not counted: a copy
 /// shaders write takes its size twice), both in bytes:
-/// `VICTORY_CARD_BUFFERS_MIN_MB` (16) and `VICTORY_CARD_BUFFERS_MB` (512).
-/// Run 69's gameplay has ten title buffers of 16 MiB or more, 494 MB, and
-/// 1,650 MB of the card's budget free.
+/// `VICTORY_CARD_BUFFERS_MIN_MB` (1) and `VICTORY_CARD_BUFFERS_MB` (512).
+///
+/// The first was 16 MiB, for run 69's ten title buffers of 16 MiB or more
+/// (494 MB, with 1,650 MB of the card's budget free). Run `fx-d3dc-1` (RX
+/// 9070 XT, native `d3dcompiler_47`, so the card's compare compiles) showed
+/// what the rest cost on the CPU: 430 MB a frame snapshotted and compared
+/// in 467 ranges of title buffers' copies, 399.8 MB of it in copies of
+/// 1 MiB or more (`58.5 ms` of snapshots, `20.8 + 27.9 ms` of finding and
+/// putting back, all on one thread, against a 172 ms frame). A copy of
+/// 1 MiB or more goes to the card's memory now, while the copies there stay
+/// under the second number: at most 512 MB of the card's budget, which the
+/// textures' queue (`resource::room`) counts like its own.
 fn card_limits() -> (u64, u64) {
     static LIMITS: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
     *LIMITS.get_or_init(|| {
@@ -166,7 +175,7 @@ fn card_limits() -> (u64, u64) {
             crate::switches::u64v(name, std::env::var(name).ok().and_then(|v| v.trim().parse().ok()).unwrap_or(default))
                 << 20
         };
-        (mb("VICTORY_CARD_BUFFERS_MIN_MB", 16).max(1 << 20), mb("VICTORY_CARD_BUFFERS_MB", 512))
+        (mb("VICTORY_CARD_BUFFERS_MIN_MB", 1).max(1 << 20), mb("VICTORY_CARD_BUFFERS_MB", 512))
     })
 }
 
@@ -384,6 +393,33 @@ pub(crate) struct CardSpan {
     pub(crate) skew: u32,
 }
 
+/// [`joined_piece_runs`], and then runs whose gap is `gap` pieces or fewer
+/// bridged into one span (`Host::card_before`, `VICTORY_CARD_HASH_SPAN`):
+/// every piece of `runs` is in the result once, and the pieces of a bridge
+/// come with it.
+///
+/// Each pass walks its pieces 16 bytes at a time and takes the time of one
+/// piece however few it has, so the passes, not the pieces, are the cost:
+/// run `fx-d3dc-1` had `473 hash passes over 1,272 pieces` a frame. A piece
+/// hashed when it need not be costs that piece's hash and nothing else: a
+/// stored hash that is never compared as differing is the same as one that
+/// was never written, and a piece that was written is hashed by the pass
+/// after its range is sent up in any case.
+pub(crate) fn hash_spans(mut runs: Vec<CardSpan>, gap: u32) -> Vec<CardSpan> {
+    runs = joined_piece_runs(runs);
+    let mut out: Vec<CardSpan> = Vec::with_capacity(runs.len());
+    for run in runs {
+        match out.last_mut() {
+            Some(last) if run.first <= last.first + last.pieces + gap => {
+                last.pieces = last.pieces.max(run.first + run.pieces - last.first);
+                last.to = last.to.max(run.to);
+            }
+            _ => out.push(run),
+        }
+    }
+    out
+}
+
 /// [`CardSpan`] for offsets `[from, to)` (`from < to`) of a copy of title
 /// memory from `start` on.
 fn card_span_of(start: usize, from: usize, to: usize) -> CardSpan {
@@ -407,7 +443,7 @@ fn card_piece_of(start: usize, len: usize, span: &CardSpan, i: u32) -> (usize, u
 
 #[cfg(test)]
 mod card_tests {
-    use super::{CardSpan, PIECE, card_piece_of, card_span_of, joined, joined_piece_runs};
+    use super::{CardSpan, PIECE, card_piece_of, card_span_of, hash_spans, joined, joined_piece_runs};
 
     /// Joined runs hold every piece of the runs given, once, and no other.
     #[test]
@@ -429,6 +465,45 @@ mod card_tests {
         assert_eq!(joined.iter().map(|r| (r.first, r.pieces)).collect::<Vec<_>>(), [(3, 5), (9, 1), (40, 3), (100, 1)]);
         assert!(joined.iter().all(|r| r.skew == 7));
         assert!(joined_piece_runs(Vec::new()).is_empty());
+    }
+
+    /// Bridged spans hold every piece of the runs given, once, and only
+    /// add pieces from the gaps bridged; a gap of `gap` pieces or fewer is
+    /// bridged, a wider one is not.
+    #[test]
+    fn hash_spans_bridge_gaps_and_hold_every_piece() {
+        let run = |first: u32, pieces: u32| CardSpan {
+            from: first * 65536,
+            to: (first + pieces) * 65536,
+            first,
+            pieces,
+            skew: 5,
+        };
+        let runs = vec![run(3, 2), run(9, 1), run(40, 3), run(100, 1)];
+        let shapes = |spans: &[CardSpan]| spans.iter().map(|r| (r.first, r.pieces)).collect::<Vec<_>>();
+        // No bridging: the joined runs, as before.
+        assert_eq!(shapes(&hash_spans(runs.clone(), 0)), [(3, 2), (9, 1), (40, 3), (100, 1)]);
+        // 3..5 and 9 are 4 pieces apart: 8 reaches, 3 does not.
+        assert_eq!(shapes(&hash_spans(runs.clone(), 8)), [(3, 7), (40, 3), (100, 1)]);
+        assert_eq!(shapes(&hash_spans(runs.clone(), 3)), [(3, 2), (9, 1), (40, 3), (100, 1)]);
+        // Everything one call: every piece of every run is in the spans.
+        for gap in [0u32, 1, 4, 8, 40, 1000] {
+            let spans = hash_spans(runs.clone(), gap);
+            let got: Vec<u32> = spans.iter().flat_map(|r| r.first..r.first + r.pieces).collect();
+            let mut wanted: Vec<u32> = runs.iter().flat_map(|r| r.first..r.first + r.pieces).collect();
+            wanted.sort_unstable();
+            for piece in wanted {
+                assert!(got.contains(&piece), "gap {gap}: piece {piece} lost");
+            }
+            // Spans are in order, apart, and keep the copy's skew.
+            for pair in spans.windows(2) {
+                assert!(pair[0].first + pair[0].pieces < pair[1].first, "gap {gap}: spans touch");
+            }
+            assert!(spans.iter().all(|r| r.skew == 5));
+            // A span reaches no further than its last run's end.
+            assert!(spans.windows(2).all(|p| p[0].to <= p[1].from));
+        }
+        assert!(hash_spans(Vec::new(), 8).is_empty());
     }
 
     /// The offsets the compare's shader takes for a piece (`CARD_COMPARE`
@@ -1238,10 +1313,12 @@ pub(crate) fn back_line(frames: f64) {
         return;
     }
     let mb = |v: f64| v / (1 << 20) as f64;
+    let least = (crate::shadow::card_limits().0 >> 20).max(1);
     tracing::info!(
         "shader writes looked for on the CPU per frame: {:.1} MB compared in {:.0} ranges of windows outside buffers ({:.1} MB \
          snapshotted), {:.1} MB in {:.0} ranges of title buffers' copies ({:.1} MB snapshotted), of them {:.1} MB in copies \
-         of 1 MiB or more (VICTORY_CARD_BUFFERS_MIN_MB=1 would have the card look there)",
+         of {least} MiB or more (those go to the card's memory while \
+         VICTORY_CARD_BUFFERS_MB's room holds)",
         mb(c[2]),
         c[5],
         mb(c[0]),
@@ -2034,7 +2111,9 @@ impl Shadow {
         let (bytes, ranges) = if self.window { (2, 5) } else { (3, 6) };
         BACK_CLASS[bytes].fetch_add((to - from) as u64, Ordering::Relaxed);
         BACK_CLASS[ranges].fetch_add(1, Ordering::Relaxed);
-        if !self.window && self.len >= 1 << 20 {
+        // Copies of the size that go to the card's memory: what the CPU
+        // would still search, were the room not there.
+        if !self.window && self.len >= card_limits().0 {
             BACK_CLASS[4].fetch_add((to - from) as u64, Ordering::Relaxed);
         }
     }
