@@ -2659,7 +2659,14 @@ fn read_backs(list: &HostList) {
 
 /// After the card ran what declared `back`: what shaders wrote there goes
 /// into title memory, and the ranges are done with.
-fn hand_back(back: &[Declared]) {
+///
+/// With the write-back on a thread of its own ([`crate::writeback`]) the
+/// work is posted there instead (`write_back_job`) and the submitting
+/// thread prepares the title's next submission meanwhile; the ranges stay
+/// `pending` (title memory there older than the copy) until the worker's
+/// merge ran, and a title thread that touches a block the job holds waits
+/// for it.
+pub(crate) fn hand_back_now(back: &[Declared]) {
     if crate::shadow::wide_back() {
         // Every range first (the pieces that differ, found on several
         // threads), then the merges, in order, as below.
@@ -2724,6 +2731,36 @@ fn hand_back(back: &[Declared]) {
         }
         shadow.copy_back_done(declared);
     }
+}
+
+/// A write-back job for `back` (`VICTORY_ASYNC_WRITEBACK=1`; `None` when the
+/// copy-back runs inline): each range is held inaccessible to the title with
+/// the job, so a title read of it waits for the worker's merge
+/// ([`crate::watch::back_begin`]). Copies in the card's memory are left to
+/// the submitting thread (their compare ran on the card).
+fn write_back_job(back: &[Declared]) -> crate::writeback::Job {
+    let mut job = crate::writeback::Job::new();
+    let done = job.done();
+    for (shadow, ranges) in back {
+        if shadow.carded() {
+            continue;
+        }
+        let mut sorted = ranges.clone();
+        sorted.sort_unstable();
+        let mut spans: Vec<(usize, usize)> = Vec::new();
+        for (from, to) in sorted {
+            match spans.last_mut() {
+                Some(last) if from <= last.1 => last.1 = last.1.max(to),
+                _ => spans.push((from, to)),
+            }
+        }
+        for (from, to) in spans {
+            shadow.write_back(from, to, done.clone());
+            job.blocks.extend(crate::watch::back_begin(&done, from, to));
+        }
+        job.back.push((shadow.clone(), ranges.clone()));
+    }
+    job
 }
 
 impl Host {
@@ -3723,6 +3760,8 @@ impl Host {
         }
         let was_working = working(true);
         let mut counted = false;
+        // A write-back job for this line, posted once its read-backs are in.
+        let mut settled_job: Option<crate::writeback::Job> = None;
         loop {
             let items = {
                 let mut line = line();
@@ -3807,8 +3846,32 @@ impl Host {
                         }
                     }
                 }
-                hand_back(&back);
+                let mut job = if crate::writeback::switched_on() && !back.is_empty() {
+                    let mut job = write_back_job(&back);
+                    for (shadow, ranges) in back.iter().filter(|(s, _)| s.carded()) {
+                        shadow.copy_back_done(ranges);
+                    }
+                    // The flights' bottom-of-pipe writes follow the
+                    // copy-back, on the same worker.
+                    for item in &items {
+                        if let Late::Write(at, what, bytes) = item {
+                            job.writes.push((*at, *what, *bytes));
+                        }
+                    }
+                    Some(job)
+                } else {
+                    hand_back_now(&back);
+                    None
+                };
                 COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
+                if let Some(job) = job.take()
+                    && !job.is_empty()
+                {
+                    // After the whole line has been read back (below), not
+                    // before: a fence signalled meanwhile may be read by the
+                    // title, and its blocks make it wait.
+                    settled_job = Some(job);
+                }
             }
             // In the order given: what tells the title the card is done.
             let mut last = 0;
@@ -3825,8 +3888,22 @@ impl Host {
                         }
                         landed.push((flight.lists, flight.order));
                     }
-                    Late::Write(at, what, bytes) => what.write(at as *mut u8, bytes),
-                    Late::Signal(fence, value) => crate::fence::set(fence as crate::object::This, value),
+                    // With the write-back on its own thread these are the
+                    // job's (it writes them after the copy-back).
+                    Late::Write(at, what, bytes) => {
+                        if settled_job.is_none() {
+                            what.write(at as *mut u8, bytes);
+                        }
+                    }
+                    Late::Signal(fence, value) => {
+                        // The fence's own words are not a job's copy-back
+                        // range, but a title thread that reads them must not
+                        // see the card's bytes half put back: wait first.
+                        if settled_job.is_some() {
+                            crate::watch::back_wait(fence, fence + 8);
+                        }
+                        crate::fence::set(fence as crate::object::This, value)
+                    }
                 }
             }
             if last > 0 {
@@ -3834,6 +3911,9 @@ impl Host {
                 bury(last);
             }
             line().landed.extend(landed);
+            if let Some(job) = settled_job.take() {
+                crate::writeback::submit(job);
+            }
         }
         if counted {
             self.log_messages();
@@ -4110,7 +4190,22 @@ impl Host {
             self.card_back(card, &mut submitted, &mut std::collections::HashSet::new());
         }
         let back = declared_writes(runs);
-        hand_back(&back);
+        // With the write-back on its own thread (`VICTORY_ASYNC_WRITEBACK=1`)
+        // the ranges are held and posted once the read-backs are in; the
+        // card's copies, whose compare ran there, are done here.
+        let mut job = if crate::writeback::switched_on() && !back.is_empty() {
+            let mut job = write_back_job(&back);
+            for (shadow, ranges) in back.iter().filter(|(s, _)| s.carded()) {
+                shadow.copy_back_done(ranges);
+            }
+            for list in runs {
+                job.writes.extend(list.deferred().writes.iter().copied());
+            }
+            Some(job)
+        } else {
+            hand_back_now(&back);
+            None
+        };
         if let Some(card) = card {
             self.card_done(card);
         }
@@ -4130,11 +4225,19 @@ impl Host {
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
         for list in runs {
             // Read backs first: a value written at the bottom of the pipe
-            // may be what tells the title that they are there.
+            // may be what tells the title that they are there. (On the
+            // worker they follow the copy-back there.)
             read_backs(list);
-            for &(at, what, bytes) in &list.deferred().writes {
-                what.write(at as *mut u8, bytes);
+            if job.is_none() {
+                for &(at, what, bytes) in &list.deferred().writes {
+                    what.write(at as *mut u8, bytes);
+                }
             }
+        }
+        if let Some(job) = job.take()
+            && !job.is_empty()
+        {
+            crate::writeback::submit(job);
         }
         self.log_messages();
         submitting(0, 0);

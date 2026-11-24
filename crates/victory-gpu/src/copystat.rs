@@ -127,8 +127,15 @@ pub(crate) enum C {
     WaitsForGroups,
     WaitsForBuffers,
     IndirectBounded,
+    /// With the write-back on its own thread (`VICTORY_ASYNC_WRITEBACK=1`):
+    /// jobs it ran and their microseconds, and the title's waits on blocks
+    /// a job held (count and microseconds).
+    AsyncJobs,
+    AsyncUs,
+    AsyncWaits,
+    AsyncWaitUs,
 }
-const COUNTERS: usize = 80;
+const COUNTERS: usize = 88;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -1128,7 +1135,8 @@ pub(crate) fn log(frames: f64) {
          until the first submission; {:.1} ms from the last submission to the present call; \
          lists reset in {:.1} ms; the process ran {user:.0} ms user + {kernel:.0} ms kernel on \
          all threads; what shaders wrote: {:.1} ms finding {:.0} pieces that differ, {:.1} ms \
-         putting them back; texture uploads: {:.0} recorded, {:.0} left out; {:.1} held \
+         putting them back; write-back jobs: {:.0} in {:.1} ms, the title waited for them \
+         {:.0} times {:.1} ms; texture uploads: {:.0} recorded, {:.0} left out; {:.1} held \
          submissions run at the present with their waits not met; waits for memory values: \
          {:.0} looks {:.1} ms; {:.0} host lists made {:.1} ms; {:.0} parts of held submissions \
          ran alone that the next part could have run with",
@@ -1139,6 +1147,10 @@ pub(crate) fn log(frames: f64) {
         ms(c[C::BackScanUs as usize]),
         c[C::BackDiffer as usize],
         ms(c[C::BackSyncUs as usize]),
+        c[C::AsyncJobs as usize],
+        ms(c[C::AsyncUs as usize]),
+        c[C::AsyncWaits as usize],
+        ms(c[C::AsyncWaitUs as usize]),
         c[C::TexUploads as usize],
         c[C::TexSkipped as usize],
         c[C::Forced as usize],

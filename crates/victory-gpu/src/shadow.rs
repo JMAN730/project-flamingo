@@ -38,8 +38,10 @@ pub(crate) struct Shadow {
     /// Whether the memory is write-watched: unknown, yes, no.
     watched: AtomicU8,
     /// Ranges shaders of a submission not yet copied back may be writing:
-    /// title memory there is older than the copy.
-    pending: Mutex<Vec<(usize, usize)>>,
+    /// title memory there is older than the copy. Each carries the
+    /// write-back job that will put it back, when that runs on its own
+    /// thread ([`crate::writeback`]).
+    pending: Mutex<Vec<Pending>>,
     /// With [`relay`]: how many submissions not yet copied back declared
     /// each range of `pending` ([`Flights`]). Locked inside `pending`'s
     /// lock.
@@ -77,6 +79,15 @@ pub(crate) struct Shadow {
     /// and the bytes from the buffer's first byte to `start` (the heap
     /// begins on a 64 KiB line; a title buffer need not).
     place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>,
+}
+
+/// A range a submission's shaders may write, until its copy-back ran.
+struct Pending {
+    from: usize,
+    to: usize,
+    /// The write-back job that puts it back, when that runs on its own
+    /// thread: a later submission's snapshot of the range waits for it.
+    done: Option<std::sync::Arc<crate::writeback::Done>>,
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
@@ -1760,10 +1771,43 @@ impl Shadow {
     /// snapshot grown to cover each was copied whole every time), in reused
     /// memory (fresh snapshots cost ~2.3 million page faults per world
     /// frame).
+    /// Waits for the write-back jobs that hold `[from, to)`: their merge
+    /// reads and writes title memory there, and what this submission takes
+    /// from it must be after theirs. No lock is held across the wait.
+    fn wait_jobs(&self, from: usize, to: usize) {
+        let jobs: Vec<std::sync::Arc<crate::writeback::Done>> = {
+            let pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+            pending
+                .iter()
+                .filter(|p| p.from < to && p.to > from)
+                .filter_map(|p| p.done.clone())
+                .filter(|d| !d.finished())
+                .collect()
+        };
+        for done in jobs {
+            done.wait();
+        }
+    }
+
+    /// [`crate::writeback`]: the job that puts `[address, address + len)`
+    /// back, for the pending range `writing` noted for it.
+    pub(crate) fn write_back(&self, address: usize, len: usize, done: std::sync::Arc<crate::writeback::Done>) {
+        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        for p in pending.iter_mut() {
+            if (p.from, p.to) == (address, address + len) {
+                p.done = Some(done.clone());
+            }
+        }
+    }
+
     pub(crate) fn writing(&self, address: usize, len: usize) {
         if self.place.is_some() {
             return;
         }
+        // A range a write-back job still holds is the bytes of *this*
+        // submission's snapshot only after the job put the GPU's back: the
+        // wait comes before the lock (the job's `copy_back_done` takes it).
+        self.wait_jobs(address, address + len);
         let range = (address, address + len);
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         // With the copy-back on its own thread: counted for this submission
@@ -1772,22 +1816,22 @@ impl Shadow {
             self.flights.lock().unwrap_or_else(|e| e.into_inner()).declare(range, PREPARED.load(Ordering::Relaxed));
         }
         // Dispatches declare the same ranges thousands of times.
-        if pending.contains(&range) {
+        if pending.iter().any(|p| (p.from, p.to) == range) {
             return;
         }
         // In the card's memory: no snapshot. What shaders wrote is found on
         // the card (`Host::card_before` reads the declared ranges from the
         // lists).
         if self.card.is_some() {
-            pending.push(range);
+            pending.push(Pending { from: range.0, to: range.1, done: None });
             return;
         }
         // The parts no declared range holds yet: their bytes are taken now,
         // just after the range's refresh (a part declared earlier has not
         // been refreshed since, and keeps the bytes taken then).
         let mut parts = vec![self.inside(address, len)];
-        for &(a, e) in pending.iter() {
-            let (a, e) = self.inside(a, e - a);
+        for p in pending.iter() {
+            let (a, e) = self.inside(p.from, p.to - p.from);
             let mut rest = Vec::with_capacity(parts.len() + 1);
             for (from, to) in parts {
                 if e <= from || a >= to {
@@ -1803,7 +1847,7 @@ impl Shadow {
             }
             parts = rest;
         }
-        pending.push(range);
+        pending.push(Pending { from: range.0, to: range.1, done: None });
         let taken: usize = parts.iter().map(|&(from, to)| to.saturating_sub(from)).sum();
         BACK_CLASS[usize::from(!self.window)].fetch_add(taken as u64, Ordering::Relaxed);
         let total = self.len as usize;
@@ -1931,6 +1975,14 @@ impl Shadow {
                 let (at, n) = (at + first, last + 1 - first);
                 let (host, old) = (&mut host[first..=last], &old[first..=last]);
                 let title = &mut title[..n];
+                // On the write-back worker the piece may be held
+                // inaccessible (the job's own `back_begin`): the kernel's
+                // read would fail. It is opened for this piece only, which
+                // is also the window in which a title read of it sees the
+                // old bytes (documented in `crate::writeback`).
+                if crate::writeback::this_is_worker() {
+                    crate::watch::back_open(start + at, n);
+                }
                 if !crate::host::read_into((start + at) as *const u8, title) {
                     continue;
                 }
@@ -2110,9 +2162,9 @@ impl Shadow {
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         if relay() {
             let free = self.flights.lock().unwrap_or_else(|e| e.into_inner()).done(ranges);
-            pending.retain(|r| !free.contains(r));
+            pending.retain(|p| !free.contains(&(p.from, p.to)));
         } else {
-            pending.retain(|r| !ranges.contains(r));
+            pending.retain(|p| !ranges.contains(&(p.from, p.to)));
         }
         if !pending.is_empty() || self.card.is_some() {
             return;
@@ -2196,8 +2248,8 @@ impl Shadow {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .iter()
-            .filter(|&&(a, e)| a < to && e > from)
-            .map(|&(a, e)| (a.max(from), e.min(to)))
+            .filter(|p| p.from < to && p.to > from)
+            .map(|p| (p.from.max(from), p.to.min(to)))
             .collect();
         if busy.is_empty() {
             return false;
@@ -2242,8 +2294,8 @@ impl Shadow {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .iter()
-            .filter(|&&(a, e)| a < to && e > from)
-            .map(|&(a, e)| (a.max(from), e.min(to)))
+            .filter(|p| p.from < to && p.to > from)
+            .map(|p| (p.from.max(from), p.to.min(to)))
             .collect();
         if busy.is_empty() {
             return false;
@@ -2360,7 +2412,7 @@ impl Shadow {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .iter()
-            .copied()
+            .map(|p| (p.from, p.to))
             .filter(|&(a, e)| a < to && e > from)
             .collect();
         if !busy.is_empty() {
