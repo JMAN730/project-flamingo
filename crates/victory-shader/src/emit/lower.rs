@@ -7469,31 +7469,45 @@ impl<'a> Lower<'a> {
             })
     }
 
-    /// Adds to `read_phis` every phi an incoming value of a read phi. A
-    /// read only marks the phi it takes the value from, so a join feeding
-    /// another join looked unread: a value with no DXIL form then quietly
-    /// became zero (or false) on that edge, and the program translated with
-    /// a different answer. Following the joins makes the reader refuse it,
-    /// as it does for a value read without a join in between.
-    fn follow_phi_reads(&mut self) {
+    /// The phis a read phi takes a value from, through any number of joins,
+    /// that no instruction reads directly. A read only marks the phi it
+    /// takes the value from, so a join feeding another join looks unread.
+    fn phis_read_through_joins(&self) -> HashSet<Value> {
         let p = self.x.p;
+        let mut through = HashSet::new();
         let mut queue: Vec<Value> = self.read_phis.iter().copied().collect();
         while let Some(v) = queue.pop() {
             let Some(&(b, i)) = self.phi_at.get(&v) else {
                 continue;
             };
             for &arg in &p.blocks[b].phis[i].args {
-                if self.phi_at.contains_key(&arg) && self.read_phis.insert(arg) {
+                if self.phi_at.contains_key(&arg)
+                    && !self.read_phis.contains(&arg)
+                    && through.insert(arg)
+                {
                     queue.push(arg);
                 }
             }
         }
+        through
+    }
+
+    /// Whether `v` is a value zero would silently misrepresent if it
+    /// reached a read through joins: a timestamp, which counts up and
+    /// which titles compare and subtract. Other missing values that only
+    /// joins carry (descriptor dwords, lane masks, interpolation halves...)
+    /// are mostly registers reused after their last use, and keep becoming
+    /// zero there: refusing them stopped hundreds of programs that
+    /// translated and validated before (upstream #736).
+    fn zero_is_wrong(&self, v: Value) -> bool {
+        self.writer(v)
+            .is_some_and(|i| matches!(i.name(), "s_memtime" | "s_memrealtime"))
     }
 
     fn fill_phis(&mut self) -> Result<(), Stop> {
-        // A phi read only through another phi is as live as its reader, so
-        // a missing incoming value stays missing (see `follow_phi_reads`).
-        self.follow_phi_reads();
+        // A phi read only through another phi is as live as its reader: a
+        // timestamp it carries stays missing (see `zero_is_wrong`).
+        let through = self.phis_read_through_joins();
         let p = self.x.p;
         for (v, b, i) in std::mem::take(&mut self.data_phis) {
             let phi = &p.blocks[b].phis[i];
@@ -7519,7 +7533,10 @@ impl<'a> Lower<'a> {
                             self.s.m.undef(self.s.t.i32)
                         }
                     }
-                    (Some(Val::Missing(why)), _) if self.read_phis.contains(&phi.value) => {
+                    (Some(Val::Missing(why)), _)
+                        if self.read_phis.contains(&phi.value)
+                            || through.contains(&phi.value) && self.zero_is_wrong(arg) =>
+                    {
                         return Err(Stop::Retry(phi.value, why));
                     }
                     _ if self.read_phis.contains(&phi.value) => {
@@ -7682,6 +7699,15 @@ mod tests {
         assert_eq!(refusal(&words), refusal(&direct));
         words[8] = 0xBF07_8000; // read the group id instead; the timestamp is dead
         lowers(&words, group_ids_xy).expect("dead timestamp");
+        // Other values with no DXIL form that only joins carry still become
+        // zero there, as before (refusing them stopped hundreds of programs
+        // that translated, upstream #736): only a direct read refuses.
+        let mut words = words;
+        words[8] = 0xBF07_8006; // read s6 again
+        words[0..2].copy_from_slice(&[0xBE86_1F00, 0xBF80_0000]); // s_getpc_b64 s[6:7]; s_nop
+        let direct = [&words[..2], &words[8..]].concat();
+        assert!(refusal(&direct).is_some(), "s_getpc_b64 read as data");
+        assert_eq!(refusal(&words), None);
     }
 
     /// The props of the heap handles of a compute program whose s4 holds
