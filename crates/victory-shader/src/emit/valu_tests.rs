@@ -174,6 +174,9 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        target: super::Target::ANY,
+        console_cf: false,
+        per_lane_only: false,
     })
     .expect("lower");
 
@@ -1677,6 +1680,9 @@ fn try_build_valu_cs(body: &[u32]) -> Result<HostShader, String> {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        target: crate::emit::Target::ANY,
+        console_cf: false,
+        per_lane_only: false,
     })
     .map_err(|e| format!("{e:?}"))?;
 
@@ -2102,6 +2108,9 @@ fn root_view_reads_stop_at_the_bound_size() {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        target: crate::emit::Target::ANY,
+        console_cf: false,
+        per_lane_only: false,
     })
     .expect("lower");
     let shader = HostShader {
