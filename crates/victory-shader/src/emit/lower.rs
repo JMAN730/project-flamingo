@@ -1278,6 +1278,7 @@ impl<'a> Lower<'a> {
                 let k24 = self.s.m.i32(24);
                 return Val::I32(self.s.m.bin(self.s.entry, Bin::Shl, w, k24));
             }
+            Input::SampleCoverage => return self.coverage(),
             _ => return Val::Missing("a pixel system input"),
         };
         let free = self
@@ -1332,6 +1333,21 @@ impl<'a> Lower<'a> {
             self.s
                 .op(entry, name, Attr::ReadNone, self.s.t.i32, opcode, &[c]),
         )
+    }
+
+    /// A pixel shader's coverage mask (`SPI_PS_INPUT_ADDR` bit 14) via
+    /// `dx.op.coverage.i32`; in DXIL, `SV_Coverage` is not a signature input
+    /// (`NotInSig`), so `emit` keeps a console container's kind-14 row out of
+    /// the input signature.
+    fn coverage(&mut self) -> Val {
+        Val::I32(self.s.op(
+            self.s.entry,
+            "coverage.i32",
+            Attr::ReadNone,
+            self.s.t.i32,
+            91,
+            &[],
+        ))
     }
 
     fn find_input(&self, row: u8, channel: u8) -> Option<(usize, u8)> {

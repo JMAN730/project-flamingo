@@ -5,7 +5,7 @@
 //! `v_med3_f32`/`v_med3_f16` with NaN operands, `v_fract_f32`/`v_fract_f16`
 //! near `1.0`, and turn-range reduction for `v_sin_*`/`v_cos_*`.
 
-use super::host::{Dispatch, Host, Root, View};
+use super::host::{Dispatch, Draw, Host, Root, View};
 use super::{HostShader, lower, validator};
 use crate::native::{
     ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
@@ -1209,6 +1209,69 @@ fn signed_64_bit_operands_sign_extend_their_literal() {
     check("s_ashr_i64", &ashr, &[([0; 4], u32::MAX)]);
 }
 
+/// A constant 64-bit compare (`v_cmp_{f,t}_{i64,u64}`) is each lane's own
+/// result, without a 64-bit operand: unlike the real 64-bit compares it must
+/// not force the container's `SFI0` `Int64` feature (bit 0x8000), which
+/// would ask D3D12 for 64-bit integer support a constant compare never uses.
+#[test]
+fn v_cmp_f_and_t_64bit_match_rdna2() {
+    // v_cmp_*_64 s6, v[1:2], v[3:4] (VOP3); v_cndmask_b32_e64 v0, 0, 1, s6.
+    let compare = |op: u16| {
+        let [a, b] = vop3(op, 6, vgpr(1), vgpr(3), 0x80);
+        let [c, d] = vop3(0x101, 0, 0x80, 0x81, sgpr(6));
+        [a, b, c, d]
+    };
+    // A constant compare ignores its operands, so any bits work.
+    let inputs = vec![[1, 2, 3, 4]];
+    for (op, want, what) in [
+        (0x0a0u16, 0u32, "v_cmp_f_i64"),
+        (0x0a7, 1, "v_cmp_t_i64"),
+        (0x0e0, 0, "v_cmp_f_u64"),
+        (0x0e7, 1, "v_cmp_t_u64"),
+    ] {
+        let shader = build_valu_cs(&compare(op));
+        if let Ok(c) = crate::dxbc::Container::parse(&shader.dxil) {
+            let sfi0 = c
+                .part(crate::dxbc::FourCC::SFI0)
+                .expect("the container's SFI0")
+                .data;
+            let features = u64::from_le_bytes(sfi0[..8].try_into().unwrap());
+            assert_eq!(features & 0x8000, 0, "{what} forced the Int64 feature");
+        }
+        run_cases(&shader, &inputs, |backend, _, _, got| {
+            assert_eq!(got, want, "{backend}: {what}");
+        });
+    }
+}
+
+/// `v_cmpx_{f,t}_i64` writes EXEC, so a constant compare activates or
+/// retires the wave's lanes just like any other constant mask.
+#[test]
+fn v_cmpx_f_and_t_64bit_change_exec() {
+    // Save EXEC, v0 = 0, v_cmpx_*_i64 (dst exec_lo), v0 = 1 if still
+    // active, restore EXEC.
+    let shader = |op: u16| {
+        let [a, b] = vop3(op, 126, vgpr(1), vgpr(3), 0x80);
+        build_valu_cs(&[
+            s_mov_b32(6, 126),    // save exec_lo
+            vop1(0x001, 0, 0x80), // v0 = 0
+            a,
+            b,                    // v_cmpx_*_i64 exec_lo, v[1:2], v[3:4]
+            vop1(0x001, 0, 0x81), // v0 = 1 if active
+            s_mov_b32(126, 6),    // restore exec_lo
+        ])
+    };
+    let inputs = vec![[1, 2, 3, 4]];
+    let f_shader = shader(0x0b0); // v_cmpx_f_i64: no lane stays active.
+    run_cases(&f_shader, &inputs, |backend, _, _, got| {
+        assert_eq!(got, 0, "{backend}: v_cmpx_f_i64 left lanes active");
+    });
+    let t_shader = shader(0x0b7); // v_cmpx_t_i64: every lane stays active.
+    run_cases(&t_shader, &inputs, |backend, _, _, got| {
+        assert_eq!(got, 1, "{backend}: v_cmpx_t_i64 retired lanes");
+    });
+}
+
 #[test]
 fn bfe_signed_and_unsigned_match_rdna2() {
     // v_bfe_i32 v0, v1, v2, v3 (VOP3 opcode 0x149)
@@ -1524,4 +1587,267 @@ fn cmp16_sdwa_preserves_word_selects() {
             });
         }
     }
+}
+
+/// Builds and lowers a synthetic RDNA2 pixel shader whose `words` compute a
+/// value into `v0`, which it exports to render target 0. `input_addr` is
+/// `SPI_PS_INPUT_ADDR`, `vgprs` the program's VGPR count.
+fn build_ps(words: &[u32], input_addr: u32, vgprs: u16) -> HostShader {
+    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let native = NativeProgram {
+        stage: HwStage::Ps,
+        wave64: false,
+        vgprs,
+        layout: vec![],
+        used: vec![],
+        io: StageIo::Ps {
+            inputs: Vec::new(),
+            input_addr,
+            db_shader_control: 0,
+            patches: Vec::new(),
+        },
+        code,
+    };
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res =
+        resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let target = crate::emit::container::SigElement {
+        name: "SV_Target".into(),
+        index: 0,
+        kind: 16,
+        comp: 9,
+        interp: 0,
+        row: Some(0),
+        col: 0,
+        cols: 4,
+        usage: 0,
+        half: false,
+    };
+    let lowered = lower::lower(&lower::Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: vec![target],
+        prims: Vec::new(),
+        mesh_stride: 0,
+    })
+    .expect("lower");
+    let shader = HostShader {
+        stage: HwStage::Ps,
+        dxil: lowered.dxil,
+        user_data: lowered.user_data,
+        samplers: lowered.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: lowered.root_cbvs,
+        root_srvs: lowered.root_srvs,
+    };
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut shader.dxil.clone())
+            .expect("DXIL validation failed");
+    }
+    shader
+}
+
+/// A vertex shader that lays one triangle over the whole target from
+/// `SV_VertexID` ((-1,-1), (3,-1), (-1,3)), written straight in DXIL like
+/// the host's stub shaders.
+fn fullscreen_vs() -> HostShader {
+    use super::bitcode::{Attr, Term, pred};
+    use super::shader::Shader;
+    use crate::emit::container::SigElement;
+    let mut s = Shader::new(false);
+    let b = s.entry;
+    // SV_VertexID: signature kind 1, row 0, channel 0.
+    s.inputs = vec![SigElement {
+        name: "SV_VertexID".into(),
+        index: 0,
+        kind: 1,
+        comp: 5,
+        interp: 0,
+        row: Some(0),
+        col: 0,
+        cols: 1,
+        usage: 0,
+        half: false,
+    }];
+    let args = [s.m.i32(0), s.m.i32(0), s.m.i8(0), s.m.undef(s.t.i32)];
+    let vid = s.op(b, "loadInput.i32", Attr::ReadNone, s.t.i32, 4, &args);
+    let zero = s.m.i32(0);
+    let first = s.m.cmp(b, pred::EQ, vid, zero);
+    let minus_one = s.m.f32(f32::to_bits(-1.0));
+    let three = s.m.f32(f32::to_bits(3.0));
+    let x = s.m.select(b, first, minus_one, three);
+    let two = s.m.i32(2);
+    let last = s.m.cmp(b, pred::EQ, vid, two);
+    let y = s.m.select(b, last, three, minus_one);
+    let z = s.m.f32(0);
+    let w = s.m.f32(f32::to_bits(1.0));
+    for (col, val) in [(0u8, x), (1, y), (2, z), (3, w)] {
+        let args = [s.m.i32(0), s.m.i32(0), s.m.i8(col), val];
+        s.op(b, "storeOutput.f32", Attr::NoUnwind, s.t.void, 5, &args);
+    }
+    s.outputs = vec![SigElement {
+        name: "SV_Position".into(),
+        index: 0,
+        kind: 3,
+        comp: 9,
+        interp: 4,
+        row: Some(0),
+        col: 0,
+        cols: 4,
+        usage: 0,
+        half: false,
+    }];
+    s.m.terminate(b, Term::Ret);
+    HostShader {
+        stage: crate::native::HwStage::Vs,
+        dxil: s.finish(),
+        user_data: Vec::new(),
+        samplers: Vec::new(),
+        static_samplers: Vec::new(),
+        root_cbvs: Vec::new(),
+        root_srvs: Vec::new(),
+    }
+}
+
+/// A pixel shader whose `SPI_PS_INPUT_ADDR` names the coverage mask (bit 14,
+/// VGPR 22) reads it with `dx.op.coverage.i32`: a covered single-sample pixel
+/// has the full mask, so it writes 1.0 to target 0.
+#[test]
+fn ps_sample_coverage_input_reads_coverage_mask() {
+    // v_cvt_f32_u32 v0, v0 (VOP1 0x006); exp mrt0 v0, off, off, off done vm.
+    // `SPI_PS_INPUT_ADDR` VGPRs number the enabled bits consecutively, so
+    // with only bit 14 the coverage mask is v0.
+    let ps = if std::env::var("VICTORY_DBG_CONST_PS").is_ok() {
+        build_ps(
+            &[vop1(0x001, 0, 0x81), 0xF800_1801, 0xFFFF_FF00, S_ENDPGM],
+            0,
+            1,
+        )
+    } else {
+        build_ps(
+            &[
+                vop1(0x006, 0, vgpr(0)),
+                0xF800_1801,
+                0xFFFF_FF00, // exp mrt0, v0, off, off, off done vm
+                S_ENDPGM,
+            ],
+            1 << 14,
+            1,
+        )
+    };
+    let vs = fullscreen_vs();
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        for (what, s) in [("vs", &vs), ("ps", &ps)] {
+            v.validate(&mut s.dxil.clone())
+                .unwrap_or_else(|e| panic!("{what}: DXIL validation failed: {e}"));
+        }
+    }
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host
+            .pipeline(&vs, &ps)
+            .unwrap_or_else(|e| panic!("{label}: pipeline failed: {e}"));
+        let out = host
+            .draw(
+                &root,
+                &pso,
+                &Draw {
+                    roots: vec![],
+                    textures: &[],
+                    samplers: &[],
+                    vertices: &[],
+                    stride: 0,
+                    size: (1, 1),
+                    mesh_groups: 0,
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: draw failed: {e}"));
+        for (i, texel) in out.iter().enumerate() {
+            assert_eq!(
+                texel[0], 1.0,
+                "{label}: pixel {i}: coverage came out {texel:?}, want 1.0"
+            );
+        }
+    }
+}
+
+/// A console container's `SV_Coverage` input row (DXBC system value 66,
+/// lowered kind 14) must not reach the emitted input signature: DXIL refuses
+/// `SV_Coverage` as a pixel input (`NotInSig`), and the lowered code reads
+/// the coverage with `dx.op.coverage.i32` instead.
+#[test]
+fn a_console_sv_coverage_input_row_is_stripped_from_the_emitted_signature() {
+    // ISG1 with one element: "SV_Coverage", system value 66, row 0, mask 1.
+    let bytes = {
+        let mut isg1 = [0u8; 8 + 32];
+        isg1[0..4].copy_from_slice(&1u32.to_le_bytes()); // element count
+        isg1[4..8].copy_from_slice(&8u32.to_le_bytes()); // element base
+        isg1[8 + 4..8 + 8].copy_from_slice(&40u32.to_le_bytes()); // name offset
+        isg1[8 + 12..8 + 16].copy_from_slice(&66u32.to_le_bytes()); // SV_Coverage
+        isg1[8 + 16..8 + 20].copy_from_slice(&3u32.to_le_bytes()); // float32
+        isg1[8 + 20..8 + 24].copy_from_slice(&0u32.to_le_bytes()); // register 0
+        isg1[8 + 24] = 1; // component mask
+        isg1.to_vec()
+    };
+    let mut bytes = bytes;
+    bytes.extend_from_slice(b"SV_Coverage\0");
+    let container_bytes = crate::dxbc::build(&[(crate::dxbc::FourCC::ISG1, &bytes)]);
+    let container = crate::dxbc::Container::parse(&container_bytes).expect("container");
+
+    // The coverage pixel shader of `ps_sample_coverage_input_reads_coverage_mask`.
+    let code: Vec<u8> = [
+        vop1(0x006, 0, vgpr(0)),
+        0xF800_1801,
+        0xFFFF_FF00, // exp mrt0, v0, off, off, off done vm
+        S_ENDPGM,
+    ]
+    .iter()
+    .flat_map(|w| w.to_le_bytes())
+    .collect();
+    let native = NativeProgram {
+        stage: HwStage::Ps,
+        wave64: false,
+        vgprs: 1,
+        layout: vec![],
+        used: vec![],
+        io: StageIo::Ps {
+            inputs: Vec::new(),
+            input_addr: 1 << 14,
+            db_shader_control: 0,
+            patches: Vec::new(),
+        },
+        code,
+    };
+    let p = ir::build(&native.code, false, 23).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let shader = super::emit_program(&container, &native, &p, &st, &io, &res, false).expect("emit");
+
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut shader.dxil.clone())
+            .expect("DXIL validation failed");
+    }
+    // The emitted input signature has no row left.
+    let isg1 = crate::dxbc::Container::parse(&shader.dxil)
+        .expect("emitted container")
+        .part(crate::dxbc::FourCC::ISG1)
+        .expect("ISG1")
+        .data
+        .to_vec();
+    let rows = super::signature(&isg1).expect("ISG1 signature");
+    assert!(
+        !rows.iter().any(|e| e.kind == 14),
+        "SV_Coverage stayed in the input signature: {rows:?}"
+    );
 }
