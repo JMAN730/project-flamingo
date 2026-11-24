@@ -453,6 +453,9 @@ function Run-Game {
     if (-not $env:VICTORY_PRESENT_1440P) {
         if ($c.console -eq 'series-x') { $env:VICTORY_PRESENT_1440P = '1' } else { $env:VICTORY_PRESENT_1440P = 'auto' }
     }
+    # Shaders that do not translate are saved here (zip and send this folder).
+    if (-not $env:VICTORY_DUMP_FAILED) { $env:VICTORY_DUMP_FAILED = Join-Path $TryHome 'failed-shaders' }
+    Say "failed shaders saved to: $($env:VICTORY_DUMP_FAILED)"
     Say "shader loop limit: $($env:VICTORY_SHADER_LOOP_LIMIT)$(if ($env:VICTORY_PRESENT_1440P) { "   world view: $($env:VICTORY_PRESENT_1440P)" })"
     $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
     $log = Join-Path $LogDir "game-$stamp.log"

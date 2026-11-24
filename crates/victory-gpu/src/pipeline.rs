@@ -133,12 +133,26 @@ impl Shader {
                             "shader translated"
                         )
                     }
-                    Err(e) => tracing::warn!(
-                        stage = self.stage,
-                        hash = %self.hash,
-                        error = %e,
-                        "shader does not translate; its pipelines' draws are dropped"
-                    ),
+                    Err(e) => {
+                        tracing::warn!(
+                            stage = self.stage,
+                            hash = %self.hash,
+                            error = %e,
+                            "shader does not translate; its pipelines' draws are dropped"
+                        );
+                        // `VICTORY_DUMP_FAILED=<dir>`: the container of each
+                        // shader that does not translate, to study offline
+                        // (`victory translate`).
+                        if let Some(dir) = std::env::var_os("VICTORY_DUMP_FAILED") {
+                            let dir = std::path::Path::new(&dir);
+                            let file = dir.join(format!("{}-{}.dxbc", self.stage, self.hash));
+                            let written = std::fs::create_dir_all(dir)
+                                .and_then(|()| std::fs::write(&file, &self.container));
+                            if let Err(e) = written {
+                                tracing::warn!(error = %e, file = %file.display(), "shader not dumped");
+                            }
+                        }
+                    }
                 }
                 done.ok()
             })
