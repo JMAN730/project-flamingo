@@ -457,15 +457,28 @@ fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
     })
 }
 
-/// A select that needs the actual scalar mask words and console lane index.
+/// A select or carry-in that needs the actual scalar mask words and console
+/// lane index.
 fn numeric_select(st: &Structured, inst: &Inst) -> bool {
-    inst.name() == "v_cndmask_b32"
-        && matches!(&inst.fields, Fields::Valu(v)
-            if matches!(v.src.get(2), Some(Operand::Scalar { code, .. }) if *code != NULL))
-        && inst
+    let Fields::Valu(v) = &inst.fields else {
+        return false;
+    };
+    let Some(&Operand::Scalar { code, .. }) = v.src.get(2) else {
+        return false;
+    };
+    if code == NULL {
+        return false;
+    }
+    match inst.name() {
+        "v_cndmask_b32" => inst
             .writes
             .first()
-            .is_some_and(|&(_, v)| !st.select_masks.contains_key(&v))
+            .is_some_and(|&(_, v)| !st.select_masks.contains_key(&v)),
+        "v_add_co_ci_u32" | "v_sub_co_ci_u32" | "v_subrev_co_ci_u32" => inst
+            .read(Reg::S(code))
+            .is_none_or(|m| !st.masks.contains_key(&m)),
+        _ => false,
+    }
 }
 
 /// Where half `h` (dword h / 2, the high half when odd) of a parameter
@@ -2304,8 +2317,19 @@ impl<'a> Lower<'a> {
         {
             return self.boolean(m, self.cur);
         }
-        let Some(&Operand::Scalar { code, .. }) = mask else {
-            return Err(UNTRACKED_SELECT);
+        self.numeric_mask(inst, mask)
+    }
+
+    /// This lane's bit of a select or carry-in mask `structure` did not
+    /// follow: inline 0 and -1 are constants; a scalar register (pair in
+    /// wave64) is tested by the console lane, in compute programs run with
+    /// console lanes (the retry after [`UNTRACKED_SELECT`]).
+    fn numeric_mask(&mut self, inst: &Inst, mask: Option<&Operand>) -> Result<V, Why> {
+        let code = match mask {
+            Some(&Operand::Scalar { code, .. }) => code,
+            Some(&Operand::Const(128)) => return Ok(self.s.m.bool(false)),
+            Some(&Operand::Const(193)) => return Ok(self.s.m.bool(true)),
+            _ => return Err(UNTRACKED_SELECT),
         };
         if code == NULL {
             return Ok(self.s.m.bool(false));
@@ -5414,10 +5438,12 @@ impl<'a> Lower<'a> {
                         Some(&Operand::Scalar { code, .. }) => inst.read(Reg::S(code)),
                         _ => None,
                     };
-                    let m = m
-                        .and_then(|m| self.x.st.masks.get(&m).copied())
-                        .ok_or("a carry-in from an untracked mask")?;
-                    Some(self.boolean(m, c)?)
+                    // An untracked carry-in fails as an untracked select
+                    // does, so compute retries it with console lanes.
+                    match m.and_then(|m| self.x.st.masks.get(&m).copied()) {
+                        Some(m) => Some(self.boolean(m, c)?),
+                        None => Some(self.numeric_mask(inst, v.src.get(2))?),
+                    }
                 } else {
                     None
                 };

@@ -1015,6 +1015,25 @@ mod tests {
         emit(&c, &native, &p, &st, &io, &res)
     }
 
+    /// Selects and carry-ins whose mask `structure` does not follow (a plain
+    /// SGPR, here a root constant) translate: compute tests this lane's bit
+    /// of the number. Inline 0 and -1 masks are constants.
+    #[test]
+    fn untracked_select_and_carry_masks_translate() {
+        let vop3 = |op: u32, sdst: u32, s0: u32, s1: u32, s2: u32| {
+            [0xD400_0000 | op << 16 | sdst << 8, s0 | s1 << 9 | s2 << 18]
+        };
+        let (v1, v2, s3) = (257, 258, 3);
+        for mask in [s3, 128, 193] {
+            // v_cndmask_b32_e64 v0, v1, v2, mask
+            translate_stored(&vop3(0x101, 0, v1, v2, mask)).unwrap();
+            // v_add_co_ci_u32_e64 v0, null, v1, v2, mask (and sub, subrev)
+            for op in [0x128, 0x129, 0x12A] {
+                translate_stored(&vop3(op, 125, v1, v2, mask)).unwrap();
+            }
+        }
+    }
+
     /// The 64-bit multiply-adds of 32-bit operands translate, both halves
     /// of the result and the unsigned form's carry; reading the signed
     /// form's carry, which is not modelled, is refused with a reason.
