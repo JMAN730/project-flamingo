@@ -37,6 +37,9 @@ impl Cache {
     /// Opens (creating) a cache at `root`. Refuses locations inside the repo.
     pub fn open(root: impl Into<PathBuf>) -> Result<Self> {
         let root = root.into();
+        // The title can change the process's working directory after startup.
+        let root =
+            std::path::absolute(&root).with_context(|| format!("resolving {}", root.display()))?;
         victory_core::ensure_outside_repo(&root)?;
         std::fs::create_dir_all(&root).with_context(|| format!("creating {}", root.display()))?;
         Ok(Cache { root })
@@ -92,6 +95,49 @@ mod tests {
             self.runs.fetch_add(1, Ordering::Relaxed);
             Ok(input.to_ascii_uppercase())
         }
+    }
+
+    fn in_child(test: &str) -> bool {
+        const CHILD: &str = "VICTORY_TEST_CACHE_CHILD";
+        if std::env::var(CHILD).as_deref() == Ok(test) {
+            return true;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &format!("cache::tests::{test}")])
+            .env(CHILD, test)
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "{stdout}{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        false
+    }
+
+    #[test]
+    fn relative_cache_survives_a_working_directory_change() {
+        // Changing the working directory must not affect other tests.
+        if !in_child("relative_cache_survives_a_working_directory_change") {
+            return;
+        }
+
+        let startup_dir = std::env::current_dir().unwrap();
+        let cache = Cache::open("cache").unwrap();
+        let title_dir = startup_dir.join("title");
+        std::fs::create_dir(&title_dir).unwrap();
+        std::env::set_current_dir(&title_dir).unwrap();
+        let converter = Upper {
+            version: 1,
+            runs: AtomicUsize::new(0),
+        };
+        let path = cache.get_or_convert(&converter, b"abc").unwrap();
+        assert!(path.starts_with(startup_dir.join("cache")));
+        assert_eq!(std::fs::read(path).unwrap(), b"ABC");
+        assert!(!title_dir.join("cache").exists());
     }
 
     #[test]
