@@ -95,7 +95,13 @@ impl Title {
                 .find(|(p, _)| p == path)
                 .map(|(_, text)| text.as_str())
         };
-        let id = get("Game/TitleId").and_then(|v| u32::from_str_radix(v, 16).ok());
+        let id = get("Game/TitleId").and_then(|v| {
+            let v = v
+                .strip_prefix("0x")
+                .or_else(|| v.strip_prefix("0X"))
+                .unwrap_or(v);
+            u32::from_str_radix(v, 16).ok()
+        });
         let storage_mb =
             get("Game/PersistentLocalStorage/SizeMB").and_then(|v| v.parse::<u64>().ok());
         Title {
@@ -115,8 +121,8 @@ impl Title {
 
 /// Each element of an XML text as its path from the root (`Game/TitleId`)
 /// and its trimmed text up to the first child, the predefined entities
-/// decoded; comments, CDATA sections, declarations and attributes are
-/// skipped.
+/// decoded. Self-closing elements have empty bodies. Comments, CDATA
+/// sections, declarations and attributes are skipped.
 fn elements(text: &str) -> Vec<(String, String)> {
     let mut out = Vec::new();
     let mut path: Vec<&str> = Vec::new();
@@ -149,16 +155,20 @@ fn elements(text: &str) -> Vec<(String, String)> {
             .next()
             .unwrap_or("");
         path.push(name);
-        let body = rest[..rest.find('<').unwrap_or(rest.len())].trim();
-        let body = [
-            ("&lt;", "<"),
-            ("&gt;", ">"),
-            ("&quot;", "\""),
-            ("&apos;", "'"),
-            ("&amp;", "&"),
-        ]
-        .iter()
-        .fold(body.to_owned(), |b, (entity, c)| b.replace(entity, c));
+        let body = if closed {
+            String::new()
+        } else {
+            let body = rest[..rest.find('<').unwrap_or(rest.len())].trim();
+            [
+                ("&lt;", "<"),
+                ("&gt;", ">"),
+                ("&quot;", "\""),
+                ("&apos;", "'"),
+                ("&amp;", "&"),
+            ]
+            .iter()
+            .fold(body.to_owned(), |b, (entity, c)| b.replace(entity, c))
+        };
         out.push((path.join("/"), body));
         if closed {
             path.pop();
@@ -253,6 +263,34 @@ mod tests {
         assert_eq!((t.id, t.storage_bytes), (0x639A_A8DD, 1024 << 20));
         assert_eq!(t.store_id, "9&C");
         assert_eq!(Title::from_manifest("").storage_bytes, 0);
+    }
+
+    #[test]
+    fn parses_title_id_with_or_without_a_hex_prefix() {
+        for id in ["1234ABCD", "0x1234ABCD", "0X1234abcd"] {
+            let text = format!("<Game><TitleId>{id}</TitleId></Game>");
+            assert_eq!(Title::from_manifest(&text).id, 0x1234_ABCD, "{id}");
+        }
+    }
+
+    #[test]
+    fn invalid_or_missing_title_ids_default_to_zero() {
+        for text in [
+            "<Game/>",
+            "<Game><TitleId>0x</TitleId></Game>",
+            "<Game><TitleId>0Xnothex</TitleId></Game>",
+            "<Game><TitleId>0x100000000</TitleId></Game>",
+        ] {
+            assert_eq!(Title::from_manifest(text).id, 0, "{text}");
+        }
+    }
+
+    #[test]
+    fn self_closing_elements_do_not_capture_trailing_text() {
+        let text = "<Game><StoreId /> trailing &amp; text <TitleId>1234</TitleId></Game>";
+        let title = Title::from_manifest(text);
+        assert_eq!(title.store_id, "");
+        assert_eq!(title.id, 0x1234);
     }
 
     #[test]
