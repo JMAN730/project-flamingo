@@ -132,6 +132,8 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     // on the next launch, even if this run never got to use it.
     if !p.used.load(Ordering::Relaxed) && !p.used.swap(true, Ordering::Relaxed) {
         super::library::note_used(&p.key);
+        // And what it is made from, for `victory prepare` after the run.
+        super::recipe::note(&p.key, &p.shaders, p.graphics.as_deref());
     }
     if p.made.get().is_none() {
         start(p, REQUESTED);
@@ -234,7 +236,7 @@ const MAKING: u8 = 3;
 /// rest, they held every worker for minutes while ~1,600 small draw
 /// pipelines waited behind them (4-9 made a minute), so the world's draws
 /// were dropped and the picture stayed black.
-const HEAVY_BYTES: usize = 32 * 1024;
+pub(super) const HEAVY_BYTES: usize = 32 * 1024;
 
 struct Queue {
     early: VecDeque<Arc<Pending>>,

@@ -152,6 +152,44 @@ fn host_blend(blend: &D3D12_BLEND_DESC, targets: &D3D12_RT_FORMAT_ARRAY) -> D3D1
     host
 }
 
+/// The layout [`GraphicsState::encode`] writes; a change to it changes this.
+const RECIPE_STATE_VERSION: u32 = 1;
+
+/// Little-endian words, for [`GraphicsState::encode`].
+struct Writer(Vec<u8>);
+
+impl Writer {
+    fn u32(&mut self, v: u32) {
+        self.0.extend_from_slice(&v.to_le_bytes());
+    }
+
+    fn i32(&mut self, v: i32) {
+        self.0.extend_from_slice(&v.to_le_bytes());
+    }
+}
+
+/// The words a [`Writer`] wrote, in order.
+struct Reader<'a>(&'a [u8]);
+
+impl Reader<'_> {
+    fn take(&mut self, n: usize) -> Option<&[u8]> {
+        if self.0.len() < n {
+            return None;
+        }
+        let (head, rest) = self.0.split_at(n);
+        self.0 = rest;
+        Some(head)
+    }
+
+    fn u32(&mut self) -> Option<u32> {
+        Some(u32::from_le_bytes(self.take(4)?.try_into().ok()?))
+    }
+
+    fn i32(&mut self) -> Option<i32> {
+        Some(i32::from_le_bytes(self.take(4)?.try_into().ok()?))
+    }
+}
+
 impl GraphicsState {
     /// A copy for a derived pipeline; its input elements point into its
     /// own names.
@@ -314,6 +352,172 @@ impl GraphicsState {
             self.depth_format.0,
             self.samples
         ) + if self.bounds() { " depth bounds" } else { "" }
+    }
+
+    /// Everything the state holds, as bytes (a pipeline recipe kept for
+    /// `victory prepare`, read back by [`GraphicsState::decode`]). Field by
+    /// field: the descriptions' padding is never read.
+    pub(crate) fn encode(&self) -> Vec<u8> {
+        let mut w = Writer(Vec::with_capacity(512));
+        w.u32(RECIPE_STATE_VERSION);
+        let b = &self.blend;
+        w.i32(b.AlphaToCoverageEnable.0);
+        w.i32(b.IndependentBlendEnable.0);
+        for t in &b.RenderTarget {
+            for v in [
+                t.BlendEnable.0,
+                t.LogicOpEnable.0,
+                t.SrcBlend.0,
+                t.DestBlend.0,
+                t.BlendOp.0,
+                t.SrcBlendAlpha.0,
+                t.DestBlendAlpha.0,
+                t.BlendOpAlpha.0,
+                t.LogicOp.0,
+            ] {
+                w.i32(v);
+            }
+            w.u32(u32::from(t.RenderTargetWriteMask));
+        }
+        w.u32(self.sample_mask);
+        let r = &self.rasterizer;
+        w.i32(r.FillMode.0);
+        w.i32(r.CullMode.0);
+        w.i32(r.FrontCounterClockwise.0);
+        w.i32(r.DepthBias);
+        w.u32(r.DepthBiasClamp.to_bits());
+        w.u32(r.SlopeScaledDepthBias.to_bits());
+        w.i32(r.DepthClipEnable.0);
+        w.i32(r.MultisampleEnable.0);
+        w.i32(r.AntialiasedLineEnable.0);
+        w.u32(r.ForcedSampleCount);
+        w.i32(r.ConservativeRaster.0);
+        let d = &self.depth;
+        w.i32(d.DepthEnable.0);
+        w.i32(d.DepthWriteMask.0);
+        w.i32(d.DepthFunc.0);
+        w.i32(d.StencilEnable.0);
+        w.u32(u32::from(d.StencilReadMask));
+        w.u32(u32::from(d.StencilWriteMask));
+        for f in [&d.FrontFace, &d.BackFace] {
+            w.i32(f.StencilFailOp.0);
+            w.i32(f.StencilDepthFailOp.0);
+            w.i32(f.StencilPassOp.0);
+            w.i32(f.StencilFunc.0);
+        }
+        w.u32(u32::from(self.depth_bounds));
+        w.u32(self.inputs.len() as u32);
+        for (e, name) in self.inputs.iter().zip(&self.names) {
+            let name = name.as_bytes();
+            w.u32(name.len() as u32);
+            w.0.extend_from_slice(name);
+            w.u32(e.SemanticIndex);
+            w.i32(e.Format.0);
+            w.u32(e.InputSlot);
+            w.u32(e.AlignedByteOffset);
+            w.i32(e.InputSlotClass.0);
+            w.u32(e.InstanceDataStepRate);
+        }
+        w.i32(self.strip_cut.0);
+        w.i32(self.topology.0);
+        for f in &self.targets.RTFormats {
+            w.i32(f.0);
+        }
+        w.u32(self.targets.NumRenderTargets);
+        w.i32(self.depth_format.0);
+        w.u32(self.samples.Count);
+        w.u32(self.samples.Quality);
+        w.0
+    }
+
+    /// The state [`GraphicsState::encode`] wrote; `None` for bytes it did
+    /// not write (another version, cut short).
+    pub(crate) fn decode(bytes: &[u8]) -> Option<GraphicsState> {
+        let mut r = Reader(bytes);
+        if r.u32()? != RECIPE_STATE_VERSION {
+            return None;
+        }
+        let mut g = GraphicsState::default();
+        let b = &mut g.blend;
+        b.AlphaToCoverageEnable.0 = r.i32()?;
+        b.IndependentBlendEnable.0 = r.i32()?;
+        for t in &mut b.RenderTarget {
+            t.BlendEnable.0 = r.i32()?;
+            t.LogicOpEnable.0 = r.i32()?;
+            t.SrcBlend.0 = r.i32()?;
+            t.DestBlend.0 = r.i32()?;
+            t.BlendOp.0 = r.i32()?;
+            t.SrcBlendAlpha.0 = r.i32()?;
+            t.DestBlendAlpha.0 = r.i32()?;
+            t.BlendOpAlpha.0 = r.i32()?;
+            t.LogicOp.0 = r.i32()?;
+            t.RenderTargetWriteMask = u8::try_from(r.u32()?).ok()?;
+        }
+        g.sample_mask = r.u32()?;
+        let ra = &mut g.rasterizer;
+        ra.FillMode.0 = r.i32()?;
+        ra.CullMode.0 = r.i32()?;
+        ra.FrontCounterClockwise.0 = r.i32()?;
+        ra.DepthBias = r.i32()?;
+        ra.DepthBiasClamp = f32::from_bits(r.u32()?);
+        ra.SlopeScaledDepthBias = f32::from_bits(r.u32()?);
+        ra.DepthClipEnable.0 = r.i32()?;
+        ra.MultisampleEnable.0 = r.i32()?;
+        ra.AntialiasedLineEnable.0 = r.i32()?;
+        ra.ForcedSampleCount = r.u32()?;
+        ra.ConservativeRaster.0 = r.i32()?;
+        let d = &mut g.depth;
+        d.DepthEnable.0 = r.i32()?;
+        d.DepthWriteMask.0 = r.i32()?;
+        d.DepthFunc.0 = r.i32()?;
+        d.StencilEnable.0 = r.i32()?;
+        d.StencilReadMask = u8::try_from(r.u32()?).ok()?;
+        d.StencilWriteMask = u8::try_from(r.u32()?).ok()?;
+        for f in [&mut d.FrontFace, &mut d.BackFace] {
+            f.StencilFailOp.0 = r.i32()?;
+            f.StencilDepthFailOp.0 = r.i32()?;
+            f.StencilPassOp.0 = r.i32()?;
+            f.StencilFunc.0 = r.i32()?;
+        }
+        g.depth_bounds = r.u32()? != 0;
+        let count = r.u32()? as usize;
+        if count > 64 {
+            return None;
+        }
+        let mut elements = Vec::with_capacity(count);
+        for _ in 0..count {
+            let len = r.u32()? as usize;
+            let name = CString::new(r.take(len)?.to_vec()).ok()?;
+            let e = D3D12_INPUT_ELEMENT_DESC {
+                SemanticName: PCSTR::null(),
+                SemanticIndex: r.u32()?,
+                Format: DXGI_FORMAT(r.i32()?),
+                InputSlot: r.u32()?,
+                AlignedByteOffset: r.u32()?,
+                InputSlotClass: D3D12_INPUT_CLASSIFICATION(r.i32()?),
+                InstanceDataStepRate: r.u32()?,
+            };
+            elements.push((e, name));
+        }
+        g.names = elements.iter().map(|(_, name)| name.clone()).collect();
+        g.inputs = elements
+            .iter()
+            .zip(&g.names)
+            .map(|((e, _), name)| D3D12_INPUT_ELEMENT_DESC {
+                SemanticName: PCSTR(name.as_ptr().cast()),
+                ..*e
+            })
+            .collect();
+        g.strip_cut = D3D12_INDEX_BUFFER_STRIP_CUT_VALUE(r.i32()?);
+        g.topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE(r.i32()?);
+        for f in &mut g.targets.RTFormats {
+            f.0 = r.i32()?;
+        }
+        g.targets.NumRenderTargets = r.u32()?;
+        g.depth_format = DXGI_FORMAT(r.i32()?);
+        g.samples.Count = r.u32()?;
+        g.samples.Quality = r.u32()?;
+        r.0.is_empty().then_some(g)
     }
 
     /// Whether the host pipeline tests depth bounds: the title's stream
@@ -1218,6 +1422,48 @@ mod tests {
         unsafe { g.read(11, std::ptr::from_ref(&sub).cast()) };
         assert!(!g.depth_bounds);
         assert!(!g.bounds());
+    }
+
+    /// A recipe's state reads back as it was written: the same description
+    /// (its name in the library), input names and all.
+    #[test]
+    fn graphics_state_reads_back_from_a_recipe() {
+        let mut g = GraphicsState::default();
+        g.blend.RenderTarget[1].BlendEnable = true.into();
+        g.blend.RenderTarget[1].RenderTargetWriteMask = 0x7;
+        g.rasterizer.DepthBias = -12;
+        g.rasterizer.SlopeScaledDepthBias = 1.5;
+        g.depth.StencilReadMask = 0x3c;
+        g.depth.BackFace.StencilFunc = D3D12_COMPARISON_FUNC_EQUAL;
+        g.depth_bounds = true;
+        g.names = vec![c"POSITION".to_owned(), c"TEXCOORD".to_owned()];
+        g.inputs = g
+            .names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| D3D12_INPUT_ELEMENT_DESC {
+                SemanticName: PCSTR(name.as_ptr().cast()),
+                SemanticIndex: i as u32,
+                Format: DXGI_FORMAT_R32G32B32_FLOAT,
+                InputSlot: 0,
+                AlignedByteOffset: 12 * i as u32,
+                InputSlotClass: D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,
+                InstanceDataStepRate: 0,
+            })
+            .collect();
+        g.topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        g.targets.NumRenderTargets = 2;
+        g.targets.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        g.targets.RTFormats[1] = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        g.depth_format = DXGI_FORMAT_D32_FLOAT;
+        let bytes = g.encode();
+        let back = GraphicsState::decode(&bytes).expect("reads back");
+        assert_eq!(back.describe(), g.describe());
+        assert_eq!(back.encode(), bytes);
+        // SAFETY: the name points into `back.names`, alive here.
+        let name = unsafe { CStr::from_ptr(back.inputs[1].SemanticName.0.cast()) };
+        assert_eq!(name, c"TEXCOORD");
+        assert!(GraphicsState::decode(&bytes[..bytes.len() - 1]).is_none());
     }
 
     /// Over 64 dwords, the largest user data blocks become root CBVs until

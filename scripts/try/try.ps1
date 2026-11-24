@@ -15,7 +15,7 @@
 
 $ErrorActionPreference = 'Continue'
 $ProgressPreference = 'SilentlyContinue'
-$TryVersion = '3.4'
+$TryVersion = '3.5'
 $ForkUrl = 'https://github.com/MfDev0/victory.git'
 $Branch = 'arena/59fabb00-victory'
 # Other places the fork may live (renamed to CAtez, or a backup copy), tried
@@ -40,11 +40,11 @@ function Bad([string]$msg) { Write-Host ('  ' + $msg) -ForegroundColor Red }
 function Load-Config {
     # console: series-x, the profile the fork's base (fxceless/victory-gta6)
     # renders the world with on NVIDIA (RTX 3080, 3070 Ti, 4070).
-    $c = @{ game_dir = ''; game_exe = ''; built_key = ''; added = ''; console = 'series-x'; base = ''; fast = ''; loop = ''; prepared = '' }
+    $c = @{ game_dir = ''; game_exe = ''; built_key = ''; added = ''; console = 'series-x'; base = ''; fast = ''; loop = ''; prepared = ''; recipes = '' }
     if (Test-Path $ConfigPath) {
         try {
             $j = Get-Content -Path $ConfigPath -Raw | ConvertFrom-Json
-            foreach ($k in @('game_dir', 'game_exe', 'built_key', 'added', 'console', 'base', 'fast', 'loop', 'prepared')) { if ($j.$k) { $c[$k] = [string]$j.$k } }
+            foreach ($k in @('game_dir', 'game_exe', 'built_key', 'added', 'console', 'base', 'fast', 'loop', 'prepared', 'recipes')) { if ($j.$k) { $c[$k] = [string]$j.$k } }
         } catch {}
     }
     # Try 3.0 moved to the victory-gta6 base: start once on Series X.
@@ -457,25 +457,37 @@ function Set-RunEnv {
     if (-not $env:VICTORY_DUMP_FAILED) { $env:VICTORY_DUMP_FAILED = Join-Path $TryHome 'failed-shaders' }
 }
 
-# Translates every shader in the game folder into the shader cache before the
-# game starts (victory.exe prepare): once after each new build, so the world
-# does not wait minutes for its shaders while the game runs (see-through
-# objects, 1 fps) and the game need not be restarted again and again.
-function Prepare-Shaders {
+# The recipes runs keep of the pipelines the game asked for (see Prepare-Shaders).
+function Recipes-File { return Join-Path $env:VICTORY_CACHE_DIR 'pipelines\recipes.bin' }
+function Recipes-Size {
+    $f = Recipes-File
+    if (Test-Path -LiteralPath $f) { return [string](Get-Item -LiteralPath $f).Length }
+    return '0'
+}
+
+# With the game closed (victory.exe prepare): compiles every pipeline the
+# game asked for in earlier runs (the recipes each run keeps) into the
+# pipeline library, translating their shaders on the way, on all cores but
+# two. The next launch then has them all from its start instead of
+# dropping their draws (see-through world) while it compiles them a few a
+# minute: one run that reaches a place is enough, no more restarting to get
+# further. Runs after each new build and after each run that asked for new
+# pipelines; quick when there is nothing new.
+function Prepare-Shaders([string]$why) {
     $c = $script:Config
-    Step 'Preparing the game''s shaders (once after each update; the game is not running)'
-    Say 'This translates every shader in the game folder ahead of time. It can take several minutes.'
-    Say 'Later launches of this build skip it. P in the menu runs it again.'
+    Step "Preparing pipelines with the game closed ($why)"
+    Say 'Compiles everything the game asked for, so the next launch shows it at once. Can take a few minutes the first time.'
     $log = Join-Path $LogDir 'prepare.log'
     Push-Location $TryHome
     try {
-        & (Victory-Exe) prepare $c.game_dir 2>&1 | ForEach-Object { "$_" } | Tee-Object -FilePath $log
+        & (Victory-Exe) prepare 2>&1 | ForEach-Object { "$_" } | Tee-Object -FilePath $log | Where-Object { $_ -match '^(prepar|translated)' }
         $code = $LASTEXITCODE
     } finally { Pop-Location }
-    if ($code -eq 0) { Say 'shaders prepared' }
-    else { Bad "preparing the shaders stopped (code $code; output in $log): the game translates the rest itself" }
-    # Not again for this build either way: a failure would repeat each launch.
+    if ($code -eq 0) { Say 'pipelines prepared' }
+    else { Bad "preparing stopped (code $code; output in $log): the game makes the rest itself" }
+    # Not again for this build and these recipes either way: a failure would repeat each launch.
     $c.prepared = $c.built_key
+    $c.recipes = Recipes-Size
     Save-Config
 }
 
@@ -504,10 +516,11 @@ function Run-Game {
     Say "command: victory.exe run `"$($c.game_exe)`" --execute --console $($c.console)   (VICTORY_GAME_DIR=$($c.game_dir))"
     Say 'To stop: close the game window. (Ctrl+C closes VIctory Try too.)'
     Set-RunEnv
-    if ("$($c.prepared)" -ne "$($c.built_key)") { Prepare-Shaders }
+    if ("$($c.prepared)" -ne "$($c.built_key)") { Prepare-Shaders 'new build' }
+    elseif ("$($c.recipes)" -ne (Recipes-Size)) { Prepare-Shaders 'new pipelines from the last run' }
     Say "failed shaders saved to: $($env:VICTORY_DUMP_FAILED)"
     Say "shader loop limit: $($env:VICTORY_SHADER_LOOP_LIMIT)   skipped programs: $($env:VICTORY_SKIP_PIPELINES)"
-    Say 'The first world visit compiles ~700 pipelines (slow, the picture may be white: auto-exposure); the next launch loads them.'
+    Say 'New places compile their pipelines while you play (things may be missing for a while); after you close the game they are all compiled, and the next launch has them from the start.'
     $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
     $log = Join-Path $LogDir "game-$stamp.log"
     Push-Location $TryHome
@@ -521,6 +534,9 @@ function Run-Game {
     $crashes = Join-Path $env:LOCALAPPDATA 'victory\data\crashes.log'
     if (Test-Path $crashes) { Say "crash details, if it crashed: $crashes" }
     try { Check-Run $log $stamp $crashes } catch { Bad "could not summarize the run: $_" }
+    # Everything this run asked for and did not get, compiled now while the
+    # game is closed: the next launch shows it from the start.
+    if ("$($c.recipes)" -ne (Recipes-Size)) { Prepare-Shaders 'new pipelines from this run' }
 }
 
 # After a run: a short summary of its log, the safer setting for next time
@@ -649,11 +665,11 @@ while ($true) {
     Write-Host ''
     Say 'Enter = run again    U = update to the newest version and run'
     Say 'G = change the game paths    C = switch Series S / Series X    F = switch speed mode'
-    Say 'P = prepare all shaders again (done by itself after each update)    Q = quit'
+    Say 'P = prepare all pipelines again (done by itself after each update and run)    Q = quit'
     $k = (Read-Host '  Choice').Trim().ToUpper()
     if ($k -eq 'Q') { exit 0 }
     if ($k -eq 'G') { while (-not (Ask-Game $true)) {} }
-    if ($k -eq 'P') { $script:Config.prepared = '' }
+    if ($k -eq 'P') { $script:Config.prepared = ''; $script:Config.recipes = '' }
     if ($k -eq 'F') {
         $script:Config.fast = $(if ($script:Config.fast -eq '1') { '' } else { '1' })
         Save-Config

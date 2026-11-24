@@ -56,12 +56,13 @@ runs the newer one, so fixes to VIctory Try itself need no new download.
    device before the first frame there). Defaults: shader loop limit 256,
    `VICTORY_RELAY=2`, the two programs known to hang the card skipped, and
    a cache folder of its own.
-   Before the first run of each new build (3.4) it runs `victory.exe prepare
-   <game folder>`: every shader in the game files is translated into the
-   shader cache with the game closed (half the CPU cores, a few minutes;
-   output in `logs\prepare.log`), so the world does not wait for them while
-   the game runs. Draws then wait only for their pipelines, which the
-   pipeline library keeps from launch to launch.
+   Each run keeps a recipe of every pipeline the game asks for (3.5). After
+   the game closes, and before the first run of a new build, VIctory Try
+   runs `victory.exe prepare`: with the game closed it compiles every one of
+   them into the pipeline library, on all cores but two (output in
+   `logs\prepare.log`). The next launch has them all from its start, so
+   one run that reaches a place is enough: no restarting again and again
+   while the world fills in a few pipelines a minute.
 5. When the game stops (3.2), it prints a short summary (typical and best
    fps, shaders that did not translate, pipelines the card refused, slow
    submissions) and puts everything to send in one file on the Desktop,
@@ -74,7 +75,7 @@ runs the newer one, so fixes to VIctory Try itself need no new download.
    - **U**: update to the newest version and run;
    - **G**: change the game paths;
    - **C**: switch between Series S and Series X (remembered);
-   - **P**: prepare all shaders again (done by itself after each update);
+   - **P**: prepare all pipelines again (done by itself after each update and run);
    - **F**: switch to the faster speed mode (late waits and card buffers:
      4-5 fps on a 12 GB card, riskier on 8 GB) and back (remembered);
    - **Q**: quit.

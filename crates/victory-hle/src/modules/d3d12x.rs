@@ -63,6 +63,32 @@ pub fn prepare_shader(_container: &[u8]) -> bool {
     false
 }
 
+/// `victory prepare`: makes the host pipeline of every recipe earlier runs
+/// kept (each pipeline a draw or dispatch asked for) into the pipeline
+/// library [`use_shader_cache`] opened, on `threads` workers; `say` gets a
+/// progress line every 15 s and a last one. Whether there were recipes.
+#[cfg(windows)]
+pub fn prepare_pipelines(threads: usize, say: &(dyn Fn(String) + Sync)) -> bool {
+    let line = |p: &victory_gpu::pipeline::Prepared, last: bool| {
+        say(format!(
+            "{} {} of {} pipelines ready ({} already in the library, {} compiled now), {} cannot be made",
+            if last { "prepared    " } else { "preparing   " },
+            p.loaded + p.made,
+            p.usable,
+            p.loaded,
+            p.made,
+            p.failed
+        ));
+    };
+    victory_gpu::pipeline::prepare_recipes(threads, &line).recipes > 0
+}
+
+/// Off Windows nothing runs: there are no recipes.
+#[cfg(not(windows))]
+pub fn prepare_pipelines(_threads: usize, _say: &(dyn Fn(String) + Sync)) -> bool {
+    false
+}
+
 /// Translations found in the shader cache and made, since the start.
 #[cfg(windows)]
 pub fn prepared_shader_counts() -> (u64, u64) {

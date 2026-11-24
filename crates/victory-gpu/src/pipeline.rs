@@ -766,6 +766,19 @@ pub(crate) mod host;
 mod library;
 #[cfg(windows)]
 mod make;
+#[cfg(windows)]
+mod recipe;
+
+#[cfg(windows)]
+pub use recipe::Prepared;
+
+/// Makes the host pipeline of every recipe the runs kept (`victory
+/// prepare`, with the game closed) into the pipeline library, on `threads`
+/// workers; `progress` is called every 15 s and at the end (`true`).
+#[cfg(windows)]
+pub fn prepare_recipes(threads: usize, progress: &(dyn Fn(&Prepared, bool) + Sync)) -> Prepared {
+    recipe::prepare(threads, progress)
+}
 
 /// Lets the pipeline library's mapped file go from memory when no pipeline
 /// has loaded for a while (`library::trim`); called by the host's sweep.

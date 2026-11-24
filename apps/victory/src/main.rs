@@ -86,12 +86,13 @@ enum Command {
         #[arg(long)]
         jobs: Option<usize>,
     },
-    /// Translate every shader in the game files into the shader cache a
-    /// run reads, ahead of the run (no game running), so the world does
-    /// not wait for its shaders on the first visit after an update.
+    /// With the game closed: make every pipeline earlier runs asked for
+    /// into the pipeline library (and translate their shaders), so the
+    /// next run has them from its start. Given game files, also translate
+    /// every shader found in them.
     Prepare {
         paths: Vec<PathBuf>,
-        /// Worker threads (default: half the logical cores).
+        /// Worker threads (default: all logical cores but two).
         #[arg(long)]
         jobs: Option<usize>,
     },
