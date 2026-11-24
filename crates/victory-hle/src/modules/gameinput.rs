@@ -344,6 +344,11 @@ struct State {
     queue: VecDeque<Event>,
     /// The one thread draining `queue`; other producers only append.
     deliverer: Option<ThreadId>,
+    /// Blocking enumerations running on their registering thread while
+    /// another thread delivers: token and thread. The delivery loop holds
+    /// that token's other events until the enumeration is done, so one
+    /// registration's callback never runs on two threads at once.
+    enumerating: Vec<(u64, ThreadId)>,
 }
 
 pub struct Hub {
@@ -390,6 +395,7 @@ impl Hub {
                 running: Vec::new(),
                 queue: VecDeque::new(),
                 deliverer: None,
+                enumerating: Vec::new(),
             }),
             returned: Condvar::new(),
         }));
@@ -461,30 +467,40 @@ impl Hub {
         }
     }
 
-    /// A blocking enumeration: its callbacks have all run on the calling
-    /// thread before this returns. The title registers holding a lock its
-    /// callback takes again, so they must not be handed to (and waited for
-    /// on) another thread that is delivering: that thread would block on the
-    /// lock this one holds. They run here, alongside that thread's current
-    /// callback. Called from a callback on the delivering thread, they queue
-    /// behind it as `deliver` does.
-    fn deliver_blocking(&self, events: Vec<Event>) {
+    /// A blocking enumeration registered while another thread delivers
+    /// (`register_device` has put `token` in `enumerating`): its callbacks run
+    /// here, on the registering thread, alongside that thread's current
+    /// callback. The title registers holding a lock its callback takes again,
+    /// so handing them to that thread and waiting would deadlock. That thread
+    /// holds this token's other events until they are done.
+    fn enumerate_here(&self, token: u64, events: Vec<Event>) {
         let me = std::thread::current().id();
-        let elsewhere = self.state().deliverer.is_some_and(|t| t != me);
-        if !elsewhere {
-            return self.deliver(events);
-        }
         for e in events {
             self.run(e, me);
         }
+        let mut state = self.state();
+        state.enumerating.retain(|&x| x != (token, me));
+        self.returned.notify_all();
     }
 
     /// Runs one event's callback on this thread, never under our lock,
-    /// unless its registration was dropped since the event was made.
+    /// unless its registration was dropped since the event was made. An
+    /// event of a registration whose enumeration runs on another thread waits
+    /// for that enumeration first.
     fn run(&self, e: Event, me: ThreadId) {
         let r = e.registration;
         {
             let mut state = self.state();
+            while state
+                .enumerating
+                .iter()
+                .any(|&(t, on)| t == r.token && on != me)
+            {
+                state = self
+                    .returned
+                    .wait(state)
+                    .unwrap_or_else(PoisonError::into_inner);
+            }
             if !state.callbacks.iter().any(|c| c.token == r.token) {
                 return;
             }
@@ -827,8 +843,10 @@ extern "system" fn register_device(
         context: context as usize,
         callback,
     };
+    let blocking = enumeration != 0 && enumeration != ASYNC_ENUMERATION;
+    let me = std::thread::current().id();
     let mut found = Vec::new();
-    {
+    let here = {
         let mut state = hub.state();
         if enumeration != 0 && status & STATUS_CONNECTED != 0 {
             let now = now();
@@ -847,15 +865,24 @@ extern "system" fn register_device(
         if enumeration == ASYNC_ENUMERATION {
             state.pending.append(&mut found);
         }
-    }
+        // Decided under the same lock that makes the registration visible,
+        // so the delivering thread cannot run its hotplug events first.
+        let here = blocking && state.deliverer.is_some_and(|t| t != me);
+        if here {
+            state.enumerating.push((registration.token, me));
+        }
+        here
+    };
     if !out.is_null() {
         // SAFETY: checked non-null.
         unsafe { out.write(registration.token) };
     }
     // A blocking enumeration's callbacks have all run, on this thread,
     // before registration returns, even while another thread is delivering.
-    if enumeration != 0 && enumeration != ASYNC_ENUMERATION {
-        hub.deliver_blocking(found);
+    // Otherwise they join the delivery queue: run here when no one else is
+    // delivering, or behind the current callback when registered from one.
+    if here {
+        hub.enumerate_here(registration.token, found);
     } else {
         hub.deliver(found);
     }
@@ -2040,6 +2067,121 @@ mod tests {
         assert_ne!(seen_at_return, 0, "its callbacks ran before it returned");
         assert_eq!(*SEEN_ON.lock().unwrap(), Some(registering));
         poller.join().unwrap();
+    }
+
+    /// While a blocking enumeration runs on its registering thread, the
+    /// delivering thread holds that registration's hotplug events: the same
+    /// callback never runs on two threads at once.
+    #[test]
+    fn hotplug_waits_for_an_enumeration_on_another_thread() {
+        use std::sync::atomic::AtomicBool;
+        static HELD: AtomicU32 = AtomicU32::new(0);
+        static RELEASE_HOLD: AtomicBool = AtomicBool::new(false);
+        static ACTIVE: AtomicU32 = AtomicU32::new(0);
+        static PEAK: AtomicU32 = AtomicU32::new(0);
+        static CALLS: AtomicU32 = AtomicU32::new(0);
+        static RELEASE_TRACK: AtomicBool = AtomicBool::new(false);
+        extern "system" fn hold(_: u64, _: *mut c_void, _: *const Device, _: u64, _: u32, _: u32) {
+            HELD.fetch_add(1, Ordering::SeqCst);
+            while !RELEASE_HOLD.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        extern "system" fn track(_: u64, _: *mut c_void, _: *const Device, _: u64, _: u32, _: u32) {
+            let active = ACTIVE.fetch_add(1, Ordering::SeqCst) + 1;
+            PEAK.fetch_max(active, Ordering::SeqCst);
+            CALLS.fetch_add(1, Ordering::SeqCst);
+            while !RELEASE_TRACK.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            ACTIVE.fetch_sub(1, Ordering::SeqCst);
+        }
+        type Register = extern "system" fn(
+            This,
+            *const Device,
+            u32,
+            u32,
+            u32,
+            *mut c_void,
+            Option<DeviceCallback>,
+            *mut u64,
+        ) -> HRESULT;
+        let wait_for = |what: &AtomicU32, message: &str| {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while what.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert_ne!(what.load(Ordering::SeqCst), 0, "{message}");
+        };
+        let (hub, host) = fake();
+        let register = slot::<Register, _>(&hub.object, 0x48);
+        for flag in [&HELD, &ACTIVE, &PEAK, &CALLS] {
+            flag.store(0, Ordering::SeqCst);
+        }
+        RELEASE_HOLD.store(false, Ordering::SeqCst);
+        RELEASE_TRACK.store(false, Ordering::SeqCst);
+        let mut token = 0;
+        let (no_context, any_device) = (std::ptr::null_mut(), std::ptr::null());
+        assert_eq!(
+            register(
+                &hub.object,
+                any_device,
+                GAMEPAD_KIND,
+                1,
+                0,
+                no_context,
+                Some(hold),
+                &mut token
+            ),
+            S_OK
+        );
+        // The poll thread delivers, and stays in `hold`.
+        let first = {
+            let host = Arc::clone(&host);
+            std::thread::spawn(move || {
+                host.lock().unwrap().pads[1] = Some(PadState::default());
+                hub.poll();
+            })
+        };
+        wait_for(&HELD, "the poll thread is delivering");
+        // `track` registers with a blocking enumeration, run on its own thread.
+        let registrar = std::thread::spawn(move || {
+            let mut token = 0;
+            let any_device = std::ptr::null();
+            register(
+                &hub.object,
+                any_device,
+                GAMEPAD_KIND,
+                1,
+                2,
+                std::ptr::null_mut(),
+                Some(track),
+                &mut token,
+            )
+        });
+        wait_for(&ACTIVE, "the enumeration runs");
+        // A second pad queues a hotplug event for `track` behind the poll
+        // thread, which then leaves `hold` and reaches it.
+        let second = std::thread::spawn(move || {
+            host.lock().unwrap().pads[2] = Some(PadState::default());
+            hub.poll();
+        });
+        second.join().unwrap();
+        RELEASE_HOLD.store(true, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(
+            PEAK.load(Ordering::SeqCst),
+            1,
+            "`track` ran on two threads at once"
+        );
+        RELEASE_TRACK.store(true, Ordering::SeqCst);
+        assert_eq!(registrar.join().unwrap(), S_OK);
+        first.join().unwrap();
+        assert!(
+            CALLS.load(Ordering::SeqCst) >= 2,
+            "enumeration and hotplug both ran"
+        );
+        assert_eq!(PEAK.load(Ordering::SeqCst), 1);
     }
 
     #[test]
