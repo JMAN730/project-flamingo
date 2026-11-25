@@ -1086,10 +1086,10 @@ impl Resource {
 
     /// The colour twin, made now if this is its first use: only a depth
     /// texture the title also writes as unordered access has one.
-    fn twin(&self) -> Option<&std::sync::Arc<Twin>> {
+    fn twin(&self, this: This) -> Option<&std::sync::Arc<Twin>> {
         self.twin
             .get_or_init(|| {
-                let depth = self.host()?;
+                let depth = self.host(this)?;
                 twin_texture(&self.desc, &depth.texture)
             })
             .as_ref()
@@ -1158,6 +1158,9 @@ impl HostTexture {
         Self {
             texture,
             state: state.into(),
+            born_seq: crate::host::birth_seq(),
+            // Twins and planes are made from the title's own description.
+            dropped: 0,
         }
     }
 }
@@ -1192,7 +1195,7 @@ pub(crate) fn twin(this: This) -> Option<std::sync::Arc<Twin>> {
     if this.is_null() {
         return None;
     }
-    resource(this).twin().cloned()
+    resource(this).twin(this).cloned()
 }
 
 /// The twin's texture, for the unordered access views of `this`.
@@ -1206,7 +1209,7 @@ pub(crate) fn twin_resource<'a>(
     // SAFETY: the twin lives as long as the host copy, which lives as long
     // as the resource.
     resource(this)
-        .twin()
+        .twin(this)
         .map(|t| unsafe { &*std::ptr::from_ref(&t.colour.texture) })
 }
 
@@ -1219,7 +1222,7 @@ pub(crate) fn twin_plane_resource<'a>(
     if this.is_null() {
         return None;
     }
-    let twin = resource(this).twin()?;
+    let twin = resource(this).twin(this)?;
     // SAFETY: as in `twin_resource`.
     twin.plane
         .as_ref()
