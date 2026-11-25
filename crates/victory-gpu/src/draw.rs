@@ -5280,10 +5280,7 @@ void main() {
     /// a null or stale descriptor.
     #[test]
     fn draw_sees_descriptor_copied_directly_in_heap_memory() {
-        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
-        use windows::Win32::Graphics::Direct3D::ID3DBlob;
         use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R32_TYPELESS, DXGI_SAMPLE_DESC};
-        use windows::core::s;
 
         struct DropHeap(This);
         impl Drop for DropHeap {
@@ -5395,10 +5392,8 @@ void main() {
         crate::descriptor::sync_all_heaps();
 
         const SOURCE: &str = r#"
-#define RS "DescriptorTable(SRV(t0, numDescriptors=1)), UAV(u0)"
 ByteAddressBuffer src : register(t0);
 RWByteAddressBuffer dst : register(u0);
-[RootSignature(RS)]
 [numthreads(1, 1, 1)]
 void main() {
     dst.Store(0, src.Load(0));
@@ -5407,32 +5402,39 @@ void main() {
     dst.Store(12, src.Load(12));
 }
 "#;
-        let mut blob: Option<ID3DBlob> = None;
-        // SAFETY: static shader source and entry point strings.
-        unsafe {
-            D3DCompile(
-                SOURCE.as_ptr().cast(),
-                SOURCE.len(),
-                s!("draw_direct_heap_copy"),
-                None,
-                None,
-                s!("main"),
-                s!("cs_5_1"),
-                0,
-                0,
-                &mut blob,
-                None,
-            )
-            .unwrap();
-        }
-        let blob = blob.unwrap();
-        // SAFETY: `blob` holds valid DXBC bytes.
-        let code = unsafe {
-            std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize())
+        let code = crate::hlsl::system_compile("draw_direct_heap_copy", SOURCE).unwrap();
+        // Supply the layout directly. Some HLSL compilers accept the source
+        // but omit the embedded root signature from compute bytecode.
+        let range = D3D12_DESCRIPTOR_RANGE1 {
+            RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+            NumDescriptors: 1,
+            Flags: D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE
+                | D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE,
+            ..Default::default()
         };
-        // SAFETY: `code` includes the root signature and compute bytecode.
-        let (root, pso): (ID3D12RootSignature, ID3D12PipelineState) = unsafe {
-            let root = host.device.CreateRootSignature(0, code).unwrap();
+        let params = [
+            D3D12_ROOT_PARAMETER1 {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+                Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                    DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE1 {
+                        NumDescriptorRanges: 1,
+                        pDescriptorRanges: &range,
+                    },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            },
+            D3D12_ROOT_PARAMETER1 {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_UAV,
+                Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                    Descriptor: D3D12_ROOT_DESCRIPTOR1::default(),
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            },
+        ];
+        let (root, _) =
+            crate::pipeline::host::root_signature(&host.device, &params, &[], true, false).unwrap();
+        // SAFETY: the serialized layout matches the compute shader bindings.
+        let pso: ID3D12PipelineState = unsafe {
             let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
                 pRootSignature: std::mem::transmute_copy(&root),
                 CS: D3D12_SHADER_BYTECODE {
@@ -5441,8 +5443,7 @@ void main() {
                 },
                 ..Default::default()
             };
-            let pso = host.device.CreateComputePipelineState(&desc).unwrap();
-            (root, pso)
+            host.device.CreateComputePipelineState(&desc).unwrap()
         };
 
         let make_buf = |kind: D3D12_HEAP_TYPE, flags, state| -> ID3D12Resource {
