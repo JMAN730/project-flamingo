@@ -3074,3 +3074,22 @@ fn a_missing_value_on_a_path_no_lane_takes_is_dead() {
     ];
     assert_eq!(refusal(&kept), None);
 }
+
+/// `v_cmp_class_f32`'s abs and neg flip the sign bit of the raw operand, as
+/// RDNA2 does: no FAbs (or fsub), which would flush a denormal to a zero and
+/// quiet a signalling NaN before it is classified.
+#[test]
+fn cmp_class_f32_modifiers_are_bitwise() {
+    // v_cmp_class_f32_e64 s6, |v1|, v2 with neg on src0 (VOP3 opcode 0x088).
+    let words = [
+        0x35 << 26 | 0x088 << 16 | 1 << 8 | 6,
+        (256 + 1) | (256 + 2) << 9 | 1 << 29,
+        S_ENDPGM,
+    ];
+    let l = lower_words(&words, 0).unwrap();
+    let fabs = l
+        .dx_ops
+        .iter()
+        .any(|(name, args)| name == "dx.op.unary.f32" && args.first() == Some(&Some(6)));
+    assert!(!fabs, "v_cmp_class_f32 abs must not lower to FAbs");
+}

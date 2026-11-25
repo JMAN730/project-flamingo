@@ -2427,10 +2427,19 @@ impl<'a> Lower<'a> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
         };
-        let op = *v.src.get(k).ok_or("a missing operand")?;
         if v.abs >> k & 1 != 0 || v.neg >> k & 1 != 0 {
             return Err("integer operand modifiers");
         }
+        self.raw_src(inst, k)
+    }
+
+    /// Source `k`'s bits (with its SDWA selection); its abs/neg modifiers
+    /// are left to the caller.
+    fn raw_src(&mut self, inst: &Inst, k: usize) -> Result<V, Why> {
+        let Fields::Valu(v) = &inst.fields else {
+            unreachable!()
+        };
+        let op = *v.src.get(k).ok_or("a missing operand")?;
         match self.src0 {
             Some(x) if k == 0 => Ok(x),
             _ => {
@@ -8344,8 +8353,22 @@ impl<'a> Lower<'a> {
                     }
                     h
                 } else {
-                    let x = self.fsrc(inst, 0)?;
-                    self.as_int(x)
+                    // abs/neg only touch the sign bit: float ops would flush
+                    // denormals and quiet signalling NaNs before the test.
+                    let Fields::Valu(v) = &inst.fields else {
+                        unreachable!()
+                    };
+                    let (abs, neg) = (v.abs & 1 != 0, v.neg & 1 != 0);
+                    let mut x = self.raw_src(inst, 0)?;
+                    if abs {
+                        let m = self.s.m.i32(0x7FFF_FFFF);
+                        x = self.s.m.bin(c, Bin::And, x, m);
+                    }
+                    if neg {
+                        let s = self.s.m.i32(0x8000_0000);
+                        x = self.s.m.bin(c, Bin::Xor, x, s);
+                    }
+                    x
                 };
                 let mask = self.src(inst, 1)?;
                 let k = |l: &mut Self, v: u32| l.s.m.i32(v);

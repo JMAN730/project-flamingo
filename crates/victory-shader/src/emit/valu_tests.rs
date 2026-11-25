@@ -1549,6 +1549,31 @@ fn v_cmp_class_f32_matches_rdna2() {
             inp[0], inp[1],
         );
     });
+
+    // With neg on src0: only the sign bit flips, so a denormal stays a
+    // denormal and a signalling NaN stays signalling.
+    let [w0, w1] = vop3(0x088, 6, vgpr(1), vgpr(2), 0);
+    let cmp_neg = build_valu_cs(&[
+        w0,
+        w1 | 1 << 29,
+        vop3(0x101, 0, 0x80, 0x81, sgpr(6))[0],
+        vop3(0x101, 0, 0x80, 0x81, sgpr(6))[1],
+    ]);
+    let neg_cases: &[([u32; 4], u32)] = &[
+        ([0x0000_0001, 1 << 4, 0, 0], 1), // +denormal -> -denormal
+        ([0x0000_0001, 1 << 5, 0, 0], 0), // not -0.0
+        ([0x7F80_0001, 1 << 0, 0, 0], 1), // sNaN stays signalling
+        ([0x7F80_0001, 1 << 1, 0, 0], 0),
+    ];
+    let neg_in: Vec<[u32; 4]> = neg_cases.iter().map(|c| c.0).collect();
+    run_cases(&cmp_neg, &neg_in, |backend, i, inp, got| {
+        let want = neg_cases[i].1;
+        assert_eq!(
+            got, want,
+            "{backend}: v_cmp_class_f32(-{:#010x}, {:#05x}) = {got}, want {want}",
+            inp[0], inp[1],
+        );
+    });
 }
 
 #[test]
