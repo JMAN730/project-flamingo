@@ -2675,3 +2675,101 @@ fn texture_mip_sizes_match_the_formats_functions() {
         },
     );
 }
+
+/// `victory_formats::texture::narrowed_view`, the function the test below runs
+/// as console code.
+fn texture_narrowed_view_reference(
+    asked: (u32, u32),
+    resident: (u32, u32),
+    mips: u32,
+) -> (u32, u32) {
+    let (first, levels) = asked;
+    let end = if levels == 0 || levels == u32::MAX {
+        mips
+    } else {
+        first.saturating_add(levels).min(mips)
+    };
+    let (rfirst, rcount) = resident;
+    let rend = rfirst.saturating_add(rcount).min(mips);
+    // Nothing the view asked for is there: its most detailed resident mip
+    // alone (the picture is the smallest mip, not black).
+    let start = first.max(rfirst).min(rend.saturating_sub(1));
+    let stop = end.min(rend);
+    let count = stop.saturating_sub(start).max(1);
+    (start, count)
+}
+
+/// Narrowing a shader view's mip range to the resident mips, written as console
+/// code, matches `victory_formats::texture::narrowed_view` on the GPU:
+/// saturating integer add/sub (`v_add_nc_u32`/`v_sub_nc_u32` with `clamp`),
+/// sentinel checks (`0` and `u32::MAX`) joined with `s_or_b32`, and packing the
+/// resulting `(start, count)` pair with `v_lshl_or_b32`.
+#[test]
+fn texture_narrowed_view_matches_the_formats_function() {
+    let vcc = sgpr(106);
+    let mut body = Vec::new();
+    // v1 = first, v2 = levels, v3 = rfirst | (rcount << 16), v4 = mips.
+    // Unpack rfirst -> v5, rcount -> v6.
+    body.extend(vop3(0x148, 5, vgpr(3), 128, 144)); // v_bfe_u32 v5, v3, 0, 16
+    body.extend(vop3(0x148, 6, vgpr(3), 144, 144)); // v_bfe_u32 v6, v3, 16, 16
+    // end = if levels == 0 || levels == u32::MAX { mips } else { first.saturating_add(levels).min(mips) }.
+    body.extend(vop3_clamp(0x125, 7, vgpr(1), vgpr(2), 128)); // v_add_nc_u32 v7, v1, v2 clamp
+    body.extend(vop3(0x113, 7, vgpr(7), vgpr(4), 128)); // v_min_u32 v7, v7, v4
+    body.extend(vop3(0x0C2, 16, vgpr(2), 128, 128)); // v_cmp_eq_u32 s16, v2, 0
+    body.extend(vop3(0x0C2, 17, vgpr(2), 193, 128)); // v_cmp_eq_u32 s17, v2, -1
+    body.push(sop2(0x10, 106, 16, 17)); // s_or_b32 vcc_lo, s16, s17
+    body.extend(vop3(0x101, 7, vgpr(7), vgpr(4), vcc)); // v_cndmask_b32 v7, v7, v4, vcc
+    // rend = rfirst.saturating_add(rcount).min(mips) -> v6.
+    body.extend(vop3_clamp(0x125, 6, vgpr(5), vgpr(6), 128)); // v_add_nc_u32 v6, v5, v6 clamp
+    body.extend(vop3(0x113, 6, vgpr(6), vgpr(4), 128)); // v_min_u32 v6, v6, v4
+    // start = first.max(rfirst).min(rend.saturating_sub(1)) -> v5.
+    body.extend(vop3(0x114, 5, vgpr(1), vgpr(5), 128)); // v_max_u32 v5, v1, v5
+    body.extend(vop3_clamp(0x126, 8, vgpr(6), 129, 128)); // v_sub_nc_u32 v8, v6, 1 clamp
+    body.extend(vop3(0x113, 5, vgpr(5), vgpr(8), 128)); // v_min_u32 v5, v5, v8
+    // stop = end.min(rend); count = stop.saturating_sub(start).max(1) -> v7.
+    body.extend(vop3(0x113, 7, vgpr(7), vgpr(6), 128)); // v_min_u32 v7, v7, v6
+    body.extend(vop3_clamp(0x126, 7, vgpr(7), vgpr(5), 128)); // v_sub_nc_u32 v7, v7, v5 clamp
+    body.extend(vop3(0x114, 7, vgpr(7), 129, 128)); // v_max_u32 v7, v7, 1
+    // Pack (start << 16) | count into v0.
+    body.extend(vop3(0x36F, 0, vgpr(5), 144, vgpr(7))); // v_lshl_or_b32 v0, v5, 16, v7
+
+    let shader = build_valu_cs(&body);
+    let mut cases = Vec::new();
+    for mips in [0u32, 1, 6, 12] {
+        for &(rfirst, rcount) in &[(0u32, 0u32), (0, 12), (2, 3), (5, 7)] {
+            for first in [0u32, 2, 5, u32::MAX - 2] {
+                for levels in [0u32, 1, 3, u32::MAX - 1, u32::MAX] {
+                    cases.push([first, levels, rfirst | (rcount << 16), mips]);
+                }
+            }
+        }
+    }
+    // Sanity-check that cases exercise overflow saturation, underflow saturation,
+    // both sentinel values, and non-overlapping ranges.
+    assert!(cases.iter().any(|&[first, levels, _, mips]| {
+        levels != 0 && levels != u32::MAX && first.checked_add(levels).is_none() && mips > 0
+    }));
+    assert!(cases.iter().any(|&[first, levels, packed, mips]| {
+        let (rfirst, rcount) = (packed & 0xFFFF, packed >> 16);
+        let (start, count) =
+            texture_narrowed_view_reference((first, levels), (rfirst, rcount), mips);
+        start > first && count == 1
+    }));
+    run_cases(
+        &shader,
+        &cases,
+        |backend, _, [first, levels, packed, mips], got| {
+            let (rfirst, rcount) = (packed & 0xFFFF, packed >> 16);
+            let (want_start, want_count) =
+                texture_narrowed_view_reference((first, levels), (rfirst, rcount), mips);
+            let want = (want_start << 16) | want_count;
+            assert_eq!(
+                got,
+                want,
+                "{backend}: asked=({first}, {levels}) resident=({rfirst}, {rcount}) mips={mips}: got ({}, {}), want ({want_start}, {want_count})",
+                got >> 16,
+                got & 0xFFFF
+            );
+        },
+    );
+}
