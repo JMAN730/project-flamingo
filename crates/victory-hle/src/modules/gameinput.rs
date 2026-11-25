@@ -1261,9 +1261,17 @@ pub(crate) fn module() -> HleModule {
 /// shifts down to fill in the gap". Keys of `previous` still in `down` keep
 /// their place; keys of `down` not in `previous` follow, in `down`'s order.
 fn press_order(previous: &[u8], down: &[u8]) -> Vec<u8> {
-    let kept = previous.iter().filter(|vk| down.contains(vk));
-    let new = down.iter().filter(|vk| !previous.contains(vk));
-    kept.chain(new).copied().collect()
+    let mut order: Vec<u8> = previous
+        .iter()
+        .filter(|vk| down.contains(vk))
+        .copied()
+        .collect();
+    for &vk in down {
+        if !order.contains(&vk) {
+            order.push(vk);
+        }
+    }
+    order
 }
 
 /// Host input: XInput pads, the keyboard while our process has focus.
@@ -1750,6 +1758,9 @@ mod tests {
         let held = press_order(&held, &[A, Z]);
         assert_eq!(held, [A, Z]);
         assert!(press_order(&held, &[]).is_empty());
+        // A key reported twice (overlapping scripted presses) is held once.
+        assert_eq!(press_order(&[], &[A, A]), [A]);
+        assert_eq!(press_order(&[A], &[A, A]), [A]);
     }
 
     use super::*;

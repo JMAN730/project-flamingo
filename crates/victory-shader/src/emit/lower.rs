@@ -8883,6 +8883,7 @@ impl<'a> Lower<'a> {
         if *tfe || *lwe {
             return Err("an image access with tfe or lwe");
         }
+        let no_channels = *dmask == 0;
         // A load or sample with no channel enabled returns the first.
         let dmask = if *dmask == 0 { &1 } else { dmask };
         let site = (b, i);
@@ -9052,6 +9053,9 @@ impl<'a> Lower<'a> {
         if store {
             if name != "image_store" {
                 return Err("an image store to a mip level");
+            }
+            if no_channels {
+                return Err("an image store of no channels");
             }
             // shortcut: stores are taken to write all four channels of a
             // float format (the console converts by the view's format).

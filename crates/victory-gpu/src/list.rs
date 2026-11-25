@@ -1475,11 +1475,13 @@ extern "system" fn allocate_upload(this: This, size: u64, alignment: u64) -> *mu
     let at = unsafe { start.add(start.align_offset(align)) };
     // SAFETY: the title passes one of our lists.
     let uploads = unsafe { &(*this.cast::<List>()).uploads };
-    // Moving the vector keeps its heap block where it is.
-    uploads
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .push(block);
+    // Moving the vector keeps its heap block where it is. The list's own
+    // growth must not abort either, so its slot is reserved first.
+    let mut uploads = uploads.lock().unwrap_or_else(|e| e.into_inner());
+    if uploads.try_reserve(1).is_err() {
+        return std::ptr::null_mut();
+    }
+    uploads.push(block);
     at
 }
 

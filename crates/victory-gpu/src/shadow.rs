@@ -1101,7 +1101,7 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
         let len = entry.end - key.0;
         // Rounded up so that views ending in the buffer's last 256 bytes fit.
         // Shaders write some buffers (unordered access), so not upload memory.
-        let alloc_size = len.next_multiple_of(1 << 16);
+        let alloc_size = len.checked_next_multiple_of(1 << 16)?;
         let (buffer, data, rebar_bytes) = alloc_shadow_buffer(alloc_size)?;
         crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
         // SAFETY: a live buffer.

@@ -3186,4 +3186,6 @@ fn image_stores_of_some_channels_zero_the_others() {
         let l = lower_image(&words).unwrap_or_else(|e| panic!("dmask {dmask:#x}: {e}"));
         assert_eq!(calls(&l, "textureStore.f32").len(), 1, "dmask {dmask:#x}");
     }
+    // No channel enabled: refused rather than writing the first register.
+    assert!(lower_image(&image_words(0x08, 0, 1, false, &addr)).is_err());
 }

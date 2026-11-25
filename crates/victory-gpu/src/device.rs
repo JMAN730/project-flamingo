@@ -346,7 +346,8 @@ extern "system" fn check_feature_support(
 /// read-only views of the same two planes.
 /// `D3D12_FORMAT_SUPPORT1` and `2` for a DXGI format. Block-compressed
 /// formats (BC1-BC7) are sampled only: no render target, blending, depth,
-/// UAV or buffer use, as D3D12 reports them (`0x0090_13E0`, `0`).
+/// UAV or buffer use, as D3D12 reports them (`0x0090_13E0`, and only
+/// `TILED` of the second set).
 // shortcut: every other format claims every use; answer from the host
 // device once there is one.
 fn format_support(format: u32) -> (u32, u32) {
@@ -354,7 +355,8 @@ fn format_support(format: u32) -> (u32, u32) {
     const SAMPLED: u32 = 0x100 | 0x200 | 0x1000 | 0x0080_0000; // load, sample, mip, gather
     const CAST_WITHIN_BIT_LAYOUT: u32 = 0x0010_0000;
     if matches!(format, 70..=84 | 94..=99) {
-        (TEXTURE | SAMPLED | CAST_WITHIN_BIT_LAYOUT, 0)
+        const TILED: u32 = 0x200;
+        (TEXTURE | SAMPLED | CAST_WITHIN_BIT_LAYOUT, TILED)
     } else {
         (0x7fff_ffff, 0xffff)
     }
@@ -621,7 +623,8 @@ mod tests {
             let (one, two) = query(bc);
             assert_eq!(one & RENDER_TARGET, 0, "format {bc}");
             assert_ne!(one & SHADER_SAMPLE, 0, "format {bc}");
-            assert_eq!(two, 0, "format {bc}: no UAV use");
+            assert_eq!(two & 0xFF, 0, "format {bc}: no UAV use");
+            assert_ne!(two & 0x200, 0, "format {bc}: tiled");
         }
         assert_ne!(query(28).0 & RENDER_TARGET, 0, "R8G8B8A8_UNORM");
         let mut short = [71u32, 0];
