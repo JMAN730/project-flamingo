@@ -14,8 +14,7 @@ pub(crate) struct Placed {
 
 #[derive(Default)]
 struct Snapshot {
-    image: Vec<u8>,
-    hash: Option<blake3::Hash>,
+    tiled: Vec<u8>,
     asked: u64,
 }
 
@@ -54,9 +53,8 @@ impl Placed {
                 last.asked = 0;
                 return None;
             }
-            let hash = blake3::hash(tiled);
             let asked = watched.map_or(0, |(stamp, _)| stamp);
-            if last.hash == Some(hash) {
+            if last.tiled == tiled {
                 last.asked = asked;
                 return None;
             }
@@ -84,29 +82,73 @@ impl Placed {
                 );
                 (footprints, size as usize)
             });
-            let mut image = vec![0; *bytes];
             let mut regions = Vec::new();
+            let mut image = vec![0; *bytes];
             let mips = self.layout.desc.mips;
             let element = self.layout.desc.element_bytes as usize;
-            for (sub, fp) in footprints.iter().enumerate() {
+            for (sub, &fp) in footprints.iter().enumerate() {
                 let sub = sub as u32;
                 let f = fp.Footprint;
                 let pitch = f.RowPitch as usize;
-                let offset = fp.Offset as usize;
+                let depth_pitch = pitch * f.Height as usize;
+                let output = &mut image[fp.Offset as usize..];
                 self.layout
-                    .detile(
-                        tiled,
+                    .copy_spans(
+                        size,
                         sub % mips,
                         sub / mips,
-                        &mut image[offset..],
+                        output.len(),
                         pitch,
-                        pitch * f.Height as usize,
+                        depth_pitch,
+                        |src, dst, len| {
+                            let new = &tiled[src..src + len];
+                            output[dst..dst + len].copy_from_slice(new);
+                            if last.tiled.is_empty() {
+                                return;
+                            }
+                            let old = &last.tiled[src..src + len];
+                            if old == new {
+                                return;
+                            }
+                            let x = (dst % pitch / element) as u32;
+                            let y = ((dst % depth_pitch) / pitch) as u32;
+                            let z = (dst / depth_pitch) as u32;
+                            let mut run = None;
+                            let mut emit = |left, right| {
+                                regions.push((
+                                    sub,
+                                    fp,
+                                    D3D12_BOX {
+                                        left: x + left,
+                                        top: y,
+                                        front: z,
+                                        right: x + right,
+                                        bottom: y + 1,
+                                        back: z + 1,
+                                    },
+                                ))
+                            };
+                            for (i, (a, b)) in old
+                                .chunks_exact(element)
+                                .zip(new.chunks_exact(element))
+                                .enumerate()
+                            {
+                                if a != b {
+                                    run.get_or_insert(i as u32);
+                                } else if let Some(left) = run.take() {
+                                    emit(left, i as u32);
+                                }
+                            }
+                            if let Some(left) = run {
+                                emit(left, (len / element) as u32);
+                            }
+                        },
                     )
                     .ok()?;
-                if last.image.is_empty() {
+                if last.tiled.is_empty() {
                     regions.push((
                         sub,
-                        *fp,
+                        fp,
                         D3D12_BOX {
                             left: 0,
                             top: 0,
@@ -116,55 +158,6 @@ impl Placed {
                             back: f.Depth,
                         },
                     ));
-                    continue;
-                }
-                for z in 0..f.Depth {
-                    for y in 0..f.Height {
-                        let start = offset + (z as usize * f.Height as usize + y as usize) * pitch;
-                        let row = start..start + f.Width as usize * element;
-                        let old = &last.image[row.clone()];
-                        let new = &image[row];
-                        if old == new {
-                            continue;
-                        }
-                        let mut run = None;
-                        for (x, (a, b)) in old
-                            .chunks_exact(element)
-                            .zip(new.chunks_exact(element))
-                            .enumerate()
-                        {
-                            if a != b {
-                                run.get_or_insert(x as u32);
-                            } else if let Some(left) = run.take() {
-                                regions.push((
-                                    sub,
-                                    *fp,
-                                    D3D12_BOX {
-                                        left,
-                                        top: y,
-                                        front: z,
-                                        right: x as u32,
-                                        bottom: y + 1,
-                                        back: z + 1,
-                                    },
-                                ));
-                            }
-                        }
-                        if let Some(left) = run {
-                            regions.push((
-                                sub,
-                                *fp,
-                                D3D12_BOX {
-                                    left,
-                                    top: y,
-                                    front: z,
-                                    right: f.Width,
-                                    bottom: y + 1,
-                                    back: z + 1,
-                                },
-                            ));
-                        }
-                    }
                 }
             }
             let upload = if regions.is_empty() {
@@ -175,11 +168,9 @@ impl Placed {
                 unsafe { std::ptr::copy_nonoverlapping(image.as_ptr(), data, *bytes) };
                 Some(Upload { buffer, regions })
             };
-            *last = Snapshot {
-                image,
-                hash: Some(hash),
-                asked,
-            };
+            last.tiled.clear();
+            last.tiled.extend_from_slice(tiled);
+            last.asked = asked;
             upload
         })
     }
@@ -327,66 +318,80 @@ impl Feedback {
 impl Placed {
     fn finish(&self, footprints: &[D3D12_PLACED_SUBRESOURCE_FOOTPRINT], gpu: &[u8]) {
         let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
-        if last.image.len() != gpu.len() || last.image == gpu {
+        if last.tiled.is_empty() {
             return;
         }
-        let size = self.layout.size as usize;
-        super::SCRATCH.with_borrow_mut(|scratch| {
-            scratch.resize(size, 0);
-            if !crate::host::read_into(self.address as *const u8, scratch) {
+        const PAGE: usize = 4096;
+        let mut pages = std::collections::BTreeMap::new();
+        for (sub, fp) in footprints.iter().enumerate() {
+            let sub = sub as u32;
+            let mips = self.layout.desc.mips;
+            let pitch = fp.Footprint.RowPitch as usize;
+            let input = &gpu[fp.Offset as usize..];
+            let visited = self.layout.copy_spans(
+                last.tiled.len(),
+                sub % mips,
+                sub / mips,
+                input.len(),
+                pitch,
+                pitch * fp.Footprint.Height as usize,
+                |mut at, linear, len| {
+                    let mut src = &input[linear..linear + len];
+                    if src == &last.tiled[at..at + len] {
+                        return;
+                    }
+                    while !src.is_empty() {
+                        let offset = at % PAGE;
+                        let n = src.len().min(PAGE - offset);
+                        if src[..n] != last.tiled[at..at + n] {
+                            let start = at - offset;
+                            let page = pages.entry(start).or_insert_with(|| {
+                                last.tiled[start..(start + PAGE).min(last.tiled.len())].to_vec()
+                            });
+                            page[offset..offset + n].copy_from_slice(&src[..n]);
+                        }
+                        at += n;
+                        src = &src[n..];
+                    }
+                },
+            );
+            if visited.is_err() {
                 return;
             }
-            let mut before = scratch.clone();
-            let mut after = scratch.clone();
-            for (sub, fp) in footprints.iter().enumerate() {
-                let mip = sub as u32 % self.layout.desc.mips;
-                let slice = sub as u32 / self.layout.desc.mips;
-                let pitch = fp.Footprint.RowPitch as usize;
-                let depth_pitch = pitch * fp.Footprint.Height as usize;
-                let start = fp.Offset as usize;
-                if self
-                    .layout
-                    .tile(
-                        &mut before,
-                        mip,
-                        slice,
-                        &last.image[start..],
-                        pitch,
-                        depth_pitch,
-                    )
-                    .is_err()
-                    || self
-                        .layout
-                        .tile(&mut after, mip, slice, &gpu[start..], pitch, depth_pitch)
-                        .is_err()
-                {
-                    return;
-                }
+        }
+        // Only pages containing GPU changes need another read of guest memory.
+        // Keep newer CPU edits. Leave them different from the GPU baseline so
+        // the next submission uploads them.
+        let mut cpu = [0u8; PAGE];
+        let mut merged = [0u8; PAGE];
+        for (start, page) in pages {
+            let cpu = &mut cpu[..page.len()];
+            let merged = &mut merged[..page.len()];
+            let address = self.address + start;
+            if !crate::host::read_into(address as *const u8, cpu) {
+                continue;
             }
-            // Preserve padding and CPU edits made while the submission was running.
-            let mut concurrent = false;
-            for ((out, old), &cpu) in after.iter_mut().zip(&before).zip(scratch.iter()) {
-                if cpu != *old {
-                    concurrent |= *out != cpu;
-                    *out = cpu;
-                }
+            let baseline = &mut last.tiled[start..start + page.len()];
+            for i in 0..page.len() {
+                merged[i] = if cpu[i] == baseline[i] {
+                    page[i]
+                } else {
+                    cpu[i]
+                };
             }
-            for (page, (src, dst)) in after.chunks(4096).zip(scratch.chunks(4096)).enumerate() {
-                if src == dst {
+            if let Some(first) = merged.iter().zip(cpu.iter()).position(|(a, b)| a != b) {
+                let end = merged
+                    .iter()
+                    .zip(cpu.iter())
+                    .rposition(|(a, b)| a != b)
+                    .unwrap()
+                    + 1;
+                if !crate::host::write_title_memory(address + first, &merged[first..end]) {
                     continue;
                 }
-                let first = src.iter().zip(dst).position(|(a, b)| a != b).unwrap();
-                let end = src.iter().zip(dst).rposition(|(a, b)| a != b).unwrap() + 1;
-                if !crate::host::write_title_memory(
-                    self.address + page * 4096 + first,
-                    &src[first..end],
-                ) {
-                    return;
-                }
             }
-            last.image.copy_from_slice(gpu);
-            last.hash = (!concurrent).then(|| blake3::hash(&after));
+            baseline.copy_from_slice(&page);
             last.asked = 0;
-        });
+        }
     }
 }
