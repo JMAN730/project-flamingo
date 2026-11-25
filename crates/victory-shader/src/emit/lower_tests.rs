@@ -3074,3 +3074,29 @@ fn a_missing_value_on_a_path_no_lane_takes_is_dead() {
     ];
     assert_eq!(refusal(&kept), None);
 }
+
+/// `v_mov_b32` and `v_cndmask_b32` are typeless: their `abs` and `neg`
+/// clear and flip bit 31 (`|-1 denormal|` stays a denormal), so they are
+/// integer operations, not `FAbs` (which flushes denormals and quiets sNaN).
+#[test]
+fn b32_moves_apply_abs_and_neg_to_the_sign_bit_only() {
+    const DS_WRITE: [u32; 2] = [0xD834_0000, 0x0000_0100]; // ds_write_b32 v0, v1
+    let cases: [&[u32]; 3] = [
+        // v_mov_b32_e64 v1, |v0|
+        &[0xD581_0101, 256],
+        // v_mov_b32_e64 v1, -v0
+        &[0xD581_0001, 256 | 1 << 29],
+        // s_mov_b32 s2, -1; v_cndmask_b32_e64 v1, |v0|, -v0, s2
+        &[0xBE82_03C1, 0xD501_0101, 256 | 256 << 9 | 2 << 18 | 2 << 29],
+    ];
+    for prefix in cases {
+        let words = [prefix, &DS_WRITE, &[S_ENDPGM]].concat();
+        let l = lower_words(&words, 1 << 15).expect("lowers"); // some LDS
+        assert!(
+            calls(&l, "unary.f32")
+                .iter()
+                .all(|args| args.first() != Some(&Some(6))),
+            "{prefix:08x?}: abs is not FAbs"
+        );
+    }
+}
