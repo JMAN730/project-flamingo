@@ -443,49 +443,69 @@ pub fn XTaskQueueTerminate(
         return E_INVALIDARG;
     };
     queue.terminated.store(true, Ordering::Release);
+    // Canceled on the terminating thread, after the pooled ones are started.
+    let mut inline = Vec::new();
     for port in &queue.ports {
         let pending = port.take_owned(queue.id);
         // Dispatches waiting on this queue end: nothing more will come.
         // (Those of other queues on the port see theirs is open and wait
         // on.) After the lock above, so none misses both flag and wake.
         port.ready.notify_all();
-        for task in pending {
-            task.run(true);
-        }
+        inline.extend(pending);
     }
     // Taken under the lock a racing submit checks `terminated` under.
     let delayed = std::mem::take(&mut *lock(&queue.delayed));
-    // Not waiting: the caller may hold a lock a canceled callback takes, so
-    // those of a thread-pool port are canceled on the pool, and the
-    // termination callback follows them there, not announcing the end while
-    // they may still touch what it frees.
     let mut pooled = Vec::new();
     for (port, task) in delayed.into_values() {
         match queue.ports[port as usize].mode {
-            Mode::ThreadPool if !wait => pooled.push(task),
-            _ => task.run(true),
+            Mode::ThreadPool => pooled.push(task),
+            _ => inline.push(task),
         }
     }
+    // Cancellations still running, the inline batch counting as one: the
+    // termination is announced when the last ends, so never while they may
+    // still touch what the callback frees. Each pooled one is its own job,
+    // so a callback waiting on another never starves it, and with `wait`
+    // false the caller (which may hold a lock they take) never blocks.
+    let latch = Arc::new((Mutex::new(pooled.len() + 1), Condvar::new()));
     let terminated = callback.map(|callback| (context as usize, callback));
-    if pooled.is_empty() {
-        if let Some((context, callback)) = terminated {
-            callback(context as *mut c_void);
+    let finish = move |latch: &(Mutex<usize>, Condvar)| {
+        let mut remaining = lock(&latch.0);
+        *remaining -= 1;
+        let last = *remaining == 0;
+        drop(remaining);
+        if last {
+            latch.1.notify_all();
+        }
+        last
+    };
+    for task in pooled {
+        let latch = latch.clone();
+        POOL.spawn(Box::new(move || {
+            task.run(true);
+            if finish(&latch)
+                && !wait
+                && let Some((context, callback)) = terminated
+            {
+                callback(context as *mut c_void);
+            }
+        }));
+    }
+    for task in inline {
+        task.run(true);
+    }
+    if finish(&latch) {
+        // Nothing was left running: announced here, whatever `wait` says.
+    } else if wait {
+        let mut remaining = lock(&latch.0);
+        while *remaining > 0 {
+            remaining = latch.1.wait(remaining).unwrap_or_else(|e| e.into_inner());
         }
     } else {
-        // One job each, so a callback waiting on another never starves it;
-        // whichever finishes last announces the termination.
-        let remaining = Arc::new(AtomicUsize::new(pooled.len()));
-        for task in pooled {
-            let remaining = remaining.clone();
-            POOL.spawn(Box::new(move || {
-                task.run(true);
-                if remaining.fetch_sub(1, Ordering::AcqRel) == 1
-                    && let Some((context, callback)) = terminated
-                {
-                    callback(context as *mut c_void);
-                }
-            }));
-        }
+        return S_OK;
+    }
+    if let Some((context, callback)) = terminated {
+        callback(context as *mut c_void);
     }
     S_OK
 }
@@ -1926,43 +1946,68 @@ mod tests {
         XTaskQueueCloseHandle(q);
     }
 
-    #[test]
-    fn pooled_cancellations_may_wait_on_each_other() {
-        static SIGNAL: (Mutex<bool>, Condvar) = (Mutex::new(false), Condvar::new());
-        static EVENTS: Mutex<Vec<&str>> = Mutex::new(Vec::new());
-        extern "system" fn first(_: *mut c_void, _: bool) {
-            let (flag, cv) = &SIGNAL;
+    fn pooled_cancellations_may_wait_on_each_other(wait: bool) {
+        struct Shared {
+            signal: (Mutex<bool>, Condvar),
+            events: Mutex<Vec<&'static str>>,
+        }
+        extern "system" fn first(context: *mut c_void, _: bool) {
+            // SAFETY: points at the `Shared` below, which outlives the test.
+            let shared = unsafe { &*(context as *const Shared) };
+            let (flag, cv) = &shared.signal;
             let (done, _) = cv
                 .wait_timeout_while(lock(flag), Duration::from_secs(5), |set| !*set)
                 .unwrap_or_else(|e| e.into_inner());
-            lock(&EVENTS).push(if *done { "first" } else { "timeout" });
+            lock(&shared.events).push(if *done { "first" } else { "timeout" });
         }
-        extern "system" fn second(_: *mut c_void, _: bool) {
-            *lock(&SIGNAL.0) = true;
-            SIGNAL.1.notify_all();
-            lock(&EVENTS).push("second");
+        extern "system" fn second(context: *mut c_void, _: bool) {
+            // SAFETY: as in `first`.
+            let shared = unsafe { &*(context as *const Shared) };
+            *lock(&shared.signal.0) = true;
+            shared.signal.1.notify_all();
+            lock(&shared.events).push("second");
         }
-        extern "system" fn terminated(_: *mut c_void) {
-            lock(&EVENTS).push("terminated");
+        extern "system" fn terminated(context: *mut c_void) {
+            // SAFETY: as in `first`.
+            let shared = unsafe { &*(context as *const Shared) };
+            lock(&shared.events).push("terminated");
         }
+        let shared = Shared {
+            signal: (Mutex::new(false), Condvar::new()),
+            events: Mutex::new(Vec::new()),
+        };
+        let context = &shared as *const Shared as *mut c_void;
         let mut q = std::ptr::null();
         assert_eq!(XTaskQueueCreate(1, 1, &mut q), S_OK);
-        let none = std::ptr::null_mut();
-        let hr = XTaskQueueSubmitDelayedCallback(q, WORK, 5_000, none, Some(first));
+        let hr = XTaskQueueSubmitDelayedCallback(q, WORK, 5_000, context, Some(first));
         assert_eq!(hr, S_OK);
-        let hr = XTaskQueueSubmitDelayedCallback(q, WORK, 5_000, none, Some(second));
+        let hr = XTaskQueueSubmitDelayedCallback(q, WORK, 5_000, context, Some(second));
         assert_eq!(hr, S_OK);
-        assert_eq!(XTaskQueueTerminate(q, false, none, Some(terminated)), S_OK);
+        assert_eq!(
+            XTaskQueueTerminate(q, wait, context, Some(terminated)),
+            S_OK
+        );
         let start = std::time::Instant::now();
-        while lock(&EVENTS).len() < 3 && start.elapsed() < Duration::from_secs(10) {
+        while lock(&shared.events).len() < 3 && start.elapsed() < Duration::from_secs(10) {
             std::thread::sleep(Duration::from_millis(10));
         }
-        let events = lock(&EVENTS).clone();
+        let events = lock(&shared.events).clone();
         assert_eq!(events.last(), Some(&"terminated"), "{events:?}");
         assert!(
             events.contains(&"first") && events.contains(&"second"),
             "{events:?}"
         );
+        assert!(!events.contains(&"timeout"), "{events:?}");
         XTaskQueueCloseHandle(q);
+    }
+
+    #[test]
+    fn pooled_cancellations_may_wait_on_each_other_without_wait() {
+        pooled_cancellations_may_wait_on_each_other(false);
+    }
+
+    #[test]
+    fn pooled_cancellations_may_wait_on_each_other_with_wait() {
+        pooled_cancellations_may_wait_on_each_other(true);
     }
 }
