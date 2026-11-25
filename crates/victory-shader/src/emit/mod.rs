@@ -1159,6 +1159,71 @@ mod tests {
         assert_ne!(features & 0x200, 0, "SFI0 {features:#x}: no StencilRef");
     }
 
+    /// A wave64 pixel program whose SGPR holds a lane mask's high dword (a compare result) on one
+    /// path and a number on the other, then compares it with zero: the
+    /// join's mask side was a lane mask read as data, which refused the
+    /// whole program. The ballot stands in for it (wave-size independent for
+    /// the zero test the console compiler emits).
+    #[test]
+    fn a_scalar_joining_a_lane_mask_and_a_number_lowers_in_pixel_programs() {
+        let words = [
+            0x7E00_02F2u32, // v_mov_b32 v0, 1.0
+            0xD405_000A,    // v_cmp_lg_f32_e64 s[10:11], v0, 0
+            0x0001_0100,
+            0xBE8C_0383, // s_mov_b32 s12, 3
+            0xBF02_850C, // s_cmp_gt_i32 s12, 5
+            0xBF85_0001, // s_cbranch_scc1 +1 (past the next word)
+            0xBE8B_0385, // s_mov_b32 s11, 5
+            0xBF06_800B, // s_cmp_eq_u32 s11, 0
+            0x850D_8081, // s_cselect_b32 s13, 1, 0
+            0x7E02_020D, // v_mov_b32 v1, s13
+            0xF800_1883, // exp mrtz v0, v1, off, off done vm
+            0x0000_0100,
+            0xBF81_0000, // s_endpgm
+        ];
+        let native = NativeProgram {
+            stage: HwStage::Ps,
+            wave64: true,
+            vgprs: 2,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ps {
+                inputs: vec![],
+                input_addr: 0,
+                db_shader_control: 0,
+                patches: vec![],
+            },
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let el = |name: &str, kind, comp| SigElement {
+            name: name.into(),
+            index: 0,
+            kind,
+            comp,
+            interp: 0,
+            row: None,
+            col: 0,
+            cols: 1,
+            usage: 1,
+            half: false,
+        };
+        let osg1 =
+            container::signature(&[el("SV_Depth", 17, 9), el("SV_StencilRef", 20, 5)], false);
+        let bytes = crate::dxbc::build(&[(FourCC::OSG1, &osg1)]);
+        let c = Container::parse(&bytes).unwrap();
+        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let out = emit(&c, &native, &p, &st, &io, &res).unwrap();
+        #[cfg(windows)]
+        if let Ok(mut v) = super::validator::Validator::load(
+            super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut out.dxil.clone()).unwrap();
+        }
+    }
+
     /// Translates the pixel program `words` (no inputs or exports) with
     /// `rsrc2` and root `layout`, and returns the emitted DXIL.
     fn pixel_program(
@@ -1177,6 +1242,7 @@ mod tests {
             io: StageIo::Ps {
                 inputs: vec![],
                 input_addr: 0,
+                rsrc2: crate::native::PsRsrc2(0),
                 rsrc2: PsRsrc2(rsrc2),
                 db_shader_control: 0,
                 patches: vec![],
