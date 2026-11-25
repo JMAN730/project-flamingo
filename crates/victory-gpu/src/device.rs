@@ -310,10 +310,7 @@ extern "system" fn check_feature_support(
         FORMAT_SUPPORT => {
             // SAFETY: checked size and non-null.
             let q = unsafe { &mut *data.cast::<[u32; 3]>() };
-            // shortcut: every use of every format; answer from the host
-            // device once there is one.
-            q[1] = 0x7fff_ffff;
-            q[2] = 0xffff;
+            (q[1], q[2]) = format_support(q[0]);
             S_OK
         }
         MULTISAMPLE => {
@@ -347,6 +344,22 @@ extern "system" fn check_feature_support(
 /// The planes of the depth/stencil format families; everything else has
 /// one. These are the DXGI format numbers, including the typeless and
 /// read-only views of the same two planes.
+/// `D3D12_FORMAT_SUPPORT1` and `2` for a DXGI format. Block-compressed
+/// formats (BC1-BC7) are sampled only: no render target, blending, depth,
+/// UAV or buffer use, as D3D12 reports them (`0x0090_13E0`, `0`).
+// shortcut: every other format claims every use; answer from the host
+// device once there is one.
+fn format_support(format: u32) -> (u32, u32) {
+    const TEXTURE: u32 = 0x20 | 0x40 | 0x80; // 2D, 3D, cube
+    const SAMPLED: u32 = 0x100 | 0x200 | 0x1000 | 0x0080_0000; // load, sample, mip, gather
+    const CAST_WITHIN_BIT_LAYOUT: u32 = 0x0010_0000;
+    if matches!(format, 70..=84 | 94..=99) {
+        (TEXTURE | SAMPLED | CAST_WITHIN_BIT_LAYOUT, 0)
+    } else {
+        (0x7fff_ffff, 0xffff)
+    }
+}
+
 fn plane_count(format: u32) -> u32 {
     1 + u32::from(matches!(format, 19..=22 | 44..=47))
 }
@@ -590,6 +603,29 @@ mod tests {
         assert_eq!(query(19, 8), (S_OK, 2), "R32G8X24_TYPELESS");
         assert_eq!(query(47, 8), (S_OK, 2), "X24_TYPELESS_G8_UINT");
         assert_eq!(query(28, 4).0, E_INVALIDARG, "wrong size");
+    }
+
+    #[test]
+    fn block_compressed_formats_are_not_render_targets() {
+        type Check = extern "system" fn(This, u32, *mut c_void, u32) -> HRESULT;
+        let check = slot::<Check>(device(), 0x68);
+        let query = |format: u32| {
+            let mut support = [format, 0, 0];
+            assert_eq!(check(device(), 3, (&raw mut support).cast(), 12), S_OK);
+            assert_eq!(support[0], format, "the format is left as given");
+            (support[1], support[2])
+        };
+        const RENDER_TARGET: u32 = 0x4000;
+        const SHADER_SAMPLE: u32 = 0x200;
+        for bc in [71, 74, 77, 80, 83, 95, 98] {
+            let (one, two) = query(bc);
+            assert_eq!(one & RENDER_TARGET, 0, "format {bc}");
+            assert_ne!(one & SHADER_SAMPLE, 0, "format {bc}");
+            assert_eq!(two, 0, "format {bc}: no UAV use");
+        }
+        assert_ne!(query(28).0 & RENDER_TARGET, 0, "R8G8B8A8_UNORM");
+        let mut short = [71u32, 0];
+        assert_eq!(check(device(), 3, (&raw mut short).cast(), 8), E_INVALIDARG);
     }
 
     #[test]
