@@ -1215,6 +1215,8 @@ mod tests {
         let st = structure::structure(&p).unwrap();
         let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
         let io = io::raise(&p, &native).unwrap();
+        // Only the Windows validator reads the DXIL.
+        #[cfg_attr(not(windows), allow(unused_variables))]
         let out = emit(&c, &native, &p, &st, &io, &res).unwrap();
         #[cfg(windows)]
         if let Ok(mut v) = super::validator::Validator::load(
@@ -1464,6 +1466,8 @@ mod tests {
         let st = structure::structure(&p).unwrap();
         let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
         let io = io::raise(&p, &native).unwrap();
+        // Only the Windows validator reads the DXIL.
+        #[cfg_attr(not(windows), allow(unused_variables))]
         let out = emit(&c, &native, &p, &st, &io, &res)?;
         #[cfg(windows)]
         if let Ok(mut v) = super::validator::Validator::load(
