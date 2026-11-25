@@ -1663,6 +1663,16 @@ fn raw_start_fits(first: u64) -> bool {
     first.is_multiple_of(4)
 }
 
+/// Whether `count` elements of `element` bytes from element `first` lie in
+/// a host buffer of `width` bytes. The console takes a view that runs past
+/// its memory; the host removes the device for one.
+fn in_buffer(width: u64, first: u64, count: u32, element: u64) -> bool {
+    first
+        .checked_add(u64::from(count))
+        .and_then(|end| end.checked_mul(element))
+        .is_some_and(|end| end <= width)
+}
+
 /// The host resource a slot made by [`make`] views, if any.
 enum Kept {
     Empty,
@@ -1865,6 +1875,13 @@ fn buffer_srv_inner(
         once!(first, "raw buffer view not on 16 bytes of its host copy");
         return None;
     }
+    // SAFETY: a live buffer.
+    let width = unsafe { shadow.buffer.GetDesc() }.Width;
+    let (first, count) = (buffer.FirstElement, buffer.NumElements);
+    if !in_buffer(width, first, count, element) {
+        once!(first, count, element, "buffer view past its host copy");
+        return None;
+    }
     // SAFETY: a live buffer and a slot of our heap.
     unsafe {
         host.device
@@ -1932,6 +1949,18 @@ fn buffer_uav(
         return None;
     }
     buffer.CounterOffsetInBytes = 0;
+    // SAFETY: a live buffer.
+    let width = unsafe { shadow.buffer.GetDesc() }.Width;
+    let (first, count) = (buffer.FirstElement, buffer.NumElements);
+    if !in_buffer(width, first, count, element) {
+        once!(
+            first,
+            count,
+            element,
+            "unordered buffer view past its host copy"
+        );
+        return None;
+    }
     let host = host()?;
     // SAFETY: a live buffer and a slot of our heap.
     unsafe {
@@ -2764,6 +2793,24 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 
 #[cfg(test)]
 mod tests {
+    /// A buffer view running past its host copy is left null: the host
+    /// removes the device for one.
+    #[test]
+    fn buffer_views_fit_their_host_copy() {
+        use super::in_buffer;
+        // 256 bytes: 64 words.
+        assert!(in_buffer(256, 0, 64, 4));
+        assert!(in_buffer(256, 60, 4, 4));
+        assert!(!in_buffer(256, 60, 5, 4));
+        assert!(!in_buffer(256, 64, 1, 4));
+        // Structured elements: 16 of 16 bytes fill it.
+        assert!(in_buffer(256, 0, 16, 16));
+        assert!(!in_buffer(256, 1, 16, 16));
+        // Overflowing arithmetic is past the end, not wrapped into it.
+        assert!(!in_buffer(256, u64::MAX, 1, 4));
+        assert!(!in_buffer(256, 1 << 62, 1, 16));
+    }
+
     use super::*;
 
     #[test]
