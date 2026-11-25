@@ -831,13 +831,24 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
 /// nothing: if a view fails, those made before it are placeholders again.
 fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
     let end = base + len;
-    split_at(base);
-    split_at(end);
+    let first = placeholder(base);
+    // From the allocation base to a point inside the same reserved
+    // region, a successful split gives exact bounds without another query.
+    let split_prefix =
+        first.is_some_and(|(start, stop)| start == base && end < stop && split_reserved(base, len));
+    if !split_prefix {
+        split_at(base, first);
+        split_at(end, placeholder(end));
+    }
     let mut made: Vec<(usize, usize, Slice)> = Vec::new();
     let mut at = base;
     while at < end {
         // What is not a placeholder fails in `map_view`.
-        let next = placeholder(at).map_or(end, |(_, stop)| stop.min(end));
+        let next = if split_prefix {
+            end
+        } else {
+            placeholder(at).map_or(end, |(_, stop)| stop.min(end))
+        };
         let offset = at - base;
         let part = Slice {
             index: slice.index + offset / PAGE,
@@ -905,10 +916,17 @@ fn map_view(base: usize, len: usize, slice: &Slice) -> bool {
     true
 }
 
+#[cfg(test)]
+thread_local! {
+    static PLACEHOLDER_QUERIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// The start and end of the placeholder holding `at`, if it may be one
 /// (other reserved memory looks the same, but the host refuses to split it
 /// or map over it).
 fn placeholder(at: usize) -> Option<(usize, usize)> {
+    #[cfg(test)]
+    PLACEHOLDER_QUERIES.with(|queries| queries.set(queries.get() + 1));
     // SAFETY: plain data; zero is a valid value.
     let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
     let size = size_of::<MEMORY_BASIC_INFORMATION>();
@@ -926,21 +944,26 @@ fn placeholder(at: usize) -> Option<(usize, usize)> {
 /// The same call frees reserved memory that replaced a placeholder back to
 /// one, committed pages and all, so everything below `at` in it must be
 /// reserved: nothing committed is ever freed here.
-fn split_at(at: usize) {
-    if let Some((start, _)) = placeholder(at)
+fn split_at(at: usize, containing: Option<(usize, usize)>) {
+    if let Some((start, _)) = containing
         && start < at
         && placeholder(start).is_some_and(|(_, stop)| stop >= at)
     {
-        // SAFETY: `[start, at)` is reserved and holds no data; the host
-        // fails the call on anything but a placeholder or memory that
-        // replaced one, and then changes nothing.
-        unsafe {
-            VirtualFree(
-                start as *mut c_void,
-                at - start,
-                MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER,
-            )
-        };
+        split_reserved(start, at - start);
+    }
+}
+
+/// The caller has checked that the whole range, starting at the allocation
+/// base, is reserved. A committed allocation must never be freed here.
+fn split_reserved(start: usize, len: usize) -> bool {
+    // SAFETY: the checked prefix holds no committed data. A successful
+    // call makes exactly that prefix a placeholder.
+    unsafe {
+        VirtualFree(
+            start as *mut c_void,
+            len,
+            MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER,
+        ) != 0
     }
 }
 
@@ -1871,5 +1894,69 @@ mod tests {
         assert_eq!(XMemMapPhysicalPages(a, 1, pages.as_ptr()), a);
         assert_eq!(XMemMapPhysicalPages(a, 1, std::ptr::null()), a);
         assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
+    }
+
+    #[test]
+    fn a_reserved_prefix_uses_one_placeholder_query() {
+        let (pages, base) = pages_and_reservation(2);
+        PLACEHOLDER_QUERIES.with(|queries| queries.set(0));
+        assert_eq!(XMemMapPhysicalPages(base, 1, pages.as_ptr()), base);
+        assert_eq!(PLACEHOLDER_QUERIES.with(std::cell::Cell::get), 1);
+
+        assert_eq!(XMemMapPhysicalPages(base, 1, std::ptr::null()), base);
+        assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);
+        // SAFETY: release the test's two placeholders after unmapping.
+        unsafe {
+            assert_ne!(VirtualFree(base, 0, MEM_RELEASE), 0);
+            assert_ne!(VirtualFree(base.wrapping_byte_add(PAGE), 0, MEM_RELEASE), 0);
+        }
+    }
+
+    /// Splitting a reserved prefix must leave its committed suffix intact,
+    /// even if the host accepts the split on a replacement allocation.
+    #[test]
+    fn a_reserved_prefix_keeps_the_committed_suffix() {
+        let (pages, base) = pages_and_reservation(3);
+        let suffix = base.wrapping_byte_add(2 * PAGE);
+        // SAFETY: replace our placeholder with a private allocation and
+        // commit its last page.
+        unsafe {
+            assert_eq!(
+                VirtualAlloc2(
+                    GetCurrentProcess(),
+                    base,
+                    3 * PAGE,
+                    MEM_RESERVE | MEM_REPLACE_PLACEHOLDER,
+                    PAGE_READWRITE,
+                    std::ptr::null_mut(),
+                    0,
+                ),
+                base
+            );
+            assert_eq!(
+                VirtualAlloc(suffix, PAGE, MEM_COMMIT, PAGE_READWRITE),
+                suffix
+            );
+            suffix.cast::<u8>().write(99);
+        }
+
+        let mapped = XMemMapPhysicalPages(base, 1, pages.as_ptr());
+        if !mapped.is_null() {
+            assert_eq!(mapped, base);
+            assert_eq!(XMemMapPhysicalPages(base, 1, std::ptr::null()), base);
+        }
+        assert_eq!(query(base).host.State, MEM_RESERVE);
+        let suffix_info = query(suffix).host;
+        assert_eq!(suffix_info.State, MEM_COMMIT);
+        // SAFETY: the suffix is still committed.
+        assert_eq!(unsafe { suffix.cast::<u8>().read() }, 99);
+        assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
+        // SAFETY: release the test's allocation, which may now be split.
+        unsafe {
+            if suffix_info.AllocationBase != base {
+                assert_ne!(VirtualFree(suffix_info.AllocationBase, 0, MEM_RELEASE), 0);
+            }
+            assert_ne!(VirtualFree(base, 0, MEM_RELEASE), 0);
+        }
     }
 }
