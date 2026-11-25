@@ -10,7 +10,7 @@
 #![allow(non_snake_case)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard};
@@ -228,6 +228,9 @@ pub struct Queue {
     ports: [Arc<Port>; 2],
     monitors: Mutex<Vec<(u64, usize, usize)>>,
     terminated: AtomicBool,
+    /// Delayed callbacks still waiting out their delay, in submission
+    /// order: terminating the queue cancels them with the queued ones.
+    delayed: Mutex<BTreeMap<u64, Task>>,
 }
 
 static NEXT_QUEUE: AtomicU64 = AtomicU64::new(1);
@@ -239,10 +242,12 @@ impl Queue {
             ports,
             monitors: Mutex::default(),
             terminated: AtomicBool::new(false),
+            delayed: Mutex::default(),
         })
     }
 
     fn submit(self: &Arc<Self>, port: u32, delay_ms: u32, task: Task) -> HRESULT {
+        static NEXT_DELAYED: AtomicU64 = AtomicU64::new(0);
         if port > COMPLETION {
             return E_INVALIDARG;
         }
@@ -251,13 +256,27 @@ impl Queue {
         }
         if delay_ms == 0 {
             self.deliver(port, task);
-        } else {
-            let queue = self.clone();
-            std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(delay_ms.into()));
-                queue.deliver(port, task);
-            });
+            return S_OK;
         }
+        let id = NEXT_DELAYED.fetch_add(1, Ordering::Relaxed);
+        {
+            // Checked again under the lock termination drains: the callback
+            // is either canceled with the others or refused.
+            let mut delayed = lock(&self.delayed);
+            if self.terminated.load(Ordering::Acquire) {
+                return E_ABORT;
+            }
+            delayed.insert(id, task);
+        }
+        let queue = self.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(delay_ms.into()));
+            // Gone if the queue was terminated meanwhile, which canceled it.
+            let task = lock(&queue.delayed).remove(&id);
+            if let Some(task) = task {
+                queue.deliver(port, task);
+            }
+        });
         S_OK
     }
 
@@ -426,6 +445,11 @@ pub fn XTaskQueueTerminate(
         for task in pending {
             task.run(true);
         }
+    }
+    // Taken under the lock a racing submit checks `terminated` under.
+    let delayed = std::mem::take(&mut *lock(&queue.delayed));
+    for task in delayed.into_values() {
+        task.run(true);
     }
     if let Some(callback) = callback {
         callback(context);
@@ -1802,5 +1826,27 @@ mod tests {
         assert_eq!(SEEN.load(Ordering::SeqCst), 1, "cleanup ran under the lock");
         assert_eq!(XAsyncGetStatus(&mut block, true), E_ABORT);
         *CLEANED.lock().unwrap() = None;
+    }
+
+    #[test]
+    fn terminate_cancels_delayed_callbacks() {
+        static EVENTS: Mutex<Vec<&str>> = Mutex::new(Vec::new());
+        extern "system" fn delayed(_: *mut c_void, canceled: bool) {
+            lock(&EVENTS).push(if canceled { "canceled" } else { "ran" });
+        }
+        extern "system" fn terminated(_: *mut c_void) {
+            lock(&EVENTS).push("terminated");
+        }
+        let mut q = std::ptr::null();
+        assert_eq!(XTaskQueueCreate(1, 1, &mut q), S_OK);
+        let none = std::ptr::null_mut();
+        let hr = XTaskQueueSubmitDelayedCallback(q, WORK, 50, none, Some(delayed));
+        assert_eq!(hr, S_OK);
+        assert_eq!(XTaskQueueTerminate(q, true, none, Some(terminated)), S_OK);
+        assert_eq!(*lock(&EVENTS), ["canceled", "terminated"]);
+        // Its delay passes without it running.
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(*lock(&EVENTS), ["canceled", "terminated"]);
+        XTaskQueueCloseHandle(q);
     }
 }
