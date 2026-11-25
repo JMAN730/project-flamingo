@@ -2218,10 +2218,16 @@ extern "system" fn map(this: This, _sub: u32, _read: *const c_void, out: *mut *m
 }
 extern "system" fn unmap(_: This, _sub: u32, _written: *const c_void) {}
 /// Returns `out`, as the x64 COM ABI requires for struct returns in `RAX`.
+/// A texture made with `MipLevels` 0 reports the chain it was given, as
+/// native D3D12 does.
 extern "system" fn resource_desc(this: This, out: *mut ResourceDesc) -> *mut ResourceDesc {
     if !out.is_null() {
+        let mut desc = resource(this).desc;
+        if desc.dimension != BUFFER && desc.mip_levels == 0 {
+            desc.mip_levels = u16::try_from(mip_count(&desc)).unwrap_or(u16::MAX);
+        }
         // SAFETY: checked non-null; the title passes room for a description.
-        unsafe { out.write(resource(this).desc) };
+        unsafe { out.write(desc) };
     }
     out
 }
@@ -3732,6 +3738,23 @@ void main() {
         let read = unsafe { back.assume_init() };
         assert_eq!((read.dimension, read.width), (BUFFER, 256));
         assert!(get_desc(committed, std::ptr::null_mut()).is_null());
+        // A texture with an automatic chain reports how many levels it got.
+        let mut tex = null;
+        let hr = create_committed(
+            null,
+            &PROPERTIES,
+            0,
+            &texture(4, 4, 28, 0),
+            0,
+            null.cast(),
+            &RESOURCE_IIDS[0],
+            &mut tex,
+        );
+        assert_eq!(hr, S_OK);
+        get_desc(tex, back.as_mut_ptr());
+        // SAFETY: written above.
+        assert_eq!(unsafe { back.assume_init() }.mip_levels, 3);
+        assert_eq!(slot::<Release>(tex, 0x10)(tex), 0);
         let mut data = std::ptr::null_mut();
         assert_eq!(
             slot::<Map>(committed, 0x40)(committed, 0, null.cast(), &mut data),
