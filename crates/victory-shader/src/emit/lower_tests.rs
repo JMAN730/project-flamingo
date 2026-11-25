@@ -950,6 +950,27 @@ fn a_scalar_carry_chain_reaches_the_select() {
     }
 }
 
+/// `v_sad_u8`, `v_sad_hi_u8`, `v_sad_u16` and `v_sad_u32` lower. An LDS
+/// store keeps the result live.
+#[test]
+fn sums_of_absolute_differences_lower() {
+    // VOP3 `op v0, v1, v2, v3`.
+    for op in [0x15Au32, 0x15B, 0x15C, 0x15D] {
+        let words = [
+            0x7E02_0285, // v_mov_b32 v1, 5
+            0x7E04_0287, // v_mov_b32 v2, 7
+            0x7E06_0281, // v_mov_b32 v3, 1
+            0xD400_0000 | op << 16,
+            0x101 | 0x102 << 9 | 0x103 << 18,
+            0x7E06_0280, // v_mov_b32 v3, 0
+            0xD834_0000,
+            0x0000_0003, // ds_write_b32 v3, v0
+            S_ENDPGM,
+        ];
+        lowers_lds(&words).unwrap_or_else(|e| panic!("VOP3 {op:#x}: {e}"));
+    }
+}
+
 /// The 24-bit multiplies lower both halves of their 48-bit product:
 /// `v_mul_i32_i24` and `v_mul_u32_u24` the low dword, `v_mul_hi_i32_i24`
 /// and `v_mul_hi_u32_u24` the high one. An LDS store keeps the result live.
