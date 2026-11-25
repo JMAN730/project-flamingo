@@ -1497,6 +1497,30 @@ mod state {
     use windows::Win32::Foundation::RECT;
     use windows::Win32::Graphics::Direct3D12::D3D12_VIEWPORT;
 
+    /// `D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT`.
+    const MAX_TARGETS: u32 = 8;
+    /// The console's render target view descriptor size.
+    const RTV_STRIDE: u64 = 128;
+
+    /// `OMSetRenderTargets`' handles: `count` (at most 8) from an array, or
+    /// for a single range consecutive descriptors from its first handle.
+    /// `handles` is not read for no targets; a range from a null handle, or
+    /// one that would wrap, gives null (skipped) slots.
+    pub(super) fn target_handles(handles: *const u64, count: u32, one_range: bool) -> Vec<u64> {
+        let count = count.min(MAX_TARGETS);
+        if !one_range || handles.is_null() || count == 0 {
+            return items(handles, count).to_vec();
+        }
+        // SAFETY: the title passes the first handle.
+        let first = unsafe { *handles };
+        (0..u64::from(count))
+            .map(|i| match first {
+                0 => 0,
+                _ => first.checked_add(RTV_STRIDE * i).unwrap_or(0),
+            })
+            .collect()
+    }
+
     /// `count` items at `items`, or none.
     fn items<'a, T>(items: *const T, count: u32) -> &'a [T] {
         if items.is_null() || count == 0 {
@@ -1605,13 +1629,7 @@ mod state {
         one_range: i32,
         depth: *const u64,
     ) {
-        let handles: Vec<u64> = if one_range != 0 && !handles.is_null() {
-            // SAFETY: the title passes the first handle.
-            let first = unsafe { *handles };
-            (0..u64::from(count)).map(|i| first + 128 * i).collect()
-        } else {
-            items(handles, count).to_vec()
-        };
+        let handles = target_handles(handles, count, one_range != 0);
         // SAFETY: the title passes a handle or null.
         let depth = unsafe { depth.as_ref() }.copied().unwrap_or(0);
         with_state(this, |list, s| s.set_targets(list, &handles, depth));
@@ -2550,6 +2568,31 @@ mod tests {
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         assert_eq!(release(list), 0);
         assert_eq!(release(allocator), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn om_set_render_targets_guards_empty_and_null_single_ranges() {
+        use super::state::target_handles;
+        // No targets: the pointer is not read, single range or not.
+        let dangling = std::ptr::dangling::<u64>();
+        assert!(target_handles(dangling, 0, true).is_empty());
+        assert!(target_handles(dangling, 0, false).is_empty());
+        assert!(target_handles(std::ptr::null(), 3, true).is_empty());
+        let first = [0x1000u64];
+        assert_eq!(
+            target_handles(first.as_ptr(), 3, true),
+            [0x1000, 0x1080, 0x1100]
+        );
+        // A range from a null handle stays null, not 0x80, 0x100, ...
+        assert_eq!(target_handles([0u64].as_ptr(), 3, true), [0, 0, 0]);
+        // A range that would wrap ends in null slots.
+        let high = [u64::MAX - 0x40];
+        assert_eq!(target_handles(high.as_ptr(), 2, true), [u64::MAX - 0x40, 0]);
+        // At most 8 targets, from a range or an array.
+        assert_eq!(target_handles(first.as_ptr(), 100, true).len(), 8);
+        let array = [7u64; 12];
+        assert_eq!(target_handles(array.as_ptr(), 12, false), [7; 8]);
     }
 
     /// Resetting or dropping a list whose submission is held behind a fence
