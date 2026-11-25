@@ -1,9 +1,9 @@
 //! Our own compute shaders (the indirect argument clamp, the rectangle
-//! expander), compiled at run time from HLSL with their root signature
-//! inside: by the system's compiler (`D3DCompile`, `cs_5_1`) and, when it
-//! refuses them, by DXC (`cs_6_0`). Wine's `d3dcompiler_47` (vkd3d-shader)
-//! rejects `RWByteAddressBuffer` loads, which every one of them uses; DXC
-//! compiles the same source.
+//! expander, and the ReBAR piece hash-compare pass), compiled at run time
+//! from HLSL with their root signature inside: by the system's compiler
+//! (`D3DCompile`, `cs_5_1`) and, when it refuses them, by DXC (`cs_6_0`).
+//! Wine's `d3dcompiler_47` (vkd3d-shader) rejects `RWByteAddressBuffer`
+//! loads, which every one of them uses; DXC compiles the same source.
 
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
@@ -39,6 +39,7 @@ fn bundled_shader(source: &str) -> Option<&'static [u8]> {
         include_str!("../shaders/argument_clamp.hlsl") => Some(bytecode!("argument_clamp")),
         include_str!("../shaders/rect_rewrite.hlsl") => Some(bytecode!("rect_rewrite")),
         include_str!("../shaders/rect_expand.hlsl") => Some(bytecode!("rect_expand")),
+        include_str!("../shaders/rebar_hash.hlsl") => Some(bytecode!("rebar_hash")),
         _ => None,
     }
 }
@@ -202,6 +203,7 @@ mod tests {
             include_str!("../shaders/argument_clamp.hlsl"),
             include_str!("../shaders/rect_rewrite.hlsl"),
             include_str!("../shaders/rect_expand.hlsl"),
+            include_str!("../shaders/rebar_hash.hlsl"),
         ] {
             let expected = bundled_shader(source).unwrap();
             let bytes = compile_compute("bundled helper", source).unwrap();
