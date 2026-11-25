@@ -353,12 +353,15 @@ impl Instruction {
                     bit(w1, 31),
                 );
                 let (r128, tfe, lwe) = (bit(w0, 15), bit(w0, 16), bit(w0, 17));
-                let mut data = if name.starts_with("image_gather4") {
+                // A ray query always returns four dwords and reads a four-dword
+                // descriptor, whatever its `dmask` and `r128` bits say.
+                let bvh = name.starts_with("image_bvh");
+                let mut data = if name.starts_with("image_gather4") || bvh {
                     4
                 } else {
                     dmask.count_ones().max(1) as u8
                 };
-                if d16 {
+                if d16 && !bvh {
                     data = data.div_ceil(2);
                 }
                 let count = image_addr_dwords(name, dim, a16);
@@ -380,7 +383,10 @@ impl Instruction {
                 Fields::Image {
                     data: vector(w1 >> 8 & 0xFF, data + u8::from(tfe || lwe)),
                     addr,
-                    rsrc: scalar(((w1 >> 16 & 0x1F) << 2) as u8, if r128 { 4 } else { 8 }),
+                    rsrc: scalar(
+                        ((w1 >> 16 & 0x1F) << 2) as u8,
+                        if r128 || bvh { 4 } else { 8 },
+                    ),
                     sampler: sampled.then(|| scalar(((w1 >> 21 & 0x1F) << 2) as u8, 4)),
                     dmask,
                     dim,

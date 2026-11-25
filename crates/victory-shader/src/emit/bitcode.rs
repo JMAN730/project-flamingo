@@ -410,6 +410,22 @@ impl Module {
         };
         self.push(block, ty, Op::Extract(agg, index))
     }
+    pub(super) fn remap_input_loads(&mut self, ids: &HashMap<V, V>) {
+        if ids.is_empty() {
+            return;
+        }
+        for inst in &mut self.insts {
+            if let Op::Call(function, args) = &mut inst.op
+                && self.funcs[*function as usize]
+                    .name
+                    .starts_with("dx.op.loadInput.")
+                && let Some(&id) = ids.get(&args[1])
+            {
+                args[1] = id;
+            }
+        }
+    }
+
     pub fn call(&mut self, block: usize, f: V, args: Vec<V>) -> V {
         let V::Func(i) = f else {
             panic!("call of a non-function")

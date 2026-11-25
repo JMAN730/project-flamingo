@@ -812,8 +812,7 @@ impl Resource {
                 let clear = clear
                     .as_ref()
                     .map_or(std::ptr::null(), |c| std::ptr::from_ref(c).cast::<c_void>());
-                let texture = host_texture(&self.desc, state, clear)?;
-                let state = crate::host::legal_state(&texture, crate::host::texture_state(state));
+                let (texture, state) = host_texture(&self.desc, state, clear)?;
                 Some(std::sync::Arc::new(HostTexture {
                     texture,
                     state: state.into(),
@@ -868,13 +867,14 @@ pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
 }
 
 /// A host texture like the title's: same description, in GPU memory,
-/// without the console's layout and flags.
+/// without the console's layout and flags, and the state it was made in
+/// (what the transitions that follow start from).
 #[cfg(windows)]
 fn host_texture(
     desc: &ResourceDesc,
     state: u32,
     clear: *const c_void,
-) -> Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
+) -> Option<(windows::Win32::Graphics::Direct3D12::ID3D12Resource, u32)> {
     use windows::Win32::Graphics::Direct3D12::*;
     const PC_FLAGS: u32 = 0xf; // render target, depth, UAV, no shader access
     if desc.dimension == BUFFER {
@@ -912,8 +912,12 @@ fn host_texture(
         d.format = family(d.format);
     }
     // The clear value names the format too: format, then color or depth
-    // and stencil (5 words).
-    let clear_value = (!clear.is_null()).then(|| {
+    // and stencil (5 words). The host takes it only when it names the
+    // resource's own format or, for a depth target, the pair's other one,
+    // so it is passed through as the title gave it and dropped only if
+    // the host refuses the texture with it: that costs the texture's
+    // initial contents, not the texture.
+    let clear_value: Option<[u32; 5]> = (!clear.is_null()).then(|| {
         // SAFETY: the title passes a whole clear value.
         let mut value = unsafe { clear.cast::<[u32; 5]>().read_unaligned() };
         value[0] = if d.flags & (RENDER_TARGET | UNORDERED) != 0 {
@@ -927,63 +931,122 @@ fn host_texture(
         Type: D3D12_HEAP_TYPE_DEFAULT,
         ..Default::default()
     };
+    // Not every host GPU offers every use of every format (NVIDIA: no
+    // unordered access to BGRA8, no B4G4R4A4 render targets, where the
+    // console's AMD GPU has both). Try what the title asked for, then give
+    // up the state, the clear value and the uses the host may refuse, in
+    // that order; the views the host cannot make are skipped as for depth.
+    let asked = crate::host::legal_for(d.flags, crate::host::texture_state(state));
+    let tries = attempts(d.flags, asked);
+    let mut tried: Vec<(u32, u32, Option<[u32; 5]>)> = Vec::with_capacity(tries.len());
     let mut texture: Option<ID3D12Resource> = None;
-    let create = |d: &ResourceDesc, texture: &mut Option<ID3D12Resource>| {
+    let mut made_in = None;
+    let mut last = None;
+    for (i, &(flags, wanted, keep_clear)) in tries.iter().enumerate() {
+        let mut trial = d;
+        trial.flags = flags;
+        let initial = crate::host::legal_for(flags, wanted);
         // A clear value is only legal on render targets and depth.
-        let clear = clear_value
-            .as_ref()
-            .filter(|_| d.flags & (1 | DEPTH) != 0)
-            .map(|v| std::ptr::from_ref(v).cast());
+        let try_clear = clear_value.filter(|_| keep_clear && flags & (RENDER_TARGET | DEPTH) != 0);
+        // Permissions that leave the description unchanged are not asked twice.
+        if tried.contains(&(flags, initial, try_clear)) {
+            continue;
+        }
+        tried.push((flags, initial, try_clear));
         // SAFETY: the description has the host layout (checked size, same
         // fields); the out pointer is ours.
-        unsafe {
+        let made = unsafe {
             host.device.CreateCommittedResource(
                 &heap,
                 D3D12_HEAP_FLAG_NONE,
-                std::ptr::from_ref(d).cast(),
-                D3D12_RESOURCE_STATES(crate::host::legal_for(
-                    d.flags,
-                    crate::host::texture_state(state),
-                ) as i32),
+                std::ptr::from_ref(&trial).cast(),
+                D3D12_RESOURCE_STATES(initial as i32),
                 // The same layout: format, then color or depth and stencil.
+                try_clear.as_ref().map(|v| std::ptr::from_ref(v).cast()),
+                &mut texture,
+            )
+        };
+        match made {
+            Ok(()) => {
+                if i > 0 {
+                    // The host refused what the title asked for: name what
+                    // was given up, once for this texture.
+                    tracing::warn!(
+                        desc = ?d,
+                        flags_asked = d.flags,
+                        flags_made = flags,
+                        state_asked = asked,
+                        state_made = initial,
+                        clear_asked = clear_value.map(|v| v[0]),
+                        clear_dropped = clear_value.is_some() && try_clear.is_none(),
+                        "host texture made only as a fallback"
+                    );
+                }
+                d = trial;
+                made_in = Some(initial);
+                break;
+            }
+            Err(e) => {
+                texture = None;
+                tracing::debug!(
+                    error = %e,
+                    attempt = i,
+                    flags,
+                    state = initial,
+                    "host texture refused; trying a fallback"
+                );
+                last = Some((e, trial, initial, try_clear.map(|v| v[0])));
+            }
+        }
+    }
+    let (Some(texture), Some(initial)) = (texture, made_in) else {
+        if let Some((e, trial, initial, clear)) = last {
+            tracing::warn!(
+                error = %e,
+                desc = ?trial,
+                state = initial,
+                title_state = state,
                 clear,
-                texture,
-            )
+                "no host texture"
+            );
         }
+        return None;
     };
-    let mut made = create(&d, &mut texture);
-    // Not every host GPU offers every use of every format (NVIDIA: no
-    // unordered access to BGRA8, no B4G4R4A4 render targets, where the
-    // console's AMD GPU has both). Give up the uses the host refuses, UAV
-    // first; the views the host cannot make are skipped as for depth.
-    for drop in [UNORDERED, 1] {
-        if made.is_ok() || d.flags & drop == 0 {
-            continue;
+    crate::host::name(&texture, || {
+        format!(
+            "texture {}x{} f{} flags {:#x}",
+            d.width, d.height, d.format, d.flags
+        )
+    });
+    Some((texture, initial))
+}
+
+/// The (flags, state, whether the clear value is kept) triples to try for a
+/// host texture, most faithful first: what the title asked for, then in the
+/// common state, then without the clear value, then without the permissions
+/// the host may refuse. A texture the host cannot make as asked still exists
+/// for the draws that read it; the log names what was lost. Nothing is
+/// tried twice, permissions only go down, and a depth target keeps its
+/// depth permission.
+#[cfg(any(windows, test))]
+fn attempts(flags: u32, state: u32) -> Vec<(u32, u32, bool)> {
+    const UNORDERED: u32 = 4;
+    const RENDER_TARGET: u32 = 1;
+    let mut out: Vec<(u32, u32, bool)> = Vec::with_capacity(7);
+    for triple in [
+        (flags, state, true),
+        (flags, 0, true),
+        (flags, state, false),
+        (flags, 0, false),
+        (flags & !UNORDERED, 0, true),
+        (flags & !UNORDERED, 0, false),
+        (flags & !UNORDERED & !RENDER_TARGET, 0, false),
+    ] {
+        if !out.contains(&triple) {
+            out.push(triple);
         }
-        let mut fewer = d;
-        fewer.flags &= !drop;
-        let mut retry: Option<ID3D12Resource> = None;
-        if create(&fewer, &mut retry).is_ok() {
-            tracing::warn!(desc = ?d, dropped = drop, "host texture without a use the host refuses");
-            d = fewer;
-            texture = retry;
-            made = Ok(());
-        } else if drop == UNORDERED {
-            d = fewer; // also try with neither
-        }
     }
-    if let Err(e) = made {
-        tracing::warn!(error = %e, desc = ?d, "no host texture");
-    }
-    if let Some(t) = &texture {
-        crate::host::name(t, || {
-            format!(
-                "texture {}x{} f{} flags {:#x}",
-                d.width, d.height, d.format, d.flags
-            )
-        });
-    }
-    texture
+    out
 }
 
 /// A texture's console memory and description; `None` for buffers.
@@ -1302,9 +1365,16 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
     if made != S_OK {
         return None;
     }
+    // create_at_address can succeed with no host texture (unsupported
+    // format/flags): do not cache that failure, or the next call would
+    // return Some with host == None (VIC-BT-027).
+    if resource(out).host().is_none() {
+        object::release_boxed::<Resource>(out);
+        return None;
+    }
     map.insert((address, *desc), out as usize);
     placed_views().insert(out as usize);
-    resource(out).host().is_some().then_some(out)
+    Some(out)
 }
 
 /// The resources [`texture_at`] made (never released, as they are).
@@ -1618,6 +1688,66 @@ mod tests {
         // Boundaries: 59 belongs to the preceding family, 66 is unmapped.
         assert_eq!(family(59), 53);
         assert_eq!(family(66), 66);
+    }
+
+    /// The ladder of descriptions a host texture is tried in.
+    #[test]
+    fn the_first_attempt_is_what_the_title_asked_for() {
+        assert_eq!(
+            attempts(5, 4),
+            [
+                (5, 4, true),
+                (5, 0, true),
+                (5, 4, false),
+                (5, 0, false),
+                (1, 0, true),
+                (1, 0, false),
+                (0, 0, false),
+            ]
+        );
+        assert_eq!(attempts(3, 0x10)[0], (3, 0x10, true));
+    }
+
+    #[test]
+    fn nothing_is_tried_twice() {
+        assert_eq!(attempts(0, 0), [(0, 0, true), (0, 0, false)]);
+        for flags in 0..16 {
+            for state in [0, 4, 0x10] {
+                let tries = attempts(flags, state);
+                for (i, a) in tries.iter().enumerate() {
+                    assert!(!tries[i + 1..].contains(a), "{flags} {state}: {tries:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_depth_target_keeps_its_depth_permission() {
+        for flags in [2, 3, 6, 7, 10] {
+            assert!(attempts(flags, 0x10).iter().all(|&(f, _, _)| f & 2 != 0));
+        }
+    }
+
+    #[test]
+    fn permissions_only_go_down_the_ladder() {
+        for flags in 0..16 {
+            let tries = attempts(flags, 4);
+            assert!(tries.iter().all(|&(f, _, _)| f & !flags == 0));
+            let mut least = flags;
+            for &(f, _, _) in &tries {
+                assert!(f & !least == 0, "{flags}: {tries:?}");
+                least = f;
+            }
+        }
+    }
+
+    #[test]
+    fn the_state_and_clear_go_before_the_permissions() {
+        let tries = attempts(5, 4);
+        let first_fewer = tries.iter().position(|&(f, _, _)| f != 5).unwrap();
+        assert!(tries[..first_fewer].iter().any(|&(_, s, _)| s == 0));
+        assert!(tries[..first_fewer].iter().any(|&(_, _, clear)| !clear));
+        assert!(tries[first_fewer..].iter().all(|&(_, s, _)| s == 0));
     }
 
     type Release = extern "system" fn(This) -> u32;

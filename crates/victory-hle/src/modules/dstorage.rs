@@ -121,7 +121,9 @@ type Factory = *const Object;
 /// Opens `path` for reading; the file object owns the handle.
 extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out: Out) -> HRESULT {
     const GENERIC_READ: u32 = 0x8000_0000;
-    const FILE_SHARE_READ: u32 = 1;
+    // Match typical archive readers: allow others to write/delete while we
+    // read, and capture LastError before any allocation (VIC-BT-037 / #440).
+    const FILE_SHARE_ALL: u32 = 0x7; // READ | WRITE | DELETE
     const OPEN_EXISTING: u32 = 3;
     if path.is_null() {
         return E_INVALIDARG;
@@ -130,23 +132,29 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
     let handle = super::files::CreateFileW(
         path,
         GENERIC_READ,
-        FILE_SHARE_READ,
+        FILE_SHARE_ALL,
         std::ptr::null(),
         OPEN_EXISTING,
         0,
         std::ptr::null_mut(),
     );
+    if handle as isize == -1 {
+        let error = std::io::Error::last_os_error();
+        // SAFETY: the title passes a NUL-terminated path.
+        let filename = unsafe {
+            let len = (0..).take_while(|&i| *path.add(i) != 0).count();
+            std::slice::from_raw_parts(path, len)
+        };
+        let name = String::from_utf16_lossy(filename);
+        tracing::warn!(path = name, %error, "dstorage: opening a file failed");
+        return from_win32(&error);
+    }
     // SAFETY: the title passes a NUL-terminated path.
     let filename = unsafe {
         let len = (0..).take_while(|&i| *path.add(i) != 0).count();
         std::slice::from_raw_parts(path, len)
     };
     let name = String::from_utf16_lossy(filename);
-    if handle as isize == -1 {
-        let error = std::io::Error::last_os_error();
-        tracing::warn!(path = name, %error, "dstorage: opening a file failed");
-        return from_win32(&error);
-    }
     tracing::info!(path = name, iid = iid_text(iid), "dstorage: file opened");
     // SAFETY: a handle we just opened and nobody else owns.
     let file = unsafe { std::fs::File::from_raw_handle(handle) };

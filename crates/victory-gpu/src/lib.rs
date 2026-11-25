@@ -45,6 +45,9 @@ mod hlsl;
 mod host;
 #[cfg(windows)]
 mod indirect;
+// CPU model of the GPU budget: only referenced from unit tests.
+#[cfg(test)]
+mod indirect_budget;
 pub mod list;
 pub mod object;
 pub mod pipeline;

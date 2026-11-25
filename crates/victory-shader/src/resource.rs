@@ -211,6 +211,10 @@ pub fn track(
                 Ok(())
             };
             match &inst.fields {
+                // A ray query is lowered as a miss and never reads its BVH
+                // descriptor, which the shader typically builds from a base
+                // address in a loop; there is nothing to trace.
+                Fields::Image { .. } if inst.name().starts_with("image_bvh") => {}
                 Fields::Image { rsrc, sampler, .. } => {
                     descriptor(rsrc, Role::Resource)?;
                     if let Some(s) = sampler {

@@ -78,6 +78,8 @@
 //!   declares and the rasterizer system values.
 
 mod bitcode;
+#[cfg(test)]
+mod bvh_tests;
 mod container;
 #[cfg(all(test, windows))]
 mod diff_tests;
@@ -311,15 +313,28 @@ pub fn translate_with_view_strides(
     translate_program(container, allow_wave32, Some(view_stride))
 }
 
+/// A precompiled compute module (`FSPX`): only GFX10 code, no DXIL to start from.
+const FSPX_UNSUPPORTED: ShaderError = ShaderError::Unsupported {
+    offset: 0,
+    what: "FSPX compute module",
+};
+
 fn translate_program(
     container: &[u8],
     allow_wave32: bool,
     view_stride: Option<ViewStride<'_>>,
 ) -> Result<(HostShader, Vec<crate::UsedResource>), ShaderError> {
+    if container.starts_with(crate::dxbc::Fspx::MAGIC) {
+        return Err(FSPX_UNSUPPORTED);
+    }
     let c = Container::parse(container)?;
-    let dxil = c
-        .part(FourCC::DXIL)
-        .ok_or(ShaderError::Malformed("no DXIL part"))?;
+    let Some(dxil) = c.part(FourCC::DXIL) else {
+        return Err(if c.fspx().is_some() {
+            FSPX_UNSUPPORTED
+        } else {
+            ShaderError::Malformed("no DXIL part")
+        });
+    };
     let native = crate::native_programs(dxil.data)?
         .into_iter()
         .find(|p| {
@@ -749,6 +764,27 @@ mod tests {
     use super::{parse_loop_limit, parse_shader_opt};
 
     #[test]
+    fn fspx_modules_are_unsupported_not_missing_dxil() {
+        let fspx = crate::dxbc::Fspx::assemble(&[0; 28], &[], &[0x55; 8], &[]);
+        let wrapped = crate::dxbc::build(&[(crate::FourCC::ACCC, &fspx)]);
+        for bytes in [&fspx, &wrapped] {
+            assert_eq!(
+                super::translate(bytes).unwrap_err(),
+                crate::ShaderError::Unsupported {
+                    offset: 0,
+                    what: "FSPX compute module"
+                }
+            );
+        }
+        // Without an FSPX module it is still the missing DXIL part.
+        let plain = crate::dxbc::build(&[(crate::FourCC::ACCC, b"other")]);
+        assert_eq!(
+            super::translate(&plain).unwrap_err(),
+            crate::ShaderError::Malformed("no DXIL part")
+        );
+    }
+
+    #[test]
     fn the_shader_opt_switch_parses_or_falls_back() {
         let all = super::bitcode::opt::ALL;
         assert_eq!(parse_shader_opt(None), all);
@@ -945,10 +981,66 @@ mod tests {
                 ..
             })
         ));
-        let mut pixel = super::shader::Shader::new(true);
-        pixel.inputs = vec![varying("value", 8, 8), varying("value", 10, 9)];
-        pixel.m.terminate(pixel.entry, super::bitcode::Term::Ret);
-        let ps = pixel.finish();
+        // The pixel program declares all ten varyings but reads only the
+        // eighth and tenth. The translated loads must follow their new IDs.
+        let inputs: Vec<_> = (1..=10).map(|n| varying("value", n, n - 1)).collect();
+        let mut target = varying("SV_Target", 0, 0);
+        target.kind = 16;
+        let isg1 = container::signature(&inputs, true);
+        let target = container::signature(&[target], false);
+        let pixel_bytes = crate::dxbc::build(&[(FourCC::ISG1, &isg1), (FourCC::OSG1, &target)]);
+        let pixel = NativeProgram {
+            stage: HwStage::Ps,
+            vgprs: 4,
+            io: StageIo::Ps {
+                inputs: [7, 9]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(attr, row)| crate::native::PsInput {
+                        usage: Usage::Generic,
+                        row,
+                        mask: 15,
+                        attr: attr as u8,
+                        flat: true,
+                        fp16: false,
+                        pack2: false,
+                        row2: row,
+                    })
+                    .collect(),
+                input_addr: 0,
+                db_shader_control: 0,
+                patches: Vec::new(),
+            },
+            code: [
+                0xC80A_0002u32, // v_interp_mov_f32 v2, p0, attr0.x
+                0xC80E_0402,    // v_interp_mov_f32 v3, p0, attr1.x
+                0xF800_180F,
+                0x0302_0302, // exp mrt0, v2, v3, v2, v3
+                0xBF81_0000,
+            ]
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect(),
+            ..native.clone()
+        };
+        let ps = translate_native(
+            &Container::parse(&pixel_bytes).unwrap(),
+            &pixel,
+            true,
+            None,
+            None,
+        )
+        .unwrap()
+        .dxil;
+        let consumer = Container::parse(&ps).unwrap();
+        assert_eq!(
+            signature_part(&consumer, FourCC::ISG1)
+                .unwrap()
+                .iter()
+                .map(|e| e.index)
+                .collect::<Vec<_>>(),
+            [8, 10]
+        );
         let linked = translate_mesh_for_pixel(&c, &native, Some(&ps))
             .unwrap()
             .unwrap();

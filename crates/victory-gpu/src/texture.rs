@@ -975,4 +975,320 @@ mod tests {
         let release = crate::object::slot::<extern "system" fn(This) -> u32>(tex, 0x10);
         assert_eq!(release(tex), 0);
     }
+
+    /// A synthetic version of a title that packs light into an integer
+    /// texture from compute and samples it through a view of another format
+    /// placed at the same address: the view's texels are the written
+    /// texture's, not the (empty) title memory behind it.
+    #[test]
+    fn view_placed_over_a_compute_written_texture_reads_what_compute_wrote() {
+        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+        use windows::Win32::Graphics::Direct3D::ID3DBlob;
+        use windows::Win32::Graphics::Dxgi::Common::{
+            DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32_TYPELESS, DXGI_FORMAT_R32_UINT, DXGI_SAMPLE_DESC,
+        };
+        use windows::core::{Interface, s};
+
+        const SHADER_RESOURCE: u32 = 0x40 | 0x80;
+        const UNORDERED_ACCESS: u32 = 0x8;
+        const TEXELS: usize = 16;
+
+        /// A title object, released when the test ends.
+        struct Title(This);
+        impl Drop for Title {
+            fn drop(&mut self) {
+                crate::object::slot::<extern "system" fn(This) -> u32>(self.0, 0x10)(self.0);
+            }
+        }
+
+        let _retire = crate::host::isolated_retire_scope();
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+
+        // The title's memory for both textures. Nothing writes it, so a
+        // view filled from it reads zeros. The placed view is never
+        // released, so the memory is never freed.
+        let memory: &'static mut [u8] = Box::leak(vec![0u8; 1 << 20].into_boxed_slice());
+        let address = memory.as_ptr() as u64;
+
+        // The words of a `ResourceDesc`: 4x4, one level and layer.
+        let words = |format: i32, flags: u32| {
+            let mut w = [0u32; 14];
+            w[0] = 3; // texture 2D
+            w[4] = 4; // width
+            w[6] = 4; // height
+            w[7] = 1 | (1 << 16); // layers, levels
+            w[8] = format as u32;
+            w[9] = 1; // samples
+            w[12] = flags;
+            w
+        };
+        const ALLOW_UNORDERED_ACCESS: u32 = 0x4;
+        #[repr(C, align(8))]
+        struct Aligned([u32; 14]);
+        let written_desc = Aligned(words(DXGI_FORMAT_R32_UINT.0, ALLOW_UNORDERED_ACCESS));
+        let iid = ID3D12Resource::IID;
+        let mut written = std::ptr::null();
+        assert_eq!(
+            crate::resource::create_at_address(
+                std::ptr::null(),
+                address,
+                written_desc.0.as_ptr().cast(),
+                0,
+                std::ptr::null(),
+                (&raw const iid).cast(),
+                &mut written,
+            ),
+            crate::object::S_OK
+        );
+        let _written = Title(written);
+        let written_host = crate::resource::host_resource(written).expect("host texture");
+        let placed = crate::resource::texture_at(address, &words(DXGI_FORMAT_R32_FLOAT.0, 0))
+            .expect("placed view");
+        let placed_host = crate::resource::host_resource(placed).expect("host texture");
+        assert_ne!(placed, written);
+        assert_eq!(
+            crate::resource::alias_of(placed),
+            Some(written),
+            "the view is found to lie over the texture the host writes"
+        );
+
+        // Stores a distinct, ordinary float bit pattern per texel; reads
+        // the view as floats and stores their bits.
+        const SOURCE: &str = r#"
+#define RS "DescriptorTable(UAV(u0, numDescriptors=2), SRV(t0, numDescriptors=1))"
+RWTexture2D<uint> light : register(u0);
+RWByteAddressBuffer dst : register(u1);
+Texture2D<float> sampled : register(t0);
+[RootSignature(RS)]
+[numthreads(4, 4, 1)]
+void write(uint3 id : SV_DispatchThreadID) {
+    light[id.xy] = 0x3F000000u | ((id.y * 4 + id.x + 1) * 0x1357u);
+}
+[RootSignature(RS)]
+[numthreads(4, 4, 1)]
+void read(uint3 id : SV_DispatchThreadID) {
+    dst.Store((id.y * 4 + id.x) * 4, asuint(sampled.Load(int3(id.xy, 0))));
+}
+"#;
+        let compile = |entry: windows::core::PCSTR| -> ID3DBlob {
+            let mut blob: Option<ID3DBlob> = None;
+            // SAFETY: the source and names are static strings.
+            unsafe {
+                D3DCompile(
+                    SOURCE.as_ptr().cast(),
+                    SOURCE.len(),
+                    s!("alias_view"),
+                    None,
+                    None,
+                    entry,
+                    s!("cs_5_1"),
+                    0,
+                    0,
+                    &mut blob,
+                    None,
+                )
+                .unwrap();
+            }
+            blob.unwrap()
+        };
+        let (write_code, read_code) = (compile(s!("write")), compile(s!("read")));
+        let bytes = |blob: &ID3DBlob| -> Vec<u8> {
+            // SAFETY: the blob holds its own bytes.
+            unsafe {
+                std::slice::from_raw_parts(
+                    blob.GetBufferPointer().cast::<u8>(),
+                    blob.GetBufferSize(),
+                )
+            }
+            .to_vec()
+        };
+        let (write_code, read_code) = (bytes(&write_code), bytes(&read_code));
+        // SAFETY: the bytecode includes the root signature.
+        let root: ID3D12RootSignature =
+            unsafe { host.device.CreateRootSignature(0, &write_code) }.unwrap();
+        let pipeline = |code: &[u8]| -> ID3D12PipelineState {
+            let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                // SAFETY: borrowed for the call only.
+                pRootSignature: unsafe { std::mem::transmute_copy(&root) },
+                CS: D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: code.as_ptr().cast(),
+                    BytecodeLength: code.len(),
+                },
+                ..Default::default()
+            };
+            // SAFETY: a valid description.
+            unsafe { host.device.CreateComputePipelineState(&desc) }.unwrap()
+        };
+        let (write_pipeline, read_pipeline) = (pipeline(&write_code), pipeline(&read_code));
+
+        let buffer = |kind, flags, state| -> ID3D12Resource {
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: 256,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                Flags: flags,
+                ..Default::default()
+            };
+            let heap = D3D12_HEAP_PROPERTIES {
+                Type: kind,
+                ..Default::default()
+            };
+            let mut made: Option<ID3D12Resource> = None;
+            // SAFETY: valid buffer creation parameters.
+            unsafe {
+                host.device
+                    .CreateCommittedResource(
+                        &heap,
+                        D3D12_HEAP_FLAG_NONE,
+                        &desc,
+                        state,
+                        None,
+                        &mut made,
+                    )
+                    .unwrap();
+            }
+            made.unwrap()
+        };
+        let out = buffer(
+            D3D12_HEAP_TYPE_DEFAULT,
+            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        );
+        let readback = buffer(
+            D3D12_HEAP_TYPE_READBACK,
+            D3D12_RESOURCE_FLAG_NONE,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+        );
+
+        // SAFETY: plain object creation and views of live resources, into
+        // slots of a heap with room for all three.
+        let (heap, table) = unsafe {
+            let heap: ID3D12DescriptorHeap = host
+                .device
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: 3,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                    NodeMask: 0,
+                })
+                .unwrap();
+            let step = host
+                .device
+                .GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
+                as usize;
+            let start = heap.GetCPUDescriptorHandleForHeapStart();
+            let slot = |n: usize| D3D12_CPU_DESCRIPTOR_HANDLE {
+                ptr: start.ptr + n * step,
+            };
+            let light = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                Format: DXGI_FORMAT_R32_UINT,
+                ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
+                Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                    Texture2D: D3D12_TEX2D_UAV {
+                        MipSlice: 0,
+                        PlaneSlice: 0,
+                    },
+                },
+            };
+            host.device.CreateUnorderedAccessView(
+                written_host,
+                None::<&ID3D12Resource>,
+                Some(&light),
+                slot(0),
+            );
+            let dst = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                Format: DXGI_FORMAT_R32_TYPELESS,
+                ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+                Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                    Buffer: D3D12_BUFFER_UAV {
+                        FirstElement: 0,
+                        NumElements: TEXELS as u32,
+                        StructureByteStride: 0,
+                        CounterOffsetInBytes: 0,
+                        Flags: D3D12_BUFFER_UAV_FLAG_RAW,
+                    },
+                },
+            };
+            host.device.CreateUnorderedAccessView(
+                &out,
+                None::<&ID3D12Resource>,
+                Some(&dst),
+                slot(1),
+            );
+            let view = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                Format: DXGI_FORMAT_R32_FLOAT,
+                ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+                Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                    Texture2D: D3D12_TEX2D_SRV {
+                        MostDetailedMip: 0,
+                        MipLevels: 1,
+                        PlaneSlice: 0,
+                        ResourceMinLODClamp: 0.0,
+                    },
+                },
+            };
+            host.device
+                .CreateShaderResourceView(placed_host, Some(&view), slot(2));
+            let table = heap.GetGPUDescriptorHandleForHeapStart();
+            (heap, table)
+        };
+
+        let list = host.new_list().expect("host list");
+        crate::list::ensure_state(&list, written, UNORDERED_ACCESS);
+        // SAFETY: `list` is open; the pipelines, heap and textures are live
+        // and the textures are in the states the barriers above name.
+        unsafe {
+            let l = &list.list;
+            l.SetComputeRootSignature(&root);
+            l.SetDescriptorHeaps(&[Some(heap.clone())]);
+            l.SetComputeRootDescriptorTable(0, table);
+            l.SetPipelineState(&write_pipeline);
+            l.Dispatch(1, 1, 1);
+        }
+        // What a draw does for a view it samples.
+        let aliased = crate::texture::alias(&list, placed, written);
+        assert!(aliased, "the written texture is copied into the view's");
+        crate::list::ensure_state(&list, placed, SHADER_RESOURCE);
+        // SAFETY: as above; the view's texture is now readable.
+        unsafe {
+            let l = &list.list;
+            l.SetPipelineState(&read_pipeline);
+            l.Dispatch(1, 1, 1);
+            l.ResourceBarrier(&[crate::host::transition(
+                &out,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+            l.CopyBufferRegion(&readback, 0, &out, 0, (TEXELS * 4) as u64);
+        }
+        list.close();
+        host.execute(&[&list]);
+
+        let mut got = [0u32; TEXELS];
+        let mut mapped = std::ptr::null_mut();
+        // SAFETY: the submission completed and the readback holds the texels.
+        unsafe {
+            let range = D3D12_RANGE {
+                Begin: 0,
+                End: TEXELS * 4,
+            };
+            readback.Map(0, Some(&range), Some(&mut mapped)).unwrap();
+            std::ptr::copy_nonoverlapping(mapped.cast::<u32>(), got.as_mut_ptr(), TEXELS);
+            readback.Unmap(0, None);
+        }
+        let expected: [u32; TEXELS] =
+            std::array::from_fn(|i| 0x3F00_0000 | ((i as u32 + 1) * 0x1357));
+        assert_eq!(got, expected);
+        list.reset();
+    }
 }

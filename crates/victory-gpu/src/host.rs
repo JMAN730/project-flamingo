@@ -1060,6 +1060,11 @@ impl Host {
 
     /// Runs closed lists and waits for them.
     pub(crate) fn execute(&self, runs: &[&HostList]) {
+        // D3D12 requires NumCommandLists >= 1; an empty submission is a no-op
+        // (VIC-BT-035 / #440).
+        if runs.is_empty() {
+            return;
+        }
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
@@ -4132,6 +4137,18 @@ mod tests {
         assert_eq!(d3.load(Ordering::SeqCst), 0);
         submitted.end_submit();
         assert_eq!(d3.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn empty_execute_does_not_submit() {
+        // D3D12 forbids ExecuteCommandLists with NumCommandLists == 0.
+        let Some(host) = host() else {
+            return;
+        };
+        let before = *host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        host.execute(&[]);
+        let after = *host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(before, after, "empty execute must not bump the fence");
     }
 
     #[test]
