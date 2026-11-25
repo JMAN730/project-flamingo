@@ -42,6 +42,9 @@ impl Default for HostPolicy {
             "api-ms-win-shcore-*",
             "msvcp_win.dll",
             "ole32.dll",
+            // BSTRs (`SysAllocStringLen` #4, `SysFreeString` #6) for the C++/CX
+            // runtime (`vccorlib140.dll`).
+            "oleaut32.dll",
             "advapi32.dll",
             "iphlpapi.dll",
             "rpcrt4.dll",
@@ -249,5 +252,25 @@ mod tests {
         let policy = HostPolicy::default();
         assert!(policy.allows("rpcrt4.dll"));
         assert!(policy.allows("RPCRT4.DLL"));
+    }
+
+    #[test]
+    fn host_policy_allows_oleaut32() {
+        let policy = HostPolicy::default();
+        assert!(policy.allows("OLEAUT32.dll"));
+    }
+
+    /// The C++/CX runtime's two BSTR imports bind to the host by ordinal.
+    #[cfg(windows)]
+    #[test]
+    fn oleaut32_bstr_ordinals_resolve() {
+        let policy = HostPolicy::default();
+        for ordinal in [4, 6] {
+            let symbol = ImportSymbol::Ordinal(ordinal);
+            assert!(
+                policy.resolve("OLEAUT32.dll", &symbol).is_some(),
+                "#{ordinal}"
+            );
+        }
     }
 }

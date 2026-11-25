@@ -1549,6 +1549,31 @@ fn v_cmp_class_f32_matches_rdna2() {
             inp[0], inp[1],
         );
     });
+
+    // With neg on src0: only the sign bit flips, so a denormal stays a
+    // denormal and a signalling NaN stays signalling.
+    let [w0, w1] = vop3(0x088, 6, vgpr(1), vgpr(2), 0);
+    let cmp_neg = build_valu_cs(&[
+        w0,
+        w1 | 1 << 29,
+        vop3(0x101, 0, 0x80, 0x81, sgpr(6))[0],
+        vop3(0x101, 0, 0x80, 0x81, sgpr(6))[1],
+    ]);
+    let neg_cases: &[([u32; 4], u32)] = &[
+        ([0x0000_0001, 1 << 4, 0, 0], 1), // +denormal -> -denormal
+        ([0x0000_0001, 1 << 5, 0, 0], 0), // not -0.0
+        ([0x7F80_0001, 1 << 0, 0, 0], 1), // sNaN stays signalling
+        ([0x7F80_0001, 1 << 1, 0, 0], 0),
+    ];
+    let neg_in: Vec<[u32; 4]> = neg_cases.iter().map(|c| c.0).collect();
+    run_cases(&cmp_neg, &neg_in, |backend, i, inp, got| {
+        let want = neg_cases[i].1;
+        assert_eq!(
+            got, want,
+            "{backend}: v_cmp_class_f32(-{:#010x}, {:#05x}) = {got}, want {want}",
+            inp[0], inp[1],
+        );
+    });
 }
 
 #[test]
@@ -3071,5 +3096,19 @@ fn lshl_add_carry_read_is_refused() {
         ]);
         let err = format!("{:?}", refused.expect_err("refused"));
         assert!(err.contains("carry"), "op {op:#x}: {err}");
+    }
+}
+
+/// A 16-bit result written to WORD_0 with UNUSED_SEXT sign-extends bit 15
+/// into the high word; UNUSED_PAD zeroes it.
+#[test]
+fn sdwa_16bit_word0_sext_sign_extends() {
+    // llvm-mc -mcpu=gfx1030: v_cvt_i16_f16_sdwa v0, v1 dst_sel:WORD_0
+    // dst_unused:UNUSED_SEXT (then UNUSED_PAD) src0_sel:WORD_0.
+    for (extension, want) in [(0x0004_0C01, 0xFFFF_FFFF), (0x0004_0401, 0x0000_FFFF)] {
+        let shader = build_valu_cs(&[0x7E00_A6F9, extension]);
+        run_cases(&shader, &[[0xBC00, 0, 0, 0]], |backend, _, _, got| {
+            assert_eq!(got, want, "{backend}: {extension:#x}: {got:#010x}");
+        });
     }
 }

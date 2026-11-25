@@ -2440,7 +2440,8 @@ impl<'a> Lower<'a> {
         self.raw_src(inst, k)
     }
 
-    /// Operand `k` as its 32 bits, without looking at its modifiers.
+    /// Source `k`'s bits (with its SDWA selection); its abs/neg modifiers
+    /// are left to the caller.
     fn raw_src(&mut self, inst: &Inst, k: usize) -> Result<V, Why> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
@@ -7337,16 +7338,26 @@ impl<'a> Lower<'a> {
         };
         let mut high = v.opsel >> 3 & 1 != 0;
         // SDWA: the word written, the other one kept (preserve) or zero
-        // (pad; a sign extension above the high word adds nothing).
-        let mut keep = true;
+        // (pad), or the low word's sign bit extended above it (sext; above
+        // the high word that adds nothing).
+        let (mut keep, mut sext) = (true, false);
         if let Some(sd) = v.sdwa {
             match (sd.dst_sel, sd.dst_unused) {
                 (4, 2) => {}
                 (5, 2) => high = true,
-                (4 | 6, _) => keep = false,
-                (5, _) => (high, keep) = (true, false),
+                (4, 1) => (keep, sext) = (false, true),
+                (4, 0) | (6, _) => keep = false,
+                (5, 0 | 1) => (high, keep) = (true, false),
                 _ => return Err("an SDWA destination of a 16-bit operation"),
             }
+        }
+        if sext {
+            let c = self.cur;
+            let k16 = self.s.m.i32(16);
+            let x = self.s.m.bin(c, Bin::Shl, x, k16);
+            let r = self.s.m.bin(c, Bin::AShr, x, k16);
+            self.write_placed(inst, Reg::V(reg), r, guard);
+            return Ok(());
         }
         let c = self.cur;
         let old = match inst.read(Reg::V(reg)).map(|o| self.i32_of(o)) {
@@ -8374,8 +8385,22 @@ impl<'a> Lower<'a> {
                     }
                     h
                 } else {
-                    let x = self.fsrc(inst, 0)?;
-                    self.as_int(x)
+                    // abs/neg only touch the sign bit: float ops would flush
+                    // denormals and quiet signalling NaNs before the test.
+                    let Fields::Valu(v) = &inst.fields else {
+                        unreachable!()
+                    };
+                    let (abs, neg) = (v.abs & 1 != 0, v.neg & 1 != 0);
+                    let mut x = self.raw_src(inst, 0)?;
+                    if abs {
+                        let m = self.s.m.i32(0x7FFF_FFFF);
+                        x = self.s.m.bin(c, Bin::And, x, m);
+                    }
+                    if neg {
+                        let s = self.s.m.i32(0x8000_0000);
+                        x = self.s.m.bin(c, Bin::Xor, x, s);
+                    }
+                    x
                 };
                 let mask = self.src(inst, 1)?;
                 let k = |l: &mut Self, v: u32| l.s.m.i32(v);
@@ -9030,9 +9055,9 @@ impl<'a> Lower<'a> {
             }
             // shortcut: stores are taken to write all four channels of a
             // float format (the console converts by the view's format).
-            if *dmask != 0xF {
-                return Err("an image store of some channels");
-            }
+            // The channels `dmask` selects come from consecutive data
+            // registers (halves with d16); the others are written as zero
+            // (RDNA2 ISA, MIMG stores).
             let iu = self.s.m.undef(self.s.t.i32);
             let mut cs = vec![iu; 3];
             for (k, slot) in cs.iter_mut().enumerate().take(coords) {
@@ -9042,7 +9067,12 @@ impl<'a> Lower<'a> {
                 return Err("image store data");
             };
             let mut vals = Vec::new();
-            for k in 0..4u8 {
+            let mut k = 0u8;
+            for ch in 0..4u8 {
+                if dmask >> ch & 1 == 0 {
+                    vals.push(self.s.m.f32(0));
+                    continue;
+                }
                 // d16: two f16 channels per VGPR, low half first.
                 let r = if *d16 { k / 2 } else { k };
                 let v = inst.read(Reg::V(reg + r)).ok_or("image store data")?;
@@ -9058,6 +9088,7 @@ impl<'a> Lower<'a> {
                 } else {
                     self.float_of(v)?
                 });
+                k += 1;
             }
             let h = self.handle(site, src, false, props)?;
             let at = self.begin_guarded(guard);

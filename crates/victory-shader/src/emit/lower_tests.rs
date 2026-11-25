@@ -3122,3 +3122,68 @@ fn b32_moves_apply_abs_and_neg_to_the_sign_bit_only() {
         );
     }
 }
+
+/// `v_cmp_class_f32`'s abs and neg flip the sign bit of the raw operand, as
+/// RDNA2 does: no FAbs (or fsub), which would flush a denormal to a zero and
+/// quiet a signalling NaN before it is classified.
+#[test]
+fn cmp_class_f32_modifiers_are_bitwise() {
+    // v_cmp_class_f32_e64 s6, |v1|, v2 with neg on src0 (VOP3 opcode 0x088).
+    let words = [
+        0x35 << 26 | 0x088 << 16 | 1 << 8 | 6,
+        (256 + 1) | (256 + 2) << 9 | 1 << 29,
+        S_ENDPGM,
+    ];
+    let l = lower_words(&words, 0).unwrap();
+    let fabs = l
+        .dx_ops
+        .iter()
+        .any(|(name, args)| name == "dx.op.unary.f32" && args.first() == Some(&Some(6)));
+    assert!(!fabs, "v_cmp_class_f32 abs must not lower to FAbs");
+}
+
+/// 16-bit SDWA destinations: WORD_0 with UNUSED_SEXT lowers (sign-extending
+/// the word); the reserved `dst_unused` 3 is refused.
+#[test]
+fn sdwa_16bit_destination_unused_modes() {
+    // v_cvt_i16_f16_sdwa v0, v1 dst_sel:WORD_0 src0_sel:WORD_0, with
+    // dst_unused UNUSED_PAD (0), UNUSED_SEXT (1), UNUSED_PRESERVE (2); then
+    // v_mov_b32 v2, 0; ds_write_b32 v2, v0, so the result is read.
+    let program = |ext: u32| {
+        [
+            0x7E00_A6F9,
+            ext,
+            0x7E04_0280,
+            0xD834_0000,
+            0x0000_0002,
+            S_ENDPGM,
+        ]
+    };
+    for unused in 0..3u32 {
+        lowers_lds(&program(0x0004_0401 | unused << 11))
+            .unwrap_or_else(|e| panic!("dst_unused {unused}: {e}"));
+    }
+    for dst_sel in [4u32, 5] {
+        let words = program(0x0004_0001 | dst_sel << 8 | 3 << 11);
+        assert!(
+            lowers_lds(&words).is_err(),
+            "dst_sel {dst_sel}, dst_unused 3"
+        );
+    }
+}
+
+/// `image_store` of some channels: the selected ones come from consecutive
+/// data registers, the others are stored as zero.
+#[test]
+fn image_stores_of_some_channels_zero_the_others() {
+    // image_store v[12:], v[2:3], s[12:19] dim:2D; v2-v15 set (the
+    // address, then distinct data in v12-v15).
+    let mut addr = vec![F_HALF, F_HALF];
+    addr.extend((4..12).map(|_| 0));
+    addr.extend([F_ONE, 0x4000_0000, 0x4040_0000, 0x4080_0000]);
+    for dmask in [0x1, 0x3, 0x5, 0x7, 0x9, 0xF] {
+        let words = image_words(0x08, dmask, 1, false, &addr);
+        let l = lower_image(&words).unwrap_or_else(|e| panic!("dmask {dmask:#x}: {e}"));
+        assert_eq!(calls(&l, "textureStore.f32").len(), 1, "dmask {dmask:#x}");
+    }
+}
