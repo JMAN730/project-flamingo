@@ -38,13 +38,36 @@ impl Placed {
         let end = self.address.checked_add(size)?;
         let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
         let watched = crate::watch::writes(self.address, end, false);
-        if let Some((_, pages)) = &watched
-            && last.asked != 0
-            && pages.iter().all(|&(_, stamp)| stamp <= last.asked)
-        {
-            return None;
-        }
         super::SCRATCH.with_borrow_mut(|scratch| {
+            // Our feedback writes can also show up in the guest's write watch.
+            // Check consecutive dirty pages together before taking a full image.
+            if let Some((stamp, pages)) = &watched
+                && last.asked != 0
+            {
+                let mut runs = pages
+                    .split(|&(_, write)| write <= last.asked)
+                    .flat_map(|pages| pages.chunk_by(|a, b| a.0 + 1 == b.0));
+                let unchanged = runs.all(|run| {
+                    let left = (run[0].0 * crate::watch::PAGE).max(self.address);
+                    let right = (run[run.len() - 1].0 * crate::watch::PAGE)
+                        .saturating_add(crate::watch::PAGE)
+                        .min(end);
+                    let len = right - left;
+                    // The ordinary full read below already handles a dirty whole image.
+                    if len == size {
+                        return false;
+                    }
+                    if scratch.len() < len {
+                        scratch.resize(len, 0);
+                    }
+                    crate::host::read_into(left as *const u8, &mut scratch[..len])
+                        && scratch[..len] == last.tiled[left - self.address..right - self.address]
+                });
+                if unchanged {
+                    last.asked = *stamp;
+                    return None;
+                }
+            }
             if scratch.len() < size {
                 scratch.resize(size, 0);
             }
@@ -411,8 +434,11 @@ impl Placed {
                     continue;
                 }
             }
+            let cpu_edited = cpu != baseline;
             baseline.copy_from_slice(&page);
-            last.asked = 0;
+            if cpu_edited {
+                last.asked = 0;
+            }
         }
     }
 }

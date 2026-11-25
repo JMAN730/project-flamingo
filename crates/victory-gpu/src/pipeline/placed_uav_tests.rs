@@ -228,7 +228,7 @@ struct Fixture {
 }
 
 impl Fixture {
-    fn new(host: &crate::host::Host, width: u32, height: u32) -> Option<Self> {
+    fn new(host: &crate::host::Host, width: u32, height: u32, watched: bool) -> Option<Self> {
         let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL {
             HighestShaderModel: D3D_SHADER_MODEL_6_6,
         };
@@ -283,8 +283,30 @@ impl Fixture {
         let handle = crate::descriptor::heap(views.0).start + 32;
 
         let count = (width * height * 4) as usize + TEXTURE_ALIGNMENT / 2;
-        let backing = Box::leak(vec![3.0f32; count].into_boxed_slice());
-        let address = (backing.as_mut_ptr() as usize).next_multiple_of(TEXTURE_ALIGNMENT) as u64;
+        let address = if watched {
+            const MEM_WRITE_WATCH: u32 = 0x20_0000;
+            use windows_sys::Win32::System::Memory::{
+                MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
+            };
+            // SAFETY: the fresh allocation holds count floats and outlives the fixture.
+            let p = unsafe {
+                VirtualAlloc(
+                    std::ptr::null(),
+                    count * 4,
+                    MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                    PAGE_READWRITE,
+                )
+            }
+            .cast::<f32>();
+            assert!(!p.is_null());
+            // SAFETY: the committed allocation holds count aligned floats.
+            unsafe { std::slice::from_raw_parts_mut(p, count) }.fill(3.0);
+            assert!(crate::watch::writes(p as usize, p as usize + count * 4, false).is_some());
+            (p as usize).next_multiple_of(TEXTURE_ALIGNMENT) as u64
+        } else {
+            let backing = Box::leak(vec![3.0f32; count].into_boxed_slice());
+            (backing.as_mut_ptr() as usize).next_multiple_of(TEXTURE_ALIGNMENT) as u64
+        };
         let format = DXGI_FORMAT_R32G32B32A32_FLOAT.0 as u32;
         let mut resource = [0; 14];
         resource[0] = D3D12_RESOURCE_DIMENSION_TEXTURE2D.0 as u32;
@@ -332,10 +354,20 @@ impl Fixture {
 
 #[test]
 fn placed_uav_dispatch_writes_its_texture() {
+    check_dispatch(false);
+}
+
+#[test]
+fn watched_placed_uav_dispatch_writes_its_texture() {
+    check_dispatch(true);
+}
+
+fn check_dispatch(watched: bool) {
     let Some(host) = crate::host::host() else {
         return;
     };
-    let Some(fixture) = Fixture::new(host, 16, 1) else {
+    // Span multiple write-watch pages so a one-channel CPU edit exercises the sparse read.
+    let Some(fixture) = Fixture::new(host, 16, 1024, watched) else {
         return;
     };
     let expected = [1.0f32, 0.5, -0.25, 2.0];
@@ -366,11 +398,11 @@ fn placed_uav_readbacks_stay_distinct_across_submissions() {
     let Some(host) = crate::host::host() else {
         return;
     };
-    let Some(a) = Fixture::new(host, 16, 1) else {
+    let Some(a) = Fixture::new(host, 16, 1, false) else {
         return;
     };
-    let b = Fixture::new(host, 16, 1).unwrap();
-    let wider = Fixture::new(host, 128, 1).unwrap();
+    let b = Fixture::new(host, 16, 1, false).unwrap();
+    let wider = Fixture::new(host, 128, 1, false).unwrap();
     for (step, second) in [&b, &b, &wider].into_iter().enumerate() {
         let left = [step as f32 + 1.0, 4.0, 5.0, 6.0];
         let right = [-left[0], 7.0, 8.0, 9.0];
@@ -389,8 +421,18 @@ fn placed_uav_readbacks_stay_distinct_across_submissions() {
 #[test]
 #[ignore = "times fenced submissions on the selected adapter"]
 fn time_single_texel_writes_to_a_16_mib_placed_uav() {
+    time_single_texel_writes(false);
+}
+
+#[test]
+#[ignore = "times fenced submissions on write-watched guest backing"]
+fn time_single_texel_writes_to_a_watched_16_mib_placed_uav() {
+    time_single_texel_writes(true);
+}
+
+fn time_single_texel_writes(watched: bool) {
     let host = crate::host::host().expect("host D3D12 device");
-    let fixture = Fixture::new(host, 1024, 1024).expect("SM 6.6 adapter");
+    let fixture = Fixture::new(host, 1024, 1024, watched).expect("SM 6.6 adapter");
     let mut times = [0; 10];
     for (i, sample) in times.iter_mut().enumerate() {
         let list = fixture.dispatch(host, [i as f32, 0.5, -0.25, 2.0]);
