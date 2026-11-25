@@ -17,7 +17,7 @@ pub extern "system" fn GetModuleHandleW(name: *const u16) -> *mut c_void {
     if name.is_null() {
         return runtime::main_image().unwrap_or(0) as *mut c_void;
     }
-    find_module(&wide(name), false).unwrap_or_else(|| host::get_module_handle_w(name))
+    find_module(&wide(name), Lookup::Query).unwrap_or_else(|| host::get_module_handle_w(name))
 }
 
 /// See [`GetModuleHandleW`].
@@ -25,7 +25,7 @@ pub extern "system" fn GetModuleHandleA(name: *const u8) -> *mut c_void {
     if name.is_null() {
         return runtime::main_image().unwrap_or(0) as *mut c_void;
     }
-    find_module(&narrow(name), false).unwrap_or_else(|| host::get_module_handle_a(name))
+    find_module(&narrow(name), Lookup::Query).unwrap_or_else(|| host::get_module_handle_a(name))
 }
 
 /// A NUL-terminated string from the title.
@@ -116,7 +116,7 @@ pub extern "system" fn LoadLibraryExA(
     flags: u32,
 ) -> *mut c_void {
     if !name.is_null()
-        && let Some(handle) = find_module(&narrow(name), runs_code(flags))
+        && let Some(handle) = find_module(&narrow(name), load_kind(flags))
     {
         return handle;
     }
@@ -130,18 +130,34 @@ pub extern "system" fn LoadLibraryExW(
     flags: u32,
 ) -> *mut c_void {
     if !name.is_null()
-        && let Some(handle) = find_module(&wide(name), runs_code(flags))
+        && let Some(handle) = find_module(&wide(name), load_kind(flags))
     {
         return handle;
     }
     host::load_library_ex_w(name, file, flags)
 }
 
-/// False for loads as data or resources (`DONT_RESOLVE_DLL_REFERENCES`,
+/// What a module lookup is for.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Lookup {
+    /// `GetModuleHandle`: only what is loaded already.
+    Query,
+    /// A load that runs the DLL's code.
+    Code,
+    /// A load as data or resources, which runs no code.
+    Data,
+}
+
+/// Data for loads as data or resources (`DONT_RESOLVE_DLL_REFERENCES`,
 /// `LOAD_LIBRARY_AS_DATAFILE(_EXCLUSIVE)`, `AS_IMAGE_RESOURCE`): those run
-/// no code, so a title DLL we have not mapped can go to the host.
-fn runs_code(flags: u32) -> bool {
-    flags & (0x1 | 0x2 | 0x20 | 0x40) == 0
+/// no code, so a title DLL we have not mapped, or a host DLL outside the
+/// host policy, can go to the host.
+fn load_kind(flags: u32) -> Lookup {
+    if flags & (0x1 | 0x2 | 0x20 | 0x40) == 0 {
+        Lookup::Code
+    } else {
+        Lookup::Data
+    }
 }
 
 pub extern "system" fn LoadLibraryA(name: *const u8) -> *mut c_void {
@@ -304,9 +320,10 @@ fn handle(m: &HleModule) -> *mut c_void {
 
 /// The title's images and our console modules by name; `None` leaves the
 /// name to the host, which only DLLs `HostPolicy` passes through get (as at
-/// import binding); others fail. With `load`, a title DLL not mapped yet is
-/// mapped now.
-fn find_module(path: &str, load: bool) -> Option<*mut c_void> {
+/// import binding), and loads as data; others fail. A code load maps a
+/// title DLL not mapped yet.
+fn find_module(path: &str, kind: Lookup) -> Option<*mut c_void> {
+    let load = kind == Lookup::Code;
     let file = path.rsplit(['\\', '/']).next().unwrap_or(path);
     // As the Windows loader does, a name without extension means a DLL.
     let file = if file.contains('.') {
@@ -339,7 +356,9 @@ fn find_module(path: &str, load: bool) -> Option<*mut c_void> {
         }
         return Some(handle(m));
     }
-    if host_dll {
+    // A load as data maps the file without running any of it, so the
+    // policy, which guards code, has nothing to refuse.
+    if host_dll || kind == Lookup::Data {
         return None;
     }
     // Any other host DLL (wininet, urlmon, ...) is beyond what we guard, and
@@ -765,6 +784,26 @@ mod tests {
         let runtime = LoadLibraryA(c"xgameruntime.dll".as_ptr().cast());
         assert!(!runtime.is_null());
         assert_eq!(GetModuleHandleW(w("XGameRuntime.dll").as_ptr()), runtime);
+    }
+
+    #[test]
+    fn a_dll_outside_the_host_policy_loads_as_data_only() {
+        // Beyond the host policy: refused as code and to `GetModuleHandle`.
+        assert_eq!(
+            find_module("wininet.dll", Lookup::Code),
+            Some(std::ptr::null_mut())
+        );
+        assert_eq!(
+            find_module("wininet.dll", Lookup::Query),
+            Some(std::ptr::null_mut())
+        );
+        // As data (no code runs) it is the host's to load.
+        assert_eq!(find_module("wininet.dll", Lookup::Data), None);
+        for flags in [0x1, 0x2, 0x20, 0x40, 0x22] {
+            assert_eq!(load_kind(flags), Lookup::Data, "{flags:#x}");
+        }
+        assert_eq!(load_kind(0), Lookup::Code);
+        assert_eq!(load_kind(0x800), Lookup::Code);
     }
 
     /// No buffer: nothing written, the error says it was too small.
