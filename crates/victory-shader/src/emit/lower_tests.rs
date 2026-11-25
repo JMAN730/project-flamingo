@@ -3005,3 +3005,23 @@ fn fma_mix_f16_lowers() {
         lowers(&words, 0).unwrap_or_else(|e| panic!("op {op:#x}: {e}"));
     }
 }
+
+/// s6 is 0 where every lane skips and the saved EXEC where some run: no
+/// lane mask at the per-lane join. EXEC taken from it guards only a
+/// `v_readlane` (written whatever EXEC holds) before it is restored.
+#[test]
+fn a_scalar_result_needs_no_exec() {
+    let words = [
+        0xBE86_0380, // s_mov_b32 s6, 0
+        0x7D88_0090, // v_cmp_gt_u32 vcc_lo, 16, v0
+        0xBE84_3C6A, // s_and_saveexec_b32 s4, vcc_lo
+        0xBF88_0001, // s_cbranch_execz +1
+        0xBE86_0304, // s_mov_b32 s6, s4
+        0xBEFE_0306, // s_mov_b32 exec_lo, s6
+        0xD760_0002, // v_readlane_b32 s2, v0, 3
+        0x0001_0700,
+        0xBEFE_0304, // s_mov_b32 exec_lo, s4
+        S_ENDPGM,
+    ];
+    lowers(&words, 1 << 7).expect("a lane read under an EXEC with no mask");
+}
