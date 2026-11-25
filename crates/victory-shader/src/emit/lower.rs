@@ -41,7 +41,7 @@ enum Eval {
     },
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 enum Val {
     I32(V),
     Bit(V),
@@ -1956,7 +1956,69 @@ impl<'a> Lower<'a> {
         let arg = if float { self.as_float(x) } else { x };
         let ty = if float { f32t } else { i32t };
         let sfx = if float { "f32" } else { "i32" };
-        let r = match (op, prefix) {
+        let r = self.wave_op(c, op, prefix, arg)?;
+        // two host waves of 32 hold the console's 64 lanes: their results combine
+        let r = if self.local || self.exchange.as_ref().is_some_and(|e| e.1) {
+            // this host wave's own result (and prefix): each wave on its own, or a group of
+            // 32 threads or fewer, which one host wave holds whole (combining with the 0 a
+            // missing half "gives" broke AND, MIN and signed MAX)
+            r
+        } else if own && prefix.is_none() && op == Op::Or && !self.all_lanes(self.cur_ir) {
+            // each thread walks the bits of this value and works only at its own, which the
+            // host wave's OR holds: the same run as with the console wave's OR
+            r
+        } else if self.exchange.is_some() {
+            if !self.all_lanes(self.cur_ir) {
+                need(self.cur_ir);
+                return Err("a wave reduction where not every lane runs");
+            }
+            let bits = |l: &mut Self, v: V| if float { l.as_int(v) } else { v };
+            let back = |l: &mut Self, v: V| if float { l.as_float(v) } else { v };
+            match prefix {
+                Some(_) => {
+                    // the upper half adds the lower half's total to its prefix
+                    let (k0, ku) = (self.s.m.i8(0), self.s.m.i8(u8::from(!float)));
+                    let total = self.s.op(c, &format!("waveActiveOp.{sfx}"), Attr::NoUnwind, ty, 119, &[arg, k0, ku]);
+                    let tb = bits(self, total);
+                    let c = self.cur;
+                    let (lo, _) = self.exchange_halves(c, tb);
+                    let lo = back(self, lo);
+                    let cl = self.console_lane();
+                    let k32 = self.s.m.i32(32);
+                    let upper = self.s.m.cmp(c, pred::IUGE, cl, k32);
+                    let zero = if float { self.s.m.f32(0) } else { self.s.m.i32(0) };
+                    let add = self.s.m.select(c, upper, lo, zero);
+                    self.s.m.bin(c, Bin::Add, r, add)
+                }
+                None => {
+                    let rb = bits(self, r);
+                    let c = self.cur;
+                    let (lo, hi) = self.exchange_halves(c, rb);
+                    let (lo, hi) = (back(self, lo), back(self, hi));
+                    self.wave_combine(c, op, lo, hi)
+                }
+            }
+        } else {
+            r
+        };
+        Ok(if float { self.as_int(r) } else { r })
+    }
+
+    /// `op` (not [`super::wave::Op::AddH`]) over the host wave's active lanes' `arg` (an f32 for
+    /// the float operations), or each lane's prefix of a sum (`prefix`: `Some(inclusive)`).
+    fn wave_op(
+        &mut self,
+        c: usize,
+        op: super::wave::Op,
+        prefix: Option<bool>,
+        arg: V,
+    ) -> Result<V, Why> {
+        use super::wave::Op;
+        let float = matches!(op, Op::AddF | Op::MinF | Op::MaxF);
+        let (i32t, f32t) = (self.s.t.i32, self.s.t.f32);
+        let ty = if float { f32t } else { i32t };
+        let sfx = if float { "f32" } else { "i32" };
+        Ok(match (op, prefix) {
             (Op::AddU | Op::AddF, Some(inclusive)) => {
                 let (k0, k1) = (self.s.m.i8(0), self.s.m.i8(1));
                 let r = self.s.op(
@@ -2002,69 +2064,164 @@ impl<'a> Lower<'a> {
                     &[arg, k, u],
                 )
             }
-        };
-        // two host waves of 32 hold the console's 64 lanes: their results combine
-        let r = if self.local || self.exchange.as_ref().is_some_and(|e| e.1) {
-            // this host wave's own result (and prefix): each wave on its own, or a group of
-            // 32 threads or fewer, which one host wave holds whole (combining with the 0 a
-            // missing half "gives" broke AND, MIN and signed MAX)
-            r
-        } else if own && prefix.is_none() && op == Op::Or && !self.all_lanes(self.cur_ir) {
-            // each thread walks the bits of this value and works only at its own, which the
-            // host wave's OR holds: the same run as with the console wave's OR
-            r
-        } else if self.exchange.is_some() {
-            if !self.all_lanes(self.cur_ir) {
-                need(self.cur_ir);
-                return Err("a wave reduction where not every lane runs");
+        })
+    }
+
+    /// `op` of two waves' results `lo` and `hi` of [`Self::wave_op`] (f32s for the float
+    /// operations): the result over both waves' lanes.
+    fn wave_combine(&mut self, c: usize, op: super::wave::Op, lo: V, hi: V) -> V {
+        use super::wave::Op;
+        let float = matches!(op, Op::AddF | Op::MinF | Op::MaxF);
+        let ty = if float { self.s.t.f32 } else { self.s.t.i32 };
+        let sfx = if float { "f32" } else { "i32" };
+        match op {
+            Op::AddU | Op::AddF => self.s.m.bin(c, Bin::Add, lo, hi),
+            Op::Or => self.s.m.bin(c, Bin::Or, lo, hi),
+            Op::And => self.s.m.bin(c, Bin::And, lo, hi),
+            Op::Xor => self.s.m.bin(c, Bin::Xor, lo, hi),
+            _ => {
+                // FMax 35, FMin 36, IMax 37, IMin 38, UMax 39, UMin 40
+                let code = match op {
+                    Op::MaxF => 35,
+                    Op::MinF => 36,
+                    Op::MinU => 40,
+                    Op::MaxU => 39,
+                    Op::MinI => 38,
+                    _ => 37,
+                };
+                self.s.op(c, &format!("binary.{sfx}"), Attr::ReadNone, ty, code, &[lo, hi])
             }
-            let bits = |l: &mut Self, v: V| if float { l.as_int(v) } else { v };
-            let back = |l: &mut Self, v: V| if float { l.as_float(v) } else { v };
-            match prefix {
-                Some(_) => {
-                    // the upper half adds the lower half's total to its prefix
-                    let (k0, ku) = (self.s.m.i8(0), self.s.m.i8(u8::from(!float)));
-                    let total = self.s.op(c, &format!("waveActiveOp.{sfx}"), Attr::NoUnwind, ty, 119, &[arg, k0, ku]);
-                    let tb = bits(self, total);
-                    let c = self.cur;
-                    let (lo, _) = self.exchange_halves(c, tb);
-                    let lo = back(self, lo);
-                    let cl = self.console_lane();
-                    let k32 = self.s.m.i32(32);
-                    let upper = self.s.m.cmp(c, pred::IUGE, cl, k32);
-                    let zero = if float { self.s.m.f32(0) } else { self.s.m.i32(0) };
-                    let add = self.s.m.select(c, upper, lo, zero);
-                    self.s.m.bin(c, Bin::Add, r, add)
-                }
-                None => {
-                    let rb = bits(self, r);
-                    let c = self.cur;
-                    let (lo, hi) = self.exchange_halves(c, rb);
-                    let (lo, hi) = (back(self, lo), back(self, hi));
-                    match op {
-                        Op::AddU | Op::AddF => self.s.m.bin(c, Bin::Add, lo, hi),
-                        Op::Or => self.s.m.bin(c, Bin::Or, lo, hi),
-                        Op::And => self.s.m.bin(c, Bin::And, lo, hi),
-                        Op::Xor => self.s.m.bin(c, Bin::Xor, lo, hi),
-                        _ => {
-                            // FMax 35, FMin 36, IMax 37, IMin 38, UMax 39, UMin 40
-                            let code = match op {
-                                Op::MaxF => 35,
-                                Op::MinF => 36,
-                                Op::MinU => 40,
-                                Op::MaxU => 39,
-                                Op::MinI => 38,
-                                _ => 37,
-                            };
-                            self.s.op(c, &format!("binary.{sfx}"), Attr::ReadNone, ty, code, &[lo, hi])
-                        }
+        }
+    }
+
+    /// Doubled ([`with_doubled`]): an instruction inside a whole-wave section, for both
+    /// halves. The values that leave the section are made from what the simulation found
+    /// them to be ([`Self::doubled_shape`]); a scalar one must come out the same in both.
+    fn doubled_section_inst(&mut self, b: usize, i: usize, start: usize) {
+        use super::wave::Shape;
+        const UNKNOWN: Why = "a whole-wave section step the simulation does not follow";
+        const SPLIT: Why = "a lane's value of a whole-wave section read as a scalar";
+        let inst = &self.x.p.blocks[b].insts[i];
+        for &(reg, w) in &inst.writes {
+            let shape = if self.section_out.contains(&w) {
+                self.sections[&b][&start].shapes.get(&w).copied()
+            } else {
+                None
+            };
+            let scalar = !matches!(reg, Reg::V(_));
+            let made = match shape {
+                None => Err(UNKNOWN),
+                // a scalar is one value in both halves: a constant, a scalar from before the
+                // section, or a reduction over the whole wave
+                Some(Shape::Masked(..) | Shape::Prefix(..)) if scalar => Err(SPLIT),
+                Some(Shape::Value(x)) if scalar => {
+                    if self.vals.get(&x) == self.other.vals.get(&x) {
+                        self.i32_of(x).map(|v| [v, v])
+                    } else {
+                        Err(SPLIT)
                     }
                 }
+                Some(sh) => self.doubled_shape(sh),
+            };
+            let vals = match made {
+                Ok([x0, x1]) => [Val::I32(x0), Val::I32(x1)],
+                Err(why) => [Val::Missing(why); 2],
+            };
+            for (h, val) in [0, 1].into_iter().zip(vals) {
+                self.in_half(h, |l| l.vals.insert(w, val));
             }
-        } else {
-            r
+        }
+    }
+
+    /// Doubled: a value a whole-wave section leaves, in half 0 and half 1. The host wave holds
+    /// both halves of the console's wave, each thread a lane of each: a reduction is the
+    /// host wave's over each half, the two then combined in the thread (the console's last
+    /// step joins its halves the same way); a prefix in half 1 adds half 0's total.
+    fn doubled_shape(&mut self, shape: super::wave::Shape) -> Result<[V; 2], Why> {
+        use super::wave::{Op, Shape};
+        let (op, src, mask, ident, prefix) = match shape {
+            Shape::K(_) | Shape::Value(_) | Shape::Masked(..) => {
+                let [a, b] = self.both(|l| l.shape(shape, false));
+                return Ok([a?, b?]);
+            }
+            Shape::Active(op, src, mask, ident) => (op, src, mask, ident, None),
+            Shape::Prefix(op, src, mask, ident, inclusive) => {
+                (op, src, mask, ident, Some(inclusive))
+            }
         };
-        Ok(if float { self.as_int(r) } else { r })
+        let c = self.cur;
+        let &m = self
+            .x
+            .st
+            .masks
+            .get(&mask)
+            .ok_or("a wave reduction's untracked mask")?;
+        // each half's lanes: the term, or the identity outside the mask
+        let [x0, x1] = self.both(|l| -> Result<V, Why> {
+            let on = l.boolean(m, c)?;
+            let x = l.i32_of(src)?;
+            let id = l.s.m.i32(ident);
+            Ok(l.s.m.select(c, on, x, id))
+        });
+        let (x0, x1) = (x0?, x1?);
+        self.s.flags |= flags::WAVE_OPS;
+        if op == Op::AddH {
+            return match prefix {
+                Some(_) => Err("a wave prefix of an operation other than a sum"),
+                None => {
+                    let r = self.doubled_half_sum(x0, x1);
+                    Ok([r, r])
+                }
+            };
+        }
+        let float = matches!(op, Op::AddF | Op::MinF | Op::MaxF);
+        let (a0, a1) = if float {
+            (self.as_float(x0), self.as_float(x1))
+        } else {
+            (x0, x1)
+        };
+        let r0 = self.wave_op(c, op, prefix, a0)?;
+        let r1 = self.wave_op(c, op, prefix, a1)?;
+        let [r0, r1] = match prefix {
+            Some(_) => {
+                // half 1's prefix starts from half 0's total
+                let total = self.wave_op(c, op, None, a0)?;
+                [r0, self.wave_combine(c, op, total, r1)]
+            }
+            None => {
+                let r = self.wave_combine(c, op, r0, r1);
+                [r, r]
+            }
+        };
+        Ok(if float {
+            [self.as_int(r0), self.as_int(r1)]
+        } else {
+            [r0, r1]
+        })
+    }
+
+    /// Doubled: [`Self::half_sum`] of the two halves' terms `x0` and `x1` (16-bit floats in
+    /// their low halves): each half's balanced tree over the host wave's 32 lanes, then the
+    /// console's last addition of the two halves' sums; the high half is lane 0's.
+    fn doubled_half_sum(&mut self, x0: V, x1: V) -> V {
+        let c = self.cur;
+        let i32t = self.s.t.i32;
+        let lane = self.s.op(c, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
+        let mut sums = [x0, x1];
+        for step in 0..5 {
+            let bit = self.s.m.i32(1 << step);
+            let partner = self.s.m.bin(c, Bin::Xor, lane, bit);
+            for sum in &mut sums {
+                let theirs = self.read_lane(*sum, partner);
+                *sum = self.add_halves(*sum, theirs);
+            }
+        }
+        let (high, low, zero) = (self.s.m.i32(0xFFFF_0000), self.s.m.i32(0xFFFF), self.s.m.i32(0));
+        let total = self.add_halves(sums[0], sums[1]);
+        let total = self.s.m.bin(c, Bin::And, total, low);
+        let first = self.read_lane(x0, zero);
+        let first = self.s.m.bin(c, Bin::And, first, high);
+        self.s.m.bin(c, Bin::Or, first, total)
     }
 
     /// The sum of two 16-bit floats (the low halves of `a` and `b`) as the console's
@@ -2173,9 +2330,6 @@ impl<'a> Lower<'a> {
         }
         self.cur = self.s.entry;
         self.find_sections();
-        if self.doubled.is_some() && !self.sections.is_empty() {
-            return Err(unsupported(0, "a whole-wave section in a doubled wave"));
-        }
         self.inputs()?;
         if self.doubled.is_some() {
             // the other half's inputs: its own thread ids, the scalars as they are
@@ -2244,13 +2398,16 @@ impl<'a> Lower<'a> {
             while i < p.blocks[b].insts.len() {
                 if self.doubled.is_some() {
                     self.doubled_inst(b, i)?;
-                    i += 1;
-                    continue;
+                } else {
+                    self.inst(b, i)?;
                 }
-                self.inst(b, i)?;
                 if let Some(end) = self.sections.get(&b).and_then(|s| s.get(&i)).map(|s| s.end) {
                     for j in i + 1..end {
-                        self.section_inst(b, j, i);
+                        if self.doubled.is_some() {
+                            self.doubled_section_inst(b, j, i);
+                        } else {
+                            self.section_inst(b, j, i);
+                        }
                     }
                     i = end;
                     continue;

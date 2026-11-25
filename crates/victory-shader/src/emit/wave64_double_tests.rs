@@ -626,3 +626,109 @@ fn a_two_dimensional_group_keeps_the_consoles_thread_ids() {
     }
     eprintln!("ran on the hardware device: the console's (x, y) in a halved group");
 }
+
+// ---- (e) whole-wave sections: a reduction and a prefix over both halves ----
+
+/// The second word of a VOP1/VOP2 with a DPP16 source (src0 = 0xFA).
+const fn dpp16(vsrc0: u32, ctrl: u32, row_mask: u32, bank_mask: u32, bound_ctrl: bool) -> u32 {
+    row_mask << 28 | bank_mask << 24 | (bound_ctrl as u32) << 19 | ctrl << 8 | vsrc0
+}
+/// VOP3 with three sources.
+const fn vop3_3(op: u32, vdst: u32, src0: u32, src1: u32, src2: u32) -> [u32; 2] {
+    [0x35 << 26 | op << 16 | vdst, src2 << 18 | src1 << 9 | src0]
+}
+const S_MOV_B32: u32 = 0x03;
+const S_OR_SAVEEXEC_B64: u32 = 0x25;
+const CNDMASK: u32 = 0x101;
+
+/// The console compiler's exclusive prefix sum of the thread index over the lanes of the
+/// entry EXEC (saved in s[12:13]) into v2, wave64: row sums by `row_shr` steps, rows joined
+/// by `v_readlane` 15, 31 and 47 under EXEC masks, then shifted up a lane (the program in
+/// `wave::tests::exec_minus_two_masks_lane_zero_and_enforces_dpp_guard`). s16 a scratch.
+fn prefix_of_thread_index_into_v2(a: &mut Asm) {
+    a.op(sop1(S_OR_SAVEEXEC_B64, 12, MINUS_ONE))
+        .op2(vop3_3(CNDMASK, 1, k(0), v(0), 12)); // v1 = saved ? t : 0
+    for shift in [1, 2, 4, 8] {
+        a.op(vop2(ADD, 1, 0xFA, 1)).op(dpp16(1, 0x110 + shift, 0xF, 0xF, false));
+    }
+    // rows 1..3 add the last lane of the rows below
+    a.op2(vop3(READLANE, 16, v(1), k(15)))
+        .op(sop1(S_MOV_B64, EXEC, 255))
+        .op(0xFFFF_0000)
+        .op(vop2(ADD, 1, 16, 1))
+        .op2(vop3(READLANE, 16, v(1), k(31)))
+        .op(sop1(S_MOV_B32, EXEC, k(0)))
+        .op(sop1(S_MOV_B32, EXEC + 1, 255))
+        .op(0x0000_FFFF)
+        .op(vop2(ADD, 1, 16, 1))
+        .op2(vop3(READLANE, 16, v(1), k(47)))
+        .op(sop1(S_MOV_B32, EXEC, k(0)))
+        .op(sop1(S_MOV_B32, EXEC + 1, 255))
+        .op(0xFFFF_0000)
+        .op(vop2(ADD, 1, 16, 1));
+    // up a lane: within rows by DPP, across rows by `v_readlane`
+    a.op(sop1(S_MOV_B64, EXEC, MINUS_ONE))
+        .op(vop1(MOV, 3, v(1)))
+        .op(vop1(MOV, 3, 0xFA))
+        .op(dpp16(1, 0x111, 0xF, 0xF, false))
+        .op2(vop3(READLANE, 16, v(1), k(15)))
+        .op(sop1(S_MOV_B64, EXEC, 255))
+        .op(0x0001_0000)
+        .op(vop1(MOV, 3, 16))
+        .op2(vop3(READLANE, 16, v(1), k(31)))
+        .op(sop1(S_MOV_B32, EXEC, k(0)))
+        .op(sop1(S_MOV_B32, EXEC + 1, k(1)))
+        .op(vop1(MOV, 3, 16))
+        .op2(vop3(READLANE, 16, v(1), k(47)))
+        .op(sop1(S_MOV_B32, EXEC, k(0)))
+        .op(sop1(S_MOV_B32, EXEC + 1, 255))
+        .op(0x0001_0000)
+        .op(vop1(MOV, 3, 16));
+    // lane 0 holds 0
+    a.op(sop1(S_MOV_B64, EXEC, MINUS_ONE))
+        .op(vop1(MOV, 2, k(0)))
+        .op(sop1(S_MOV_B64, EXEC, k(0) + 66)) // -2
+        .op(vop1(MOV, 2, v(3)))
+        .op(sop1(S_MOV_B64, EXEC, 12));
+}
+
+/// Inside `if (t < s1)`, in a group of two console waves: `WaveActiveSum(s2 + t)` into s7
+/// (the console's tree: DPP8, `row_mirror`, `v_permlanex16`, `v_readlane` 32 and 0) and the
+/// exclusive prefix sum of t into v2, both whole-wave sections. Each thread stores the sum at
+/// `t` and its prefix at `128 + t`. Each console wave sums its own lanes in the branch.
+#[test]
+fn whole_wave_sum_and_prefix_span_both_halves() {
+    let mut a = Asm::default();
+    a.op(vop2(LSHLREV, 5, k(2), 0)) // v5 = t * 4
+        .op(cmp(CMP_GT_U32, 1, 0)) // vcc = s1 > t
+        .op(sop1(S_AND_SAVEEXEC_B64, 14, VCC_LO))
+        .branch(EXECZ, "end")
+        .op(vop2(ADD, 7, 2, 0)); // v7 = s2 + t
+    // `WaveActiveBitOr(v7)` into s7 with each v_or_b32 an add: the sum
+    for &w in &super::wave::WAVE_OR_V7_TO_S7 {
+        a.op(if w >> 25 == OR { w & 0x01FF_FFFF | ADD << 25 } else { w });
+    }
+    a.op(vop1(MOV, 8, 7)) // v8 = s7
+        .op2(store(8, 5, 0));
+    prefix_of_thread_index_into_v2(&mut a);
+    a.op2(store(2, 5, 512)).label("end").op(sop1(S_MOV_B64, EXEC, 14));
+    let words = a.done();
+    let native = native(&words, [128, 1, 1]);
+    let names = ["s_or_saveexec_b64", "v_permlanex16_b32", "v_readlane_b32", "v_cndmask_b32"];
+    let shader = doubled(&native, &names, true);
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let s2 = 1000;
+    for s1 in [128u32, 100, 64, 45, 32, 20, 1, 0] {
+        let Some(out) = on_the_card(&shader, [0, s1, s2, 0], 256) else { return };
+        // the console: each wave of 64 over its lanes in the branch
+        let mut want = vec![0u32; 256];
+        for t in 0..s1.min(128) {
+            let wave = t & !63;
+            let lanes = wave..s1.min(wave + 64);
+            want[t as usize] = lanes.clone().map(|l| s2 + l).sum();
+            want[128 + t as usize] = (wave..t).sum();
+        }
+        assert_eq!(out, want, "{s1} threads in the branch");
+    }
+    eprintln!("ran on the hardware device: wave sums and prefixes over both halves of each console wave");
+}
