@@ -57,6 +57,9 @@ pub(crate) struct Lowered {
     /// Test builds: typed loads assembled from a dword-aligned pair.
     #[cfg(test)]
     pub unaligned_typed_loads: u32,
+    /// Test builds: d16 format loads that kept the destination's high half.
+    #[cfg(test)]
+    pub d16_kept_high_halves: u32,
     /// Test builds: constant byte offsets of `s_buffer_load_dword*`.
     #[cfg(test)]
     pub smem_buffer_bytes: Vec<u32>,
@@ -1212,6 +1215,8 @@ impl<'a> Lower<'a> {
         Ok(Lowered {
             #[cfg(test)]
             unaligned_typed_loads: self.s.unaligned_typed_loads,
+            #[cfg(test)]
+            d16_kept_high_halves: self.s.d16_kept_high_halves,
             #[cfg(test)]
             smem_buffer_bytes: std::mem::take(&mut self.s.smem_buffer_bytes),
             #[cfg(test)]
@@ -4392,6 +4397,53 @@ impl<'a> Lower<'a> {
             out.push(self.s.m.i32(if k == 3 { one } else { 0 }));
         }
         out.truncate(channels as usize);
+        Ok(out)
+    }
+
+    /// Channels of buffer format `format`, as [`Self::format_load`] gives
+    /// them, as d16 data: 16 bits each, two per dword, low half first.
+    /// Integer formats saturate to 16 bits (UINT to 0xFFFF, SINT to
+    /// -32768..32767), as RDNA2 does for a 32-bit channel; the others become
+    /// f16 (nearest even). An odd last channel is a single half: the caller
+    /// merges it with [`Self::low_half`].
+    fn d16_channels(&mut self, format: u8, channels: Vec<V>) -> Result<Vec<V>, Why> {
+        let (_, numeric) = buffer_format(format).ok_or("a buffer format")?;
+        let c = self.cur;
+        let mut halves = Vec::new();
+        for x in channels {
+            halves.push(if matches!(numeric, Numeric::Uint) {
+                let m = self.s.m.i32(0xFFFF);
+                let lt = self.s.m.cmp(c, pred::IULT, x, m);
+                self.s.m.select(c, lt, x, m)
+            } else if matches!(numeric, Numeric::Sint) {
+                let (lo, hi, m) = (
+                    self.s.m.i32((-32768i32) as u32),
+                    self.s.m.i32(32767),
+                    self.s.m.i32(0xFFFF),
+                );
+                let below = self.s.m.cmp(c, pred::SLT, x, lo);
+                let x = self.s.m.select(c, below, lo, x);
+                let above = self.s.m.cmp(c, pred::SGT, x, hi);
+                let x = self.s.m.select(c, above, hi, x);
+                self.s.m.bin(c, Bin::And, x, m)
+            } else {
+                // Float / normalized: round to nearest even f16.
+                let f = self.as_float(x);
+                self.f16_nearest(f)
+            });
+        }
+        let mut out = Vec::new();
+        for pair in halves.chunks(2) {
+            out.push(match *pair {
+                [lo, hi] => {
+                    let k16 = self.s.m.i32(16);
+                    let hi = self.s.m.bin(c, Bin::Shl, hi, k16);
+                    self.s.m.bin(c, Bin::Or, lo, hi)
+                }
+                [lo] => lo,
+                _ => unreachable!("chunks of one or two"),
+            });
+        }
         Ok(out)
     }
 
@@ -7948,8 +8000,8 @@ impl<'a> Lower<'a> {
             "buffer_load_sshort" => Some(12), // 16_SINT
             _ => None,
         };
-        // d16: two 16-bit channels per VGPR, low half first.
-        let d16 = name.starts_with("buffer_") && name.contains("_format_d16_");
+        // d16: two 16-bit channels per VGPR, low half first (MUBUF and MTBUF).
+        let d16 = name.contains("_format_d16_");
         let plain = name.replace("_format_d16_", "_format_");
         let (typed, count) = match plain
             .strip_prefix("buffer_load_")
@@ -8157,8 +8209,23 @@ impl<'a> Lower<'a> {
             let Some(Operand::Vector { reg, .. }) = *data else {
                 return Err("a buffer result");
             };
-            for (k, x) in self.format_load(h, off, f, count)?.into_iter().enumerate() {
-                self.write(inst, Reg::V(reg + k as u8), x, guard);
+            let mut xs = self.format_load(h, off, f, count)?;
+            if d16 {
+                xs = self.d16_channels(f, xs)?;
+            }
+            let n = xs.len();
+            for (k, x) in xs.into_iter().enumerate() {
+                let reg = reg + k as u8;
+                let x = if d16 && k + 1 == n && count % 2 == 1 {
+                    #[cfg(test)]
+                    {
+                        self.s.d16_kept_high_halves += 1;
+                    }
+                    self.low_half(inst, reg, x)
+                } else {
+                    x
+                };
+                self.write(inst, Reg::V(reg), x, guard);
             }
             return Ok(());
         }
@@ -8244,7 +8311,10 @@ impl<'a> Lower<'a> {
             return Err("a buffer result");
         };
         if d16 {
-            // Two f16 channels per VGPR (an odd last high half 0).
+            // Two f16 channels per VGPR. An odd last channel leaves its high
+            // half intact. shortcut: MUBUF typed loads use a float view, so
+            // UINT/SINT saturation for d16 is handled on the MTBUF path where
+            // the instruction names the format (`d16_channels`).
             let k16 = self.s.m.i32(16);
             for k in 0..count.div_ceil(2) {
                 let mut x = None;
@@ -8259,7 +8329,16 @@ impl<'a> Lower<'a> {
                         None => h,
                     });
                 }
-                self.write(inst, Reg::V(reg + k as u8), x.expect("a channel"), guard);
+                let reg = reg + k as u8;
+                let mut x = x.expect("a channel");
+                if 2 * k + 1 == count {
+                    #[cfg(test)]
+                    {
+                        self.s.d16_kept_high_halves += 1;
+                    }
+                    x = self.low_half(inst, reg, x);
+                }
+                self.write(inst, Reg::V(reg), x, guard);
             }
             return Ok(());
         }
@@ -9820,7 +9899,9 @@ mod tests {
         let op_shift = if mtbuf { 16 } else { 18 };
         [
             class << 26
-                | u32::from(opcode & if mtbuf { 0x7 } else { 0x7F }) << op_shift
+                // MUBUF opcodes are 8 bits (0x00..0xff); MTBUF uses 4 bits
+                // split across the two words.
+                | u32::from(opcode & if mtbuf { 0x7 } else { 0xFF }) << op_shift
                 | u32::from(format) << 19
                 | u32::from(offen) << 12
                 | u32::from(idxen) << 13
@@ -9942,6 +10023,91 @@ mod tests {
             ),
             "{err:?}"
         );
+    }
+
+    /// `v_mov_b32 vdst, literal`.
+    fn v_mov_lit(vdst: u8, lit: u32) -> [u32; 2] {
+        [0x7E00_0000 | (vdst as u32) << 17 | 0x01 << 9 | 255, lit]
+    }
+
+    /// Seeds `v[reg]` then runs a d16 buffer load into it, writing the
+    /// packed result VGPRs to LDS so they stay live.
+    fn d16_buffer_program(opcode: u16, mtbuf: bool, format: u8, reg: u8, seed: u32) -> Vec<u32> {
+        let channels = match opcode & 3 {
+            0 => 1u8, // x
+            1 => 1,   // xy → one packed VGPR
+            2 => 2,   // xyz → two packed VGPRs
+            _ => 2,   // xyzw
+        };
+        let mut words = vec![
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], null
+        ];
+        words.extend_from_slice(&v_mov_lit(reg, seed));
+        words.push(v_mov(3, 128)); // v3 = 0 (address / index)
+        words.extend_from_slice(&buffer(opcode, mtbuf, format, 0, false, !mtbuf, reg, 3, 8));
+        words.push(v_mov(5, 128)); // LDS address
+        for k in 0..channels {
+            words.extend_from_slice(&ds_write_b32(5, reg + k));
+        }
+        words.push(S_ENDPGM);
+        words
+    }
+
+    #[test]
+    fn packed_d16_buffer_loads_keep_an_odd_high_half() {
+        // VIC-BT-015: buffer_load_format_d16_x / _xyz leave vdst[31:16] intact
+        // on the trailing VGPR; a full pair (xy) replaces the whole dword.
+        // MTBUF names the format; MUBUF typed d16 uses the same odd-half merge
+        // (covered end-to-end on Windows by the waterfall host test).
+        let (layout, used) = fetch_tables(0, 4);
+        for (label, opcode, format) in [
+            ("d16_x", 0x008u16, 13u8), // 16_FLOAT
+            ("d16_xy", 0x009, 29),     // 16_16_FLOAT
+            ("d16_xyz", 0x00a, 65),    // 16_16_16_16_UNORM
+        ] {
+            let want = u32::from(opcode != 0x009);
+            let l = lower_with(
+                &d16_buffer_program(opcode, true, format, 0, 0xDEAD_0000),
+                layout.clone(),
+                used.clone(),
+            )
+            .unwrap_or_else(|e| panic!("{label}: {e}"));
+            assert_eq!(l.d16_kept_high_halves, want, "{label}");
+        }
+        // MUBUF buffer_load_format_d16_*: same merge on the float typed view.
+        for (label, opcode) in [("d16_x", 0x080u16), ("d16_xy", 0x081), ("d16_xyz", 0x082)] {
+            let want = u32::from(opcode != 0x081);
+            let l = lower_with(
+                &d16_buffer_program(opcode, false, 0, 0, 0xDEAD_0000),
+                layout.clone(),
+                used.clone(),
+            )
+            .unwrap_or_else(|e| panic!("mubuf {label}: {e}"));
+            assert_eq!(l.d16_kept_high_halves, want, "mubuf {label}");
+        }
+    }
+
+    #[test]
+    fn tbuffer_d16_integer_formats_saturate_to_16_bits() {
+        // VIC-BT-015: tbuffer_load_format_d16_x of 32_UINT / 32_SINT saturates
+        // to 16 bits rather than converting through f16.
+        let (layout, used) = fetch_tables(0, 4);
+        for format in [20u8, 21] {
+            // Seed the high half so the odd-channel merge is exercised too.
+            let l = lower_with(
+                &d16_buffer_program(0x008, true, format, 0, 0xDEAD_0000),
+                layout.clone(),
+                used.clone(),
+            )
+            .unwrap_or_else(|e| panic!("d16_x format {format}: {e}"));
+            assert_eq!(
+                l.d16_kept_high_halves, 1,
+                "format {format}: odd d16 channel keeps the high half"
+            );
+        }
     }
 
     /// Tables of 2D textures at s0 and samplers at s1.
