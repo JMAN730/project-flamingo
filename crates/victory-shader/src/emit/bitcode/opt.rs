@@ -48,10 +48,15 @@ pub const REUSE: u32 = 4;
 pub const FACTS: u32 = 8;
 /// One read for one place within a block, while nothing is stored.
 pub const LOADS: u32 = 16;
+/// Not a pass over the module: the lowering of a first-lane read in a
+/// wave64 program run as two host waves skips the exchange that asks which
+/// half has a lane where every lane is in EXEC (`lower.rs`,
+/// `v_readfirstlane_b32`).
+pub const FIRST: u32 = 32;
 /// The passes over the module.
 pub const MODULE: u32 = DEAD | FOLD | REUSE | FACTS | LOADS;
 /// Every pass.
-pub const ALL: u32 = MODULE;
+pub const ALL: u32 = MODULE | FIRST;
 
 /// What the instructions a module writes use, of the features a shader
 /// declares by flag (the validator's "flags must match usage").

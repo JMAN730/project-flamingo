@@ -67,6 +67,19 @@ fn build(wave32: bool) -> &'static [u8; 32] {
         match exe {
             Ok(mut bytes) => {
                 bytes.extend_from_slice(&limit.to_le_bytes());
+                bytes.push(victory_shader::emit::group_sync());
+                for name in [
+                    "VICTORY_WAVE_WIDE",
+                    "VICTORY_WAVE_DEEP_SKIPS",
+                    "VICTORY_WAVE_OWN_BITS",
+                ] {
+                    bytes.extend_from_slice(name.as_bytes());
+                    bytes.push(b'=');
+                    if let Some(value) = std::env::var_os(name) {
+                        bytes.extend_from_slice(value.as_encoded_bytes());
+                    }
+                    bytes.push(0);
+                }
                 bytes.extend_from_slice(&victory_shader::emit::shader_opt().to_le_bytes());
                 bytes.push(u8::from(wave32));
                 *blake3::hash(&bytes).as_bytes()
@@ -86,14 +99,43 @@ fn build(wave32: bool) -> &'static [u8; 32] {
 /// The translation of a console shader container, from the cache when
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
+    use victory_shader::emit;
     let wave32 = allow_wave32();
+    let hash = blake3::hash(container).to_hex()[..16].to_owned();
     let translate = |c: &[u8]| {
-        victory_shader::emit::translate_with_wave32(c, wave32).map_err(|e| e.to_string())
+        emit::for_program(&hash, || emit::translate_with_wave32(c, wave32))
+            .map_err(|e| e.to_string())
     };
     match CACHE.get() {
-        Some(cache) => cached(cache, build(wave32), container, translate),
+        Some(cache) => {
+            let off = !emit::deep_skips_allowed(Some(&hash)) && emit::wave64_retried(container);
+            cached(
+                cache,
+                &program_key(build(wave32), off),
+                container,
+                translate,
+            )
+        }
         None => translate(container),
     }
+}
+
+/// The key of one program's entries: the build's, mixed with the
+/// per-program decision when the program is kept out of the wave64 form
+/// "without skips, scalars followed" (`VICTORY_WAVE_DEEP_SKIPS_NOT`,
+/// `_ONLY`: `victory_shader::emit::deep_skips_allowed`). Only for a wave64
+/// compute program on a host of 32-lane waves, the only ones it can change.
+/// So the lists are in no key: changing one translates again only the
+/// programs whose decision it changes, and a program allowed the form keeps
+/// the key it had without any list.
+fn program_key(build: &[u8; 32], deep_skips_off: bool) -> [u8; 32] {
+    if !deep_skips_off {
+        return *build;
+    }
+    let mut h = blake3::Hasher::new();
+    h.update(build);
+    h.update(b"VICTORY_WAVE_DEEP_SKIPS off for this program");
+    *h.finalize().as_bytes()
 }
 
 /// The cache entry's converter: the build and the container in, the encoded
@@ -516,5 +558,43 @@ mod tests {
         bad_utf8.extend(2u32.to_le_bytes());
         bad_utf8.extend([0xff, 0xfe]);
         assert_eq!(decode(&bad_utf8), None);
+    }
+
+    #[test]
+    fn a_program_kept_out_of_the_deep_skips_form_has_a_key_of_its_own() {
+        let build = [7u8; 32];
+        assert_eq!(
+            program_key(&build, false),
+            build,
+            "allowed: the build's key, as without lists"
+        );
+        let off = program_key(&build, true);
+        assert_ne!(off, build);
+        assert_eq!(
+            program_key(&build, true),
+            off,
+            "the same decision, the same key"
+        );
+        assert_ne!(program_key(&[8; 32], true), off, "and still the build's");
+
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open(dir.path()).unwrap();
+        let runs = AtomicU64::new(0);
+        let translate = |_: &[u8]| {
+            runs.fetch_add(1, Ordering::Relaxed);
+            Ok(shader())
+        };
+        let [a, b] = [b"program a".as_slice(), b"program b"];
+        for c in [a, b] {
+            cached(&cache, &program_key(&build, false), c, translate).unwrap();
+        }
+        assert_eq!(runs.load(Ordering::Relaxed), 2);
+        cached(&cache, &program_key(&build, true), a, translate).unwrap();
+        cached(&cache, &program_key(&build, false), b, translate).unwrap();
+        assert_eq!(runs.load(Ordering::Relaxed), 3);
+        for c in [a, b] {
+            cached(&cache, &program_key(&build, false), c, translate).unwrap();
+        }
+        assert_eq!(runs.load(Ordering::Relaxed), 3);
     }
 }

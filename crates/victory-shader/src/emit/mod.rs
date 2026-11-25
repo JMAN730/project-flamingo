@@ -89,6 +89,8 @@ mod lds_tests;
 mod lower;
 #[cfg(test)]
 mod mtbuf_tests;
+mod own_bits;
+mod per_program;
 mod rect;
 #[cfg(test)]
 mod root_uav_tests;
@@ -104,12 +106,16 @@ mod valu_tests;
 mod waterfall_tests;
 mod wave;
 #[cfg(all(test, windows))]
+mod wave64_tests;
+#[cfg(all(test, windows))]
 mod wave_prefix_tests;
 
 use crate::dxbc::{Container, FourCC};
 use crate::native::{HwStage, NativeProgram, RootType};
 use crate::{ShaderError, io, ir, resource, structure};
 
+pub use lower::set_host_max_wave;
+pub use per_program::{deep_skips_allowed, for_program, wave64_retried};
 pub use sampler::StaticSampler;
 pub use shader::{ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
 
@@ -142,6 +148,30 @@ pub fn loop_limit() -> u32 {
             parse_loop_limit(std::env::var("VICTORY_SHADER_LOOP_LIMIT").ok().as_deref())
         } else {
             lower::LOOP_LIMIT
+        }
+    })
+}
+
+/// Which of a translated program's group barriers wait for the whole
+/// group (`GroupMemoryBarrierWithGroupSync`); the others keep their memory
+/// fence and lose the wait. `VICTORY_GROUP_SYNC`:
+/// - unset or `2`: every barrier waits, as before.
+/// - `1`: barriers wait only where every lane runs.
+/// - `0`: no barrier waits (fence only).
+///
+/// Part of the translation: the shader cache keys on it (`victory-gpu`'s
+/// does).
+pub fn group_sync() -> u8 {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| {
+        match std::env::var("VICTORY_GROUP_SYNC")
+            .ok()
+            .as_deref()
+            .map(str::trim)
+        {
+            Some("0") => 0,
+            Some("1") => 1,
+            _ => 2,
         }
     })
 }
@@ -278,10 +308,17 @@ pub fn translate_with_wave32(
     allow_wave32: bool,
 ) -> Result<HostShader, ShaderError> {
     let c = Container::parse(container)?;
+    let native = main_program(&c)?;
+    translate_native(&c, &native, allow_wave32, None)
+}
+
+/// The program of a container that [`translate`] translates: its vertex,
+/// pixel, compute or mesh program.
+fn main_program(c: &Container) -> Result<NativeProgram, ShaderError> {
     let dxil = c
         .part(FourCC::DXIL)
         .ok_or(ShaderError::Malformed("no DXIL part"))?;
-    let native = crate::native_programs(dxil.data)?
+    crate::native_programs(dxil.data)?
         .into_iter()
         .find(|p| {
             matches!(
@@ -292,8 +329,7 @@ pub fn translate_with_wave32(
         .ok_or(ShaderError::Unsupported {
             offset: 0,
             what: "a container without a vertex, pixel, compute or mesh program",
-        })?;
-    translate_native(&c, &native, allow_wave32, None)
+        })
 }
 
 /// Emits an oversized mesh shader with only the varyings its pipeline's
@@ -381,7 +417,186 @@ fn emit_parts(
     res: &resource::Resources,
     options: (bool, Option<&[container::SigElement]>),
 ) -> Result<HostShader, ShaderError> {
+    lower::take_needs();
     let original = emit_program(c, native, p, st, io, res, options);
+    let stuck = match &original {
+        Ok((_, wave)) => *wave == Some(64),
+        Err(ShaderError::Unsupported { what, .. }) => lower::needs_every_lane(what),
+        Err(_) => false,
+    };
+    let exact_only = matches!(
+        &original,
+        Err(ShaderError::Unsupported { what, .. }) if *what == lower::MASK_ELSEWHERE
+    );
+    if stuck && native.stage == HwStage::Cs && native.wave64 && lower::host_max_wave() == 32 {
+        let why = std::env::var_os("VICTORY_WAVE_WHY").is_some();
+        let program = per_program::current();
+        let hash = program.as_deref().unwrap_or("?");
+        let report = |what: &str, r: &Result<(HostShader, Option<u32>), ShaderError>| {
+            if why {
+                match r {
+                    Ok((_, wave)) => eprintln!("WAVE64-RETRY #{hash} {what}: wave {wave:?}"),
+                    Err(e) => eprintln!("WAVE64-RETRY #{hash} {what}: {e}"),
+                }
+            }
+        };
+        let done = |r: &Result<(HostShader, Option<u32>), ShaderError>| matches!(r, Ok((_, wave)) if *wave != Some(64));
+        let local_on = std::env::var_os("VICTORY_WAVE_LOCAL").is_none_or(|v| v != "0");
+        let strict = std::env::var_os("VICTORY_WAVE_LOCAL").is_some_and(|v| v == "idiom");
+        let idiom = |p: &ir::Program, st: &structure::Structured| match lower::wave_local(p, st) {
+            Ok(()) => true,
+            Err((offset, what)) => {
+                if why {
+                    eprintln!(
+                        "WAVE64-RETRY #{hash} local waves: not the allocation idiom at {offset:#x}: {what}"
+                    );
+                }
+                false
+            }
+        };
+        let form = |p: Option<ir::Program>| {
+            p.and_then(|p| {
+                let st = structure::structure(&p).ok()?;
+                let io = io::raise(&p, native).ok()?;
+                let res = resource::track(&p, &native.layout, native.stage, Some(&st)).ok()?;
+                Some((p, st, io, res))
+            })
+        };
+        let forms = [
+            ("without early-outs", form(ir::without_early_outs(p))),
+            ("without skips", form(ir::without_skips(p, false))),
+        ];
+        for (name, f) in &forms {
+            if let Some((p, st, io, res)) = f {
+                let again = emit_program(c, native, p, st, io, res, options);
+                report(name, &again);
+                if done(&again) {
+                    return again.map(|(shader, _)| shader);
+                }
+            }
+        }
+        let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1");
+        for exact in [true, false] {
+            if !exact {
+                let deep_on = deep_skips_allowed(program.as_deref());
+                if why && !deep_on {
+                    eprintln!(
+                        "WAVE64-RETRY #{hash} without skips, scalars followed: off for this program"
+                    );
+                }
+                let deep = if deep_on {
+                    form(ir::without_skips(p, true))
+                } else {
+                    None
+                };
+                if let Some((p, st, io, res)) = &deep {
+                    let again = emit_program(c, native, p, st, io, res, options);
+                    report("without skips, scalars followed", &again);
+                    if done(&again) {
+                        return again.map(|(shader, _)| shader);
+                    }
+                }
+                if wide_on {
+                    let bases = [
+                        deep.as_ref().map(|f| &f.0),
+                        forms[1].1.as_ref().map(|f| &f.0),
+                        forms[0].1.as_ref().map(|f| &f.0),
+                        Some(p),
+                    ];
+                    if let Some(base) = bases.into_iter().flatten().next() {
+                        let again = widen(c, native, base, options, why);
+                        report("wave-wide branches", &again);
+                        if done(&again) {
+                            return again.map(|(shader, _)| shader);
+                        }
+                    }
+                }
+                if strict {
+                    break;
+                }
+            }
+            if !local_on || exact_only {
+                continue;
+            }
+            for (name, f) in &forms {
+                if let Some((p, st, io, res)) = f
+                    && idiom(p, st) == exact
+                {
+                    let local = lower::with_local_waves(|| {
+                        emit_program(c, native, p, st, io, res, options)
+                    });
+                    report(
+                        &format!(
+                            "local waves ({}), {name}",
+                            if exact { "idiom" } else { "APPROXIMATE" }
+                        ),
+                        &local,
+                    );
+                    if done(&local) {
+                        return local.map(|(shader, _)| shader);
+                    }
+                }
+            }
+            if idiom(p, st) == exact {
+                let local =
+                    lower::with_local_waves(|| emit_program(c, native, p, st, io, res, options));
+                report(
+                    if exact {
+                        "local waves (idiom)"
+                    } else {
+                        "local waves (APPROXIMATE)"
+                    },
+                    &local,
+                );
+                if done(&local) {
+                    return local.map(|(shader, _)| shader);
+                }
+            }
+        }
+        if local_on && !exact_only && !strict {
+            for (name, f) in &forms {
+                if let Some((p, st, io, res)) = f {
+                    let local = lower::with_local_waves_any(|| {
+                        emit_program(c, native, p, st, io, res, options)
+                    });
+                    report(
+                        &format!("local waves (APPROXIMATE, any mask), {name}"),
+                        &local,
+                    );
+                    if done(&local) {
+                        return local.map(|(shader, _)| shader);
+                    }
+                }
+            }
+            let local =
+                lower::with_local_waves_any(|| emit_program(c, native, p, st, io, res, options));
+            report("local waves (APPROXIMATE, any mask)", &local);
+            if done(&local) {
+                return local.map(|(shader, _)| shader);
+            }
+        }
+    }
+    let original = match original {
+        Err(ShaderError::Unsupported { what, .. })
+            if native.stage == HwStage::Cs
+                && what == lower::LANE_MASK
+                && std::env::var_os("VICTORY_WAVE_WIDE").is_none_or(|v| v != "0") =>
+        {
+            let again = widen(
+                c,
+                native,
+                p,
+                options,
+                std::env::var_os("VICTORY_WAVE_WHY").is_some(),
+            );
+            match again {
+                Ok(_) => again,
+                Err(_) => emit_program(c, native, p, st, io, res, options),
+            }
+        }
+        other => other,
+    };
+    let original = original.map(|(shader, _)| shader);
     // Retry unsupported programs only. Threading can separate an unknown
     // register value from its apparent use on a mutually exclusive path.
     if !matches!(original, Err(ShaderError::Unsupported { .. })) {
@@ -395,7 +610,66 @@ fn emit_parts(
     let st = structure::structure(&p)?;
     let io = io::raise(&p, native)?;
     let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
-    emit_program(c, native, &p, &st, &io, &res, options)
+    emit_program(c, native, &p, &st, &io, &res, options).map(|(shader, _)| shader)
+}
+
+/// `p` (a console wave64 compute program on a host of 32-lane waves) with the per-lane
+/// branches around its cross-lane code taken wave-wide ([`structure::structure_wide`]).
+fn widen(
+    c: &Container<'_>,
+    native: &NativeProgram,
+    p: &ir::Program,
+    options: (bool, Option<&[container::SigElement]>),
+    why: bool,
+) -> Result<(HostShader, Option<u32>), ShaderError> {
+    const NOT: ShaderError = ShaderError::Unsupported {
+        offset: 0,
+        what: "wave-wide branches in a thread group of several console waves",
+    };
+    match native.io {
+        crate::native::StageIo::Cs(_) if !(native.wave64 && lower::host_max_wave() == 32) => {}
+        crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 64 => {}
+        crate::native::StageIo::Cs(cs) => {
+            if why {
+                eprintln!("WAVE64-WIDE not tried: thread groups of {:?}", cs.threads);
+            }
+            return Err(NOT);
+        }
+        _ => return Err(NOT),
+    }
+    let mut wide = std::collections::HashSet::new();
+    loop {
+        let st = structure::structure_wide(p, &wide)?;
+        let io = io::raise(p, native)?;
+        let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
+        lower::take_needs();
+        let r = emit_program(c, native, p, &st, &io, &res, options);
+        let needs = lower::take_needs();
+        let stuck = matches!(&r, Err(ShaderError::Unsupported { what, .. })
+                if lower::needs_every_lane(what) || *what == lower::LANE_MASK && !needs.is_empty())
+            || matches!(&r, Ok((_, Some(64)))) && !needs.is_empty();
+        if !stuck {
+            if why {
+                eprintln!("WAVE64-WIDE {} branches taken wave-wide", wide.len());
+            }
+            return r;
+        }
+        let more: Vec<usize> = lower::branches_around(&st, &needs)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|b| !wide.contains(b))
+            .collect();
+        if more.is_empty() {
+            if why {
+                eprintln!(
+                    "WAVE64-WIDE stopped with {} branches wave-wide: a branch around it cannot be",
+                    wide.len()
+                );
+            }
+            return r;
+        }
+        wide.extend(more);
+    }
 }
 
 fn emit_program(
@@ -406,7 +680,7 @@ fn emit_program(
     io: &io::Io,
     res: &resource::Resources,
     (allow_wave32, pixel_inputs): (bool, Option<&[container::SigElement]>),
-) -> Result<HostShader, ShaderError> {
+) -> Result<(HostShader, Option<u32>), ShaderError> {
     let pixel = native.stage == HwStage::Ps;
     let mut inputs = signature_part(c, FourCC::ISG1)?;
     let mut outputs = signature_part(c, FourCC::OSG1)?;
@@ -501,27 +775,31 @@ fn emit_program(
         allow_wave32,
         pixel_inputs,
     )?;
-    Ok(HostShader {
-        stage: native.stage,
-        dxil: l.dxil,
-        user_data: l.user_data,
-        static_samplers: l
-            .samplers
-            .iter()
-            .enumerate()
-            .map(|(n, &w)| {
-                let mut s = StaticSampler::from_words(w);
-                if l.cmp_samplers >> n & 1 != 0 {
-                    s.filter |= 0x80;
-                }
-                s
-            })
-            .collect(),
-        samplers: l.samplers,
-        root_cbvs: l.root_cbvs,
-        root_srvs: l.root_srvs,
-        root_uavs: l.root_uavs,
-    })
+    let wave_size = l.wave_size;
+    Ok((
+        HostShader {
+            stage: native.stage,
+            dxil: l.dxil,
+            user_data: l.user_data,
+            static_samplers: l
+                .samplers
+                .iter()
+                .enumerate()
+                .map(|(n, &w)| {
+                    let mut s = StaticSampler::from_words(w);
+                    if l.cmp_samplers >> n & 1 != 0 {
+                        s.filter |= 0x80;
+                    }
+                    s
+                })
+                .collect(),
+            samplers: l.samplers,
+            root_cbvs: l.root_cbvs,
+            root_srvs: l.root_srvs,
+            root_uavs: l.root_uavs,
+        },
+        wave_size,
+    ))
 }
 
 fn signature_part(
