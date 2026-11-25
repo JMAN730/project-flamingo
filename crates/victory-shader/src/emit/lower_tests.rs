@@ -3074,3 +3074,34 @@ fn a_missing_value_on_a_path_no_lane_takes_is_dead() {
     ];
     assert_eq!(refusal(&kept), None);
 }
+
+/// The VOP3P integer dot products lower in the form assemblers write
+/// (op_sel_hi all set); op_sel, neg_hi, clamp and constant packed sources
+/// are refused rather than computed wrongly. An LDS store keeps the result
+/// live.
+#[test]
+fn integer_dot_products_lower() {
+    // `op v0, v1, v2, v3` with op_sel_hi:[1,1,1].
+    let dot = |op: u32, w0: u32, src1: u32| {
+        let words = [
+            0x7E02_0285, // v_mov_b32 v1, 5
+            0x7E04_0287, // v_mov_b32 v2, 7
+            0x7E06_0281, // v_mov_b32 v3, 1
+            0xCC00_4000 | op << 16 | w0,
+            0x1800_0000 | 0x101 | src1 << 9 | 0x103 << 18,
+            0x7E06_0280, // v_mov_b32 v3, 0
+            0xD834_0000,
+            0x0000_0003, // ds_write_b32 v3, v0
+            S_ENDPGM,
+        ];
+        lowers_lds(&words)
+    };
+    for op in 0x14..=0x19u32 {
+        dot(op, 0, 0x102).unwrap_or_else(|e| panic!("VOP3P {op:#x}: {e}"));
+        assert!(dot(op, 1 << 11, 0x102).is_err(), "op_sel, {op:#x}");
+        assert!(dot(op, 1 << 8, 0x102).is_err(), "neg_hi, {op:#x}");
+        assert!(dot(op, 1 << 15, 0x102).is_err(), "clamp, {op:#x}");
+        // src1 the inline constant 1 instead of v2.
+        assert!(dot(op, 0, 0x81).is_err(), "constant, {op:#x}");
+    }
+}
