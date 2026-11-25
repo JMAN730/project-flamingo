@@ -70,7 +70,8 @@ fn build(wave32: bool) -> &'static [u8; 32] {
                 bytes.extend_from_slice(&victory_shader::emit::shader_opt().to_le_bytes());
                 bytes.push(
                     u8::from(wave32)
-                        | (u8::from(wave32 && victory_shader::emit::wave64_double()) << 1),
+                        | (u8::from(wave32 && victory_shader::emit::wave64_double()) << 1)
+                        | (u8::from(wave32 && victory_shader::emit::wave64_console_flow()) << 2),
                 );
                 *blake3::hash(&bytes).as_bytes()
             }

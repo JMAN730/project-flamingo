@@ -433,6 +433,11 @@ pub struct Structured {
     /// such lane reaches the writing block, so a ballot there gives the
     /// mask as data.
     pub active: HashSet<Value>,
+    /// Per block and instruction: the lane's EXEC bit at each vector
+    /// instruction, whatever path the lane took (`None` for scalar ones).
+    /// What a program run as the console runs it, every lane through every
+    /// block, guards its vector instructions with ([`structure_console`]).
+    pub execs: Vec<Vec<Option<Bool>>>,
     /// Masks (low dwords) set in every lane that does not run where they
     /// are written (EXEC clear there, or not reaching a join): a ballot
     /// there, with every lane it leaves out set, gives the mask as data.
@@ -474,7 +479,20 @@ impl Bools {
 
 /// Builds the per-lane form of `program`.
 pub fn structure(program: &Program) -> Result<Structured, ShaderError> {
-    let mut l = Lanes::new(program)?;
+    run(Lanes::new(program, false)?)
+}
+
+/// The same for a program run as the console runs it: every lane of the
+/// console wave through every block, the branches taken wave-wide. Masks
+/// joined at a block are never resolved from what the lanes arriving there
+/// know, since lanes outside EXEC arrive too: each join that differs
+/// between edges is a phi ([`Atom::Phi`]). Guard vector instructions with
+/// [`Structured::execs`] and ignore [`Structured::exits`]' conditions.
+pub fn structure_console(program: &Program) -> Result<Structured, ShaderError> {
+    run(Lanes::new(program, true)?)
+}
+
+fn run(mut l: Lanes) -> Result<Structured, ShaderError> {
     loop {
         let execs = l.masks_in_order();
         let cond = l.paths()?;
@@ -493,6 +511,8 @@ type Key = (Value, Value);
 
 struct Lanes<'a> {
     p: &'a Program,
+    /// See [`structure_console`].
+    console: bool,
     order: Vec<usize>,
     /// Reverse-postorder index per block.
     index: Vec<usize>,
@@ -547,7 +567,7 @@ struct SopMasks {
 const MAX_ROUNDS: usize = 256;
 
 impl<'a> Lanes<'a> {
-    fn new(p: &'a Program) -> Result<Self, ShaderError> {
+    fn new(p: &'a Program, console: bool) -> Result<Self, ShaderError> {
         let blocks = &p.blocks;
         let order = crate::ir::reverse_postorder(blocks);
         let mut index = vec![usize::MAX; blocks.len()];
@@ -572,6 +592,7 @@ impl<'a> Lanes<'a> {
         }
         Ok(Lanes {
             p,
+            console,
             order,
             index,
             incoming,
@@ -845,6 +866,7 @@ impl<'a> Lanes<'a> {
             exits,
             guards,
             reach: cond.to_vec(),
+            execs: execs.to_vec(),
         })
     }
 
@@ -1028,7 +1050,7 @@ impl<'a> Lanes<'a> {
         {
             return Some((m, derived));
         }
-        if !self.unresolved.contains(&id) {
+        if !self.console && !self.unresolved.contains(&id) {
             for value in [true, false] {
                 let b = &mut self.b;
                 let holds = forward.iter().all(|&(e, m)| {
