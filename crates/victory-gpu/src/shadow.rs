@@ -1513,6 +1513,16 @@ mod tests {
     }
 
     #[test]
+    fn a_buffer_too_big_to_round_to_a_shadow_size_gets_no_copy() {
+        // The end saturates at the top, so rounding its length up to 64 KiB
+        // would overflow: no copy, before any host allocation.
+        register(usize::MAX - 1, 0x1000, u64::MAX);
+        let found = find(0x1000, 1);
+        unregister(usize::MAX - 1, 0x1000);
+        assert!(found.is_none());
+    }
+
+    #[test]
     fn concurrent_aligned_views_share_the_copy_refreshed_at_submission() {
         if crate::host::host().is_none() {
             return;
