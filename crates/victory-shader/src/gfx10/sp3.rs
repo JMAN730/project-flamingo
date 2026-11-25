@@ -964,4 +964,28 @@ mod tests {
         assert_eq!(data, Operand::Vector { reg: 8, dwords: 2 });
         assert_eq!(addr.len(), 2);
     }
+
+    /// MIMG 0x061 is `image_gather4h` and 0x0e8-0x0ef the `_cd_g16` samples
+    /// (RDNA2 ISA). Words from `llvm-mc -triple=amdgcn -mcpu=gfx1030`, which
+    /// gives the same address ranges (it also prints `dmask:0x1`).
+    #[test]
+    fn coarse_g16_samples_and_gather4h_have_their_names() {
+        let cases = [
+            (0xF1A0_0109, "image_sample_cd_g16 v4, v[2:5]"),
+            (0xF1A4_0109, "image_sample_cd_cl_g16 v4, v[2:6]"),
+            (0xF1A8_0109, "image_sample_c_cd_g16 v4, v[2:6]"),
+            (0xF1AC_0109, "image_sample_c_cd_cl_g16 v4, v[2:7]"),
+            (0xF1B0_0109, "image_sample_cd_o_g16 v4, v[2:6]"),
+            (0xF1B4_0109, "image_sample_cd_cl_o_g16 v4, v[2:7]"),
+            (0xF1B8_0109, "image_sample_c_cd_o_g16 v4, v[2:7]"),
+            (0xF1BC_0109, "image_sample_c_cd_cl_o_g16 v4, v[2:8]"),
+            (0xF184_0108, "image_gather4h v[4:7], v[2:3]"),
+        ];
+        for (w0, want) in cases {
+            assert_eq!(
+                one(&[w0, 0x0082_0402], true),
+                format!("{want}, s[8:15], s[16:19] dim:SQ_RSRC_IMG_2D")
+            );
+        }
+    }
 }
