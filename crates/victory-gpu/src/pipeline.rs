@@ -9,11 +9,11 @@
 //! containers are shared by content hash and translated once, on first
 //! use (decision 0003).
 //!
-//! shortcut: only vertex plus pixel pipelines from streams and compute
-//! pipelines get host pipelines; mesh, tessellation and geometry stages,
-//! and the plain graphics description, keep their containers only. The 32-byte
-//! packet after the header stays zero: titles only copy it inline, which
-//! our null command-list limits keep from running.
+//! Host pipelines cover vertex-plus-pixel (including a geometry stage that
+//! expands rectangle lists), mesh-plus-pixel, and compute. shortcut:
+//! tessellation stages and the plain graphics description keep their
+//! containers only. The 32-byte packet after the header stays zero: titles
+//! only copy it inline, which our null command-list limits keep from running.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::collections::HashMap;
