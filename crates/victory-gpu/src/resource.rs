@@ -814,6 +814,7 @@ impl Resource {
                 Some(std::sync::Arc::new(HostTexture {
                     texture,
                     state: state.into(),
+                    placed: Default::default(),
                 }))
             })
             .as_ref()
@@ -828,6 +829,7 @@ impl Resource {
 /// lists that name it).
 #[cfg(windows)]
 pub(crate) struct HostTexture {
+    pub(crate) placed: std::sync::OnceLock<Box<crate::texture::Placed>>,
     pub(crate) texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
     pub(crate) state: std::sync::atomic::AtomicU32,
 }
@@ -1301,7 +1303,24 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
     }
     map.insert((address, *desc), out as usize);
     placed_views().insert(out as usize);
-    resource(out).host().is_some().then_some(out)
+    let copy = resource(out).host()?;
+    const DEPTH: u32 = 2;
+    const UNORDERED: u32 = 4;
+    if d.flags & (DEPTH | UNORDERED) == UNORDERED
+        && d.sample_count == 1
+        && let Some(layout) = texture_layout(&d)
+            .and_then(|t| t.planes.into_iter().next())
+            .map(|plane| plane.layout)
+        && layout.addressable()
+        && layout.desc.block == 1
+        && element(pc_format(d.format)) == Some((u64::from(layout.desc.element_bytes), 1))
+    {
+        let _ = copy.placed.set(Box::new(crate::texture::Placed::new(
+            address as usize,
+            layout,
+        )));
+    }
+    Some(out)
 }
 
 /// The resources [`texture_at`] made (never released, as they are).
