@@ -286,6 +286,9 @@ extern "system" fn estimate_download(
     if let Err(hr) = validate_selectors(count, selectors.cast()) {
         return hr;
     }
+    if bytes.is_null() {
+        return xasync::E_INVALIDARG;
+    }
     if !confirm.is_null() {
         // SAFETY: checked non-null.
         unsafe { confirm.write(false) };
@@ -556,6 +559,53 @@ mod tests {
             method::<Uninstall>(&OBJECT, 0x98)(this, id, 1, none),
             xasync::E_INVALIDARG
         );
+    }
+
+    #[test]
+    fn estimate_with_null_bytes_fails_before_writing_confirm() {
+        // Hold the title across identifier() and both estimate calls so a
+        // parallel storage test cannot rewrite it mid-flight.
+        let _title = crate::runtime::title_test_lock();
+        let this: This = &OBJECT;
+        let ours = format!("{}\0", identifier());
+        type Estimate = extern "system" fn(
+            This,
+            *const c_char,
+            u32,
+            *const c_void,
+            *mut u64,
+            *mut bool,
+        ) -> HRESULT;
+        let estimate = method::<Estimate>(&OBJECT, 0x90);
+        let none = std::ptr::null();
+
+        let mut confirm = true;
+        assert_eq!(
+            estimate(
+                this,
+                ours.as_ptr().cast(),
+                0,
+                none,
+                std::ptr::null_mut(),
+                &mut confirm
+            ),
+            xasync::E_INVALIDARG
+        );
+        assert!(confirm, "confirm is untouched when bytes is null");
+
+        let (mut bytes, mut confirm) = (7, true);
+        assert_eq!(
+            estimate(
+                this,
+                ours.as_ptr().cast(),
+                0,
+                none,
+                &mut bytes,
+                &mut confirm
+            ),
+            S_OK
+        );
+        assert_eq!((bytes, confirm), (0, false));
     }
 
     #[test]

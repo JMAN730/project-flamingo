@@ -145,6 +145,18 @@ impl Shadow {
         address - self.start
     }
 
+    /// `len` bytes at a title address from the host copy, for the log: the
+    /// bytes the copy holds, as of its last refresh (None outside the buffer).
+    pub(crate) fn bytes(&self, address: u64, len: u64) -> Option<&[u8]> {
+        if address < self.start || len == 0 || len > self.left(address) {
+            return None;
+        }
+        let at = usize::try_from(address - self.start).ok()?;
+        let len = usize::try_from(len).ok()?;
+        // SAFETY: inside the mapping, which is as long as the buffer.
+        Some(unsafe { std::slice::from_raw_parts(self.data.add(at), len) })
+    }
+
     /// Brings `len` bytes at `address` up to date when `list` is submitted,
     /// and keeps the copy alive until the list is reset.
     pub(crate) fn refresh(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
@@ -440,6 +452,19 @@ impl Shadow {
     }
 }
 
+/// A refresh that copies none of its range is skipped: the writes it was
+/// asked about were already in the copy, the range is outside the buffer,
+/// or shaders were still writing all of it (that part is left to a later
+/// refresh). Counted for the frame-rate line as one skipped refresh of
+/// `len` bytes, so `0 skipped` there means no refresh was answered
+/// without a copy, not that nothing was checked. A range copied in part is
+/// not skipped; of what it did not copy, `unchanged` counts only the parts
+/// this refresh checked, not the sub-ranges shaders still write.
+#[cfg(any(feature = "diagnostics", test))]
+pub(crate) fn skipped(len: usize, copied: usize) -> Option<u64> {
+    (len > 0 && copied == 0).then_some(len as u64)
+}
+
 struct Entry {
     end: u64,
     shadow: Option<Arc<Shadow>>,
@@ -517,6 +542,31 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
     entry.shadow.clone()
 }
 
+/// The copy of the innermost title buffer holding `[address, address +
+/// len)`, if one has already been made: the same lookup as [`find`] without
+/// making a copy, for paths that must not allocate one.
+pub(crate) fn peek(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    let end = address.checked_add(len.max(1))?;
+    let map = buffers();
+    let shadow = map
+        .range(..=(address, usize::MAX))
+        .rev()
+        .take(64)
+        .find(|(_, e)| e.end >= end)
+        .and_then(|(_, e)| e.shadow.clone());
+    if shadow.is_some() {
+        return shadow;
+    }
+    drop(map);
+    let start = address & !(WINDOW - 1);
+    let len = end.next_multiple_of(WINDOW) - start;
+    LOOSE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&(start, len))
+        .cloned()
+}
+
 /// Titles also use memory outside any buffer object as GPU memory (Grand
 /// Theft Auto VI's interface vertices, from its own allocator). Such memory
 /// gets copies of the aligned windows it touches.
@@ -584,6 +634,19 @@ pub(crate) fn near(va: u64) -> String {
 mod tests {
     use super::*;
     use std::ops::Range;
+
+    /// A refresh that copied nothing of its range is what the frame-rate
+    /// line's `skipped` counts; one that copied any part of it is not, and
+    /// an empty range is neither.
+    #[test]
+    fn a_refresh_that_copies_nothing_is_counted_as_skipped() {
+        assert_eq!(skipped(0, 0), None);
+        assert_eq!(skipped(4 << 20, 0), Some(4 << 20));
+        assert_eq!(skipped(4 << 20, 1), None);
+        assert_eq!(skipped(4 << 20, 4 << 20), None);
+        // Nothing in the buffer: the range was outside it.
+        assert_eq!(skipped(4096, 0), Some(4096));
+    }
 
     #[test]
     fn partial_match_leaves_unchecked_bytes_visible() {
@@ -734,6 +797,35 @@ mod tests {
         assert_eq!(weak.strong_count(), 1);
         unregister(resource, start);
         assert_eq!(weak.strong_count(), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn bytes_reads_the_copy_inside_the_buffer_only() {
+        let _retire = crate::host::isolated_retire_scope();
+        if host().is_none() {
+            return;
+        }
+        let data = vec![0u8; 4096];
+        let start = data.as_ptr() as u64;
+        let resource = 0xdead_beef_0002_usize;
+        register(resource, start, data.len() as u64);
+        let shadow = find(start, 64).expect("shadow");
+        assert_eq!(shadow.bytes(start, 16).map(<[u8]>::len), Some(16));
+        assert_eq!(
+            shadow
+                .bytes(start + data.len() as u64 - 16, 16)
+                .map(<[u8]>::len),
+            Some(16),
+            "a range ending in the buffer's last bytes is inside it"
+        );
+        assert!(shadow.bytes(start - 4, 4).is_none(), "before the buffer");
+        assert!(
+            shadow.bytes(start + data.len() as u64 - 8, 16).is_none(),
+            "past the buffer"
+        );
+        assert!(shadow.bytes(start, 0).is_none(), "nothing to read");
+        unregister(resource, start);
     }
 
     #[cfg(windows)]

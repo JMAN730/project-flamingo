@@ -2,8 +2,9 @@
 //! 0007, step 3). Translated shaders index the heaps directly at the
 //! title's descriptor positions, so each host heap keeps the title heap's
 //! order: slot `i` is made from what the title wrote at slot `i`, when it
-//! writes it (view creation and descriptor copies) and again when a draw
-//! reads it through a table and finds the slot changed.
+//! writes it (view creation and descriptor copies), when a heap is synced for
+//! direct CPU copies inside heap memory, and again when a draw reads it
+//! through a table and finds the slot changed.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -59,13 +60,21 @@ struct TexTracker {
     /// Bounded ring of `(generation, resource)` additions/overwrites so
     /// `bindless_textures` can sync newly written descriptors incrementally.
     changes: VecDeque<(u64, usize)>,
-    slot_res: Vec<Option<(usize, bool)>>,
+    slot_res: Vec<Option<(usize, bool, u32)>>,
     live_srvs: HashMap<usize, u32>,
     live_uavs: HashMap<usize, u32>,
     res_slots: HashMap<(usize, bool), HashSet<u32>>,
 }
 
 impl TexTracker {
+    fn first_mip(&self, resource: usize) -> u32 {
+        self.res_slots[&(resource, false)]
+            .iter()
+            .filter_map(|&slot| self.slot_res[slot as usize].map(|(_, _, mip)| mip))
+            .min()
+            .unwrap_or(0)
+    }
+
     fn new(sampler: bool, count: u32) -> Self {
         Self {
             generation: 0,
@@ -127,6 +136,12 @@ impl TexTracker {
         }
     }
 }
+
+type LiveTextures = (
+    u64,
+    Vec<(crate::object::Held, u32)>,
+    Vec<crate::object::Held>,
+);
 
 pub(crate) struct HostHeap {
     pub(crate) heap: ID3D12DescriptorHeap,
@@ -458,23 +473,7 @@ impl HostHeap {
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
         let (next, taken) = &mut *guard;
         let n = n as usize;
-        // Search from `next` on, then from the start.
-        let starts = (*next as usize..spare).chain(0..*next as usize);
-        let mut run = 0;
-        let mut found = None;
-        let mut last = usize::MAX;
-        for at in starts {
-            // A run cannot wrap past the end.
-            if at != last.wrapping_add(1) {
-                run = 0;
-            }
-            last = at;
-            run = if taken[at] { 0 } else { run + 1 };
-            if run == n {
-                found = Some(at + 1 - n);
-                break;
-            }
-        }
+        let found = super::find_free_run(taken, *next as usize, n);
         let Some(first) = found else {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| {
@@ -510,7 +509,7 @@ impl HostHeap {
 
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
     /// host cannot.
-    pub(crate) fn make_at(&self, index: u32, view: &View) {
+    pub(crate) fn make_at(&self, index: u32, view: &View) -> bool {
         let kept = make(view, self.cpu(index));
         if kept.is_none() {
             if self.sampler {
@@ -519,7 +518,9 @@ impl HostHeap {
                 null_for(view, self.cpu(index));
             }
         }
+        let made = kept.is_some();
         self.keep(index, kept.unwrap_or(Kept::Empty));
+        made
     }
 
     /// Makes slot `index` (a dynamic one) a structured buffer alias with
@@ -787,7 +788,9 @@ impl HostHeap {
             };
             let made_ok = kept.is_some();
             let new_entry = match &kept {
-                Some(Kept::Texture { title, is_uav, .. }) => Some((*title, *is_uav)),
+                Some(Kept::Texture { title, is_uav, .. }) => {
+                    Some((*title, *is_uav, placed_first_mip(&view)))
+                }
                 _ => None,
             };
             if !made_ok && !self.sampler {
@@ -807,8 +810,52 @@ impl HostHeap {
         Some(view)
     }
 
+    /// Scans title descriptor slots `[first, end)` and mirrors any slot whose
+    /// on-heap `(tag, view_index, generation)` differs from what the host slot
+    /// was last made from, catching descriptors the title copied directly in
+    /// heap memory without calling a descriptor method.
+    pub(crate) fn sync_slots(
+        &self,
+        start: u64,
+        step: u64,
+        first: u32,
+        end: u32,
+        for_draw: bool,
+    ) -> usize {
+        let end = end.min(self.count);
+        if first >= end || step == 0 {
+            return 0;
+        }
+        let mut changed = Vec::new();
+        {
+            let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+            for index in first..end {
+                let handle = start + u64::from(index) * step;
+                // SAFETY: `[first, end)` is bounded by `self.count` (which does
+                // not exceed the title heap's descriptor count) and each
+                // descriptor slot is at least 16 bytes.
+                let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+                let expected = if tag == VIEW_TAG {
+                    u64::from(generation) << 32 | u64::from(i)
+                } else {
+                    0
+                };
+                if made[index as usize] != expected {
+                    changed.push(index);
+                }
+            }
+        }
+        let mut mirrored = 0;
+        for index in changed {
+            let handle = start + u64::from(index) * step;
+            self.mirror(index, handle, for_draw);
+            mirrored += 1;
+        }
+        mirrored
+    }
+
     /// Updates the leaf-only live texture tracker for slot `index`.
-    fn track_slot(&self, index: u32, new_entry: Option<(usize, bool)>) {
+    fn track_slot(&self, index: u32, new_entry: Option<(usize, bool, u32)>) {
         if self.sampler {
             return;
         }
@@ -821,14 +868,14 @@ impl HostHeap {
             return;
         }
         *slot = new_entry;
-        if let Some((res, is_uav)) = old_entry {
+        if let Some((res, is_uav, _)) = old_entry {
             tracker.remove_entry(index, res, is_uav);
         }
-        if let Some((res, is_uav)) = new_entry {
+        if let Some((res, is_uav, _)) = new_entry {
             tracker.add_entry(index, res, is_uav);
         }
         tracker.generation += 1;
-        if let Some((res, _)) = new_entry {
+        if let Some((res, _, _)) = new_entry {
             tracker.record_change(res);
         }
     }
@@ -845,7 +892,7 @@ impl HostHeap {
             if let Some(slots) = tracker.res_slots.remove(&(resource, is_uav)) {
                 for slot in slots {
                     if let Some(entry) = tracker.slot_res.get_mut(slot as usize)
-                        && *entry == Some((resource, is_uav))
+                        && entry.is_some_and(|(r, u, _)| (r, u) == (resource, is_uav))
                     {
                         *entry = None;
                     }
@@ -875,11 +922,7 @@ impl HostHeap {
     /// Snapshot of `(tex_gen, live_srvs, live_uavs)` in `O(active)` time,
     /// pinning each live title `Resource` with [`crate::object::Held`] while
     /// `tex_tracker` is locked so concurrent releases cannot free it mid-pass.
-    pub(crate) fn live_textures(
-        &self,
-        srvs: bool,
-        uavs: bool,
-    ) -> (u64, Vec<crate::object::Held>, Vec<crate::object::Held>) {
+    pub(crate) fn live_textures(&self, srvs: bool, uavs: bool) -> LiveTextures {
         let tracker = self.tex_tracker.lock().unwrap_or_else(|e| e.into_inner());
         let pin = |r: &usize| {
             // SAFETY: while `tex_tracker` is held, any tracked `Resource` has
@@ -888,7 +931,11 @@ impl HostHeap {
             unsafe { crate::object::Held::try_new(*r as crate::object::This) }
         };
         let srv_list = if srvs {
-            tracker.live_srvs.keys().filter_map(pin).collect()
+            tracker
+                .live_srvs
+                .keys()
+                .filter_map(|r| Some((pin(r)?, tracker.first_mip(*r))))
+                .collect()
         } else {
             Vec::new()
         };
@@ -911,7 +958,7 @@ impl HostHeap {
         extra_candidates: &[usize],
         srvs: bool,
         uavs: bool,
-    ) -> Option<(u64, Vec<crate::object::Held>, Vec<crate::object::Held>)> {
+    ) -> Option<LiveTextures> {
         let tracker = self.tex_tracker.lock().unwrap_or_else(|e| e.into_inner());
         if since_gen < tracker.oldest_gen {
             return None;
@@ -942,9 +989,9 @@ impl HostHeap {
                 {
                     uav_list.push(second);
                 }
-                srv_list.push(held);
+                srv_list.push((held, tracker.first_mip(r)));
             } else if is_srv {
-                srv_list.push(held);
+                srv_list.push((held, tracker.first_mip(r)));
             } else {
                 uav_list.push(held);
             }
@@ -1032,6 +1079,36 @@ fn uav_desc(words: &[u32; 10]) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
             .cast::<D3D12_UNORDERED_ACCESS_VIEW_DESC>()
             .read_unaligned()
     }
+}
+
+/// The stride of a matching structured buffer view. The shader declaration
+/// and its descriptor must agree on both the access class and element size.
+pub(crate) fn structured_stride(view: &View, uav: bool) -> Option<u32> {
+    let words = match (view, uav) {
+        (View::Shader(_, Some(words)), false) | (View::Unordered(_, _, Some(words)), true) => words,
+        (View::Placed(unordered, resource, words), _) if *unordered == uav && resource[0] == 1 => {
+            words[..10].try_into().ok()?
+        }
+        _ => return None,
+    };
+    let stride = if uav {
+        let desc = uav_desc(words);
+        if desc.ViewDimension != D3D12_UAV_DIMENSION_BUFFER || desc.Format != DXGI_FORMAT_UNKNOWN {
+            return None;
+        }
+        // SAFETY: The view dimension selects the buffer member.
+        let buffer = unsafe { desc.Anonymous.Buffer };
+        (buffer.Flags == D3D12_BUFFER_UAV_FLAG_NONE).then_some(buffer.StructureByteStride)?
+    } else {
+        let desc = srv_desc(words);
+        if desc.ViewDimension != D3D12_SRV_DIMENSION_BUFFER || desc.Format != DXGI_FORMAT_UNKNOWN {
+            return None;
+        }
+        // SAFETY: The view dimension selects the buffer member.
+        let buffer = unsafe { desc.Anonymous.Buffer };
+        (buffer.Flags == D3D12_BUFFER_SRV_FLAG_NONE).then_some(buffer.StructureByteStride)?
+    };
+    ((4..=2048).contains(&stride) && stride.is_multiple_of(4)).then_some(stride)
 }
 
 /// A buffer view of title memory at `address` on its host copy: the first
@@ -1158,6 +1235,49 @@ fn buffer_srv_parts(view: &View) -> Option<(u64, u64, D3D12_SHADER_RESOURCE_VIEW
         }
         _ => None,
     }
+}
+
+pub(crate) struct BufferRead {
+    pub(crate) shadow: Arc<crate::shadow::Shadow>,
+    pub(crate) address: u64,
+    pub(crate) bytes: u64,
+    pub(crate) stride: u32,
+}
+
+/// A bounded dword-readable window in the backing buffer. Raw views index
+/// bytes, even though the descriptor expresses its extent in dwords.
+pub(crate) fn selected_buffer(view: &View) -> Option<BufferRead> {
+    let (base, size, desc) = buffer_srv_parts(view)?;
+    if desc.ViewDimension != D3D12_SRV_DIMENSION_BUFFER {
+        return None;
+    }
+    // SAFETY: the dimension selects the Buffer union member.
+    let b = unsafe { desc.Anonymous.Buffer };
+    let element = element_size(&desc);
+    let stride = if b.Flags == D3D12_BUFFER_SRV_FLAG_RAW {
+        1
+    } else {
+        element.try_into().ok()?
+    };
+    let start = b.FirstElement.checked_mul(element)?;
+    let bytes = u64::from(b.NumElements).checked_mul(element)?;
+    if bytes < 4 || start.checked_add(bytes)? > size {
+        return None;
+    }
+    let shadow = crate::shadow::find(base, size)?;
+    let address = base.checked_add(start)?;
+    let offset = shadow.offset(address);
+    // Reserve the last 16-byte block as an out-of-bounds address even for
+    // four-dword reads. Include the prefix required by raw SRV alignment.
+    if !offset.is_multiple_of(4) || bytes + offset % 16 > u64::from(u32::MAX - 15) {
+        return None;
+    }
+    Some(BufferRead {
+        shadow,
+        address,
+        bytes,
+        stride,
+    })
 }
 
 /// Re-expresses the exact byte start and length of a raw buffer SRV as
@@ -1840,6 +1960,20 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 buffer_srv(address, len, srv_desc(words), at)
             }
         }
+    }
+}
+
+/// First mip sampled by a shader view the title placed over a single 2D texture.
+pub(crate) fn placed_first_mip(view: &View) -> u32 {
+    let View::Placed(false, _, words) = view else {
+        return 0;
+    };
+    let desc = srv_desc(words[..10].try_into().unwrap());
+    if desc.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2D {
+        // SAFETY: the dimension selects the Texture2D union member.
+        unsafe { desc.Anonymous.Texture2D.MostDetailedMip }
+    } else {
+        0
     }
 }
 
@@ -2774,7 +2908,7 @@ mod tests {
             let (g, s, u) = host_heap.live_textures(srvs, uavs);
             (
                 g,
-                s.iter().map(|h| h.get() as usize).collect::<Vec<_>>(),
+                s.iter().map(|(h, _)| h.get() as usize).collect::<Vec<_>>(),
                 u.iter().map(|h| h.get() as usize).collect::<Vec<_>>(),
             )
         };
@@ -2893,25 +3027,176 @@ mod tests {
     }
 
     #[test]
+    fn direct_heap_byte_copies_are_mirrored_and_tracked() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        const MEM_WRITE_WATCH: u32 = 0x0020_0000;
+
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let tex_a = make_texture(
+            D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            4,
+            4,
+            1,
+            DXGI_FORMAT_R8G8B8A8_UNORM,
+            1,
+            D3D12_RESOURCE_FLAG_NONE,
+        );
+        let tex_b = make_texture(
+            D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            4,
+            4,
+            1,
+            DXGI_FORMAT_R8G8B8A8_UNORM,
+            1,
+            D3D12_RESOURCE_FLAG_NONE,
+        );
+        let addr_a = tex_a.0 as usize;
+        let addr_b = tex_b.0 as usize;
+
+        let mut cpu_staging = [0u64; 2 * 4];
+        let src_a = cpu_staging.as_mut_ptr() as u64;
+        let src_b = src_a + 32;
+        crate::descriptor::create_srv(std::ptr::null(), tex_a.0, std::ptr::null(), src_a);
+        crate::descriptor::create_srv(std::ptr::null(), tex_b.0, std::ptr::null(), src_b);
+
+        // 1. Plain (non-write-watched) shader-visible heap: pre-init direct copy,
+        //    post-init direct copy, overwrite, and zero-clear.
+        let plain_heap = make_view_heap(16);
+        let plain = crate::descriptor::heap(plain_heap.0);
+        let plain_slot = |i: u32| plain.start + u64::from(i) * 32;
+
+        // Direct byte copy BEFORE `Heap::host()` exists.
+        // SAFETY: both pointers reference live 32-byte descriptor slots.
+        unsafe { std::ptr::copy_nonoverlapping(src_a as *const u8, plain_slot(2) as *mut u8, 32) };
+        let plain_host = plain.host().expect("plain host view heap");
+        assert!(plain_host.live_texture_addrs(true, false).1.is_empty());
+        assert_eq!(plain.sync_direct_copies(true), 1);
+        assert_eq!(plain_host.live_texture_addrs(true, false).1, vec![addr_a]);
+        assert_eq!(plain.sync_direct_copies(true), 0);
+
+        // Overwrite slot 2 directly with `tex_b`, then clear it to zeroes.
+        // SAFETY: both pointers reference live 32-byte descriptor slots.
+        unsafe { std::ptr::copy_nonoverlapping(src_b as *const u8, plain_slot(2) as *mut u8, 32) };
+        assert_eq!(plain.sync_direct_copies(true), 1);
+        assert_eq!(plain_host.live_texture_addrs(true, false).1, vec![addr_b]);
+
+        // SAFETY: slot 2 lies inside the live 16-slot view heap.
+        unsafe { std::ptr::write_bytes(plain_slot(2) as *mut u8, 0, 32) };
+        assert_eq!(plain.sync_direct_copies(true), 1);
+        assert!(plain_host.live_texture_addrs(true, false).1.is_empty());
+
+        // 2. Write-watched placed shader-visible heap spanning two 64 KiB pages
+        //    (4096 slots * 32 bytes = 128 KiB).
+        struct WatchedMemory(*mut u8);
+        impl Drop for WatchedMemory {
+            fn drop(&mut self) {
+                if !self.0.is_null() {
+                    // SAFETY: allocated by `VirtualAlloc` below.
+                    unsafe { VirtualFree(self.0.cast(), 0, MEM_RELEASE) };
+                }
+            }
+        }
+        const SLOTS: u32 = 4096;
+        const BYTES: usize = SLOTS as usize * 32;
+        // SAFETY: requests a fresh zeroed 128 KiB write-watched region.
+        let mem = WatchedMemory(unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                BYTES,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+            .cast()
+        });
+        assert!(!mem.0.is_null(), "VirtualAlloc(MEM_WRITE_WATCH) failed");
+
+        #[repr(C)]
+        struct PlacedDesc {
+            desc: [u32; 4],
+            placement: [u64; 2],
+        }
+        let placed = PlacedDesc {
+            desc: [0, SLOTS, 1, 0],
+            placement: [mem.0 as u64, BYTES as u64],
+        };
+        let mut raw_heap: crate::object::This = std::ptr::null();
+        assert_eq!(
+            crate::descriptor::create_heap(
+                std::ptr::null(),
+                std::ptr::from_ref(&placed).cast(),
+                &crate::object::guid(
+                    0x8efb471d,
+                    0x616c,
+                    0x4f49,
+                    [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51],
+                ),
+                &mut raw_heap,
+            ),
+            crate::object::S_OK
+        );
+        let watched_heap = OwnedObject(raw_heap);
+        let watched = crate::descriptor::heap(watched_heap.0);
+        assert_eq!(watched.start, mem.0 as u64);
+        let watched_slot = |i: u32| watched.start + u64::from(i) * 32;
+
+        // Copy `tex_a` directly into slot 5 (page 0) before `host()` is created.
+        // SAFETY: slot 5 lies within the 4096-slot placed heap.
+        unsafe {
+            std::ptr::copy_nonoverlapping(src_a as *const u8, watched_slot(5) as *mut u8, 32)
+        };
+        let watched_host = watched.host().expect("watched host view heap");
+        assert_eq!(watched.sync_direct_copies(true), 1);
+        assert_eq!(watched_host.live_texture_addrs(true, false).1, vec![addr_a]);
+        // Clean sync scans zero dirty pages.
+        assert_eq!(watched.sync_direct_copies(true), 0);
+
+        // Direct copy into slot 2050 (second 64 KiB page) is picked up by `sync_all_heaps`.
+        // SAFETY: slot 2050 lies within the 4096-slot placed heap.
+        unsafe {
+            std::ptr::copy_nonoverlapping(src_b as *const u8, watched_slot(2050) as *mut u8, 32);
+        }
+        crate::descriptor::sync_all_heaps();
+        let mut live = watched_host.live_texture_addrs(true, false).1;
+        live.sort_unstable();
+        let mut expected = vec![addr_a, addr_b];
+        expected.sort_unstable();
+        assert_eq!(live, expected);
+        assert_eq!(watched.sync_direct_copies(true), 0);
+
+        assert_eq!(host.log_messages(), None);
+    }
+
+    #[test]
     fn bindless_tracker_forget_is_aba_safe_when_pointer_reused() {
         let Some(heap) = HostHeap::new(false, 16) else {
             return; // no host GPU
         };
         let reused_addr = 0x1234_5678usize;
         // Resource A mirrored at slot 5, then released without rewriting slot 5.
-        heap.track_slot(5, Some((reused_addr, false)));
+        heap.track_slot(5, Some((reused_addr, false, 8)));
+        heap.track_slot(6, Some((reused_addr, false, 3)));
+        let first = || heap.tex_tracker.lock().unwrap().first_mip(reused_addr);
+        assert_eq!(first(), 3);
+        heap.track_slot(6, Some((reused_addr, false, 5)));
+        assert_eq!(first(), 5);
+        heap.track_slot(6, None);
+        assert_eq!(first(), 8);
         assert_eq!(heap.live_texture_addrs(true, false).1, vec![reused_addr]);
         heap.forget_resource(reused_addr);
         assert!(heap.live_texture_addrs(true, false).1.is_empty());
         // New resource B allocated at the same pointer and mirrored into slot 7.
-        heap.track_slot(7, Some((reused_addr, false)));
+        heap.track_slot(7, Some((reused_addr, false, 0)));
         // Later, stale slot 5 is overwritten with null/another view: slot 7 stays live!
         heap.track_slot(5, None);
         assert_eq!(heap.live_texture_addrs(true, false).1, vec![reused_addr]);
         // And UAV slots share the same ABA guarantee.
-        heap.track_slot(2, Some((reused_addr, true)));
+        heap.track_slot(2, Some((reused_addr, true, 0)));
         heap.forget_resource(reused_addr);
-        heap.track_slot(9, Some((reused_addr, true)));
+        heap.track_slot(9, Some((reused_addr, true, 0)));
         heap.track_slot(2, None);
         assert_eq!(heap.live_texture_addrs(false, true).2, vec![reused_addr]);
     }
@@ -2928,7 +3213,7 @@ mod tests {
         // Simulate a `View::Placed` texture tracked in `HostHeap::tex_tracker`
         // that never had an entry in `descriptor::VIEWS.by_resource`.
         let placed_addr = 0xfeed_face_0000usize;
-        host_heap.track_slot(3, Some((placed_addr, false)));
+        host_heap.track_slot(3, Some((placed_addr, false, 0)));
         assert_eq!(
             host_heap.live_texture_addrs(true, false).1,
             vec![placed_addr]
@@ -2960,6 +3245,41 @@ mod structured_alias_tests {
                 },
             },
         }
+    }
+
+    #[test]
+    fn structured_stride_requires_a_view_of_the_matching_access_class() {
+        let mut srv = [0; 10];
+        srv[1] = D3D12_SRV_DIMENSION_BUFFER.0 as u32;
+        srv[2] = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srv[6] = 2; // NumElements
+        srv[7] = 16; // StructureByteStride
+        assert_eq!(
+            structured_stride(&View::Shader(0, Some(srv)), false),
+            Some(16)
+        );
+        assert_eq!(structured_stride(&View::Shader(0, Some(srv)), true), None);
+
+        let mut uav = [0; 10];
+        uav[1] = D3D12_UAV_DIMENSION_BUFFER.0 as u32;
+        uav[4] = 2; // NumElements
+        uav[5] = 32; // StructureByteStride
+        assert_eq!(
+            structured_stride(&View::Unordered(0, 0, Some(uav)), true),
+            Some(32)
+        );
+        assert_eq!(
+            structured_stride(&View::Unordered(0, 0, Some(uav)), false),
+            None
+        );
+
+        uav[5] = 6;
+        assert_eq!(
+            structured_stride(&View::Unordered(0, 0, Some(uav)), true),
+            None
+        );
+        srv[8] = D3D12_BUFFER_SRV_FLAG_RAW.0 as u32;
+        assert_eq!(structured_stride(&View::Shader(0, Some(srv)), false), None);
     }
 
     fn placed_raw_srv_handle(

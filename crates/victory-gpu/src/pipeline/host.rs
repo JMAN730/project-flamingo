@@ -372,6 +372,18 @@ impl Shader {
     }
 }
 
+/// Gets the host PSO for the strides of the views bound to this draw or dispatch.
+pub(crate) fn bound_pipeline(
+    this: crate::object::This,
+    view_stride: impl Fn(victory_shader::emit::StructuredBinding) -> Option<u32>,
+) -> Option<Arc<HostPipeline>> {
+    if this.is_null() {
+        return None;
+    }
+    let _ = super::host_pipeline(this);
+    super::make::ready_with_strides(&super::pipeline(this).host, view_stride)
+}
+
 pub(crate) struct HostPipeline {
     /// A compute pipeline (else graphics).
     pub(crate) compute: bool,
@@ -383,6 +395,7 @@ pub(crate) struct HostPipeline {
     pub(crate) root: ID3D12RootSignature,
     /// Vertex, then pixel stage, or the compute stage.
     pub(crate) stages: Vec<Stage>,
+    pub(crate) structured_strides: Vec<(victory_shader::emit::StructuredBinding, u32)>,
     /// The vertex buffer slots it reads (bit per slot).
     pub(crate) slots: u32,
     pub(crate) inputs: Vec<Input>,
@@ -404,7 +417,11 @@ fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Option<HostPipeline>
 impl HostPipeline {
     /// A host pipeline for vertex and pixel shaders with the graphics
     /// state `g`, or for one compute shader.
-    pub(crate) fn new(shaders: &[Arc<Shader>], g: Option<&GraphicsState>) -> Option<HostPipeline> {
+    pub(crate) fn new(
+        shaders: &[Arc<Shader>],
+        g: Option<&GraphicsState>,
+        structured_strides: &[(victory_shader::emit::StructuredBinding, u32)],
+    ) -> Option<HostPipeline> {
         let find = |stage| shaders.iter().find(|s| s.stage == stage);
         let compute = match shaders {
             [cs] if cs.stage == "compute" => Some(cs),
@@ -638,6 +655,7 @@ impl HostPipeline {
                 pso,
                 root,
                 stages: bound,
+                structured_strides: structured_strides.to_vec(),
                 name: format!("{shaders:?}"),
                 rects: false,
                 slots: 0,
@@ -675,6 +693,7 @@ impl HostPipeline {
                 pso,
                 root,
                 stages: bound,
+                structured_strides: structured_strides.to_vec(),
                 name: format!("{shaders:?}"),
                 rects: false,
                 slots: 0,
@@ -814,6 +833,7 @@ impl HostPipeline {
             pso,
             root,
             stages: bound,
+            structured_strides: structured_strides.to_vec(),
             name: format!("{shaders:?}"),
             rects: rect_gs.is_some(),
             slots: g.slots(),

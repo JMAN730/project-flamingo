@@ -88,7 +88,8 @@ impl Task {
 
 struct Port {
     mode: Mode,
-    tasks: Mutex<VecDeque<Task>>,
+    /// Queued tasks, each with the id of the queue it was submitted through.
+    tasks: Mutex<VecDeque<(u64, Task)>>,
     ready: Condvar,
 }
 
@@ -116,21 +117,45 @@ impl Port {
         port
     }
 
-    fn submit(&self, task: Task) {
+    fn submit(&self, owner: &Queue, task: Task) {
         match self.mode {
             Mode::Immediate => task.run(false),
             Mode::ThreadPool => POOL.submit(task),
             Mode::Manual | Mode::Serialized => {
-                lock(&self.tasks).push_back(task);
+                let mut tasks = lock(&self.tasks);
+                // Under the lock, so a task racing with its queue's
+                // terminate is canceled here or drained there, never kept.
+                if owner.terminated.load(Ordering::Acquire) {
+                    drop(tasks);
+                    task.run(true);
+                    return;
+                }
+                tasks.push_back((owner.id, task));
+                drop(tasks);
                 self.ready.notify_one();
             }
         }
     }
 
+    /// Removes and returns the queued tasks `owner` submitted, in order;
+    /// other queues' tasks on a shared port stay queued.
+    fn take_owned(&self, owner: u64) -> Vec<Task> {
+        let mut tasks = lock(&self.tasks);
+        let (mine, others) = std::mem::take(&mut *tasks)
+            .into_iter()
+            .partition::<VecDeque<_>, _>(|(id, _)| *id == owner);
+        *tasks = others;
+        mine.into_iter().map(|(_, task)| task).collect()
+    }
+
     /// The next queued task, waiting up to `timeout_ms`, or until `ended`
-    /// (checked whenever the port is woken) says no task will come.
+    /// (checked whenever the port is woken) says no task will come. Once
+    /// `ended`, nothing is taken even if tasks are queued: termination
+    /// drained the queue's own, so those left are other queues' on a shared
+    /// port, and running them would keep a dispatcher loop of the ended
+    /// queue going.
     fn take(&self, timeout_ms: u32, ended: impl Fn() -> bool) -> Option<Task> {
-        let waiting = |t: &mut VecDeque<Task>| t.is_empty() && !ended();
+        let waiting = |t: &mut VecDeque<(u64, Task)>| t.is_empty() && !ended();
         let tasks = lock(&self.tasks);
         let mut tasks = if timeout_ms == INFINITE {
             self.ready
@@ -143,7 +168,10 @@ impl Port {
                 .unwrap_or_else(|e| e.into_inner())
                 .0
         };
-        tasks.pop_front()
+        if ended() {
+            return None;
+        }
+        tasks.pop_front().map(|(_, task)| task)
     }
 }
 
@@ -193,14 +221,19 @@ impl Pool {
 /// A queue handle is `Arc::into_raw` of this; duplicating and closing a
 /// handle add and drop a reference.
 pub struct Queue {
+    /// Tells queues sharing a port apart; handle duplicates share it.
+    id: u64,
     ports: [Arc<Port>; 2],
     monitors: Mutex<Vec<(u64, usize, usize)>>,
     terminated: AtomicBool,
 }
 
+static NEXT_QUEUE: AtomicU64 = AtomicU64::new(1);
+
 impl Queue {
     fn new(ports: [Arc<Port>; 2]) -> Arc<Queue> {
         Arc::new(Queue {
+            id: NEXT_QUEUE.fetch_add(1, Ordering::Relaxed),
             ports,
             monitors: Mutex::default(),
             terminated: AtomicBool::new(false),
@@ -227,7 +260,7 @@ impl Queue {
     }
 
     fn deliver(self: &Arc<Self>, port: u32, task: Task) {
-        self.ports[port as usize].submit(task);
+        self.ports[port as usize].submit(self, task);
         // Copied out: a monitor may unregister itself.
         let monitors = lock(&self.monitors).clone();
         for (_, context, callback) in monitors {
@@ -369,7 +402,8 @@ pub fn XTaskQueueSubmitDelayedCallback(
     }
 }
 
-/// Cancels what is still queued (callbacks see `canceled`), refuses new
+/// Cancels what is still queued through this queue (callbacks see
+/// `canceled`; other queues' work on a shared port stays queued), refuses new
 /// work, then calls `callback`.
 pub fn XTaskQueueTerminate(
     handle: *const Queue,
@@ -382,7 +416,7 @@ pub fn XTaskQueueTerminate(
     };
     queue.terminated.store(true, Ordering::Release);
     for port in &queue.ports {
-        let pending: Vec<Task> = lock(&port.tasks).drain(..).collect();
+        let pending = port.take_owned(queue.id);
         // Dispatches waiting on this queue end: nothing more will come.
         // (Those of other queues on the port see theirs is open and wait
         // on.) After the lock above, so none misses both flag and wake.
@@ -1661,6 +1695,43 @@ mod tests {
         );
         // And a dispatch that starts after the end returns at once.
         assert!(!XTaskQueueDispatch(a, WORK, INFINITE));
+        XTaskQueueCloseHandle(a);
+        XTaskQueueCloseHandle(b);
+    }
+
+    /// Terminating one queue cancels only what was submitted through it,
+    /// not other queues' work on a shared port.
+    #[test]
+    fn terminate_keeps_other_queues_tasks_on_a_shared_port() {
+        extern "system" fn note(context: *mut c_void, canceled: bool) {
+            // SAFETY: the test passes a pointer to its flag.
+            unsafe { *context.cast::<i32>() = if canceled { 2 } else { 1 } };
+        }
+        let none = std::ptr::null_mut();
+        let (mut a, mut b) = (std::ptr::null(), std::ptr::null());
+        assert_eq!(XTaskQueueCreate(0, 0, &mut a), S_OK);
+        let (mut work, mut completion) = (std::ptr::null(), std::ptr::null());
+        assert_eq!(XTaskQueueGetPort(a, WORK, &mut work), S_OK);
+        assert_eq!(XTaskQueueGetPort(a, COMPLETION, &mut completion), S_OK);
+        assert_eq!(XTaskQueueCreateComposite(work, completion, &mut b), S_OK);
+        let (mut from_a, mut from_b) = (0i32, 0i32);
+        for (q, state) in [(a, &mut from_a), (b, &mut from_b)] {
+            let flag = (state as *mut i32).cast();
+            assert_eq!(
+                XTaskQueueSubmitDelayedCallback(q, WORK, 0, flag, Some(note)),
+                S_OK
+            );
+        }
+        assert_eq!(XTaskQueueTerminate(b, false, none, None), S_OK);
+        assert_eq!(from_b, 2, "its own task is canceled");
+        assert_eq!(from_a, 0, "the other queue's task is untouched");
+        // A dispatch through the ended queue takes nothing, though the
+        // shared port still holds the other queue's task.
+        assert!(!XTaskQueueDispatch(b, WORK, 0));
+        assert!(!XTaskQueueDispatch(b, WORK, INFINITE));
+        assert_eq!(from_a, 0, "not run through the terminated queue");
+        assert!(XTaskQueueDispatch(a, WORK, 0));
+        assert_eq!(from_a, 1, "and still runs normally");
         XTaskQueueCloseHandle(a);
         XTaskQueueCloseHandle(b);
     }

@@ -1,7 +1,7 @@
 //! Synthetic normalized MTBUF loads. gfx1036 measurements in #1060 found
 //! correctly rounded results for all twenty formats, including packed fields.
 
-use super::{HostShader, emit};
+use super::{Emission, HostShader, StructuredBinding, ViewStride, emit_with_view_strides};
 use crate::native::{
     ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
 };
@@ -39,12 +39,20 @@ fn load_shader(format: u8) -> HostShader {
         0x8003_0100, // buffer_store_dwordx4 v[1:4], v0, s[12:15], 0 offen
         0xBF81_0000, // s_endpgm
     ];
-    let range = |kind, table_offset_dwords| UsedResource {
+    buffer_shader(&words, Some(0), &|_, _| None).unwrap()
+}
+
+fn buffer_shader(
+    words: &[u32],
+    input_stride: Option<u32>,
+    view_stride: ViewStride<'_>,
+) -> Result<HostShader, crate::ShaderError> {
+    let range = |kind, table_offset_dwords, stride| UsedResource {
         kind,
         root: RootType::Table,
         table_offset_dwords,
         lower_bound: 0,
-        stride: 0,
+        stride,
         dwords: 4,
         user_data: 0,
         slot: 0,
@@ -61,7 +69,11 @@ fn load_shader(format: u8) -> HostShader {
             user_data: 0,
             slot: 0,
         }],
-        used: vec![range(ResourceType::Srv, 0), range(ResourceType::Uav, 8)],
+        used: input_stride
+            .map(|stride| range(ResourceType::Srv, 0, stride))
+            .into_iter()
+            .chain([range(ResourceType::Uav, 8, 0)])
+            .collect(),
         io: StageIo::Cs(ComputeIo {
             rsrc2: 1 << 7 | 1 << 1, // group ID x and one user SGPR
             threads: [64, 1, 1],
@@ -74,7 +86,108 @@ fn load_shader(format: u8) -> HostShader {
     let io = io::raise(&p, &native).unwrap();
     let bytes = crate::dxbc::build(&[]);
     let container = Container::parse(&bytes).unwrap();
-    emit(&container, &native, &p, &st, &io, &res).unwrap()
+    emit_with_view_strides(
+        Emission {
+            c: &container,
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+        },
+        true,
+        Some(view_stride),
+    )
+}
+
+#[test]
+fn raw_buffer_byte_and_halfword_loads_extend_at_every_byte_offset() {
+    // One lane per byte offset. All four loads use the same address.
+    let words = [
+        0xbe81_0380, // upper half of table address
+        0xf408_0200,
+        0xfa00_0000, // SRV in s[8:11]
+        0xf408_0300,
+        0xfa00_0020, // UAV in s[12:15]
+        0xe020_1000,
+        0x8002_0100, // buffer_load_ubyte v1 at v0
+        0xe024_1000,
+        0x8002_0200, // buffer_load_sbyte v2
+        0xe028_1000,
+        0x8002_0300, // buffer_load_ushort v3
+        0xe02c_1000,
+        0x8002_0400, // buffer_load_sshort v4
+        0x3400_0084, // output byte offset = lane * 16
+        0xe078_1000,
+        0x8003_0100, // store four result dwords
+        0xbf81_0000,
+    ];
+    let shader = buffer_shader(&words, Some(0), &|_, _| None).unwrap();
+    assert!(
+        Container::parse(&shader.dxil)
+            .unwrap()
+            .part(FourCC::DXIL)
+            .is_some()
+    );
+
+    #[cfg(windows)]
+    {
+        use super::host::{Dispatch, Host, Root, Stride, View};
+        let _one = super::valu_tests::ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let bytes: Vec<u8> = (0u8..68)
+            .map(|n| n.wrapping_mul(91).wrapping_add(17))
+            .collect();
+        let data: Vec<u32> = bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .copied()
+            .map(u32::from_le_bytes)
+            .collect();
+        let expected: Vec<u32> = bytes
+            .windows(2)
+            .take(64)
+            .flat_map(|b| {
+                let half = u16::from_le_bytes([b[0], b[1]]);
+                [
+                    u32::from(b[0]),
+                    b[0] as i8 as i32 as u32,
+                    u32::from(half),
+                    half as i16 as i32 as u32,
+                ]
+            })
+            .collect();
+        let force_warp = std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
+        for &(name, warp) in super::valu_tests::backends(force_warp) {
+            let Ok(host) = Host::new(warp) else { continue };
+            let (root, pso) = host.compute_pipeline(&shader).unwrap();
+            let output = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(
+                            0,
+                            Root::Constants(vec![0; shader.user_data_dwords() as usize]),
+                        )],
+                        views: &[
+                            View::Buffer {
+                                data: &data,
+                                stride: Stride::Raw,
+                            },
+                            View::RawUav(256),
+                        ],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap();
+            assert_eq!(output[0], expected, "{name}");
+            eprintln!("{name}: verified all 256 extension results");
+        }
+    }
 }
 
 #[test]
@@ -177,5 +290,156 @@ fn normalized_mtbuf_loads_round_every_field_value() {
                 }
             }
         }
+    }
+}
+
+// Read dword 1 of each record, then copy it to a raw output at 4 * thread ID.
+const STRUCTURED_READ: &[u32] = &[
+    0xBE81_0380, // s_mov_b32 s1, 0
+    0xF408_0200,
+    0xFA00_0000, // s_load_dwordx4 s[8:11], s[0:1], 0
+    0xF408_0300,
+    0xFA00_0020, // s_load_dwordx4 s[12:15], s[0:1], 32
+    0xE030_2004,
+    0x8002_0100, // buffer_load_dword v1, v0, s[8:11], 0 idxen offset:4
+    0x3400_0082, // v_lshlrev_b32 v0, 2, v0
+    0xE070_1000,
+    0x8003_0100, // buffer_store_dword v1, v0, s[12:15], 0 offen
+    0xBF81_0000, // s_endpgm
+];
+
+#[test]
+fn indexed_load_uses_the_view_stride_when_metadata_is_missing_or_invalid() {
+    for metadata in [None, Some(0), Some(6), Some(2052)] {
+        assert!(matches!(
+            buffer_shader(STRUCTURED_READ, metadata, &|_, _| None),
+            Err(crate::ShaderError::Unsupported {
+                what: super::UNKNOWN_STRUCTURED_STRIDE,
+                ..
+            })
+        ));
+        for stride in [16, 32] {
+            let called = std::cell::Cell::new(false);
+            buffer_shader(STRUCTURED_READ, metadata, &|binding, required| {
+                if !required {
+                    return None;
+                }
+                called.set(true);
+                assert_eq!(
+                    binding,
+                    StructuredBinding {
+                        slot: 0,
+                        offset_dwords: 0,
+                        uav: false
+                    }
+                );
+                Some(stride)
+            })
+            .unwrap();
+            assert!(called.get());
+        }
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn undeclared_structured_stride_reads_two_view_strides() {
+    use super::host::{Dispatch, Host, Root, Stride, View};
+
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let force_warp = std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
+    let hosts: Vec<_> = super::valu_tests::backends(force_warp)
+        .iter()
+        .filter_map(|&(name, warp)| match Host::new(warp) {
+            Ok(host) => Some((name, host)),
+            Err(error) => {
+                eprintln!("{name}: {error}");
+                None
+            }
+        })
+        .collect();
+    for stride in [16, 32] {
+        let mut shader = buffer_shader(STRUCTURED_READ, Some(0), &|_, required| {
+            required.then_some(stride)
+        })
+        .unwrap();
+        let path = super::validator::Validator::default_path();
+        if path.is_some() {
+            super::validator::Validator::load(path.as_deref())
+                .unwrap()
+                .validate(&mut shader.dxil)
+                .unwrap();
+        }
+        let expected: Vec<u32> = (0..64).map(|i| 0x1234_0000 + i * 61 + stride).collect();
+        let mut data = vec![0xdead_beef; 64 * stride as usize / 4];
+        for (record, value) in data.chunks_exact_mut(stride as usize / 4).zip(&expected) {
+            record[1] = *value;
+        }
+        for (name, host) in &hosts {
+            let (root, pso) = host.compute_pipeline(&shader).unwrap();
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(
+                            0,
+                            Root::Constants(vec![0; shader.user_data_dwords() as usize]),
+                        )],
+                        views: &[
+                            View::Buffer {
+                                data: &data,
+                                stride: Stride::Structured(stride),
+                            },
+                            View::RawUav(64),
+                        ],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap();
+            assert_eq!(out[0], expected, "{name}, stride {stride}");
+            eprintln!("{name}: exact readback at stride {stride}");
+        }
+    }
+}
+
+#[test]
+fn indexed_store_and_atomic_use_the_structured_uav_view_stride() {
+    for opcode in [0x1C_u32, 0x32_u32] {
+        let words = [
+            0xBE81_0380, // s_mov_b32 s1, 0
+            0xF408_0300,
+            0xFA00_0020, // s_load_dwordx4 s[12:15], s[0:1], 32
+            0xE000_2004 | (opcode << 18),
+            0x8003_0000, // store / atomic_add v0, v0, s[12:15], 0 idxen offset:4
+            0xBF81_0000, // s_endpgm
+        ];
+        assert!(buffer_shader(&words, None, &|_, _| None).is_err());
+        let shader = buffer_shader(&words, None, &|binding, required| {
+            if !required {
+                return None;
+            }
+            assert_eq!(
+                binding,
+                StructuredBinding {
+                    slot: 0,
+                    offset_dwords: 8,
+                    uav: true
+                }
+            );
+            Some(16)
+        })
+        .unwrap();
+        #[cfg(windows)]
+        if let Some(path) = super::validator::Validator::default_path() {
+            super::validator::Validator::load(Some(&path))
+                .unwrap()
+                .validate(&mut shader.dxil.clone())
+                .unwrap();
+        }
+        assert!(!shader.dxil.is_empty());
     }
 }

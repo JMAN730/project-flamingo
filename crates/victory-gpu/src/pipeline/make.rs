@@ -16,20 +16,27 @@
 //! guess; a pass the title runs only once and whose pipeline takes longer
 //! is lost.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use super::Shader;
+use super::{Shader, Translated};
+use victory_shader::emit::{StructuredBinding, translate_with_view_strides};
+use victory_shader::{ResourceType, RootType, UsedResource};
+
+type Strides = Vec<(StructuredBinding, u32)>;
 use super::host::{GraphicsState, HostPipeline};
 
 /// What a host pipeline is made from, and the host pipeline once made.
 pub(crate) struct Pending {
     shaders: Vec<Arc<Shader>>,
-    pub(crate) graphics: Option<Box<GraphicsState>>,
+    pub(crate) graphics: Option<Arc<GraphicsState>>,
     queue_state: AtomicU8,
-    made: OnceLock<Option<HostPipeline>>,
+    made: OnceLock<Option<Arc<HostPipeline>>>,
+    bindings: OnceLock<Vec<StructuredBinding>>,
+    strides: Strides,
+    variants: Mutex<VecDeque<Arc<Pending>>>,
     /// What identifies it across runs (shader containers and state), and
     /// whether a draw has used it yet.
     key: String,
@@ -58,9 +65,12 @@ impl Pending {
         );
         Pending {
             shaders,
-            graphics,
+            graphics: graphics.map(Arc::from),
             queue_state: AtomicU8::new(NOT_QUEUED),
             made: OnceLock::new(),
+            bindings: OnceLock::new(),
+            strides: Vec::new(),
+            variants: Mutex::new(VecDeque::new()),
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
         }
@@ -74,11 +84,116 @@ impl Pending {
                 let tid = unsafe { windows::Win32::System::Threading::GetCurrentThreadId() };
                 tracing::info!(tid = format_args!("{tid:04x}"), shaders = ?self.shaders, "starting host pipeline");
             }
-            HostPipeline::new(&self.shaders, self.graphics.as_deref())
+            if self.strides.is_empty() {
+                let made = HostPipeline::new(&self.shaders, self.graphics.as_deref(), &[]);
+                if made.is_none()
+                    && let Some(bindings) = self.find_stride_bindings()
+                {
+                    let _ = self.bindings.set(bindings);
+                }
+                made.map(Arc::new)
+            } else {
+                let shaders = self.specialize_shaders()?;
+                HostPipeline::new(&shaders, self.graphics.as_deref(), &self.strides).map(Arc::new)
+            }
         });
         let (lock, done) = &DONE;
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         done.notify_all();
+    }
+
+    fn find_stride_bindings(&self) -> Option<Vec<StructuredBinding>> {
+        let host = crate::host::host()?;
+        let bindings = std::cell::RefCell::new(BTreeSet::new());
+        for shader in &self.shaders {
+            if shader.translated().is_none() {
+                // Probe lowering with a valid annotation. Only the binding
+                // locations survive the probe; its DXIL never reaches D3D12.
+                translate_with_view_strides(
+                    &shader.container,
+                    host.supports_wave32(),
+                    &|binding, required| {
+                        required.then(|| {
+                            bindings.borrow_mut().insert(binding);
+                            4
+                        })
+                    },
+                )
+                .ok()?;
+            }
+        }
+        Some(bindings.into_inner().into_iter().collect())
+    }
+
+    fn specialize_shaders(&self) -> Option<Vec<Arc<Shader>>> {
+        let host = crate::host::host()?;
+        self.shaders
+            .iter()
+            .map(|shader| {
+                if shader.translated.get().is_some_and(Option::is_some) {
+                    return Some(shader.clone());
+                }
+                let accessed = std::cell::RefCell::new(BTreeSet::new());
+                let (host, mut used) = translate_with_view_strides(
+                    &shader.container,
+                    host.supports_wave32(),
+                    &|binding, _| {
+                        let i = self
+                            .strides
+                            .binary_search_by_key(&binding, |&(key, _)| key)
+                            .ok()?;
+                        let stride = self.strides[i].1;
+                        accessed.borrow_mut().insert((binding, stride));
+                        Some(stride)
+                    },
+                )
+                .map_err(|error| {
+                    tracing::warn!(?shader, %error, "shader with bound structured views refused");
+                })
+                .ok()?;
+                // Include exact slots absent from the console metadata so draw
+                // binding snapshots and transitions the views that lowering reads.
+                for (binding, stride) in accessed.into_inner() {
+                    let kind = if binding.uav {
+                        ResourceType::Uav
+                    } else {
+                        ResourceType::Srv
+                    };
+                    if let Some(entry) = used.iter_mut().find(|u| {
+                        u.root == RootType::Table
+                            && u.slot == binding.slot
+                            && u.table_offset_dwords == binding.offset_dwords
+                            && u.kind == kind
+                    }) {
+                        entry.stride = stride;
+                    } else {
+                        let user_data = host
+                            .user_data
+                            .iter()
+                            .find(|u| u.root == RootType::Table && u.slot == binding.slot)?
+                            .index;
+                        used.push(UsedResource {
+                            kind,
+                            root: RootType::Table,
+                            table_offset_dwords: binding.offset_dwords,
+                            lower_bound: 0,
+                            stride,
+                            dwords: 4,
+                            user_data: user_data.try_into().ok()?,
+                            slot: binding.slot,
+                        });
+                    }
+                }
+                Some(Arc::new(Shader {
+                    stage: shader.stage,
+                    hash: shader.hash.clone(),
+                    container: Vec::new(),
+                    translated: OnceLock::from(Some(Translated { host, used })),
+                    #[cfg(feature = "diagnostics")]
+                    wave64: OnceLock::new(),
+                }))
+            })
+            .collect()
     }
 }
 
@@ -130,7 +245,61 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     if made.is_some() && !p.used.swap(true, Ordering::Relaxed) {
         super::library::note_used(&p.key);
     }
-    made
+    made.map(Arc::as_ref)
+}
+
+/// Uses the existing worker queue and wait budget for stride variants. Old
+/// variants can be evicted while commands keep their PSO and root signature.
+pub(super) fn ready_with_strides(
+    p: &Arc<Pending>,
+    view_stride: impl Fn(StructuredBinding) -> Option<u32>,
+) -> Option<Arc<HostPipeline>> {
+    if let Some(made) = p.made.get()?.as_ref() {
+        return Some(made.clone());
+    }
+    let bindings = p.bindings.get().filter(|bindings| !bindings.is_empty())?;
+    let Some(strides) = bindings
+        .iter()
+        .map(|&binding| Some((binding, view_stride(binding)?)))
+        .collect::<Option<Strides>>()
+    else {
+        static WARN: std::sync::Once = std::sync::Once::new();
+        WARN.call_once(|| {
+            tracing::warn!("a draw or dispatch requires a matching structured buffer view")
+        });
+        return None;
+    };
+    let variant = {
+        let mut variants = p.variants.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(i) = variants
+            .iter()
+            .position(|variant| variant.strides == strides)
+        {
+            let variant = variants.remove(i).expect("a variant at this index");
+            variants.push_back(variant.clone());
+            variant
+        } else {
+            const MAX_VARIANTS: usize = 16;
+            let variant = Arc::new(Pending {
+                shaders: p.shaders.clone(),
+                graphics: p.graphics.clone(),
+                queue_state: AtomicU8::new(NOT_QUEUED),
+                made: OnceLock::new(),
+                bindings: OnceLock::new(),
+                strides,
+                variants: Mutex::new(VecDeque::new()),
+                key: p.key.clone(),
+                used: AtomicBool::new(false),
+            });
+            if variants.len() >= MAX_VARIANTS {
+                variants.pop_front();
+            }
+            variants.push_back(variant.clone());
+            variant
+        }
+    };
+    ready(&variant)?;
+    variant.made.get()?.clone()
 }
 
 /// At the title's creation of a pipeline: starts it at once if an earlier

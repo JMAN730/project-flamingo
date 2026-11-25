@@ -9,11 +9,11 @@
 //! containers are shared by content hash and translated once, on first
 //! use (decision 0003).
 //!
-//! shortcut: only vertex plus pixel pipelines from streams and compute
-//! pipelines get host pipelines; mesh, tessellation and geometry stages,
-//! and the plain graphics description, keep their containers only. The 32-byte
-//! packet after the header stays zero: titles only copy it inline, which
-//! our null command-list limits keep from running.
+//! Host pipelines cover vertex-plus-pixel (including a geometry stage that
+//! expands rectangle lists), mesh-plus-pixel, and compute. shortcut:
+//! tessellation stages and the plain graphics description keep their
+//! containers only. The 32-byte packet after the header stays zero: titles
+//! only copy it inline, which our null command-list limits keep from running.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::collections::HashMap;
@@ -137,6 +137,32 @@ impl Shader {
             translated,
             #[cfg(feature = "diagnostics")]
             wave64: OnceLock::new(),
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_compute(native: victory_shader::NativeProgram) -> Arc<Self> {
+        use victory_shader::{Container, emit, io, ir, resource, structure};
+        let c = Container {
+            digest: [0; 16],
+            version: (1, 0),
+            parts: Vec::new(),
+        };
+        let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let host = emit::emit(&c, &native, &p, &st, &io, &res).unwrap();
+        Arc::new(Self {
+            stage: "compute",
+            hash: blake3::hash(&host.dxil).to_hex()[..16].to_string(),
+            container: Vec::new(),
+            translated: OnceLock::from(Some(Translated {
+                host,
+                used: native.used,
+            })),
+            #[cfg(feature = "diagnostics")]
+            wave64: OnceLock::from(native.wave64),
         })
     }
 

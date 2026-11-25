@@ -185,6 +185,9 @@ mod tests {
         type Space = extern "system" fn(This, *mut SpaceInfo) -> HRESULT;
         type Prompt = extern "system" fn(This, u64, *mut AsyncBlock) -> HRESULT;
         type Result = extern "system" fn(This, *mut AsyncBlock) -> HRESULT;
+        // Hold for the whole test so package tests that capture identifier()
+        // cannot interleave with our set_title.
+        let _title = runtime::title_test_lock();
         let this: This = &OBJECT;
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("save.dat"), [0u8; 100]).unwrap();

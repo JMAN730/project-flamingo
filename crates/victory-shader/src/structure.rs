@@ -1225,7 +1225,15 @@ impl<'a> Lanes<'a> {
                         Some(&mask) => (mask, true),
                         None => self.mask(k),
                     };
-                    if derived {
+                    // A mask the same in every lane (SCC turned into all lanes
+                    // or none, or a constant) picks one source for all of them:
+                    // no lane index is needed to read it.
+                    let uniform = self
+                        .b
+                        .support(mask)
+                        .iter()
+                        .all(|a| matches!(a, Atom::Uniform(_)));
+                    if derived || uniform {
                         self.select_masks.insert(dst, mask);
                     }
                 }
@@ -1503,6 +1511,76 @@ mod tests {
             let mask = *s.masks.get(&original).expect("comparison mask");
             assert_eq!(s.select_masks.get(&select) == Some(&mask), restored);
         }
+    }
+
+    /// The `v_cndmask_b32 v1, v2, v3, s2` or `s[2:3]` after `prefix`, and
+    /// the select's destination value and mask.
+    fn select_after(prefix: &[u32], wave64: bool) -> (Structured, Option<Bool>) {
+        let mut words = prefix.to_vec();
+        words.extend([
+            0xD501_0001,
+            258 | (259 << 9) | (2 << 18), // v_cndmask_b32 v1, v2, v3, s2
+            S_ENDPGM,
+        ]);
+        let p = build(&words, wave64);
+        let s = structure(&p).unwrap();
+        let select = p
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .find(|i| i.name() == "v_cndmask_b32")
+            .and_then(|i| i.write(Reg::V(1)))
+            .unwrap();
+        let mask = s.select_masks.get(&select).copied();
+        (s, mask)
+    }
+
+    #[test]
+    fn a_select_on_scc_turned_into_all_lanes_or_none_has_a_mask() {
+        for (words, wave64) in [
+            (
+                [
+                    0xBF06_0100, // s_cmp_eq_u32 s0, s1
+                    0x8502_80C1, // s_cselect_b32 s2, -1, 0
+                ],
+                false,
+            ),
+            (
+                [
+                    0xBF06_0100, // s_cmp_eq_u32 s0, s1
+                    0x8582_80C1, // s_cselect_b64 s[2:3], -1, 0
+                ],
+                true,
+            ),
+        ] {
+            let (s, mask) = select_after(&words, wave64);
+            let mask = mask.expect("tracked select mask");
+            assert!(matches!(s.bools.support(mask)[..], [Atom::Uniform(_)]));
+        }
+    }
+
+    #[test]
+    fn a_select_on_a_constant_all_or_none_mask_has_a_mask() {
+        for (words, wave64, all) in [
+            (&[0xBE82_03C1][..], false, true),  // s_mov_b32 s2, -1
+            (&[0xBE82_0380][..], false, false), // s_mov_b32 s2, 0
+            (&[0xBE82_04C1][..], true, true),   // s_mov_b64 s[2:3], -1
+            (&[0xBE82_0480][..], true, false),  // s_mov_b64 s[2:3], 0
+        ] {
+            let (_, mask) = select_after(words, wave64);
+            let expected = if all { Bool::TRUE } else { Bool::FALSE };
+            assert_eq!(mask, Some(expected), "{words:x?} wave64={wave64}");
+        }
+    }
+
+    #[test]
+    fn a_select_on_a_mask_that_differs_by_lane_stays_untracked() {
+        // s_lshl_b32 s2, 1, s0
+        let (_, mask) = select_after(&[0x8402_0081], false);
+        assert_eq!(mask, None);
+        // A wave64 pair whose halves come from different scalar results.
+        let (_, mask) = select_after(&[0xBF06_0100, 0x8502_80C1, 0xBE83_0380], true);
+        assert_eq!(mask, None);
     }
 
     #[test]

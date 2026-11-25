@@ -12,13 +12,14 @@
 //! descriptor heaps, [`root`] root signatures, [`query`] query heaps,
 //! [`signature`] command signatures, [`pipeline`] pipeline states,
 //! [`frame`] frame pacing, [`object`] what all console graphics objects
-//! share, [`console`] which console model the title sees. Planned:
-//! `present` (swap chain).
+//! share, [`console`] which console model the title sees. Presentation
+//! (the title's present plane → host swap chain) lives in [`queue`].
 
 // Off Windows there is no host GPU: only the portable parts are built (for
 // their tests), and the paths that feed the host go unused.
 #![cfg_attr(not(windows), allow(dead_code, unused_variables, unused_mut))]
 
+mod adapter;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 pub mod console;
@@ -49,6 +50,8 @@ pub mod object;
 pub mod pipeline;
 #[cfg(windows)]
 mod primitive;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod profile;
 pub mod query;
 pub mod queue;
 #[cfg(windows)]

@@ -75,6 +75,10 @@ pub(crate) struct Shader {
     /// Test builds: typed loads assembled from a dword-aligned pair.
     #[cfg(test)]
     pub unaligned_typed_loads: u32,
+    /// Test builds: indices into the address list of image instructions that
+    /// were read.
+    #[cfg(test)]
+    pub image_address_reads: Vec<usize>,
     pub t: Types,
     pub pixel: bool,
     pub inputs: Vec<SigElement>,
@@ -137,6 +141,8 @@ impl Shader {
             #[cfg(test)]
             #[cfg(test)]
             unaligned_typed_loads: 0,
+            #[cfg(test)]
+            image_address_reads: Vec::new(),
             t: Types {
                 void,
                 i1,
