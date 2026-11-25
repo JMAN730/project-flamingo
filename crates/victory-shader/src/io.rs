@@ -7,9 +7,9 @@
 //! barycentrics; `v_interp_mov` reads one vertex's value. After the 32-bit
 //! export patch ([`NativeProgram::patched_code`]) exports carry plain
 //! 32-bit values: `mrt<n>` is render target n, `mrtz` depth, stencil and
-//! sample mask, `null` nothing. A lane whose EXEC bit is clear at the
-//! export that ends the program (`done`) is discarded: that export's guard
-//! after structurisation.
+//! sample mask, `null` nothing. Pixel survival follows the EXEC mask of the
+//! last export with `vm` (Valid Mask) set; colour writes are masked by EXEC
+//! per MRT. `done` only marks the program's final export.
 //!
 //! Vertex shaders that run as the hardware VS get the vertex id in v0, the
 //! primitive id in v2 and the instance id in v3; the fetch shader loads
@@ -183,8 +183,11 @@ pub struct Export {
     pub values: [Option<Value>; 4],
     /// Two f16 values per dword.
     pub compressed: bool,
-    /// The program's last export (for pixels: kills the lanes not in EXEC).
+    /// The program's last export.
     pub done: bool,
+    /// Valid Mask: when set on a pixel export, EXEC becomes the survival mask
+    /// (last `vm` wins). Independent of [`Export::done`].
+    pub vm: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -417,7 +420,7 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                     src,
                     compr,
                     done,
-                    ..
+                    vm,
                 } => {
                     let target = match *target {
                         t @ 0..=7 => Target::Color(t),
@@ -450,6 +453,7 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                         values,
                         compressed: *compr,
                         done: *done,
+                        vm: *vm,
                     });
                 }
                 _ => {}
@@ -687,8 +691,8 @@ mod tests {
             panic!("{:?}", io.exports)
         };
         assert_eq!(
-            (e.target, e.done, e.compressed),
-            (Target::Color(0), true, false)
+            (e.target, e.done, e.vm, e.compressed),
+            (Target::Color(0), true, true, false)
         );
         assert_eq!(e.values[0], p.blocks[0].insts[1].write(Reg::V(2)));
     }

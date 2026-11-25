@@ -153,7 +153,7 @@ impl Heap {
             false,
         );
         let [tag, index, generation] = record;
-        let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+        let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
         let (view, current) = views.list.get(index as usize)?;
         if tag != VIEW_TAG || *current != generation {
             return None;
@@ -547,13 +547,54 @@ struct Views {
     free: Vec<u32>,
 }
 
-static VIEWS: std::sync::Mutex<Views> = std::sync::Mutex::new(Views {
+static VIEWS: std::sync::RwLock<Views> = std::sync::RwLock::new(Views {
     list: Vec::new(),
     index: std::collections::BTreeMap::new(),
     by_resource: std::collections::BTreeMap::new(),
     free: Vec::new(),
 });
 pub(crate) const VIEW_TAG: u32 = u32::from_le_bytes(*b"vVIE");
+
+/// Top 2 bits of the third descriptor word (`w2`) identify how the 62-bit
+/// payload is interpreted: `0` is a table entry `(index, generation)` in
+/// [`VIEWS`]; [`KIND_CONSTANT`] encodes a `View::Constant(address, size)`
+/// inline so ephemeral per-frame CBVs never contend on or grow `VIEWS`.
+/// `KIND_CONSTANT = 2` also guarantees `w2` never equals `VIEW_TAG`.
+const KIND_SHIFT: u32 = 30;
+const GENERATION_MASK: u32 = (1 << KIND_SHIFT) - 1;
+const KIND_CONSTANT: u32 = 2;
+/// 47 bits cover the x64 user-mode virtual address space; the upper 15 bits
+/// carry the byte size (exact below 16 KiB, or 256-byte units up to 4 MiB).
+const CONSTANT_ADDRESS_BITS: u32 = 47;
+
+fn encode_constant(address: u64, size: u32) -> Option<[u32; 2]> {
+    if address >> CONSTANT_ADDRESS_BITS != 0 {
+        return None;
+    }
+    let code = if size < (1 << 14) {
+        u64::from(size)
+    } else if size.is_multiple_of(256) && (size >> 8) < (1 << 14) {
+        (1 << 14) | u64::from(size >> 8)
+    } else {
+        return None;
+    };
+    let payload = (code << CONSTANT_ADDRESS_BITS) | address;
+    Some([
+        payload as u32,
+        (KIND_CONSTANT << KIND_SHIFT) | (payload >> 32) as u32,
+    ])
+}
+
+fn decode_constant(w1: u32, w2: u32) -> View {
+    let payload = (u64::from(w2 & GENERATION_MASK) << 32) | u64::from(w1);
+    let code = (payload >> CONSTANT_ADDRESS_BITS) as u32;
+    let size = if code >> 14 == 0 {
+        code
+    } else {
+        (code & 0x3fff) << 8
+    };
+    View::Constant(payload & ((1 << CONSTANT_ADDRESS_BITS) - 1), size)
+}
 
 impl View {
     /// The resource objects the view names.
@@ -570,38 +611,58 @@ fn record(handle: u64, view: View) {
     if handle == 0 {
         return;
     }
-    let mut views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
-    let i = match views.index.get(&view) {
-        Some(&i) => i,
+    if let View::Constant(address, size) = view
+        && let Some([w1, w2]) = encode_constant(address, size)
+    {
+        // SAFETY: the handle is a descriptor slot, at least 16 bytes.
+        unsafe { (handle as *mut [u32; 3]).write_unaligned([VIEW_TAG, w1, w2]) };
+        #[cfg(windows)]
+        mirror(handle);
+        return;
+    }
+    let hit = {
+        let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
+        views
+            .index
+            .get(&view)
+            .map(|&i| (i, views.list[i as usize].1))
+    };
+    let (i, generation) = match hit {
+        Some(pair) => pair,
         None => {
-            let i = match views.free.pop() {
-                Some(i) => {
-                    views.list[i as usize].0 = view.clone();
+            let mut views = VIEWS.write().unwrap_or_else(|e| e.into_inner());
+            let i = match views.index.get(&view) {
+                Some(&i) => i,
+                None => {
+                    let i = match views.free.pop() {
+                        Some(i) => {
+                            views.list[i as usize].0 = view.clone();
+                            i
+                        }
+                        None => {
+                            views.list.push((view.clone(), 1));
+                            views.list.len() as u32 - 1
+                        }
+                    };
+                    for r in view.resources().into_iter().filter(|&r| r != 0) {
+                        views.by_resource.entry(r).or_default().push(i);
+                    }
+                    views.index.insert(view, i);
                     i
                 }
-                None => {
-                    views.list.push((view.clone(), 1));
-                    views.list.len() as u32 - 1
-                }
             };
-            for r in view.resources().into_iter().filter(|&r| r != 0) {
-                views.by_resource.entry(r).or_default().push(i);
-            }
-            views.index.insert(view, i);
-            i
+            (i, views.list[i as usize].1)
         }
     };
-    let generation = views.list[i as usize].1;
     // SAFETY: the handle is a descriptor slot, at least 16 bytes.
     unsafe { (handle as *mut [u32; 3]).write_unaligned([VIEW_TAG, i, generation]) };
-    drop(views);
     #[cfg(windows)]
     mirror(handle);
 }
 
 /// The title released `resource`: the views naming it go stale.
 pub(crate) fn forget(resource: usize) {
-    let mut views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut views = VIEWS.write().unwrap_or_else(|e| e.into_inner());
     if let Some(entries) = views.by_resource.remove(&resource) {
         for i in entries {
             let (view, generation) = views.list[i as usize].clone();
@@ -611,7 +672,7 @@ pub(crate) fn forget(resource: usize) {
                 continue;
             }
             views.index.remove(&view);
-            views.list[i as usize].1 = generation.wrapping_add(1).max(1);
+            views.list[i as usize].1 = (generation.wrapping_add(1) & GENERATION_MASK).max(1);
             // The view's other resource (a counter) keeps a stale entry, which
             // `forget` of that resource skips.
             views.free.push(i);
@@ -649,12 +710,51 @@ fn forget_host_resources(resource: usize) {
     }
 }
 
-/// The view of entry `i` if `generation` is still its own.
-#[cfg(windows)]
+/// The view of entry `i` if `generation` is still its own (or an inline CBV).
 fn view_at(i: u32, generation: u32) -> Option<View> {
-    let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
-    let (view, current) = views.list.get(i as usize)?;
-    (*current == generation).then(|| view.clone())
+    match generation >> KIND_SHIFT {
+        KIND_CONSTANT => Some(decode_constant(i, generation)),
+        0 => {
+            let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
+            let (view, current) = views.list.get(i as usize)?;
+            (*current == generation).then(|| view.clone())
+        }
+        _ => None,
+    }
+}
+
+/// For each raw descriptor header `[tag, w1, w2]`, sets `dead_out[idx]` to
+/// `true` iff `tag == VIEW_TAG` and the referenced view has gone stale.
+/// Checks an entire descriptor table with zero `View` clones and at most one
+/// shared `VIEWS` read lock (zero locks when every slot is untagged or inline).
+#[cfg(windows)]
+pub(crate) fn check_dead_slots(raws: &[[u32; 3]], dead_out: &mut Vec<bool>) {
+    dead_out.clear();
+    dead_out.resize(raws.len(), false);
+    let mut needs_table = false;
+    for (dead, &[tag, _, w2]) in dead_out.iter_mut().zip(raws) {
+        if tag != VIEW_TAG {
+            continue;
+        }
+        match w2 >> KIND_SHIFT {
+            0 => needs_table = true,
+            KIND_CONSTANT => {}
+            _ => *dead = true,
+        }
+    }
+    if !needs_table {
+        return;
+    }
+    let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
+    for (dead, &[tag, i, generation]) in dead_out.iter_mut().zip(raws) {
+        if tag == VIEW_TAG && (generation >> KIND_SHIFT) == 0 {
+            let alive = views
+                .list
+                .get(i as usize)
+                .is_some_and(|&(_, current)| current == generation);
+            *dead = !alive;
+        }
+    }
 }
 
 /// The view recorded at `handle`, if one is (and its resource is alive).
@@ -664,9 +764,10 @@ pub(crate) fn view(handle: u64) -> Option<View> {
     }
     // SAFETY: the handle is a descriptor slot the title passes back.
     let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
-    let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
-    let (view, current) = views.list.get(i as usize)?;
-    (tag == VIEW_TAG && *current == generation).then(|| view.clone())
+    if tag != VIEW_TAG {
+        return None;
+    }
+    view_at(i, generation)
 }
 
 /// A description of `N` words, if the title passes one.
@@ -769,8 +870,32 @@ pub(crate) extern "system" fn copy_simple(_: This, count: u32, dst: u64, src: u6
         // SAFETY: both ranges are descriptor slots the title owns.
         unsafe { std::ptr::copy(src as *const u8, dst as *mut u8, len as usize) };
         #[cfg(windows)]
-        for i in 0..u64::from(count) {
-            mirror(dst + i * step);
+        if count > 0 && step > 0 {
+            if let Some((heap, start_index)) = shader_slot(dst)
+                && u64::from(start_index) + u64::from(count) <= u64::from(heap.desc.count)
+            {
+                let host = if let Some(host) = heap.host.get() {
+                    host.as_ref()
+                } else {
+                    let mut pending = heap.pending.lock().unwrap_or_else(|e| e.into_inner());
+                    match heap.host.get() {
+                        None => {
+                            pending.extend(start_index..start_index + count);
+                            return;
+                        }
+                        Some(host) => host.as_ref(),
+                    }
+                };
+                if let Some(host) = host {
+                    for i in 0..count {
+                        host.mirror(start_index + i, dst + u64::from(i) * step, false);
+                    }
+                }
+            } else {
+                for i in 0..u64::from(count) {
+                    mirror(dst + i * step);
+                }
+            }
         }
     }
 }
@@ -1216,6 +1341,82 @@ mod tests {
         );
         assert!(get_desc(h, std::ptr::null_mut()).is_null());
         assert_eq!(slot::<extern "system" fn(This) -> u32>(h, 0x10)(h), 0);
+    }
+
+    #[test]
+    fn inline_cbvs_round_trip_without_growing_view_table() {
+        let null = std::ptr::null();
+        let before = VIEWS.read().unwrap_or_else(|e| e.into_inner()).list.len();
+        let mut slots = [0u64; 16];
+        let base = slots.as_mut_ptr() as u64;
+        let at = |i: usize| base + 32 * i as u64;
+
+        // Exact small size (< 16 KiB), 256-byte aligned larger size (up to 4 MiB - 256),
+        // and high 47-bit user-space address all encode inline without touching `VIEWS`.
+        let inline_cases = [
+            (0x0000_0000_0000_1000u64, 256u32),
+            (0x0000_7fff_ffff_f000u64, 16_383u32),
+            (0x0000_0200_1234_5600u64, 65_536u32),
+            (0x0000_0001_0000_0000u64, ((1 << 14) - 1) << 8),
+        ];
+        for (idx, &(addr, size)) in inline_cases.iter().enumerate() {
+            let desc = [addr as u32, (addr >> 32) as u32, size, 0];
+            create_cbv(null, &desc, at(idx));
+            assert_eq!(view(at(idx)), Some(View::Constant(addr, size)));
+            // SAFETY: slot `idx` lies inside `slots`.
+            let raw = unsafe { *(at(idx) as *const [u32; 3]) };
+            assert_eq!(raw[0], VIEW_TAG);
+            assert_eq!(raw[2] >> KIND_SHIFT, KIND_CONSTANT);
+            assert_ne!(raw[2], VIEW_TAG);
+        }
+        let after_inline = VIEWS.read().unwrap_or_else(|e| e.into_inner()).list.len();
+        assert_eq!(
+            after_inline, before,
+            "inline CBVs must not insert into VIEWS"
+        );
+
+        // Unaligned size >= 16 KiB or address >= 2^47 falls back to the table.
+        let fallback_cases = [
+            (0x0000_0000_0000_2000u64, 16_385u32),
+            (0x0000_8000_0000_1000u64, 256u32),
+        ];
+        for &(addr, size) in &fallback_cases {
+            let desc = [addr as u32, (addr >> 32) as u32, size, 0];
+            create_cbv(null, &desc, at(0));
+            assert_eq!(view(at(0)), Some(View::Constant(addr, size)));
+            // SAFETY: slot 0 lies inside `slots`.
+            let raw = unsafe { *(at(0) as *const [u32; 3]) };
+            assert_eq!(raw[2] >> KIND_SHIFT, 0);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn check_dead_slots_matches_view_liveness_across_inline_live_stale_and_untagged() {
+        let null = std::ptr::null();
+        let mut slots = [0u64; 4 * 4];
+        let base = slots.as_mut_ptr() as u64;
+        let at = |i: usize| base + 32 * i as u64;
+        let res_live = 0x7777_1000usize as This;
+        let res_dead = 0x7777_2000usize as This;
+
+        // Slot 0: inline CBV (always alive).
+        create_cbv(null, &[0x1000, 0, 512, 0], at(0));
+        // Slot 1: live resource SRV.
+        create_srv(null, res_live, std::ptr::null(), at(1));
+        // Slot 2: resource SRV that will be forgotten (stale).
+        create_srv(null, res_dead, std::ptr::null(), at(2));
+        // Slot 3: untagged zero slot (not dead).
+        forget(res_dead as usize);
+
+        let raws: Vec<[u32; 3]> = (0..4)
+            // SAFETY: all four 32-byte slots lie inside `slots`.
+            .map(|i| unsafe { *(at(i) as *const [u32; 3]) })
+            .collect();
+        let mut dead = Vec::new();
+        check_dead_slots(&raws, &mut dead);
+        assert_eq!(dead, vec![false, false, true, false]);
+        forget(res_live as usize);
     }
 
     /// Creation ids are unique across heaps, including after a release that

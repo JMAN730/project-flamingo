@@ -308,7 +308,7 @@ pub(crate) fn ready(
             // Held for the heap's life: not given back with a list's slots.
             let base = heap.dynamic(HEAP_SLOTS)?;
             heap.null_raw_uav_at(base);
-            heap.raw_at(
+            heap.raw_resource_at(
                 base + DIRECTORY_SLOT_OFFSET,
                 &m.directory.0,
                 0,
@@ -325,7 +325,7 @@ pub(crate) fn ready(
     };
     for (n, shadow) in m.copies.iter().enumerate().skip(made as usize) {
         let (_, len) = shadow.span();
-        heap.raw_uav_at(base + 1 + n as u32, &shadow.buffer, 0, len);
+        heap.raw_shadow_uav_at(base + 1 + n as u32, shadow, 0, len);
     }
     m.heaps.insert(key, (base, m.copies.len() as u32));
     // Once per list, and for copies numbered since: the builder alone

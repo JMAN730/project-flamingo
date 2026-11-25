@@ -414,6 +414,81 @@ fn undeclared_structured_stride_reads_two_view_strides() {
     }
 }
 
+/// A view-supplied stride of exactly zero is a flat byte buffer: an indexed
+/// access to it is the raw access at its byte offset (`index * 0` adds
+/// nothing), not a structured buffer of unknown stride.
+fn zero_stride(_: StructuredBinding, _: bool) -> Option<u32> {
+    Some(0)
+}
+
+#[test]
+fn indexed_load_through_a_zero_stride_view_is_a_raw_load() {
+    let mut unindexed = STRUCTURED_READ.to_vec();
+    unindexed[5] &= !0x2000; // buffer_load_dword v1, off, s[8:11], 0 offset:4
+    let raw = buffer_shader(&unindexed, None, &|_, _| None).unwrap();
+    let indexed = buffer_shader(STRUCTURED_READ, None, &zero_stride).unwrap();
+    assert_eq!(indexed.dxil, raw.dxil);
+    let structured =
+        buffer_shader(STRUCTURED_READ, None, &|_, required| required.then_some(16)).unwrap();
+    assert_ne!(indexed.dxil, structured.dxil);
+}
+
+#[test]
+fn indexed_store_and_atomic_through_a_zero_stride_view_are_raw() {
+    for opcode in [0x1C_u32, 0x32_u32] {
+        let word = |idxen: u32| {
+            [
+                0xBE81_0380, // s_mov_b32 s1, 0
+                0xF408_0300,
+                0xFA00_0020, // s_load_dwordx4 s[12:15], s[0:1], 32
+                0xE000_0004 | (opcode << 18) | idxen,
+                0x8003_0000, // store / atomic_add v0, v0, s[12:15], 0 [idxen] offset:4
+                0xBF81_0000, // s_endpgm
+            ]
+        };
+        let raw = buffer_shader(&word(0), None, &|_, _| None).unwrap();
+        let indexed = buffer_shader(&word(0x2000), None, &zero_stride).unwrap();
+        assert_eq!(indexed.dxil, raw.dxil, "opcode {opcode:#x}");
+    }
+}
+
+#[test]
+fn zero_stride_routes_to_raw_only_when_the_view_says_so() {
+    // Console metadata of 0 does not say the view is flat: it is the declared
+    // stride of a range that is not structured, and stays unknown.
+    assert!(matches!(
+        buffer_shader(STRUCTURED_READ, Some(0), &|_, _| None),
+        Err(crate::ShaderError::Unsupported {
+            what: super::UNKNOWN_STRUCTURED_STRIDE,
+            ..
+        })
+    ));
+    // Strides 1 to 3 are neither raw nor a structured element size.
+    for stride in [1, 2, 3, 6, 2052] {
+        assert!(
+            matches!(
+                buffer_shader(STRUCTURED_READ, None, &|_, required| required
+                    .then_some(stride)),
+                Err(crate::ShaderError::Unsupported {
+                    what: super::UNKNOWN_STRUCTURED_STRIDE,
+                    ..
+                })
+            ),
+            "stride {stride}"
+        );
+    }
+    // A declared structured stride keeps priority over the bound view.
+    let declared = buffer_shader(STRUCTURED_READ, Some(16), &|_, required| {
+        required.then_some(0)
+    })
+    .unwrap();
+    let structured = buffer_shader(STRUCTURED_READ, Some(16), &|_, required| {
+        required.then_some(16)
+    })
+    .unwrap();
+    assert_eq!(declared.dxil, structured.dxil);
+}
+
 #[test]
 fn indexed_store_and_atomic_use_the_structured_uav_view_stride() {
     for opcode in [0x1C_u32, 0x32_u32] {

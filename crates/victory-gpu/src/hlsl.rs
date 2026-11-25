@@ -1,4 +1,5 @@
 //! Our own shaders (the indirect argument clamp, the rectangle expander,
+//! the ReBAR piece hash-compare pass,
 //! the pass that draws a depth plane from its twin), compiled at run time
 //! from HLSL with their root signature inside: by the system's compiler
 //! (`D3DCompile`, `cs_5_1`, `ps_5_1`, `vs_5_1`) and, when it refuses them,
@@ -89,6 +90,9 @@ fn bundled_shader(source: &str, entry: &str, target: &str) -> Option<&'static [u
         }
         (include_str!("../shaders/plane_floats.hlsl"), "plane", "ps_5_1") => {
             Some(bytecode!("plane_floats"))
+        }
+        (include_str!("../shaders/rebar_hash.hlsl"), "main", "cs_5_1") => {
+            Some(bytecode!("rebar_hash"))
         }
         _ => None,
     }
@@ -287,6 +291,7 @@ mod tests {
             include_str!("../shaders/argument_clamp.hlsl"),
             include_str!("../shaders/rect_rewrite.hlsl"),
             include_str!("../shaders/rect_expand.hlsl"),
+            include_str!("../shaders/rebar_hash.hlsl"),
         ] {
             let expected = bundled_shader(source, "main", "cs_5_1").unwrap();
             let bytes = compile_compute("bundled helper", source).unwrap();

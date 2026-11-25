@@ -54,8 +54,8 @@ fn allow_wave32() -> bool {
 /// passes, which a diagnostics build can change at run time, and whether
 /// Wave32 lowering is enabled for the active host adapter).
 fn build(wave32: bool) -> &'static [u8; 32] {
-    static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
-    BUILD.get_or_init(|| {
+    static BUILDS: [OnceLock<[u8; 32]>; 2] = [const { OnceLock::new() }; 2];
+    BUILDS[usize::from(wave32)].get_or_init(|| {
         let exe = std::env::current_exe().and_then(std::fs::read);
         let limit = victory_shader::emit::loop_limit();
         if limit != victory_shader::emit::DEFAULT_LOOP_LIMIT {
@@ -68,7 +68,10 @@ fn build(wave32: bool) -> &'static [u8; 32] {
             Ok(mut bytes) => {
                 bytes.extend_from_slice(&limit.to_le_bytes());
                 bytes.extend_from_slice(&victory_shader::emit::shader_opt().to_le_bytes());
-                bytes.push(u8::from(wave32));
+                bytes.push(
+                    u8::from(wave32)
+                        | (u8::from(wave32 && victory_shader::emit::wave64_double()) << 1),
+                );
                 *blake3::hash(&bytes).as_bytes()
             }
             Err(e) => {

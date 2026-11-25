@@ -35,9 +35,23 @@ struct Journal {
     written: BTreeMap<usize, u64>,
     /// Room for the kernel's answer.
     found: Vec<usize>,
+    /// Page ranges `[first, last)` asked ahead for the current submission
+    /// ([`ask_once`]): `writes` answers any range inside one from the journal
+    /// without another kernel call.
+    ahead: Vec<(usize, usize)>,
+    /// Whether `ahead` stands until [`ask_once_end`].
+    kept: bool,
 }
 
 impl Journal {
+    /// Refreshes overlapping an announced file read must ask the kernel
+    /// again, even when a previous query covered their pages.
+    fn forget_ahead(&mut self, (first, last): (usize, usize)) {
+        const _: () = assert!(BLOCK == PAGE);
+        self.ahead.retain(|&(a, b)| b <= first || last <= a);
+        self.kept = !self.ahead.is_empty();
+    }
+
     fn snapshot(&self, first: usize, last: usize) -> (u64, Vec<(usize, u64)>) {
         (
             self.asked,
@@ -53,7 +67,169 @@ static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
     asked: 0,
     written: BTreeMap::new(),
     found: Vec::new(),
+    ahead: Vec::new(),
+    kept: false,
 });
+
+/// Ranges of one submission closer than this are asked about together:
+/// walking the pages between them costs less than another `GetWriteWatch`
+/// reset call.
+const AHEAD_GAP: usize = (8 << 20) / PAGE;
+/// Maximum span of a single coalesced `GetWriteWatch` asking (1 GiB).
+const AHEAD_MAX: usize = (1 << 30) / PAGE;
+
+/// Inserts 4 KiB kernel-reported addresses into `written` at 64 KiB `PAGE`
+/// granularity, skipping consecutive addresses that fold into the same page.
+fn insert_found(found: &[usize], written: &mut BTreeMap<usize, u64>, now: u64) {
+    let mut prev = usize::MAX;
+    for &at in found {
+        let page = at / PAGE;
+        if page != prev {
+            written.insert(page, now);
+            prev = page;
+        }
+    }
+}
+
+/// Asks the kernel once for the written pages of `[first, last)` and notes
+/// them in the journal under `now`; returns `false` (leaving the journal
+/// unchanged) if the range is not write-watched memory of one reservation.
+fn ask_kernel(j: &mut Journal, first: usize, last: usize, now: u64) -> bool {
+    use windows_sys::Win32::System::Memory::GetWriteWatch;
+    const WRITE_WATCH_FLAG_RESET: u32 = 1;
+    let mut count = (last - first) * PAGE / KERNEL_PAGE;
+    j.found.resize(count.max(j.found.len()), 0);
+    let mut granularity = 0;
+    #[cfg(feature = "diagnostics")]
+    let started = std::time::Instant::now();
+    // SAFETY: the answer buffer holds `count` entries.
+    let failed = unsafe {
+        GetWriteWatch(
+            WRITE_WATCH_FLAG_RESET,
+            (first * PAGE) as *const _,
+            (last - first) * PAGE,
+            j.found.as_mut_ptr().cast(),
+            &mut count,
+            &mut granularity,
+        )
+    } != 0;
+    if failed {
+        return false;
+    }
+    #[cfg(feature = "diagnostics")]
+    {
+        use crate::copystat::{C, add};
+        add(C::Watches, 1);
+        add(C::WatchUs, started.elapsed().as_micros() as u64);
+    }
+    insert_found(&j.found[..count], &mut j.written, now);
+    true
+}
+
+/// Tries one kernel asking for `pieces` (sorted page ranges); bisects if the
+/// combined span crosses reservations or non-watched memory.
+fn ask_run(j: &mut Journal, pieces: &[(usize, usize)], now: u64) {
+    if pieces.len() < 2 {
+        return;
+    }
+    let first = pieces[0].0;
+    let last = pieces.iter().map(|p| p.1).max().unwrap_or(first);
+    if ask_kernel(j, first, last, now) {
+        j.ahead.push((first, last));
+        return;
+    }
+    let (a, b) = pieces.split_at(pieces.len() / 2);
+    ask_run(j, a, now);
+    ask_run(j, b, now);
+}
+
+/// Coalesces write-watch queries for all `(start, end)` ranges of a submission
+/// into a small number of `GetWriteWatch` calls so repeated flushes within the
+/// submission answer from the journal until [`ask_once_end`]. Ranges that are
+/// not single-allocation write-watched memory are left to [`writes`].
+pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
+    let mut pieces: Vec<(usize, usize)> = ranges
+        .iter()
+        .filter(|&&(start, end)| start < end)
+        .map(|&(start, end)| (start / PAGE, end.div_ceil(PAGE)))
+        .collect();
+    if pieces.is_empty() {
+        return;
+    }
+    pieces.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(pieces.len());
+    for (first, last) in pieces {
+        match merged.last_mut() {
+            Some(prev) if first <= prev.1 => prev.1 = prev.1.max(last),
+            _ => merged.push((first, last)),
+        }
+    }
+    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    let j = &mut *j;
+    // Snapshot before the kernel queries. A read already in progress may
+    // complete while they run. A newly announced read takes this journal
+    // lock and invalidates its range before the caller starts writing.
+    let pending: Vec<_> = guards().announced.keys().copied().collect();
+    j.ahead.clear();
+    j.kept = false;
+    j.asked += 1;
+    let now = j.asked;
+    let mut i = 0;
+    while i < merged.len() {
+        let first = merged[i].0;
+        let mut last = merged[i].1;
+        let mut k = i + 1;
+        while k < merged.len()
+            && merged[k].0 <= last + AHEAD_GAP
+            && last.max(merged[k].1) - first <= AHEAD_MAX
+        {
+            last = last.max(merged[k].1);
+            k += 1;
+        }
+        ask_run(j, &merged[i..k], now);
+        i = k;
+    }
+    // Single isolated ranges (or halves that failed coalescing) are asked once
+    // here so repeated flushes in the same submission do not re-query them.
+    for &(first, last) in &merged {
+        if !j.ahead.iter().any(|&(a, b)| a <= first && last <= b) && ask_kernel(j, first, last, now)
+        {
+            j.ahead.push((first, last));
+        }
+    }
+    j.kept = !j.ahead.is_empty();
+    for range in pending {
+        j.forget_ahead(range);
+    }
+}
+
+/// Ends the active per-submission coalesced asking so later [`writes`] calls
+/// query the kernel again.
+pub(crate) fn ask_once_end() {
+    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    if j.kept {
+        j.kept = false;
+        j.ahead.clear();
+    }
+}
+
+/// Notes that our submission wrote title memory `[at, at + len)` while a
+/// coalesced asking stands, so refreshes recorded after the copy see those
+/// pages as written without ending coalescing for the rest of the submission.
+pub(crate) fn wrote(at: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    if !j.kept {
+        return;
+    }
+    j.asked += 1;
+    let now = j.asked;
+    for page in at / PAGE..at.saturating_add(len).div_ceil(PAGE) {
+        j.written.insert(page, now);
+    }
+}
 
 /// The pages of `[start, end)` (whole pages) as last written, for pages
 /// written since tracking began: `(page number, asking)` in page order, and
@@ -66,6 +242,9 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     let j = &mut *j;
+    if j.kept && j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
+        return Some(j.snapshot(first, last));
+    }
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
     // Clean mapped-view blocks are still protected. A write, kernel-write
@@ -112,8 +291,8 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     }
     j.asked += 1;
     let now = j.asked;
-    let pages = j.found[..count].iter().map(|&at| at / PAGE).chain(guarded);
-    for page in pages.collect::<Vec<_>>() {
+    insert_found(&j.found[..count], &mut j.written, now);
+    for page in guarded {
         j.written.insert(page, now);
     }
     Some(j.snapshot(first, last))
@@ -225,16 +404,31 @@ fn guards() -> std::sync::MutexGuard<'static, Guards> {
 /// they were last guarded (all of a block's pages), guarding them again
 /// before the caller copies them. `None` if the range contains no mapped view.
 fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
+    let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
+    // Every block in `clean` is also in `protected` (previously verified as
+    // mapped view memory and still read-only). When the entire range is clean,
+    // skip both the kernel query and per-block lookups.
+    if first < last && guards().clean.range(first..last).count() == last - first {
+        return Some(Vec::new());
+    }
     if !has_mapped(start, end) {
         return None;
     }
     install();
     let mut g = guards();
+    let clean: Vec<usize> = g.clean.range(first..last).copied().collect();
+    if clean.len() == last - first {
+        return Some(Vec::new());
+    }
     let mut written = Vec::new();
     let mut run: Option<usize> = None;
-    let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
+    let mut next_clean = 0;
     for block in first..=last {
-        let open = block < last && !g.clean.contains(&block);
+        while next_clean < clean.len() && clean[next_clean] < block {
+            next_clean += 1;
+        }
+        let is_clean = next_clean < clean.len() && clean[next_clean] == block;
+        let open = block < last && !is_clean;
         if open {
             written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
             if g.protected.contains(&block) {
@@ -402,11 +596,12 @@ pub(crate) fn writing(at: usize, len: usize) {
 /// and the read would fail.
 pub fn kernel_will_write(at: usize, len: usize) {
     let end = at.saturating_add(len);
+    let range = (at / BLOCK, end.div_ceil(BLOCK));
+    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     let mut g = guards();
     open(&mut g, at, end);
-    *g.announced
-        .entry((at / BLOCK, end.div_ceil(BLOCK)))
-        .or_default() += 1;
+    *g.announced.entry(range).or_default() += 1;
+    j.forget_ahead(range);
 }
 
 /// The kernel write [`kernel_will_write`] announced for `[at, at + len)`
@@ -449,6 +644,192 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     }
     g.announced
         .retain(|&(from, to), _| !(first <= from && to <= end));
+}
+
+/// Coordinates in-place CPU reads of title memory with mapping changes.
+///
+/// Only used when `VICTORY_MAPPING_RANGES=0` ([`by_range`]); otherwise reads
+/// and changes hold only the bytes they touch ([`SPANS`]).
+static MAPPING: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+/// Whether a read in place and a change of mapping keep apart only when
+/// their bytes meet ([`SPANS`]), not whatever memory each touches
+/// ([`MAPPING`]); `VICTORY_MAPPING_RANGES=0` holds all of title memory for
+/// each. On by default.
+pub(crate) fn by_range() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MAPPING_RANGES").is_none_or(|v| v != "0"))
+}
+
+/// Reads of title memory in place under way, and changes of its mapping,
+/// by the bytes they touch ([`by_range`]).
+struct Spans {
+    /// To tell them apart.
+    next: u64,
+    /// Reads under way: number, start and end.
+    reads: Vec<(u64, usize, usize)>,
+    /// Changes: number, start, end, and whether under way (else waiting for
+    /// the reads over its bytes to end; no read begins over them meanwhile,
+    /// so that one read after another cannot keep a change waiting).
+    changes: Vec<(u64, usize, usize, bool)>,
+    /// Threads waiting on [`SPANS_LEFT`].
+    waiting: usize,
+}
+
+static SPANS: Mutex<Spans> = Mutex::new(Spans {
+    next: 0,
+    reads: Vec::new(),
+    changes: Vec::new(),
+    waiting: 0,
+});
+
+/// Told when a read or a change ends while a thread waits.
+static SPANS_LEFT: std::sync::Condvar = std::sync::Condvar::new();
+
+fn spans() -> std::sync::MutexGuard<'static, Spans> {
+    SPANS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Waits until a read or a change ends.
+fn spans_wait(
+    mut s: std::sync::MutexGuard<'static, Spans>,
+) -> std::sync::MutexGuard<'static, Spans> {
+    s.waiting += 1;
+    let mut s = SPANS_LEFT.wait(s).unwrap_or_else(|e| e.into_inner());
+    s.waiting -= 1;
+    s
+}
+
+/// Whether `[a, b)` and `[c, d)` share a byte.
+fn meet(a: usize, b: usize, c: usize, d: usize) -> bool {
+    a < d && c < b
+}
+
+impl Spans {
+    fn read(&mut self, at: usize, end: usize) -> Span {
+        self.next += 1;
+        self.reads.push((self.next, at, end));
+        Span(self.next, false)
+    }
+}
+
+/// A read's or a change's place in [`SPANS`] (its number, and whether a
+/// change), given up when dropped.
+struct Span(u64, bool);
+
+impl Drop for Span {
+    fn drop(&mut self) {
+        let mut s = spans();
+        if self.1 {
+            s.changes.retain(|c| c.0 != self.0);
+        } else if let Some(i) = s.reads.iter().position(|r| r.0 == self.0) {
+            s.reads.swap_remove(i);
+        }
+        if s.waiting > 0 {
+            SPANS_LEFT.notify_all();
+        }
+    }
+}
+
+/// What a read or a change of mapping holds: its bytes ([`by_range`]) or
+/// the lock over all of title memory.
+enum Held<G> {
+    All(#[allow(dead_code)] G),
+    Bytes(#[allow(dead_code)] Span),
+}
+
+/// Since the last frame-rate line: changes of title memory's mapping, the
+/// microseconds they waited for reads in place, and those they were under
+/// way.
+pub(crate) static REMAPS: [std::sync::atomic::AtomicU64; 3] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// What the runtime holds while it changes what title memory shows
+/// ([`title_memory_remapping`]).
+pub struct Remapping {
+    _held: Held<std::sync::RwLockWriteGuard<'static, ()>>,
+    since: std::time::Instant,
+}
+
+impl Drop for Remapping {
+    fn drop(&mut self) {
+        REMAPS[2].fetch_add(
+            self.since.elapsed().as_micros() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+}
+
+/// The runtime is about to map, unmap or move physical pages of title
+/// memory `[at, at + len)`: until what it returns is dropped, no read of
+/// those bytes in place is under way and none begins
+/// ([`title_memory_reading`]). Taken around the whole change, the unmapping
+/// and the mapping again, over all the bytes whose mapping it changes.
+pub fn title_memory_remapping(at: usize, len: usize) -> Remapping {
+    use std::sync::atomic::Ordering::Relaxed;
+    let started = std::time::Instant::now();
+    let held = if by_range() {
+        let end = at.saturating_add(len);
+        let mut s = spans();
+        s.next += 1;
+        let id = s.next;
+        s.changes.push((id, at, end, false));
+        while s.reads.iter().any(|r| meet(r.1, r.2, at, end))
+            || s.changes.iter().any(|c| c.3 && meet(c.1, c.2, at, end))
+        {
+            s = spans_wait(s);
+        }
+        if let Some(c) = s.changes.iter_mut().find(|c| c.0 == id) {
+            c.3 = true;
+        }
+        Held::Bytes(Span(id, true))
+    } else {
+        Held::All(MAPPING.write().unwrap_or_else(|e| e.into_inner()))
+    };
+    REMAPS[0].fetch_add(1, Relaxed);
+    REMAPS[1].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
+    Remapping {
+        _held: held,
+        since: std::time::Instant::now(),
+    }
+}
+
+/// What a read of title memory in place holds ([`title_memory_reading`]).
+pub struct Reading(#[allow(dead_code)] Held<std::sync::RwLockReadGuard<'static, ()>>);
+
+/// For reading title memory `[at, at + len)` in place: until what it
+/// returns is dropped, the runtime changes no mapping of those bytes, so
+/// memory found mapped stays mapped. Not to be taken twice by one thread,
+/// nor held across anything that maps title memory.
+pub fn title_memory_reading(at: usize, len: usize) -> Reading {
+    if !by_range() {
+        return Reading(Held::All(MAPPING.read().unwrap_or_else(|e| e.into_inner())));
+    }
+    let end = at.saturating_add(len);
+    let mut s = spans();
+    while s.changes.iter().any(|c| meet(c.1, c.2, at, end)) {
+        s = spans_wait(s);
+    }
+    Reading(Held::Bytes(s.read(at, end)))
+}
+
+/// [`title_memory_reading`] if it can be had at once: `None` while the
+/// runtime changes a mapping of those bytes (or waits to), for a caller
+/// that has another way to read and would rather not wait.
+pub fn title_memory_reading_now(at: usize, len: usize) -> Option<Reading> {
+    if !by_range() {
+        return match MAPPING.try_read() {
+            Ok(guard) => Some(Reading(Held::All(guard))),
+            Err(std::sync::TryLockError::Poisoned(e)) => Some(Reading(Held::All(e.into_inner()))),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+        };
+    }
+    let end = at.saturating_add(len);
+    let mut s = spans();
+    if s.changes.iter().any(|c| meet(c.1, c.2, at, end)) {
+        return None;
+    }
+    Some(Reading(Held::Bytes(s.read(at, end))))
 }
 
 /// Registers the handler that takes writes to guarded blocks, once, ahead
@@ -935,5 +1316,327 @@ mod tests {
             )
         };
         title_memory_remapped(view, 2 * BLOCK);
+    }
+
+    /// Serializes tests that drive the process-wide `ask_once` journal state
+    /// (`JOURNAL.ahead` / `j.kept` / `j.asked`).
+    static ASK_ONCE_TEST: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn ask_once_coalesces_ranges_and_surfaces_intervening_wrote() {
+        let _serial = ASK_ONCE_TEST.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: a fresh write-watched allocation, freed after cleaning up.
+        let p = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                6 * PAGE,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert_ne!(p, 0);
+        // Clear any journal entries from previous allocations at this VA.
+        {
+            let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+            for page in p / PAGE..(p + 6 * PAGE) / PAGE {
+                j.written.remove(&page);
+            }
+        }
+        // Baseline clear.
+        assert!(writes(p, p + 6 * PAGE, false).is_some());
+
+        // Write page 1 and page 4, then coalesce two disjoint ranges inside the allocation.
+        // SAFETY: committed write-watched pages of ours.
+        unsafe {
+            ((p + PAGE + 4) as *mut u8).write(7);
+            ((p + 4 * PAGE + 4) as *mut u8).write(9);
+        }
+        ask_once(&[(p, p + 2 * PAGE), (p + 4 * PAGE, p + 5 * PAGE)]);
+        let (now1, found1) = writes(p, p + 2 * PAGE, false).expect("covered by ask_once");
+        let (now2, found2) =
+            writes(p + 4 * PAGE, p + 5 * PAGE, false).expect("covered by ask_once");
+        assert_eq!(found1.len(), 1);
+        assert_eq!(found2.len(), 1);
+        assert_eq!(found1[0].0, p / PAGE + 1);
+        assert_eq!(found2[0].0, p / PAGE + 4);
+        let coalesced_gen = found1[0].1;
+        assert_eq!(
+            found2[0].1, coalesced_gen,
+            "coalesced asks share one asking number"
+        );
+        assert!(coalesced_gen <= now1 && coalesced_gen <= now2);
+
+        // An intervening submission copy into page 0 updates the journal and advances `now`.
+        wrote(p + 16, 64);
+        let (now3, found3) = writes(p, p + 2 * PAGE, false).expect("still covered");
+        assert!(now3 > coalesced_gen);
+        assert_eq!(found3.len(), 2);
+        assert_eq!(found3[0].0, p / PAGE);
+        assert!(found3[0].1 > coalesced_gen && found3[0].1 <= now3);
+        assert_eq!(found3[1], (p / PAGE + 1, coalesced_gen));
+
+        ask_once_end();
+        // After `ask_once_end`, a fresh CPU write is seen by the kernel again.
+        // SAFETY: committed write-watched page of ours.
+        unsafe { ((p + 5 * PAGE + 8) as *mut u8).write(11) };
+        let (now4, found4) = writes(p + 5 * PAGE, p + 6 * PAGE, false).expect("watched");
+        assert!(now4 > now3);
+        assert_eq!(found4, [(p / PAGE + 5, now4)]);
+
+        {
+            let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+            for page in p / PAGE..(p + 6 * PAGE) / PAGE {
+                j.written.remove(&page);
+            }
+        }
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn a_file_read_after_the_submission_query_reaches_every_reader() {
+        use std::io::{Read, Seek, Write};
+        let _serial = ASK_ONCE_TEST.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: allocate a writable page and release it after all reads.
+        let at = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                PAGE,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert_ne!(at, 0);
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(b"texel").unwrap();
+        for already_announced in [false, true] {
+            let (before, _) = writes(at, at + PAGE, false).unwrap();
+            if already_announced {
+                kernel_will_write(at, 5);
+            }
+            ask_once(&[(at, at + PAGE)]);
+            if !already_announced {
+                kernel_will_write(at, 5);
+            }
+            file.rewind().unwrap();
+            // SAFETY: these five bytes belong to the committed allocation.
+            let dest = unsafe { std::slice::from_raw_parts_mut(at as *mut u8, 5) };
+            file.read_exact(dest).unwrap();
+            assert_eq!(dest, b"texel");
+            // An overlapped read can still have an open announcement when a
+            // refresh runs. Another reader can ask after completion.
+            for finished in [false, true] {
+                if finished {
+                    kernel_wrote(at, 5);
+                }
+                let (_, pages) = writes(at, at + PAGE, false).unwrap();
+                assert!(
+                    pages.iter().any(|&(p, w)| p == at / PAGE && w > before),
+                    "already_announced={already_announced}, finished={finished}"
+                );
+            }
+            ask_once_end();
+        }
+        {
+            let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+            j.written.remove(&(at / PAGE));
+        }
+        // SAFETY: the reservation is ours.
+        unsafe { VirtualFree(at as _, 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn ask_once_handles_mixed_watched_and_unwatched_ranges() {
+        let _serial = ASK_ONCE_TEST.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: a fresh write-watched allocation.
+        let watched = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                2 * PAGE,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert_ne!(watched, 0);
+        // A previous test may have used these virtual addresses.
+        {
+            let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+            for page in watched / PAGE..(watched + 2 * PAGE) / PAGE {
+                j.written.remove(&page);
+            }
+        }
+        let mut plain = vec![0u8; PAGE];
+        let plain_start = plain.as_mut_ptr() as usize;
+
+        // SAFETY: committed write-watched page of ours.
+        unsafe { ((watched + 4) as *mut u8).write(3) };
+        ask_once(&[
+            (watched, watched + 2 * PAGE),
+            (plain_start, plain_start + PAGE),
+        ]);
+        let (now, found) = writes(watched, watched + 2 * PAGE, false).expect("watched range");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].0, watched / PAGE);
+        assert!(found[0].1 > 0 && found[0].1 <= now);
+        assert!(writes(plain_start, plain_start + PAGE, false).is_none());
+        ask_once_end();
+
+        {
+            let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+            for page in watched / PAGE..(watched + 2 * PAGE) / PAGE {
+                j.written.remove(&page);
+            }
+        }
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(watched as *mut _, 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn guard_clean_fast_path_returns_empty_and_still_detects_faults() {
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
+            UnmapViewOfFile,
+        };
+        // SAFETY: a 4-block pagefile section mapped read-write.
+        let view = unsafe {
+            let section = CreateFileMappingW(
+                -1isize as _,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                (4 * BLOCK) as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 4 * BLOCK).Value as usize
+        };
+        assert_ne!(view, 0);
+        let initial = guard(view, view + 4 * BLOCK).expect("guarded");
+        assert_eq!(initial.len(), 4);
+        // All blocks clean -> fast path returns empty without re-protecting.
+        assert_eq!(guard(view, view + 4 * BLOCK), Some(Vec::new()));
+        // Write block 2 via fault handler -> only block 2 reported dirty.
+        // SAFETY: mapped view memory; our VEH opens the block on write.
+        unsafe { ((view + 2 * BLOCK + 16) as *mut u8).write(0x55) };
+        assert_eq!(guard(view, view + 4 * BLOCK), Some(vec![view / PAGE + 2]));
+        // Clean again immediately after re-guarding.
+        assert_eq!(guard(view, view + 4 * BLOCK), Some(Vec::new()));
+        // SAFETY: our view.
+        unsafe {
+            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
+                Value: view as *mut _,
+            });
+        }
+        title_memory_remapped(view, 4 * BLOCK);
+    }
+}
+
+#[cfg(test)]
+mod mapping_tests {
+    use super::{PAGE, by_range, title_memory_reading, title_memory_remapping};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, mpsc};
+    use std::time::Duration;
+
+    /// Addresses only these tests hold (nothing is read there).
+    const HERE: usize = 0x7e00_0000_0000;
+
+    /// A change of mapping waits for a read in place of its bytes that is
+    /// under way, and such a read waits for the change.
+    #[test]
+    fn reads_in_place_and_remappings_wait_for_each_other() {
+        // A reader holds; the change does not begin until it lets go.
+        let changed = Arc::new(AtomicBool::new(false));
+        let reading = title_memory_reading(HERE + PAGE / 2, PAGE);
+        let (began, wait) = mpsc::channel();
+        let change = {
+            let changed = changed.clone();
+            std::thread::spawn(move || {
+                began.send(()).unwrap();
+                let _changing = title_memory_remapping(HERE + PAGE, PAGE);
+                changed.store(true, Ordering::SeqCst);
+            })
+        };
+        wait.recv().unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(!changed.load(Ordering::SeqCst));
+        drop(reading);
+        change.join().unwrap();
+        assert!(changed.load(Ordering::SeqCst));
+        // A change holds; the read does not begin until it is done.
+        let read = Arc::new(AtomicBool::new(false));
+        let changing = title_memory_remapping(HERE, 2 * PAGE);
+        let (began, wait) = mpsc::channel();
+        let reader = {
+            let read = read.clone();
+            std::thread::spawn(move || {
+                began.send(()).unwrap();
+                let _reading = title_memory_reading(HERE + PAGE + 16, 16);
+                read.store(true, Ordering::SeqCst);
+            })
+        };
+        wait.recv().unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(!read.load(Ordering::SeqCst));
+        drop(changing);
+        reader.join().unwrap();
+        assert!(read.load(Ordering::SeqCst));
+    }
+
+    /// Reads and changes whose bytes do not meet do not wait for each other,
+    /// and a change waiting for a read keeps new reads of its bytes out (but
+    /// not of others).
+    #[test]
+    fn reads_and_remappings_of_other_bytes_go_on() {
+        if !by_range() {
+            return; // VICTORY_MAPPING_RANGES=0: one lock over all of it
+        }
+        let at = HERE + 16 * PAGE;
+        let reading = title_memory_reading(at, PAGE);
+        // Another page changes while the read is under way, and another
+        // read goes on while that change is.
+        let (done, finished) = mpsc::channel();
+        std::thread::spawn(move || {
+            let changing = title_memory_remapping(at + PAGE, PAGE);
+            let (read, was_read) = mpsc::channel();
+            std::thread::spawn(move || {
+                let _reading = title_memory_reading(at + 2 * PAGE, PAGE);
+                read.send(()).unwrap();
+            });
+            let other = was_read.recv_timeout(Duration::from_secs(10)).is_ok();
+            drop(changing);
+            done.send(other).unwrap();
+        });
+        assert_eq!(
+            finished.recv_timeout(Duration::from_secs(10)),
+            Ok(true),
+            "kept apart though their bytes do not meet"
+        );
+        // A change of the read's page waits, and keeps a new read of its
+        // bytes out meanwhile; a read elsewhere is not kept out.
+        let changed = Arc::new(AtomicBool::new(false));
+        let change = {
+            let changed = changed.clone();
+            std::thread::spawn(move || {
+                let _changing = title_memory_remapping(at, PAGE);
+                changed.store(true, Ordering::SeqCst);
+            })
+        };
+        while !super::spans().changes.iter().any(|c| c.1 == at) {
+            std::thread::yield_now();
+        }
+        assert!(
+            super::title_memory_reading_now(at + 8, 8).is_none(),
+            "a read began over a change that waits"
+        );
+        assert!(super::title_memory_reading_now(at + 3 * PAGE, 8).is_some());
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            !changed.load(Ordering::SeqCst),
+            "the mapping changed under a read in place"
+        );
+        drop(reading);
+        change.join().unwrap();
+        assert!(changed.load(Ordering::SeqCst));
     }
 }

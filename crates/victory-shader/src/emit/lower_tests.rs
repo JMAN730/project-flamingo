@@ -239,6 +239,21 @@ fn lowers(words: &[u32], rsrc2: u32) -> Result<(), crate::ShaderError> {
     lower_words(words, rsrc2).map(|_| ())
 }
 
+/// `ds_swizzle_b32` must ballot-mask inactive source lanes to 0 (VIC-BT-018):
+/// a plain `waveReadLaneAt` would otherwise return a stale VGPR.
+#[test]
+fn ds_swizzle_b32_zeros_inactive_source_lanes() {
+    // s_mov_b32 exec_lo, 0x5555 (odd lanes inactive); ds_swizzle_b32 v1, v0
+    // offset:0x41f (and:0x1f or:0 xor:1 — exchange with the neighbour).
+    let words = [0xBEFE_03FF, 0x0000_5555, 0xD8D4_041F, 0x0100_0000, S_ENDPGM];
+    let lowered = lower_words(&words, 0).expect("ds_swizzle_b32 lowers");
+    assert!(
+        lowered.has_wave_ballot,
+        "ds_swizzle_b32 must ballot-mask inactive source lanes to 0"
+    );
+    assert!(lowered.wave_ops, "ds_swizzle_b32 uses wave operations");
+}
+
 #[test]
 fn med3_f32_emits_dxil_isnan_instead_of_fcmp_uno() {
     // v_med3_f32 v0, v1, v2, v3 (VOP3 opcode 0x157)
@@ -351,6 +366,82 @@ fn pixel_sample_coverage_input_reads_dx_op_coverage() {
     assert!(!without.has_coverage_op);
 }
 
+/// VIC-BT-011: pixel survival follows the last `exp` with `vm`, and
+/// conditional non-`done` MRT writes are latched under EXEC instead of
+/// being refused or discarded on `done`'s guard alone.
+#[test]
+fn pixel_export_tracks_last_vm_and_masks_mrt_under_exec() {
+    use super::super::container::SigElement;
+    // v_cmp_eq_u32 vcc, 0, v0; s_and_saveexec_b32 s0, vcc_lo — narrow
+    // EXEC without a branch so the exports stay guarded in one block.
+    // exp mrt0 v0,v0,v0,v0 (no done, no vm) — previously "a conditional export".
+    // exp null done vm — last Valid Mask; survival uses this EXEC.
+    let words = [
+        0x7D84_0080u32, // v_cmp_eq_u32 vcc, 0, v0
+        0xBE80_3C6A,    // s_and_saveexec_b32 s0, vcc_lo
+        0xF800_000F,
+        0,
+        0xF800_1890,
+        0,
+        S_ENDPGM,
+    ];
+    let native = NativeProgram {
+        stage: HwStage::Ps,
+        wave64: false,
+        vgprs: 1,
+        layout: vec![],
+        used: vec![],
+        io: StageIo::Ps {
+            inputs: vec![],
+            // No SPI inputs: v0 is not a barycentric, only a compare/export source.
+            input_addr: 0,
+            rsrc2: Default::default(),
+            db_shader_control: 0,
+            patches: vec![],
+        },
+        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    let target = SigElement {
+        name: "SV_Target".into(),
+        index: 0,
+        kind: 16,
+        comp: 5,
+        interp: 0,
+        row: Some(0),
+        col: 0,
+        cols: 4,
+        usage: 0,
+        half: false,
+    };
+    let p = ir::build(&native.code, false, native.vgprs).unwrap();
+    let st = structure::structure(&p).unwrap();
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+    let io = io::raise(&p, &native).unwrap();
+    assert_eq!(io.exports.len(), 2);
+    assert!(!io.exports[0].done && !io.exports[0].vm);
+    assert!(io.exports[1].done && io.exports[1].vm);
+    assert!(
+        st.guards.iter().flatten().any(|g| g.is_some()),
+        "narrowed EXEC must guard the colour export"
+    );
+    let lowered = lower(&Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: vec![],
+        outputs: vec![target],
+        prims: vec![],
+        mesh_stride: 0,
+    })
+    .expect("conditional MRT + last-vm done must lower");
+    assert!(
+        lowered.has_discard_op,
+        "pixel exit must discard from the last Valid Mask"
+    );
+}
+
 #[test]
 fn buffer_cache_invalidations_lower_as_no_ops() {
     // MUBUF opcode 0x071/0x072 with no data operand: the title asks the
@@ -415,8 +506,8 @@ fn f16_fma_and_mad_mac_lower() {
     lowers(&mac, 0).expect("v_mac_f16");
 }
 
-/// Lowers a pixel program with one target: whether it translates.
-fn lowers_ps(words: &[u32]) -> Result<(), crate::ShaderError> {
+/// Lowers a pixel program with one target.
+fn lower_ps_words(words: &[u32]) -> Result<Lowered, crate::ShaderError> {
     let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
     let native = NativeProgram {
         stage: HwStage::Ps,
@@ -460,7 +551,34 @@ fn lowers_ps(words: &[u32]) -> Result<(), crate::ShaderError> {
         prims: vec![],
         mesh_stride: 0,
     })
-    .map(|_| ())
+}
+
+/// Lowers a pixel program with one target: whether it translates.
+fn lowers_ps(words: &[u32]) -> Result<(), crate::ShaderError> {
+    lower_ps_words(words).map(|_| ())
+}
+
+/// A bare `v_readfirstlane_b32` in a pixel shader (not a proved waterfall
+/// descriptor read) wraps `waveReadLaneFirst` so a helper lane keeps its
+/// own value: `select(isHelperLane(), own, first)`. Compute is unchanged.
+#[test]
+fn pixel_readfirstlane_helper_lane_keeps_own_value() {
+    // v_readfirstlane_b32 s0, v0; v_mov_b32 v0, s0; exp mrt0 …; s_endpgm
+    let words = [0x7E00_0500, 0x7E00_0200, 0xF800_180F, 0, S_ENDPGM];
+    let ps = lower_ps_words(&words).expect("pixel readfirstlane");
+    assert!(ps.wave_ops);
+    assert!(
+        ps.has_helper_lane_op,
+        "pixel v_readfirstlane must emit dx.op.isHelperLane.i1"
+    );
+
+    // Same code as compute: no helpers, so no isHelperLane wrap.
+    let cs = lower_words(&words, 0).expect("compute readfirstlane");
+    assert!(cs.wave_ops);
+    assert!(
+        !cs.has_helper_lane_op,
+        "compute v_readfirstlane must stay bare waveReadLaneFirst"
+    );
 }
 
 /// Lowers a compute program of constants that allocates 512 bytes of LDS
@@ -518,6 +636,94 @@ fn permlanex16_reads_a_lane_of_the_other_row() {
         S_ENDPGM,
     ];
     lowers_lds(&words).unwrap();
+}
+
+/// VOP1 DPP16: `v_mov_b32_dpp vdst, vsrc row_shr:1` with `bound_ctrl` and `fi`.
+const fn vop1_dpp16_row_shr1(vdst: u8, vsrc: u8, bound_ctrl: bool, fi: bool) -> [u32; 2] {
+    [
+        0x7E00_0000 | (vdst as u32) << 17 | 0x01 << 9 | 0xFA,
+        (0xFu32) << 28
+            | 0xF << 24
+            | (bound_ctrl as u32) << 19
+            | (fi as u32) << 18
+            | 0x111 << 8
+            | vsrc as u32,
+    ]
+}
+
+/// VOP1 DPP8: `v_mov_b32_dpp vdst, vsrc dpp8:[1,0,3,2,5,4,7,6]` (`fi` via 0xEA).
+const fn vop1_dpp8_swap(vdst: u8, vsrc: u8, fi: bool) -> [u32; 2] {
+    let src0 = if fi { 0xEAu32 } else { 0xE9 };
+    let sel = 1 | 3 << 6 | 2 << 9 | 5 << 12 | 4 << 15 | 7 << 18 | 6 << 21;
+    [
+        0x7E00_0000 | (vdst as u32) << 17 | 0x01 << 9 | src0,
+        sel << 8 | vsrc as u32,
+    ]
+}
+
+/// Lowers a 32-thread compute shader that uses LDS (so the DPP result is
+/// consumed) and returns the lowered module.
+fn lower_wave32_dpp(words: &[u32]) -> Lowered {
+    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 8,
+        layout: vec![],
+        used: vec![],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 1 << 15,
+            threads: [32, 1, 1],
+        }),
+        code,
+    };
+    let p = ir::build(&native.code, false, 8).unwrap();
+    let st = structure::structure(&p).unwrap();
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+    let io = io::raise(&p, &native).unwrap();
+    lower(&Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: vec![],
+        outputs: vec![],
+        prims: vec![],
+        mesh_stride: 0,
+    })
+    .expect("lower")
+}
+
+/// VIC-BT-008: with `fi:0`, DPP must ballot active lanes so inactive
+/// sources follow `bound_ctrl` (zero / preserve dest). With `fi:1`, no
+/// ballot is required for that check.
+#[test]
+fn dpp_fetch_inactive_ballots_source_lane_activity() {
+    let end = [0x7E04_0280u32, 0xD834_0000, 0x0000_0102, S_ENDPGM]; // v2=0; ds_write_b32 v2, v1
+    let with_fi = |fi: bool| {
+        let mut w = Vec::new();
+        w.extend_from_slice(&vop1_dpp16_row_shr1(1, 0, true, fi));
+        w.extend_from_slice(&end);
+        lower_wave32_dpp(&w)
+    };
+    assert!(
+        with_fi(false).has_wave_ballot,
+        "fi:0 must waveActiveBallot for source EXEC"
+    );
+    assert!(
+        !with_fi(true).has_wave_ballot,
+        "fi:1 must not ballot just to read inactive sources"
+    );
+    // DPP8 with fi:0 also ballots; fi:1 does not.
+    let dpp8 = |fi: bool| {
+        let mut w = Vec::new();
+        w.extend_from_slice(&vop1_dpp8_swap(1, 0, fi));
+        w.extend_from_slice(&end);
+        lower_wave32_dpp(&w)
+    };
+    assert!(dpp8(false).has_wave_ballot);
+    assert!(!dpp8(true).has_wave_ballot);
 }
 
 #[test]

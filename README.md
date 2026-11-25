@@ -72,6 +72,8 @@ shader model 6.6 (and mesh shaders for the world), Rust (pinned in
 `rust-toolchain.toml`). On Linux, see
 [docs/linux-proton.md](docs/linux-proton.md) for which crates build and test
 natively today, cross-building `victory.exe` and running it under Proton.
+For Windows 10 runtime setup, adapter selection, and GPU troubleshooting, see
+[docs/windows-gpu-support.md](docs/windows-gpu-support.md).
 
 Under Wine or Proton, builds without embedded helper shaders also need DXC's
 `dxcompiler.dll` (with its `dxil.dll`): Wine's `d3dcompiler_47` cannot compile
@@ -196,6 +198,12 @@ If a hash differs, restore that file from your verified backup and rerun with
 the same build of VIctory and the same options. A breakpoint can have other
 causes. Include the archive verification outcome in your test report.
 
+Set `VICTORY_WAVE64_DOUBLE=1` to let a 32-lane host run a straight-line
+64-thread compute group that reads indexed lanes across the two halves.
+The initial form handles integer register operations, dword LDS reads and
+writes, and raw UAV stores. It uses no extra LDS. Other programs retain
+their usual translation. The option has separate shader cache entries.
+
 A release build has no debugging aids. Build them in with
 
 ```powershell
@@ -234,6 +242,7 @@ The on/off switches below (`...=1`) are off when unset or set to `0`.
 | `VICTORY_SHADER_LOOP_LIMIT=<n>` | translated shader loops stop after `n` iterations per lane instead of 2^20 (own shader cache entries); if a lower `n` makes world frames much faster, loops hitting the limit are what makes them slow |
 | `VICTORY_SHADER_OPT=<bits>` | which clean-up passes run over each translated shader (own shader cache entries): `0` none, 1 dead code, 2 constants and identities, 4 reuse of values, 8 branch facts, 16 loads within a block; unset runs all. Every pass is exact, so a fault that goes away with `0` is in a pass |
 | `VICTORY_ALIAS_COPY=0` | views the title places in the memory of a texture the host writes are filled from title memory again instead of copied from that texture on the host |
+| `VICTORY_REBAR=0` | disable `D3D12_HEAP_TYPE_GPU_UPLOAD` (Resizable BAR) placement for scratch and shadow buffers, keeping them in system memory |
 | `VICTORY_AUDIO_CAPTURE=<file.wav>` | records what the title plays (our process only) |
 | `VICTORY_XMA_DUMP=<dir>` | saves the first 32 XMA voices' context and input |
 | `VICTORY_NO_WATCHDOG=1` | apply the opt-in title watchdog disarm hooks (Series 1.0.2.1) |
