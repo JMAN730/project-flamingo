@@ -11273,6 +11273,16 @@ mod wave_size_tests {
         allow_wave32: bool,
         expected_threads: [u32; 3],
     ) -> (super::super::HostShader, (u32, u32)) {
+        let shader = try_compile_wave64_cs(words, threads, rsrc2_extra, allow_wave32).unwrap();
+        check_wave64_cs(shader, expected_threads)
+    }
+
+    fn try_compile_wave64_cs(
+        words: &[u32],
+        threads: [u32; 3],
+        rsrc2_extra: u32,
+        allow_wave32: bool,
+    ) -> Result<super::super::HostShader, crate::ShaderError> {
         let native = NativeProgram {
             stage: HwStage::Cs,
             wave64: true,
@@ -11307,11 +11317,17 @@ mod wave_size_tests {
         let st = crate::structure::structure(&p).unwrap();
         let io = crate::io::raise(&p, &native).unwrap();
         let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
-        let shader = if allow_wave32 {
-            emit(&c, &native, &p, &st, &io, &res).unwrap()
+        if allow_wave32 {
+            emit(&c, &native, &p, &st, &io, &res)
         } else {
-            emit_with_wave32(&c, &native, &p, &st, &io, &res, false).unwrap()
-        };
+            emit_with_wave32(&c, &native, &p, &st, &io, &res, false)
+        }
+    }
+
+    fn check_wave64_cs(
+        shader: super::super::HostShader,
+        expected_threads: [u32; 3],
+    ) -> (super::super::HostShader, (u32, u32)) {
         #[cfg(windows)]
         if let Ok(mut v) = super::super::validator::Validator::load(
             super::super::validator::Validator::default_path().as_deref(),
@@ -11569,6 +11585,76 @@ mod wave_size_tests {
         for (host, values) in run_cs_uav(&shader, 64) {
             assert_eq!(values, vec![1; 64], "{host}");
         }
+    }
+
+    /// A wave64 program: a first-lane read forces the console flow, then
+    /// `branch` runs between the stores of 1 and 2 into `out[tid]`.
+    fn console_flow_branch_words(branch: &[u32]) -> Vec<u32> {
+        let mut words = vec![
+            0xBE81_0380, // s_mov_b32 s1, 0
+            0xF408_0200,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[0:1], null
+            0x3408_0082, // v_lshlrev_b32 v4, 2, v0
+            0x7E04_0500, // v_readfirstlane_b32 s2, v0
+            0x7E04_0281, // v_mov_b32 v2, 1
+        ];
+        words.extend_from_slice(branch);
+        words.extend([
+            0xE070_1000,
+            0x8002_0204, // buffer_store_dword v2, v4, s[8:11], 0 offen
+            S_ENDPGM,
+        ]);
+        words
+    }
+
+    #[test]
+    fn console_flow_branches_on_a_numeric_vcc() {
+        let words = console_flow_branch_words(&[
+            0xBEEA_0480, // s_mov_b64 vcc, 0
+            0xBF86_0001, // s_cbranch_vccz +1
+            0x7E04_0282, // v_mov_b32 v2, 2
+        ]);
+        super::super::TEST_CONSOLE_FLOW.set(Some(true));
+        let (_, bounds) = compile_wave64_cs(&words, [64, 1, 1], 0);
+        super::super::TEST_CONSOLE_FLOW.set(None);
+        assert_eq!(bounds, (32, 32));
+    }
+
+    #[test]
+    fn console_flow_scc_join_of_mask_operations_is_resolved_or_refused() {
+        let words = console_flow_branch_words(&[
+            0x7D88_0088, // v_cmp_gt_u32_e32 vcc, 8, v0
+            0xBF06_8000, // s_cmp_eq_u32 s0, 0
+            0xBF85_0002, // s_cbranch_scc1 +2
+            0x8782_7E6A, // s_and_b64 s[2:3], vcc, exec
+            0xBF82_0001, // s_branch +1
+            0x8784_7E6A, // s_and_b64 s[4:5], vcc, exec
+            0xBF85_0001, // s_cbranch_scc1 +1
+            0x7E04_0282, // v_mov_b32 v2, 2
+        ]);
+        super::super::TEST_CONSOLE_FLOW.set(Some(false));
+        let off = try_compile_wave64_cs(&words, [64, 1, 1], 0, true);
+        super::super::TEST_CONSOLE_FLOW.set(Some(true));
+        let on = try_compile_wave64_cs(&words, [64, 1, 1], 0, true);
+        super::super::TEST_CONSOLE_FLOW.set(None);
+        eprintln!("off: {:?}", off.as_ref().err());
+        eprintln!("on: {:?}", on.as_ref().err());
+        assert!(on.is_err());
+    }
+
+    #[test]
+    fn console_flow_exec_hi_only_write_terminates() {
+        // A mask whose only change is its high dword is keyed by the
+        // unchanged low dword: reading it must stop, not recurse.
+        let words = console_flow_branch_words(&[
+            0xBEFF_0380, // s_mov_b32 exec_hi, 0
+            0xBF86_0001, // s_cbranch_vccz +1
+            0x7E04_0282, // v_mov_b32 v2, 2
+        ]);
+        super::super::TEST_CONSOLE_FLOW.set(Some(true));
+        let result = try_compile_wave64_cs(&words, [64, 1, 1], 0, true);
+        super::super::TEST_CONSOLE_FLOW.set(None);
+        let _ = result;
     }
 
     #[test]
