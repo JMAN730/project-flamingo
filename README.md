@@ -132,6 +132,10 @@ window or every render target 1080p. Changing the DXGI mode list alone does
 not change the scene resolution ([issue #203](https://github.com/Marvisak/VIctory/issues/203));
 Series S multi-plane presentation is covered separately by
 [PR #211](https://github.com/Marvisak/VIctory/pull/211).
+The experimental `VICTORY_PRESENT_TWO_PLANES=1` setting enables composition
+for the two full-screen RGBA8 planes used by the Series S menu. It uses the
+base plane when the overlay is unavailable or the compositor cannot start.
+The diagnostic render-target override takes precedence.
 
 The same report measured about 3.9 GB less committed process memory in the
 menus/intro and about 3.6 GB less at the world peak with Series S enabled.

@@ -19,6 +19,11 @@ use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObj
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{HRESULT, Interface, PCWSTR, w};
 
+use crate::present_compositor::PresentCompositor;
+
+#[cfg(all(test, feature = "diagnostics"))]
+mod present_tests;
+
 /// Resource states without the console's own bits (compression hints from
 /// bit 25 up), which the host rejects.
 pub(crate) fn pc_state(state: u32) -> u32 {
@@ -147,6 +152,7 @@ pub(crate) struct Host {
     /// with no desktop to present on would otherwise ask DXGI at the frame
     /// rate.
     present_retry: Mutex<Retry>,
+    present_compositor_retry: Mutex<Retry>,
     /// Detached host lists whose submissions finished, ready to reuse.
     free_lists: Mutex<Vec<HostList>>,
     #[cfg(test)]
@@ -751,6 +757,7 @@ fn create() -> windows::core::Result<Host> {
             next_rtv: AtomicU32::new(0),
             presenter: Mutex::new(None),
             present_retry: Mutex::new(Retry::new()),
+            present_compositor_retry: Mutex::new(Retry::new()),
             free_lists: Mutex::default(),
             #[cfg(test)]
             reused_lists: std::sync::atomic::AtomicU64::new(0),
@@ -5031,6 +5038,7 @@ struct Presenter {
     hwnd: HWND,
     meter: Meter,
     last_present_issue: Option<HRESULT>,
+    compositor: Option<PresentCompositor>,
 }
 
 /// A successful DXGI status may still mean nothing was presented.
@@ -5224,13 +5232,61 @@ impl Host {
     /// shown or the diagnostic probe has no reading. Otherwise diagnostics
     /// builds report whether the sampled pixels were black.
     pub(crate) fn present(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
+        self.present_overlay_with_compositor(
+            texture,
+            state,
+            None,
+            frame,
+            PresentCompositor::new,
+            #[cfg(all(test, feature = "diagnostics"))]
+            |_, _| {},
+        )
+    }
+
+    /// Presents the base with a premultiplied overlay when both can be sampled.
+    pub(crate) fn present_overlay(
+        &self,
+        texture: &ID3D12Resource,
+        state: u32,
+        overlay: &ID3D12Resource,
+        overlay_state: u32,
+        frame: u64,
+    ) -> Option<bool> {
+        self.present_overlay_with_compositor(
+            texture,
+            state,
+            Some((overlay, overlay_state)),
+            frame,
+            PresentCompositor::new,
+            #[cfg(all(test, feature = "diagnostics"))]
+            |_, _| {},
+        )
+    }
+
+    fn present_overlay_with_compositor(
+        &self,
+        texture: &ID3D12Resource,
+        state: u32,
+        overlay: Option<(&ID3D12Resource, u32)>,
+        frame: u64,
+        create: impl Fn(&ID3D12Device, DXGI_FORMAT) -> windows::core::Result<PresentCompositor>,
+        #[cfg(all(test, feature = "diagnostics"))] inspect: impl FnOnce(
+            &ID3D12Resource,
+            &D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
+        ),
+    ) -> Option<bool> {
+        #[cfg(feature = "diagnostics")]
+        let overlay = overlay.filter(|_| crate::capture::show_spec().is_none());
+        let mut overlay = overlay.and_then(|(overlay, state)| {
+            let extent = crate::present_compositor::extent(texture, overlay)?;
+            Some((overlay, D3D12_RESOURCE_STATES(state as i32), extent))
+        });
         // SAFETY: a live resource.
         let desc = unsafe { texture.GetDesc() };
         let Some(format) = swap_format(desc.Format) else {
             tracing::warn!(format = desc.Format.0, "cannot present this format");
             return None;
         };
-        let (width, height) = (desc.Width as u32, desc.Height);
         let mut presenter = self.presenter.lock().unwrap_or_else(|e| e.into_inner());
         let mut retry = self.present_retry.lock().unwrap_or_else(|e| e.into_inner());
         let now = std::time::Instant::now();
@@ -5239,6 +5295,33 @@ impl Host {
         if !retry.due(now) {
             return None;
         }
+        // Initialize before choosing the swap-chain extent or opening a list.
+        // A failed attempt can still present the base and retry on a later call.
+        let mut new_compositor = None;
+        if overlay.is_some() && presenter.as_ref().is_none_or(|p| p.compositor.is_none()) {
+            let mut compositor_retry = self
+                .present_compositor_retry
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if compositor_retry.due(now) {
+                match create(&self.device, format) {
+                    Ok(compositor) => {
+                        new_compositor = Some(compositor);
+                        compositor_retry.reset();
+                    }
+                    Err(error) => {
+                        compositor_retry.failed(std::time::Instant::now());
+                        if compositor_retry.attempts == 1 {
+                            tracing::warn!(%error, "no PresentX compositor; showing the base plane");
+                        }
+                    }
+                }
+            }
+            if new_compositor.is_none() {
+                overlay = None;
+            }
+        }
+        let (width, height) = overlay.map_or((desc.Width as u32, desc.Height), |(_, _, size)| size);
         if presenter.is_none() {
             match self.presenter(width, height, format) {
                 Ok(p) => {
@@ -5311,8 +5394,14 @@ impl Host {
         } else {
             p.sync_color_space(false);
         }
+        if let Some(compositor) = new_compositor {
+            p.compositor = Some(compositor);
+            tracing::info!(width, height, "compositing two PresentX planes");
+        }
+        let composition = overlay.zip(p.compositor.as_ref());
         let state = D3D12_RESOURCE_STATES(state as i32);
-        // SAFETY: our swap chain, list and a live source texture.
+        // SAFETY: our swap chain, list and live source textures. Lists are
+        // waited for before the presenter can reuse its descriptors.
         unsafe {
             let index = p.swap_chain.GetCurrentBackBufferIndex();
             let Ok(back) = p.swap_chain.GetBuffer::<ID3D12Resource>(index) else {
@@ -5320,42 +5409,76 @@ impl Host {
             };
             p.copy.reset();
             let list = &p.copy.list;
-            list.ResourceBarrier(&[
-                transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE),
-                transition(
-                    &back,
-                    D3D12_RESOURCE_STATE_PRESENT,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                ),
-            ]);
-            // Diagnostics: `VICTORY_SHOW_TARGET` shows one of the title's render targets instead.
+            let capture_source =
+                if let Some(((overlay, overlay_state, extent), compositor)) = composition {
+                    compositor.record(
+                        &self.device,
+                        list,
+                        &back,
+                        [(texture, state), (overlay, overlay_state)],
+                        extent,
+                    );
+                    #[cfg(feature = "diagnostics")]
+                    list.ResourceBarrier(&[transition(
+                        &back,
+                        D3D12_RESOURCE_STATE_RENDER_TARGET,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    )]);
+                    &back
+                } else {
+                    if state != D3D12_RESOURCE_STATE_COPY_SOURCE {
+                        list.ResourceBarrier(&[transition(
+                            texture,
+                            state,
+                            D3D12_RESOURCE_STATE_COPY_SOURCE,
+                        )]);
+                    }
+                    list.ResourceBarrier(&[transition(
+                        &back,
+                        D3D12_RESOURCE_STATE_PRESENT,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                    )]);
+                    // Diagnostics: show a selected title render target instead.
+                    #[cfg(feature = "diagnostics")]
+                    let shown = crate::capture::show(list, &back);
+                    #[cfg(not(feature = "diagnostics"))]
+                    let shown = false;
+                    if !shown {
+                        list.CopyResource(&back, texture);
+                    }
+                    texture
+                };
             #[cfg(feature = "diagnostics")]
-            let shown = crate::capture::show(list, &back);
-            #[cfg(not(feature = "diagnostics"))]
-            let shown = false;
-            if !shown {
-                list.CopyResource(&back, texture);
-            }
-            #[cfg(feature = "diagnostics")]
-            let capture = crate::capture::wanted(frame)
-                .then(|| crate::capture::read_back(&self.device, list, texture))
+            let capture = (cfg!(test) || crate::capture::wanted(frame))
+                .then(|| crate::capture::read_back(&self.device, list, capture_source))
                 .flatten();
             #[cfg(feature = "diagnostics")]
-            let probe = crate::capture::probe(&self.device, list, texture);
+            let probe = crate::capture::probe(&self.device, list, capture_source);
             #[cfg(not(feature = "diagnostics"))]
-            let _ = frame;
-            list.ResourceBarrier(&[
-                transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state),
-                transition(
-                    &back,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                    D3D12_RESOURCE_STATE_PRESENT,
-                ),
-            ]);
+            let _ = capture_source;
+            let back_state = if composition.is_some() {
+                if cfg!(feature = "diagnostics") {
+                    D3D12_RESOURCE_STATE_COPY_SOURCE
+                } else {
+                    D3D12_RESOURCE_STATE_RENDER_TARGET
+                }
+            } else {
+                if state != D3D12_RESOURCE_STATE_COPY_SOURCE {
+                    list.ResourceBarrier(&[transition(
+                        texture,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE,
+                        state,
+                    )]);
+                }
+                D3D12_RESOURCE_STATE_COPY_DEST
+            };
+            list.ResourceBarrier(&[transition(&back, back_state, D3D12_RESOURCE_STATE_PRESENT)]);
             p.copy.close();
             self.execute(&[&p.copy]);
             #[cfg(feature = "diagnostics")]
             if let Some((buffer, footprint)) = capture {
+                #[cfg(test)]
+                inspect(&buffer, &footprint);
                 crate::capture::save_read_back(frame, &buffer, &footprint);
             }
             let status = p.swap_chain.Present(0, DXGI_PRESENT(0));
@@ -5438,6 +5561,7 @@ impl Host {
                 hwnd,
                 meter: Meter::new(),
                 last_present_issue: None,
+                compositor: None,
             };
             p.sync_color_space(display_hdr_info().is_some());
             Ok(p)

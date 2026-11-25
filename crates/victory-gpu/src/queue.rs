@@ -335,8 +335,7 @@ pub(crate) fn presented() -> u64 {
 
 /// Shows the first plane's first resource in our window.
 ///
-/// shortcut: one plane, no scaling or placement, the source expected in
-/// the common state.
+/// shortcut: only the opt-in Series S two-plane layout adds an overlay.
 extern "system" fn present(
     this: This,
     planes: u32,
@@ -357,15 +356,65 @@ extern "system" fn present(
         .map(|plane| unsafe { *plane.resources })
         .filter(|resource| !resource.is_null())
         .map(object::Held::new);
-    queue(this)
-        .timeline
-        .submit(Op::Run(Box::new(move || show(resource))));
+    #[cfg(windows)]
+    let run = {
+        static TWO_PLANES: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let overlay = if planes == 2
+            && plane.is_some_and(|plane| plane.count == 1)
+            && crate::console::current() == crate::console::Console::SeriesS
+            && *TWO_PLANES.get_or_init(|| crate::switch::on("VICTORY_PRESENT_TWO_PLANES"))
+        {
+            resource
+                .as_ref()
+                .and_then(|primary| retain_present_overlay(plane_parameters, primary.get()))
+        } else {
+            None
+        };
+        move || show(resource, overlay)
+    };
+    #[cfg(not(windows))]
+    let run = move || show(resource);
+    queue(this).timeline.submit(Op::Run(Box::new(run)));
     S_OK
 }
 
-/// A present, once the queue's work before it has run: counts the frame
-/// and shows the plane's first resource.
-fn show(resource: Option<object::Held>) {
+/// Reads the second plane only for the observed Series S two-plane layout.
+/// Its stride is larger than the common prefix described by `Plane`.
+#[cfg(windows)]
+fn retain_present_overlay(
+    plane_parameters: *const Plane,
+    primary: This,
+) -> Option<crate::resource::PresentTarget> {
+    const SERIES_S_PLANE_STRIDE: usize = 0x48;
+    let plane = (plane_parameters as usize).checked_add(SERIES_S_PLANE_STRIDE)?;
+    let count_at = plane.checked_add(std::mem::offset_of!(Plane, count))?;
+    let mut count = [0; size_of::<u32>()];
+    if !crate::host::read_into(count_at as *const u8, &mut count) || u32::from_ne_bytes(count) != 1
+    {
+        return None;
+    }
+    let resources_at = plane.checked_add(std::mem::offset_of!(Plane, resources))?;
+    let mut resources = [0; size_of::<usize>()];
+    if !crate::host::read_into(resources_at as *const u8, &mut resources) {
+        return None;
+    }
+    let resources = usize::from_ne_bytes(resources);
+    let mut overlay = [0; size_of::<usize>()];
+    if resources == 0 || !crate::host::read_into(resources as *const u8, &mut overlay) {
+        return None;
+    }
+    let overlay = usize::from_ne_bytes(overlay);
+    if overlay == primary as usize {
+        return None;
+    }
+    crate::resource::PresentTarget::retain(overlay)
+}
+
+/// Counts and shows the frame once the queue's preceding work has run.
+fn show(
+    resource: Option<object::Held>,
+    #[cfg(windows)] overlay: Option<crate::resource::PresentTarget>,
+) {
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
     if frame.is_power_of_two() {
         let (draws, dispatches) = crate::list::take_counts();
@@ -401,18 +450,30 @@ fn show(resource: Option<object::Held>) {
     }
     #[cfg(windows)]
     if let Some(resource) = resource.as_ref().map(object::Held::get)
-        && let Some(texture) = crate::resource::host_resource(resource)
+        && let Some(copy) = crate::resource::host_copy_ref(resource)
         && let Some(host) = crate::host::host()
     {
-        const COPY_SOURCE: u32 = 0x800;
-        let state = crate::resource::host_transition(resource, COPY_SOURCE)
-            .map_or(COPY_SOURCE, |(_, before)| before);
-        let shown = host.present(texture, state, frame);
-        crate::resource::host_transition(resource, state);
+        let (state, shown) = if let Some(overlay) = overlay
+            .as_ref()
+            .and_then(crate::resource::PresentTarget::existing_host_copy)
+        {
+            let state = copy.state.load(Ordering::Relaxed);
+            let overlay_state = overlay.state.load(Ordering::Relaxed);
+            let shown =
+                host.present_overlay(&copy.texture, state, &overlay.texture, overlay_state, frame);
+            (state, shown)
+        } else {
+            const COPY_SOURCE: u32 = 0x800;
+            let state = crate::resource::host_transition(resource, COPY_SOURCE)
+                .map_or(COPY_SOURCE, |(_, before)| before);
+            let shown = host.present(&copy.texture, state, frame);
+            crate::resource::host_transition(resource, state);
+            (state, shown)
+        };
         #[cfg(feature = "diagnostics")]
         blinks(frame, resource, state, shown);
         #[cfg(not(feature = "diagnostics"))]
-        let _ = shown;
+        let _ = (state, shown);
     }
     #[cfg(not(windows))]
     let _ = resource;
@@ -787,6 +848,62 @@ mod tests {
         for object in [waits, signals, ready, done] {
             assert_eq!(release(object), 0);
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn series_s_overlay_uses_second_plane_stride_and_retains_the_target() {
+        #[repr(C)]
+        struct FullPlane {
+            prefix: Plane,
+            reserved: [u64; 6],
+        }
+
+        let backing = [0u64; 2];
+        let primary = crate::resource::test_target(std::ptr::from_ref(&backing[0]) as u64);
+        let overlay = crate::resource::test_target(std::ptr::from_ref(&backing[1]) as u64);
+        let retained = {
+            let primary_resources = [primary];
+            let overlay_resources = [overlay];
+            let mut planes = [
+                FullPlane {
+                    prefix: Plane {
+                        token: 1,
+                        count: 1,
+                        resources: primary_resources.as_ptr(),
+                    },
+                    reserved: [0; 6],
+                },
+                FullPlane {
+                    prefix: Plane {
+                        token: 1,
+                        count: 1,
+                        resources: overlay_resources.as_ptr(),
+                    },
+                    reserved: [0; 6],
+                },
+            ];
+            let retain = |planes: &[FullPlane; 2]| {
+                let parameters = std::hint::black_box(planes.as_ptr().cast::<Plane>());
+                retain_present_overlay(parameters, primary)
+            };
+            planes[1].prefix.count = 2;
+            assert!(retain(&planes).is_none());
+            planes[1].prefix.count = 1;
+            planes[1].prefix.resources = std::ptr::null();
+            assert!(retain(&planes).is_none());
+            planes[1].prefix.resources = primary_resources.as_ptr();
+            assert!(retain(&planes).is_none());
+            planes[1].prefix.resources = overlay_resources.as_ptr();
+            retain(&planes).expect("second plane retained")
+        };
+
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        assert_eq!(release(overlay), 1, "present retains its own reference");
+        assert!(retained.existing_host_copy().is_none());
+        drop(retained);
+        assert!(crate::resource::PresentTarget::retain(overlay as usize).is_none());
+        assert_eq!(release(primary), 0);
     }
 
     /// A present submitted after a wait must not run until the wait is

@@ -2070,6 +2070,31 @@ fn targets() -> std::sync::MutexGuard<'static, std::collections::BTreeMap<u64, u
     TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// A recognized renderable resource retained for an optional present overlay.
+#[cfg(windows)]
+pub(crate) struct PresentTarget(object::Held);
+
+#[cfg(windows)]
+impl PresentTarget {
+    /// Checks the submitted pointer against the live target table before
+    /// accessing the object.
+    pub(crate) fn retain(address: usize) -> Option<Self> {
+        let targets = targets();
+        if !targets.values().any(|&target| target == address) {
+            return None;
+        }
+        // SAFETY: a resource in the table must acquire this same lock before
+        // its allocation can be freed. try_new refuses an object in Drop.
+        unsafe { object::Held::try_new(address as This) }.map(Self)
+    }
+
+    /// An ignored plane should not acquire a host texture just by being
+    /// inspected. Reuse a host copy that preceding work materialized.
+    pub(crate) fn existing_host_copy(&self) -> Option<&HostTexture> {
+        resource(self.0.get()).host.get()?.as_deref()
+    }
+}
+
 /// For `this`, a texture made for a view the title placed in memory
 /// ([`texture_at`]): the title texture the host writes that lies in the same
 /// memory, if there is one of the same size, levels and layers with texels of
@@ -2331,6 +2356,37 @@ pub(crate) fn test_buffer(width: u64) -> This {
         &mut out,
     );
     assert_eq!(hr, S_OK);
+    out
+}
+
+#[cfg(all(test, windows))]
+pub(crate) fn test_target(address: u64) -> This {
+    let desc = ResourceDesc {
+        dimension: TEXTURE_2D,
+        alignment: 0,
+        width: 1,
+        height: 1,
+        depth_or_array_size: 1,
+        mip_levels: 1,
+        format: 28,
+        sample_count: 1,
+        sample_quality: 0,
+        layout: 0,
+        flags: 1,
+    };
+    let mut out = std::ptr::null();
+    assert_eq!(
+        create_at_address(
+            std::ptr::null(),
+            address,
+            &desc,
+            0,
+            std::ptr::null(),
+            &RESOURCE_IIDS[0],
+            &mut out,
+        ),
+        S_OK
+    );
     out
 }
 
