@@ -655,7 +655,7 @@ impl Layout {
         row_pitch: usize,
         depth_pitch: usize,
     ) -> Result<(), Error> {
-        self.walk(
+        self.copy_spans(
             tiled.len(),
             mip,
             slice,
@@ -678,7 +678,7 @@ impl Layout {
         row_pitch: usize,
         depth_pitch: usize,
     ) -> Result<(), Error> {
-        self.walk(
+        self.copy_spans(
             tiled.len(),
             mip,
             slice,
@@ -691,9 +691,11 @@ impl Layout {
         )
     }
 
-    /// Visits contiguous runs as (tiled byte offset, linear byte offset, length).
+    /// Visits each contiguous run in one subresource, in linear row order, as
+    /// (tiled byte offset, linear byte offset, byte count). A run contains
+    /// whole elements of one row. The bounds match those of `tile` and `detile`.
     #[allow(clippy::too_many_arguments)]
-    fn walk(
+    pub fn copy_spans(
         &self,
         tiled_len: usize,
         mip: u32,

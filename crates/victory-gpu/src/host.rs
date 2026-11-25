@@ -39,12 +39,18 @@ const RTV_RING: u32 = 1024;
 /// Maximum number of detached host lists kept for reuse after pending resets.
 const LIST_POOL_CAP: usize = 64;
 
+#[derive(Default)]
+struct Submission {
+    /// The last value signalled on the host fence.
+    fence_value: u64,
+    readbacks: crate::texture::ReadbackCache,
+}
+
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
     queue: ID3D12CommandQueue,
     fence: ID3D12Fence,
-    /// The last value signalled on `fence`, behind the submission lock.
-    submitted: Mutex<u64>,
+    submitted: Mutex<Submission>,
     event: HANDLE,
     rtvs: ID3D12DescriptorHeap,
     rtv_size: u32,
@@ -444,7 +450,7 @@ fn create() -> windows::core::Result<Host> {
             device,
             queue,
             fence,
-            submitted: Mutex::new(0),
+            submitted: Mutex::default(),
             event,
             rtvs,
             rtv_size,
@@ -784,6 +790,7 @@ struct Readback {
 /// the upload/readback buffers its GPU commands name, kept until reset.
 #[derive(Default)]
 struct Deferred {
+    placed_writes: std::collections::HashMap<usize, std::sync::Arc<crate::resource::HostTexture>>,
     /// Destination, source, bytes.
     copies: Vec<Step>,
     /// Post-submission readbacks from GPU textures into title buffers.
@@ -1006,19 +1013,28 @@ impl Host {
         // Where each run's lists start in `lists`.
         let mut firsts = Vec::with_capacity(runs.len());
         let mut batch = Batch::default();
+        let mut placed_uploads = Vec::new();
         {
             #[cfg(test)]
             let _scope = enter_retire_scope(exec_scope.clone());
             for list in runs {
                 list.run_deferred(&mut batch);
                 firsts.push(lists.len());
-                if let Some(prelude) = list.prelude() {
+                if let Some(prelude) = list.prelude(&mut batch, &mut placed_uploads) {
                     lists.push(Some(prelude));
                 }
                 lists.push(list.list.cast().ok());
             }
         }
         batch.flush();
+        let feedback = crate::texture::Feedback::record(
+            self,
+            batch.placed_writes.values(),
+            &mut submitted.readbacks,
+        );
+        if let Some(f) = &feedback {
+            lists.push(Some(f.list.clone()));
+        }
         let prepared = std::time::Instant::now();
         // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`).
         #[cfg(feature = "diagnostics")]
@@ -1034,13 +1050,16 @@ impl Host {
         #[cfg(not(feature = "diagnostics"))]
         let groups = [&lists[..]];
         for (i, group) in groups.iter().enumerate() {
-            *submitted += 1;
+            submitted.fence_value += 1;
             let started = std::time::Instant::now();
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
                 self.queue.ExecuteCommandLists(group);
-                match self.queue.Signal(&self.fence, *submitted) {
-                    Ok(()) => match self.fence.SetEventOnCompletion(*submitted, self.event) {
+                match self.queue.Signal(&self.fence, submitted.fence_value) {
+                    Ok(()) => match self
+                        .fence
+                        .SetEventOnCompletion(submitted.fence_value, self.event)
+                    {
                         Ok(()) => {
                             let waited = WaitForSingleObject(self.event, INFINITE);
                             if waited != WAIT_OBJECT_0 {
@@ -1048,7 +1067,7 @@ impl Host {
                                     wait = waited.0,
                                     "host fence event wait failed; polling fence"
                                 );
-                                self.poll_fence(*submitted);
+                                self.poll_fence(submitted.fence_value);
                             }
                         }
                         Err(e) => {
@@ -1056,7 +1075,7 @@ impl Host {
                                 error = %e,
                                 "host fence event registration failed; polling fence"
                             );
-                            self.poll_fence(*submitted);
+                            self.poll_fence(submitted.fence_value);
                         }
                     },
                     Err(e) => fail(format_args!(
@@ -1123,6 +1142,9 @@ impl Host {
         // submission, however many dispatches declared it (the world's
         // passes declare the same big ranges dozens of times).
         let copying = std::time::Instant::now();
+        if let Some(f) = feedback {
+            f.finish(&mut submitted.readbacks);
+        }
         for (shadow, address, len) in batch.gpu_writes {
             let written = shadow.copy_back(address, len);
             COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
@@ -1731,6 +1753,11 @@ impl HostList {
     ) -> Option<(&'static ID3D12Resource, u32)> {
         let texture = crate::resource::host_resource(resource)?;
         let copy = crate::resource::host_copy(resource)?;
+        if copy.placed.get().is_some() && wanted & (0x4 | 0x8 | 0x400) != 0 {
+            self.deferred()
+                .placed_writes
+                .insert(std::sync::Arc::as_ptr(&copy) as usize, copy.clone());
+        }
         self.mark_work();
         let wanted = legal_state(texture, wanted);
         let (changed, result) = {
@@ -1806,22 +1833,39 @@ impl HostList {
     /// At submission: the list that moves each texture this list uses from
     /// its real state to the one the list starts with; the textures' real
     /// states become those the list ends with.
-    fn prelude(&self) -> Option<ID3D12CommandList> {
+    fn prelude(
+        &self,
+        batch: &mut Batch,
+        keep: &mut Vec<crate::texture::Upload>,
+    ) -> Option<ID3D12CommandList> {
         let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
-        let barriers: Vec<D3D12_RESOURCE_BARRIER> = states
-            .values()
-            .filter_map(|(first, last, _, copy)| {
-                let real = copy.state.swap(*last, Ordering::Relaxed);
-                (real != *first).then(|| {
-                    transition(
+        let first_upload = keep.len();
+        let mut destinations = Vec::new();
+        let mut before = Vec::new();
+        let mut barriers = Vec::new();
+        for (key, (first, last, _, copy)) in states.iter() {
+            let mut real = D3D12_RESOURCE_STATES(copy.state.swap(*last, Ordering::Relaxed) as i32);
+            if let Some(placed) = copy.placed.get()
+                && batch.placed.insert(*key)
+                && let Some(upload) = placed.changes(&copy.texture)
+            {
+                if real != D3D12_RESOURCE_STATE_COPY_DEST {
+                    before.push(transition(
                         &copy.texture,
-                        D3D12_RESOURCE_STATES(real as i32),
-                        D3D12_RESOURCE_STATES(*first as i32),
-                    )
-                })
-            })
-            .collect();
-        if barriers.is_empty() {
+                        real,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                    ));
+                }
+                real = D3D12_RESOURCE_STATE_COPY_DEST;
+                destinations.push(&copy.texture);
+                keep.push(upload);
+            }
+            let first = D3D12_RESOURCE_STATES(*first as i32);
+            if real != first {
+                barriers.push(transition(&copy.texture, real, first));
+            }
+        }
+        if barriers.is_empty() && destinations.is_empty() {
             return None;
         }
         let (allocator, list) = &self.prelude;
@@ -1830,7 +1874,15 @@ impl HostList {
         let recorded = unsafe {
             allocator.Reset().and_then(|()| {
                 list.Reset(allocator, None)?;
-                list.ResourceBarrier(&barriers);
+                if !before.is_empty() {
+                    list.ResourceBarrier(&before);
+                }
+                for (texture, upload) in destinations.iter().zip(&keep[first_upload..]) {
+                    upload.record(list, texture);
+                }
+                if !barriers.is_empty() {
+                    list.ResourceBarrier(&barriers);
+                }
                 list.Close()
             })
         };
@@ -2240,7 +2292,14 @@ impl HostList {
     fn run_deferred(&self, batch: &mut Batch) {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
-        for step in &self.deferred().copies {
+        let deferred = self.deferred();
+        batch.placed_writes.extend(
+            deferred
+                .placed_writes
+                .iter()
+                .map(|(&key, copy)| (key, copy.clone())),
+        );
+        for step in &deferred.copies {
             let mut started = std::time::Instant::now();
             let copied = match step {
                 &Step::Copy(dst, src, len) => {
@@ -2316,6 +2375,8 @@ impl HostList {
 /// once, it is checked again only after a step that writes title memory.
 #[derive(Default)]
 struct Batch {
+    placed_writes: std::collections::HashMap<usize, std::sync::Arc<crate::resource::HostTexture>>,
+    placed: std::collections::HashSet<usize>,
     refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
     gpu_writes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
     declared_writes: std::collections::HashSet<(usize, usize, usize)>,
@@ -2369,6 +2430,7 @@ impl Batch {
     fn title_written(&mut self) {
         self.flush();
         self.textures.clear();
+        self.placed.clear();
     }
 
     fn flush(&mut self) {
@@ -2439,6 +2501,11 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     } else {
         read_pieces(src, dst, len);
     }
+}
+
+/// Copies the resident part of a guest range, zeroing each unavailable span.
+pub(crate) fn read_resident_into(src: *const u8, dst: &mut [u8]) {
+    read_sparse(src, dst.as_mut_ptr(), dst.len());
 }
 
 /// After a failed bulk read into host memory, skip contiguous holes. Never

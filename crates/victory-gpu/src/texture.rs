@@ -24,6 +24,9 @@ use windows::Win32::Graphics::Direct3D12::*;
 use crate::host::{HostList, host};
 use crate::object::This;
 
+mod placed;
+pub(crate) use placed::{Feedback, Placed, ReadbackCache, Upload};
+
 macro_rules! once {
     ($($arg:tt)*) => {{
         static ONCE: std::sync::Once = std::sync::Once::new();
@@ -328,6 +331,9 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
 
 /// Uploads the levels the placed view can sample, starting at `first`.
 pub(crate) fn upload_from(list: &HostList, resource: This, texture: &ID3D12Resource, first: u32) {
+    if crate::resource::host_copy(resource).is_some_and(|c| c.placed.get().is_some()) {
+        return; // placed colour UAVs are reconciled in submission order
+    }
     let host_written = HOST_WRITTEN
         .lock()
         .unwrap_or_else(|e| e.into_inner())

@@ -95,124 +95,380 @@ impl Drop for Guest {
     }
 }
 
-// The cached placement must stay live for the process. Align within the array.
+/// A separately recorded guest CopyTextureRegion from mip zero into a CPU-visible buffer.
+struct TexelReadback {
+    list: Guest,
+    destination: Guest,
+    _allocator: Guest,
+}
+
+impl TexelReadback {
+    fn new(texture: This, row: u32) -> Self {
+        let null = std::ptr::null();
+        let mut allocator = null;
+        assert_eq!(
+            crate::list::create_allocator(
+                null,
+                0,
+                std::ptr::from_ref(&ID3D12CommandAllocator::IID).cast(),
+                &mut allocator
+            ),
+            S_OK
+        );
+        let allocator = Guest(allocator);
+        let mut list = null;
+        assert_eq!(
+            crate::list::create_list(
+                null,
+                0,
+                0,
+                allocator.0,
+                null,
+                std::ptr::from_ref(&ID3D12GraphicsCommandList::IID).cast(),
+                &mut list
+            ),
+            S_OK
+        );
+        let list = Guest(list);
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_READBACK,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: 256,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let mut destination = null;
+        assert_eq!(
+            crate::resource::create_committed(
+                null,
+                (&raw const heap).cast(),
+                0,
+                (&raw const desc).cast(),
+                D3D12_RESOURCE_STATE_COPY_DEST.0 as u32,
+                null.cast(),
+                std::ptr::from_ref(&ID3D12Resource::IID).cast(),
+                &mut destination
+            ),
+            S_OK
+        );
+        let destination = Guest(destination);
+        #[repr(C)]
+        struct Location {
+            resource: This,
+            kind: u32,
+            footprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
+        }
+        const _: () = assert!(size_of::<Location>() == size_of::<D3D12_TEXTURE_COPY_LOCATION>());
+        let from = Location {
+            resource: texture,
+            kind: 0,
+            footprint: Default::default(),
+        };
+        let to = Location {
+            resource: destination.0,
+            kind: 1,
+            footprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                Offset: 0,
+                Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                    Format: DXGI_FORMAT_R32G32B32A32_FLOAT,
+                    Width: 16,
+                    Height: 1,
+                    Depth: 1,
+                    RowPitch: 256,
+                },
+            },
+        };
+        let copy = slot::<
+            extern "system" fn(This, &Location, u32, u32, u32, &Location, *const [u32; 6]),
+        >(list.0, crate::list::test_slot(list.0, 16));
+        let region = [0u32, row, 0, 2, row + 1, 1];
+        copy(list.0, &to, 0, 0, 0, &from, region.as_ptr().cast());
+        let close =
+            slot::<extern "system" fn(This) -> i32>(list.0, crate::list::test_slot(list.0, 9));
+        assert_eq!(close(list.0), S_OK);
+        Self {
+            list,
+            destination,
+            _allocator: allocator,
+        }
+    }
+
+    fn read(&self, host: &crate::host::Host) -> [[f32; 4]; 2] {
+        let segments = crate::list::segments(self.list.0);
+        let [crate::list::Segment::List(list)] = segments.as_slice() else {
+            panic!("expected a single copy list");
+        };
+        host.execute(&[list]);
+        let (data, len) = crate::resource::buffer_bytes(self.destination.0).unwrap();
+        assert!(len >= 32);
+        // SAFETY: the completed guest readback filled this buffer with two RGBA32_FLOAT texels.
+        unsafe { data.cast::<[[f32; 4]; 2]>().read_unaligned() }
+    }
+}
+
+// The placement stays live for the process. A nonzero initial texel distinguishes
+// preserved title data from a freshly allocated host resource.
 const TEXTURE_ALIGNMENT: usize = 64 << 10;
-static BACKING: [u8; 2 * TEXTURE_ALIGNMENT] = [0; 2 * TEXTURE_ALIGNMENT];
+
+struct Fixture {
+    pipeline: Guest,
+    views: Guest,
+    handle: u64,
+    address: u64,
+    placed: This,
+}
+
+impl Fixture {
+    fn new(host: &crate::host::Host, width: u32, height: u32, watched: bool) -> Option<Self> {
+        let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL {
+            HighestShaderModel: D3D_SHADER_MODEL_6_6,
+        };
+        // SAFETY: an output value of the size required for this feature query.
+        let shader_model = unsafe {
+            host.device.CheckFeatureSupport(
+                D3D12_FEATURE_SHADER_MODEL,
+                (&raw mut sm).cast(),
+                size_of_val(&sm) as u32,
+            )
+        };
+        if shader_model.is_err() || sm.HighestShaderModel.0 < D3D_SHADER_MODEL_6_6.0 {
+            eprintln!("placed UAV dispatch needs SM 6.6");
+            return None;
+        }
+
+        let mut pipeline = std::ptr::null();
+        assert_eq!(
+            hand_out(vec![store_shader()], None, &PIPELINE_IIDS[0], &mut pipeline),
+            S_OK
+        );
+        let pipeline = Guest(pipeline);
+        assert!(
+            host_pipeline(pipeline.0).is_some(),
+            "synthetic host pipeline"
+        );
+
+        #[repr(C)]
+        struct HeapDescWithPlacement(D3D12_DESCRIPTOR_HEAP_DESC, [u64; 2]);
+        let desc = HeapDescWithPlacement(
+            D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                NumDescriptors: 2,
+                Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                NodeMask: 0,
+            },
+            [0; 2],
+        );
+        let iid = ID3D12DescriptorHeap::IID;
+        let iid = guid(iid.data1, iid.data2, iid.data3, iid.data4);
+        let mut views = std::ptr::null();
+        assert_eq!(
+            crate::descriptor::create_heap(
+                std::ptr::null(),
+                std::ptr::from_ref(&desc).cast(),
+                &iid,
+                &mut views
+            ),
+            S_OK
+        );
+        let views = Guest(views);
+        let handle = crate::descriptor::heap(views.0).start + 32;
+
+        let count = (width * height * 4) as usize + TEXTURE_ALIGNMENT / 2;
+        let address = if watched {
+            const MEM_WRITE_WATCH: u32 = 0x20_0000;
+            use windows_sys::Win32::System::Memory::{
+                MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
+            };
+            // SAFETY: the fresh allocation holds count floats and outlives the fixture.
+            let p = unsafe {
+                VirtualAlloc(
+                    std::ptr::null(),
+                    count * 4,
+                    MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                    PAGE_READWRITE,
+                )
+            }
+            .cast::<f32>();
+            assert!(!p.is_null());
+            // SAFETY: the committed allocation holds count aligned floats.
+            unsafe { std::slice::from_raw_parts_mut(p, count) }.fill(3.0);
+            assert!(crate::watch::writes(p as usize, p as usize + count * 4, false).is_some());
+            (p as usize).next_multiple_of(TEXTURE_ALIGNMENT) as u64
+        } else {
+            let backing = Box::leak(vec![3.0f32; count].into_boxed_slice());
+            (backing.as_mut_ptr() as usize).next_multiple_of(TEXTURE_ALIGNMENT) as u64
+        };
+        let format = DXGI_FORMAT_R32G32B32A32_FLOAT.0 as u32;
+        let mut resource = [0; 14];
+        resource[0] = D3D12_RESOURCE_DIMENSION_TEXTURE2D.0 as u32;
+        resource[4] = width;
+        resource[6] = height;
+        resource[7] = 1 | (1 << 16); // one slice and one mip
+        resource[8] = format;
+        resource[9] = 1; // sample count
+        resource[11] = 1; // linear layout
+        resource[12] = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 as u32;
+        let mut view = [0; 16];
+        view[0] = format;
+        view[1] = D3D12_UAV_DIMENSION_TEXTURE2D.0 as u32;
+        view[10] = address as u32;
+        view[11] = (address >> 32) as u32;
+        let placed = crate::resource::texture_at(address, &resource).expect("placed texture");
+        crate::descriptor::create_placed_uav(std::ptr::null(), &resource, &view, handle);
+
+        Some(Self {
+            pipeline,
+            views,
+            handle,
+            address,
+            placed,
+        })
+    }
+
+    fn dispatch(&self, host: &crate::host::Host, expected: [f32; 4]) -> crate::host::HostList {
+        let list = host.new_list().unwrap();
+        let mut state = crate::draw::State::default();
+        state.set_pipeline(self.pipeline.0);
+        state.set_heaps(&[self.views.0]);
+        state.set_constants(true, 0, &expected.map(f32::to_bits), 0);
+        state.set_table(true, 1, self.handle);
+        let dispatched = crate::draw::dispatched();
+        state.dispatch(&list, 1, 1, 1);
+        assert!(
+            crate::draw::dispatched() > dispatched,
+            "dispatch did not record"
+        );
+        list.close();
+        list
+    }
+}
 
 #[test]
 fn placed_uav_dispatch_writes_its_texture() {
+    check_dispatch(false);
+}
+
+#[test]
+fn watched_placed_uav_dispatch_writes_its_texture() {
+    check_dispatch(true);
+}
+
+fn check_dispatch(watched: bool) {
     let Some(host) = crate::host::host() else {
         return;
     };
-    let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL {
-        HighestShaderModel: D3D_SHADER_MODEL_6_6,
-    };
-    // SAFETY: an output value of the size required for this feature query.
-    let shader_model = unsafe {
-        host.device.CheckFeatureSupport(
-            D3D12_FEATURE_SHADER_MODEL,
-            (&raw mut sm).cast(),
-            size_of_val(&sm) as u32,
-        )
-    };
-    if shader_model.is_err() || sm.HighestShaderModel.0 < D3D_SHADER_MODEL_6_6.0 {
-        eprintln!("placed UAV dispatch needs SM 6.6");
+    // Span multiple write-watch pages so a one-channel CPU edit exercises the sparse read.
+    let Some(fixture) = Fixture::new(host, 16, 1024, watched) else {
         return;
-    }
-
-    let mut pipeline = std::ptr::null();
-    assert_eq!(
-        hand_out(vec![store_shader()], None, &PIPELINE_IIDS[0], &mut pipeline),
-        S_OK
-    );
-    let pipeline = Guest(pipeline);
-    assert!(
-        host_pipeline(pipeline.0).is_some(),
-        "synthetic host pipeline"
-    );
-
-    #[repr(C)]
-    struct HeapDescWithPlacement(D3D12_DESCRIPTOR_HEAP_DESC, [u64; 2]);
-    let desc = HeapDescWithPlacement(
-        D3D12_DESCRIPTOR_HEAP_DESC {
-            Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-            NumDescriptors: 2,
-            Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
-            NodeMask: 0,
-        },
-        [0; 2],
-    );
-    let iid = ID3D12DescriptorHeap::IID;
-    let iid = guid(iid.data1, iid.data2, iid.data3, iid.data4);
-    let mut views = std::ptr::null();
-    assert_eq!(
-        crate::descriptor::create_heap(
-            std::ptr::null(),
-            std::ptr::from_ref(&desc).cast(),
-            &iid,
-            &mut views
-        ),
-        S_OK
-    );
-    let views = Guest(views);
-    let handle = crate::descriptor::heap(views.0).start + 32;
-
-    let address = (BACKING.as_ptr() as usize).next_multiple_of(TEXTURE_ALIGNMENT) as u64;
-    let format = DXGI_FORMAT_R32G32B32A32_FLOAT.0 as u32;
-    let mut resource = [0; 14];
-    resource[0] = D3D12_RESOURCE_DIMENSION_TEXTURE2D.0 as u32;
-    resource[4] = 16; // width, one 256-byte RGBA32_FLOAT row
-    resource[6] = 1; // height
-    resource[7] = 1 | (1 << 16); // one slice and one mip
-    resource[8] = format;
-    resource[9] = 1; // sample count
-    resource[11] = 1; // linear layout
-    resource[12] = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 as u32;
-    let mut view = [0; 16];
-    view[0] = format;
-    view[1] = D3D12_UAV_DIMENSION_TEXTURE2D.0 as u32;
-    view[10] = address as u32;
-    view[11] = (address >> 32) as u32;
-    let placed = crate::resource::texture_at(address, &resource).expect("placed texture");
-    let texture = crate::resource::host_resource(placed).expect("host texture");
-    crate::descriptor::create_placed_uav(std::ptr::null(), &resource, &view, handle);
-
-    let expected = [1.0f32, 0.5, -0.25, 2.0];
-    let list = host.new_list().unwrap();
-    let mut state = crate::draw::State::default();
-    state.set_pipeline(pipeline.0);
-    state.set_heaps(&[views.0]);
-    state.set_constants(true, 0, &expected.map(f32::to_bits), 0);
-    state.set_table(true, 1, handle);
-    let dispatched = crate::draw::dispatched();
-    state.dispatch(&list, 1, 1, 1);
-    assert!(
-        crate::draw::dispatched() > dispatched,
-        "dispatch did not record"
-    );
-    // A readback uploads a texture the title fills (the texture-to-buffer
-    // copy does, without asking whether the host wrote it): what the shader
-    // stored must survive, so nothing of the title memory (zeroes) may be
-    // copied over it.
-    crate::texture::upload(&list, placed, texture);
-    crate::list::ensure_state(&list, placed, D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32);
-    let (readback, footprint) =
-        crate::capture::read_back(&host.device, &list.list, texture).unwrap();
-    list.close();
-    host.execute(&[&list]);
-
-    // SAFETY: read the two RGBA32_FLOAT texels after the synchronous submission.
-    let texels = unsafe {
-        let mut data = std::ptr::null_mut();
-        readback.Map(0, None, Some(&mut data)).unwrap();
-        let texels = data
-            .cast::<u8>()
-            .add(footprint.Offset as usize)
-            .cast::<[[f32; 4]; 2]>()
-            .read_unaligned();
-        readback.Unmap(0, None);
-        assert!(host.device.GetDeviceRemovedReason().is_ok());
-        texels
     };
-    assert_eq!(texels, [expected, [0.0; 4]], "placed UAV dispatch readback");
+    let expected = [1.0f32, 0.5, -0.25, 2.0];
+    let list = fixture.dispatch(host, expected);
+    let consumer = TexelReadback::new(fixture.placed, 0);
+    host.execute(&[&list]);
+    assert_eq!(consumer.read(host), [expected, [3.0; 4]]);
+    let other = [-0.5f32, 3.0, 4.0, 5.0];
+    // SAFETY: the adjacent texel is inside the aligned guest backing and the dispatch has completed.
+    unsafe { (fixture.address as *mut [f32; 4]).add(1).write(other) };
+    assert_eq!(consumer.read(host), [expected, other]);
+    // A direct CPU read after the GPU fence observes the stored texel. Reset one
+    // component to its original value; the remaining GPU-written channels survive.
+    let first = fixture.address as *mut [f32; 4];
+    // SAFETY: the mapped, aligned texel is live and both submissions completed.
+    unsafe {
+        assert_eq!(first.read(), expected, "fenced guest backing");
+        first.cast::<f32>().write(3.0);
+    }
+    assert_eq!(consumer.read(host), [[3.0, 0.5, -0.25, 2.0], other]);
+    // SAFETY: the host device is live after both completed submissions.
+    assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    eprintln!("placed UAV readback, fenced backing and CPU channel reset verified");
+}
+
+#[test]
+fn placed_uav_preserves_resident_rows_around_a_remapped_page() {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_DECOMMIT, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+    };
+    let Some(host) = crate::host::host() else {
+        return;
+    };
+    // One 256-texel RGBA32_FLOAT row occupies one 4 KiB page.
+    let Some(fixture) = Fixture::new(host, 256, 32, true) else {
+        return;
+    };
+    let rows = [0, 15, 31].map(|y| TexelReadback::new(fixture.placed, y));
+    let inspect = || rows.each_ref().map(|row| row.read(host)[0]);
+    assert_eq!(inspect(), [[3.0; 4]; 3]);
+    let middle = (fixture.address as usize + 15 * 4096) as *mut std::ffi::c_void;
+    // SAFETY: this page belongs to the fixture's process-lifetime reservation.
+    assert_ne!(unsafe { VirtualFree(middle, 4096, MEM_DECOMMIT) }, 0);
+    let written = [7.0, 8.0, 9.0, 10.0];
+    host.execute(&[&fixture.dispatch(host, written)]);
+    assert_eq!(inspect(), [written, [0.0; 4], [3.0; 4]]);
+    // SAFETY: restore exactly the decommitted page before writing its first texel.
+    let restored = unsafe { VirtualAlloc(middle, 4096, MEM_COMMIT, PAGE_READWRITE) };
+    assert_eq!(restored, middle);
+    // SAFETY: the page is recommitted, writable and aligned for the texel.
+    unsafe { middle.cast::<[f32; 4]>().write([5.0; 4]) };
+    assert_eq!(inspect(), [written, [5.0; 4], [3.0; 4]]);
+}
+
+#[test]
+fn placed_uav_readbacks_stay_distinct_across_submissions() {
+    let Some(host) = crate::host::host() else {
+        return;
+    };
+    let Some(a) = Fixture::new(host, 16, 1, false) else {
+        return;
+    };
+    let b = Fixture::new(host, 16, 1, false).unwrap();
+    let wider = Fixture::new(host, 128, 1, false).unwrap();
+    for (step, second) in [&b, &b, &wider].into_iter().enumerate() {
+        let left = [step as f32 + 1.0, 4.0, 5.0, 6.0];
+        let right = [-left[0], 7.0, 8.0, 9.0];
+        let first_list = a.dispatch(host, left);
+        let second_list = second.dispatch(host, right);
+        host.execute(&[&first_list, &second_list]);
+        // SAFETY: both fixtures own distinct aligned backing, and execute waited for the fence.
+        unsafe {
+            assert_eq!((a.address as *const [f32; 4]).read(), left);
+            assert_eq!((second.address as *const [f32; 4]).read(), right);
+        }
+    }
+    eprintln!("distinct placed UAV writebacks verified across footprint changes");
+}
+
+#[test]
+#[ignore = "times fenced submissions on the selected adapter"]
+fn time_single_texel_writes_to_a_16_mib_placed_uav() {
+    time_single_texel_writes(false);
+}
+
+#[test]
+#[ignore = "times fenced submissions on write-watched guest backing"]
+fn time_single_texel_writes_to_a_watched_16_mib_placed_uav() {
+    time_single_texel_writes(true);
+}
+
+fn time_single_texel_writes(watched: bool) {
+    let host = crate::host::host().expect("host D3D12 device");
+    let fixture = Fixture::new(host, 1024, 1024, watched).expect("SM 6.6 adapter");
+    let mut times = [0; 10];
+    for (i, sample) in times.iter_mut().enumerate() {
+        let list = fixture.dispatch(host, [i as f32, 0.5, -0.25, 2.0]);
+        let start = std::time::Instant::now();
+        host.execute(&[&list]);
+        *sample = start.elapsed().as_micros();
+    }
+    eprintln!("placed UAV submission times in microseconds (first is cold): {times:?}");
 }
