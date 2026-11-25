@@ -95,9 +95,129 @@ impl Drop for Guest {
     }
 }
 
-// The cached placement must stay live for the process. Align within the array.
+/// A separately recorded guest CopyTextureRegion from mip zero into a CPU-visible buffer.
+struct TexelReadback {
+    list: Guest,
+    destination: Guest,
+    _allocator: Guest,
+}
+
+impl TexelReadback {
+    fn new(texture: This) -> Self {
+        let null = std::ptr::null();
+        let mut allocator = null;
+        assert_eq!(
+            crate::list::create_allocator(
+                null,
+                0,
+                std::ptr::from_ref(&ID3D12CommandAllocator::IID).cast(),
+                &mut allocator
+            ),
+            S_OK
+        );
+        let allocator = Guest(allocator);
+        let mut list = null;
+        assert_eq!(
+            crate::list::create_list(
+                null,
+                0,
+                0,
+                allocator.0,
+                null,
+                std::ptr::from_ref(&ID3D12GraphicsCommandList::IID).cast(),
+                &mut list
+            ),
+            S_OK
+        );
+        let list = Guest(list);
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_READBACK,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: 256,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let mut destination = null;
+        assert_eq!(
+            crate::resource::create_committed(
+                null,
+                (&raw const heap).cast(),
+                0,
+                (&raw const desc).cast(),
+                D3D12_RESOURCE_STATE_COPY_DEST.0 as u32,
+                null.cast(),
+                std::ptr::from_ref(&ID3D12Resource::IID).cast(),
+                &mut destination
+            ),
+            S_OK
+        );
+        let destination = Guest(destination);
+        #[repr(C)]
+        struct Location {
+            resource: This,
+            kind: u32,
+            footprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
+        }
+        const _: () = assert!(size_of::<Location>() == size_of::<D3D12_TEXTURE_COPY_LOCATION>());
+        let from = Location {
+            resource: texture,
+            kind: 0,
+            footprint: Default::default(),
+        };
+        let to = Location {
+            resource: destination.0,
+            kind: 1,
+            footprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                Offset: 0,
+                Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                    Format: DXGI_FORMAT_R32G32B32A32_FLOAT,
+                    Width: 16,
+                    Height: 1,
+                    Depth: 1,
+                    RowPitch: 256,
+                },
+            },
+        };
+        let copy = slot::<
+            extern "system" fn(This, &Location, u32, u32, u32, &Location, *const [u32; 6]),
+        >(list.0, crate::list::test_slot(list.0, 16));
+        copy(list.0, &to, 0, 0, 0, &from, null.cast());
+        let close =
+            slot::<extern "system" fn(This) -> i32>(list.0, crate::list::test_slot(list.0, 9));
+        assert_eq!(close(list.0), S_OK);
+        Self {
+            list,
+            destination,
+            _allocator: allocator,
+        }
+    }
+
+    fn read(&self, host: &crate::host::Host) -> [[f32; 4]; 2] {
+        let segments = crate::list::segments(self.list.0);
+        let [crate::list::Segment::List(list)] = segments.as_slice() else {
+            panic!("expected a single copy list");
+        };
+        host.execute(&[list]);
+        let (data, len) = crate::resource::buffer_bytes(self.destination.0).unwrap();
+        assert!(len >= 32);
+        // SAFETY: the completed guest readback filled this buffer with two RGBA32_FLOAT texels.
+        unsafe { data.cast::<[[f32; 4]; 2]>().read_unaligned() }
+    }
+}
+
+// The placement stays live for the process. A nonzero initial texel distinguishes
+// preserved title data from a freshly allocated host resource.
 const TEXTURE_ALIGNMENT: usize = 64 << 10;
-static BACKING: [u8; 2 * TEXTURE_ALIGNMENT] = [0; 2 * TEXTURE_ALIGNMENT];
 
 #[test]
 fn placed_uav_dispatch_writes_its_texture() {
@@ -157,7 +277,8 @@ fn placed_uav_dispatch_writes_its_texture() {
     let views = Guest(views);
     let handle = crate::descriptor::heap(views.0).start + 32;
 
-    let address = (BACKING.as_ptr() as usize).next_multiple_of(TEXTURE_ALIGNMENT) as u64;
+    let backing = Box::leak(vec![3.0f32; TEXTURE_ALIGNMENT / 2].into_boxed_slice());
+    let address = (backing.as_mut_ptr() as usize).next_multiple_of(TEXTURE_ALIGNMENT) as u64;
     let format = DXGI_FORMAT_R32G32B32A32_FLOAT.0 as u32;
     let mut resource = [0; 14];
     resource[0] = D3D12_RESOURCE_DIMENSION_TEXTURE2D.0 as u32;
@@ -174,7 +295,6 @@ fn placed_uav_dispatch_writes_its_texture() {
     view[10] = address as u32;
     view[11] = (address >> 32) as u32;
     let placed = crate::resource::texture_at(address, &resource).expect("placed texture");
-    let texture = crate::resource::host_resource(placed).expect("host texture");
     crate::descriptor::create_placed_uav(std::ptr::null(), &resource, &view, handle);
 
     let expected = [1.0f32, 0.5, -0.25, 2.0];
@@ -190,29 +310,14 @@ fn placed_uav_dispatch_writes_its_texture() {
         crate::draw::dispatched() > dispatched,
         "dispatch did not record"
     );
-    // A readback uploads a texture the title fills (the texture-to-buffer
-    // copy does, without asking whether the host wrote it): what the shader
-    // stored must survive, so nothing of the title memory (zeroes) may be
-    // copied over it.
-    crate::texture::upload(&list, placed, texture);
-    crate::list::ensure_state(&list, placed, D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32);
-    let (readback, footprint) =
-        crate::capture::read_back(&host.device, &list.list, texture).unwrap();
     list.close();
+    let consumer = TexelReadback::new(placed);
     host.execute(&[&list]);
-
-    // SAFETY: read the two RGBA32_FLOAT texels after the synchronous submission.
-    let texels = unsafe {
-        let mut data = std::ptr::null_mut();
-        readback.Map(0, None, Some(&mut data)).unwrap();
-        let texels = data
-            .cast::<u8>()
-            .add(footprint.Offset as usize)
-            .cast::<[[f32; 4]; 2]>()
-            .read_unaligned();
-        readback.Unmap(0, None);
-        assert!(host.device.GetDeviceRemovedReason().is_ok());
-        texels
-    };
-    assert_eq!(texels, [expected, [0.0; 4]], "placed UAV dispatch readback");
+    assert_eq!(consumer.read(host), [expected, [3.0; 4]]);
+    let other = [-0.5f32, 3.0, 4.0, 5.0];
+    // SAFETY: the adjacent texel is inside the aligned guest backing and the dispatch has completed.
+    unsafe { (address as *mut [f32; 4]).add(1).write(other) };
+    assert_eq!(consumer.read(host), [expected, other]);
+    // SAFETY: the host device is live after both completed submissions.
+    assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
 }
