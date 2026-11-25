@@ -403,9 +403,8 @@ fn a_mask_joined_with_a_number_at_a_loop_header_is_balloted_in_the_loop() {
     ]);
 }
 
-/// Lowers the wave32 pixel program `words` and checks that no join's ballot
-/// was placed after a loop.
-fn assert_ballot_stays_in_loop(words: &[u32]) {
+/// Lowers the wave32 pixel program `words` exporting `SV_Target`.
+fn lower_wave32_ps(words: &[u32]) -> Result<Lowered, crate::ShaderError> {
     use super::super::container::SigElement;
     let native = NativeProgram {
         stage: HwStage::Ps,
@@ -438,7 +437,7 @@ fn assert_ballot_stays_in_loop(words: &[u32]) {
     let st = structure::structure(&p).unwrap();
     let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
     let io = io::raise(&p, &native).unwrap();
-    let lowered = lower(&Parts {
+    lower(&Parts {
         native: &native,
         p: &p,
         st: &st,
@@ -449,12 +448,69 @@ fn assert_ballot_stays_in_loop(words: &[u32]) {
         prims: vec![],
         mesh_stride: 0,
     })
-    .expect("lower");
+}
+
+/// Lowers the wave32 pixel program `words` and checks that no join's ballot
+/// was placed after a loop.
+fn assert_ballot_stays_in_loop(words: &[u32]) -> Lowered {
+    let lowered = lower_wave32_ps(words).expect("lower");
     assert!(lowered.wave_ops, "the join's mask side is a ballot");
     assert_eq!(
         lowered.mask_ballots_after_loop, 0,
         "the ballot must dominate the phi inside the loop"
     );
+    lowered
+}
+
+/// A mask the loop's backedge joins into a header phi and the code after
+/// the loop zero-tests too: the ballot for the phi is the latch's own, not
+/// the one taken after the loop (which does not dominate the backedge).
+#[test]
+fn a_loop_mask_also_tested_after_the_loop_is_balloted_again_for_the_backedge() {
+    let words = [
+        0x7E00_02F2u32, // v_mov_b32 v0, 1.0
+        0xBE8A_0385,    // s_mov_b32 s10, 5
+        0xBE8C_0380,    // s_mov_b32 s12, 0
+        0xBF06_800A,    // loop: s_cmp_eq_u32 s10, 0
+        0x850D_8081,    // s_cselect_b32 s13, 1, 0
+        0x800C_810C,    // s_add_u32 s12, s12, 1
+        0xD405_000A,    // v_cmp_lg_f32_e64 s10, v0, 0
+        0x0001_0100,
+        0xBF04_830C, // s_cmp_lt_i32 s12, 3
+        0xBF85_FFF9, // s_cbranch_scc1 loop
+        0xBF06_800A, // s_cmp_eq_u32 s10, 0 (after the loop)
+        0x850E_8081, // s_cselect_b32 s14, 1, 0
+        0x7E02_020E, // v_mov_b32 v1, s14
+        0xF800_180F, // exp mrt0 v0, v0, v0, v0 done
+        0,
+        S_ENDPGM,
+    ];
+    let lowered = lower_wave32_ps(&words).expect("lower");
+    assert_eq!(
+        lowered.mask_ballots_taken, 2,
+        "one ballot after the loop and one at the latch for the header phi"
+    );
+}
+
+/// A mask joined with a number that arithmetic then reads would see the host
+/// wave's ballot bits, which differ from the console's: still refused.
+#[test]
+fn a_mask_joined_with_a_number_and_used_as_arithmetic_is_refused() {
+    let words = [
+        0x7E00_02F2u32, // v_mov_b32 v0, 1.0
+        0xD405_000A,    // v_cmp_lg_f32_e64 s10, v0, 0
+        0x0001_0100,
+        0xBE8C_0383, // s_mov_b32 s12, 3
+        0xBF02_850C, // s_cmp_gt_i32 s12, 5
+        0xBF85_0001, // s_cbranch_scc1 +1 (past the next word)
+        0xBE8A_0385, // s_mov_b32 s10, 5
+        0x840E_810A, // s_max_i32 s14, s10, 1
+        0x7E02_020E, // v_mov_b32 v1, s14
+        0xF800_180F, // exp mrt0 v1, v1, v1, v1 done
+        0x0101_0101,
+        S_ENDPGM,
+    ];
+    assert!(lower_wave32_ps(&words).is_err());
 }
 
 #[test]

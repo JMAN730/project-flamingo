@@ -111,6 +111,9 @@ pub(crate) struct Lowered {
     /// them (issue #465), not at the write site inside the loop.
     #[cfg(test)]
     pub mask_ballots_after_loop: u32,
+    /// Test builds: ballots of masks read as data, one per mask and site.
+    #[cfg(test)]
+    pub mask_ballots_taken: u32,
 }
 
 pub(crate) struct Parts<'a> {
@@ -361,6 +364,8 @@ struct Lower<'a> {
     mask_ok: bool,
     /// Ballots of masks read as data, by low dword: (low, high).
     ballots: HashMap<Value, (V, V)>,
+    /// Ballots taken for a phi's incoming edge, by predecessor block.
+    edge_ballots: HashMap<usize, HashMap<Value, (V, V)>>,
     /// Masks whose ballot is being built: a mask whose lane bit needs its
     /// own value as a number (an opaque mask keyed by a dword it shares
     /// with another) would otherwise recurse until the stack overflows.
@@ -368,6 +373,9 @@ struct Lower<'a> {
     /// See [`Lowered::mask_ballots_after_loop`].
     #[cfg(test)]
     mask_ballots_after_loop: u32,
+    /// See [`Lowered::mask_ballots_taken`].
+    #[cfg(test)]
+    mask_ballots_taken: u32,
     /// Block writing each value.
     def_block: HashMap<Value, usize>,
     /// IR block being lowered.
@@ -875,9 +883,12 @@ impl<'a> Lower<'a> {
             },
             mask_ok: false,
             ballots: HashMap::new(),
+            edge_ballots: HashMap::new(),
             balloting: HashSet::new(),
             #[cfg(test)]
             mask_ballots_after_loop: 0,
+            #[cfg(test)]
+            mask_ballots_taken: 0,
             def_block: p
                 .blocks
                 .iter()
@@ -1456,6 +1467,8 @@ impl<'a> Lower<'a> {
             has_f16_one_imm: self.s.m.has_i32_const(0x3C00),
             #[cfg(test)]
             mask_ballots_after_loop: self.mask_ballots_after_loop,
+            #[cfg(test)]
+            mask_ballots_taken: self.mask_ballots_taken,
             cmp_samplers,
             root_cbvs,
             root_srvs,
@@ -1995,6 +2008,10 @@ impl<'a> Lower<'a> {
                     xy = (add(xy.0, 0), add(xy.1, 1));
                 }
                 self.ballots.insert(lo, xy);
+                #[cfg(test)]
+                {
+                    self.mask_ballots_taken += 1;
+                }
                 xy
             }
         };
@@ -3587,21 +3604,56 @@ impl<'a> Lower<'a> {
 
     // ---- instructions ----
 
+    /// Whether a pixel or vertex program may read a lane mask as data in
+    /// the instruction `name`: only uses that mean the same on any wave.
+    fn host_mask_use(name: &str) -> bool {
+        name.starts_with("s_bcnt1_i32_")
+            || name.starts_with("s_ff1_i32_")
+            || name.starts_with("v_mbcnt_")
+            || matches!(
+                name,
+                "s_cmp_eq_u32" | "s_cmp_lg_u32" | "s_cmp_eq_u64" | "s_cmp_lg_u64"
+            )
+    }
+
+    /// Whether every read of `v`, through further phis, is one a pixel or
+    /// vertex program may make of a lane mask ([`Self::host_mask_use`]).
+    fn read_only_as_host_mask(&self, v: Value) -> bool {
+        let mut seen = HashSet::new();
+        let mut work = vec![v];
+        while let Some(v) = work.pop() {
+            if !seen.insert(v) {
+                continue;
+            }
+            for block in &self.x.p.blocks {
+                work.extend(
+                    block
+                        .phis
+                        .iter()
+                        .filter(|phi| phi.args.contains(&v))
+                        .map(|phi| phi.value),
+                );
+                let reads = |i: &&Inst| i.reads.iter().any(|r| r.1 == v);
+                if block
+                    .insts
+                    .iter()
+                    .filter(reads)
+                    .any(|i| !Self::host_mask_use(i.name()))
+                {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
     fn inst(&mut self, b: usize, i: usize) -> Result<(), Stop> {
         let inst: &'a Inst = &self.x.p.blocks[b].insts[i];
         let offset = inst.machine.offset;
         let name = inst.name();
         self.mask_ok = match self.mask_data {
             MaskData::Console => true,
-            MaskData::Host => {
-                name.starts_with("s_bcnt1_i32_")
-                    || name.starts_with("s_ff1_i32_")
-                    || name.starts_with("v_mbcnt_")
-                    || matches!(
-                        name,
-                        "s_cmp_eq_u32" | "s_cmp_lg_u32" | "s_cmp_eq_u64" | "s_cmp_lg_u64"
-                    )
-            }
+            MaskData::Host => Self::host_mask_use(name),
             MaskData::None => false,
         };
         let effect = matches!(inst.fields, Fields::Exp { .. })
@@ -10420,13 +10472,20 @@ impl<'a> Lower<'a> {
                     && !high_of_wave64
                     && self.read_phis.contains(&phi.value)
                     && self.x.st.masks.contains_key(&lo)
-                    && self.def_block.contains_key(&lo);
+                    && self.def_block.contains_key(&lo)
+                    && self.read_only_as_host_mask(phi.value);
                 let ballot = if ballot_ok {
                     // Every block is lowered by now: place the ballot as a read
                     // at the end of the phi's predecessor, whose edge uses it.
+                    // A ballot taken for another read (after a loop, say) may
+                    // not dominate this edge, so each edge has its own cache.
                     let saved = (self.cur, self.cur_ir);
                     (self.cur, self.cur_ir) = (pred_tail, q);
+                    let mut cache = self.edge_ballots.remove(&q).unwrap_or_default();
+                    std::mem::swap(&mut self.ballots, &mut cache);
                     let ballot = self.mask_dword(arg).ok();
+                    std::mem::swap(&mut self.ballots, &mut cache);
+                    self.edge_ballots.insert(q, cache);
                     (self.cur, self.cur_ir) = saved;
                     ballot
                 } else {
