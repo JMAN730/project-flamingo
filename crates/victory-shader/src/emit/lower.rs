@@ -113,6 +113,7 @@ pub(crate) struct Lowered {
     pub mask_ballots_after_loop: u32,
 }
 
+#[derive(Clone)]
 pub(crate) struct Parts<'a> {
     pub native: &'a NativeProgram,
     pub p: &'a Program,
@@ -806,6 +807,7 @@ impl<'a> Lower<'a> {
                     || n.starts_with("v_permlane")
                     || n.starts_with("v_mbcnt")
                     || matches!(n, "v_readlane_b32" | "v_writelane_b32")
+                    || (wave_mode != WaveMode::Original && n == "v_readfirstlane_b32")
                     || reads_mask_as_data(x.st, i)
                     || numeric_selects && numeric_select(x.st, i)
             };
@@ -951,7 +953,12 @@ impl<'a> Lower<'a> {
                 }
             }
         }
-        let fence_only_barrier = divergent_barriers(p, x.st, &no_barrier);
+        // Console branches dispatch the same edge to the whole thread group.
+        let fence_only_barrier = if wave_mode == WaveMode::ConsoleFlow {
+            HashSet::new()
+        } else {
+            divergent_barriers(p, x.st, &no_barrier)
+        };
         Lower {
             s,
             x,
@@ -1588,6 +1595,12 @@ impl<'a> Lower<'a> {
             self.exit(b)?;
         }
         self.fill_phis()?;
+        if self.xchg.is_some() && self.s.lds_dwords > 8190 {
+            return Err(unsupported(
+                0,
+                "no group-shared space for the cross-half exchange",
+            ));
+        }
         self.s.prune_pixel_inputs();
         let user_data = self.user_reads.values().copied().collect();
         self.s.samplers = self.samplers.len() as u32;
@@ -2119,8 +2132,12 @@ impl<'a> Lower<'a> {
                 Some(&b) if b == self.cur_ir => self.cur,
                 Some(&b) => self.tail[b].ok_or("a lane mask written after its use")?,
             };
-            let bit = self.boolean(m, at)?;
-            let xy = self.console_ballot(at, bit);
+            if !self.balloting.insert(lo) {
+                return Err("a lane mask whose lanes depend on its own value");
+            }
+            let bit = self.boolean(m, at);
+            self.balloting.remove(&lo);
+            let xy = self.console_ballot(at, bit?);
             self.ballots.insert(lo, xy);
             return Ok(if high { xy.1 } else { xy.0 });
         }
@@ -3607,7 +3624,13 @@ impl<'a> Lower<'a> {
             } else {
                 src
             };
-            let r = self.active_lane_or_zero(r, probe);
+            let r = if self.console_cf {
+                let active = self.src_lane_active(probe, guard);
+                let zero = self.s.m.i32(0);
+                self.s.m.select(c, active, r, zero)
+            } else {
+                self.active_lane_or_zero(r, probe)
+            };
             let reg = dst_reg.ok_or("a swizzle result")?;
             self.write(inst, Reg::V(reg), r, guard);
             return Ok(());
@@ -6275,7 +6298,7 @@ impl<'a> Lower<'a> {
         }
         let mut guard = self.guard(b, i)?;
         if let Some(d) = v.dpp {
-            let (x, enable) = self.dpp(inst, d)?;
+            let (x, enable) = self.dpp(inst, d, guard)?;
             guard = match (guard, enable) {
                 (Some(g), Some(e)) => Some(self.s.m.bin(self.cur, Bin::And, g, e)),
                 (g, e) => g.or(e),
@@ -6288,8 +6311,20 @@ impl<'a> Lower<'a> {
     }
 
     /// Whether lane `src` is active in the current EXEC (via `waveActiveBallot`).
-    fn src_lane_active(&mut self, src: V) -> V {
+    fn src_lane_active(&mut self, src: V, exec: Option<V>) -> V {
         let c = self.cur;
+        if self.console_cf {
+            // DPP and swizzles only address lanes within their own half.
+            let active = exec.unwrap_or_else(|| self.s.m.bool(true));
+            let word = self.ballot_word(c, active);
+            let mask = self.s.m.i32(31);
+            let one = self.s.m.i32(1);
+            let zero = self.s.m.i32(0);
+            let shift = self.s.m.bin(c, Bin::And, src, mask);
+            let bit = self.s.m.bin(c, Bin::LShr, word, shift);
+            let bit = self.s.m.bin(c, Bin::And, bit, one);
+            return self.s.m.cmp(c, pred::NE, bit, zero);
+        }
         let i32t = self.s.t.i32;
         let t = self.s.m.bool(true);
         let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
@@ -6324,7 +6359,7 @@ impl<'a> Lower<'a> {
     /// way a row-bound miss is: `bound_ctrl` selects zero, else the lane
     /// keeps its old destination. DPP8 has no `bound_ctrl` bit and always
     /// zeros inactive sources when `fi` is clear.
-    fn dpp(&mut self, inst: &Inst, dpp: Dpp) -> Result<(V, Option<V>), Why> {
+    fn dpp(&mut self, inst: &Inst, dpp: Dpp, exec: Option<V>) -> Result<(V, Option<V>), Why> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
         };
@@ -6428,7 +6463,7 @@ impl<'a> Lower<'a> {
         // Geometric bounds, and source EXEC when fetch-inactive is clear.
         let mut valid = inside;
         if !fi {
-            let active = self.src_lane_active(src);
+            let active = self.src_lane_active(src, exec);
             valid = Some(match valid {
                 Some(v) => self.s.m.bin(c, Bin::And, v, active),
                 None => active,
@@ -10667,6 +10702,7 @@ impl<'a> Lower<'a> {
                     .st
                     .masks
                     .get(&lo)
+                    .or_else(|| self.x.st.numbers.get(&lo))
                     .ok_or("a branch on an untracked mask")?;
                 (self.any_lane(m)?, name.ends_with("nz"))
             }
@@ -10683,6 +10719,11 @@ impl<'a> Lower<'a> {
     /// Console flow: an SCC value as a bit. A mask operation's SCC (result
     /// not zero) is whether some lane of the console wave has its bit.
     fn scc_bit(&mut self, v: Value) -> Result<V, Why> {
+        // A live join must either resolve every incoming SCC or refuse to
+        // translate. An unused phi may be filled with a dummy false value.
+        if self.phi_at.contains_key(&v) {
+            self.read_phis.insert(v);
+        }
         if let Some(&Val::Bit(x)) = self.vals.get(&v) {
             return Ok(x);
         }
@@ -11503,6 +11544,40 @@ mod wave_size_tests {
         let (_, native_only) = compile_wave64_cs_mode(&words, group, lds_512_bytes, false);
         assert_eq!(native_only, (64, 64));
         super::super::TEST_CONSOLE_FLOW.set(None);
+    }
+
+    #[test]
+    fn console_flow_broadcasts_the_first_lane_to_both_halves() {
+        let words = [
+            0xBE81_0380, // s_mov_b32 s1, 0
+            0xF408_0200,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[0:1], null
+            0x3408_0082, // v_lshlrev_b32 v4, 2, v0
+            0x7E04_0500, // v_readfirstlane_b32 s2, v0
+            0x7E04_0281, // v_mov_b32 v2, 1
+            0x4A04_0402, // v_add_nc_u32 v2, s2, v2
+            0xE070_1000,
+            0x8002_0204, // buffer_store_dword v2, v4, s[8:11], 0 offen
+            S_ENDPGM,
+        ];
+        super::super::TEST_CONSOLE_FLOW.set(Some(true));
+        let (shader, bounds) = compile_wave64_cs(&words, [64, 1, 1], 0);
+        super::super::TEST_CONSOLE_FLOW.set(None);
+        let _ = &shader;
+        assert_eq!(bounds, (32, 32));
+        #[cfg(windows)]
+        for (host, values) in run_cs_uav(&shader, 64) {
+            assert_eq!(values, vec![1; 64], "{host}");
+        }
+    }
+
+    #[test]
+    fn console_flow_keeps_the_native_whole_wave_reduction() {
+        let words = wave64_sum_cs_words(false, &[], &[]);
+        super::super::TEST_CONSOLE_FLOW.set(Some(true));
+        let (_, wave_bounds) = compile_wave64_cs(&words, [64, 1, 1], 0);
+        super::super::TEST_CONSOLE_FLOW.set(None);
+        assert_eq!(wave_bounds, (64, 64));
     }
 
     #[test]

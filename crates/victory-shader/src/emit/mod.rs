@@ -633,7 +633,7 @@ fn emit_program(
         }
         _ => 0,
     };
-    let mut parts = lower::Parts {
+    let parts = lower::Parts {
         native,
         p,
         st,
@@ -644,19 +644,34 @@ fn emit_program(
         prims,
         mesh_stride,
     };
+    let lower_original =
+        || lower::lower_with_wave32(&parts, allow_wave32, pixel_inputs, view_stride);
     let l = if allow_wave32 && wave64_console_flow() && native.stage == HwStage::Cs && native.wave64
     {
         use lower::WaveMode::{ConsoleFlow, Wave32};
-        match lower::lower_with_wave_mode(&parts, true, pixel_inputs, view_stride, Wave32) {
-            Err(ShaderError::Unsupported { what, .. }) if what == lower::CONSOLE_FLOW => {
-                let console = structure::structure_console(p)?;
-                parts.st = &console;
-                lower::lower_with_wave_mode(&parts, true, pixel_inputs, view_stride, ConsoleFlow)?
-            }
-            result => result?,
-        }
+        let lowered =
+            match lower::lower_with_wave_mode(&parts, true, pixel_inputs, view_stride, Wave32) {
+                Err(ShaderError::Unsupported { what, .. }) if what == lower::CONSOLE_FLOW => {
+                    structure::structure_console(p).and_then(|console| {
+                        let parts = lower::Parts {
+                            st: &console,
+                            ..parts.clone()
+                        };
+                        lower::lower_with_wave_mode(
+                            &parts,
+                            true,
+                            pixel_inputs,
+                            view_stride,
+                            ConsoleFlow,
+                        )
+                    })
+                }
+                result => result,
+            };
+        // The ordinary shader can still be usable on a host with Wave64.
+        lowered.or_else(|reason| lower_original().map_err(|_| reason))?
     } else {
-        lower::lower_with_wave32(&parts, allow_wave32, pixel_inputs, view_stride)?
+        lower_original()?
     };
     Ok(HostShader {
         stage: native.stage,
