@@ -53,6 +53,11 @@ mod tests {
     fn a_folder_spelled_like_the_file_does_not_hide_it() {
         let dir = folder("folder");
         std::fs::create_dir(dir.join("LATE.DLL")).unwrap();
+        if dir.join("late.dll").exists() {
+            // A case-insensitive folder (the Windows default) cannot hold both.
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
         std::fs::write(dir.join("late.dll"), b"x").unwrap();
         let found = file_in(&dir, "Late.dll").unwrap();
         assert!(found.is_file());
