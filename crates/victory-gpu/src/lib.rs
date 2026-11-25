@@ -54,6 +54,8 @@ mod memory;
 pub mod object;
 pub mod pipeline;
 #[cfg(windows)]
+mod present_compositor;
+#[cfg(windows)]
 mod primitive;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod profile;
