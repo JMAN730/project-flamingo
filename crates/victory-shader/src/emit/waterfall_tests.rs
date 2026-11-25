@@ -443,3 +443,84 @@ fn scalar_structured_load_and_record_count_use_the_same_view() {
         }
     }
 }
+
+#[test]
+fn explicit_cube_gradients_select_face_and_mip() {
+    // Six faces, split into four groups of lanes with different derivatives.
+    // At width 8, ds/dx of 1/4 chooses mip 1; dt/dy of 1/2 or 1 chooses mip 2 or 3.
+    let setup = [
+        0xbe84_0300, // s_mov_b32 s4, s0
+        0xbe85_0380, // s_mov_b32 s5, 0
+        0xbe86_0301, // s_mov_b32 s6, s1
+        0xbe87_0380, // s_mov_b32 s7, 0
+        0xf40c_0302,
+        0xfa00_0000, // s_load_dwordx8 s[12:19], s[4:5], 0x0
+        0xf408_0a02,
+        0xfa00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
+        0xf408_0203,
+        0xfa00_0000, // s_load_dwordx4 s[8:11], s[6:7], 0x0
+        0x3604_0087, // v_and_b32_e32 v2, 7, v0
+        0x2604_0485, // v_min_u32_e32 v2, 5, v2
+        0x7e14_0d02, // v_cvt_f32_u32_e32 v10, v2
+        0x2c06_0083, // v_lshrrev_b32_e32 v3, 3, v0
+        0x3608_0681, // v_and_b32_e32 v4, 1, v3
+        0x7e08_0d04, // v_cvt_f32_u32_e32 v4, v4
+        0x1008_08ff,
+        0x3e80_0000, // v_mul_f32_e32 v4, 0x3e800000, v4
+        0x7e0a_0280, // v_mov_b32_e32 v5, 0
+        0x7e0c_0280, // v_mov_b32_e32 v6, 0
+        0x2c0e_0681, // v_lshrrev_b32_e32 v7, 1, v3
+        0x340e_0f03, // v_lshlrev_b32_e32 v7, v3, v7 (0, 0, 4, 8)
+        0x7e0e_0d07, // v_cvt_f32_u32_e32 v7, v7
+        0x100e_0eff,
+        0x3e00_0000, // v_mul_f32_e32 v7, 0.125, v7
+        0x3420_0082, // v_lshlrev_b32 v16, 2, v0
+    ];
+    let ordinary = [
+        0x7e10_02ff,
+        0x3fc0_0000, // v8 = 1.5
+        0x7e12_02ff,
+        0x3fc0_0000, // v9 = 1.5
+        0xf088_0118,
+        0x0043_0c04, // image_sample_d v12, v[4:10], s[12:19], s[8:11], cube
+    ];
+    let packed = [
+        0x7e10_02ff,
+        0x3e00_3e00, // s and t packed into v8
+        0x7e12_150a, // v_cvt_f16_f32 v9, v10 (face)
+        0x3812_12f4, // v_or_b32 v9, 0x40000000, v9 (minimum LOD 2)
+        0xf08c_0118,
+        0x4043_0c04, // image_sample_d_cl v12, v[4:9], s[12:19], s[8:11], cube a16
+    ];
+    let store = [0xe070_1000, 0x800a_0c10, 0xbf81_0000]; // store v12 at v16, then end
+    let mut texels = Vec::new();
+    for face in 0..6 {
+        for mip in 0..4 {
+            let size = 8 >> mip;
+            texels.extend(std::iter::repeat_n(
+                [(face * 10 + mip) as f32; 4],
+                size * size,
+            ));
+        }
+    }
+    let views = [
+        View::Cube(8, 4, &texels),
+        View::Texture(1, 1, &[[0.0; 4]]),
+        View::RawUav(32),
+    ];
+    for (sample, min_lod) in [(&ordinary[..], 0), (&packed[..], 2)] {
+        let words = [&setup[..], sample, &store[..]].concat();
+        let (shader, _) = build_any(&words, false);
+        let expected: Vec<_> = (0..32)
+            .map(|lane| {
+                let face = (lane % 8).min(5);
+                let mip = [0, 1, 2, 3][lane / 8].max(min_lod);
+                ((face * 10 + mip) as f32).to_bits()
+            })
+            .collect();
+        for (backend, readback) in run(&shader, &views) {
+            assert_eq!(readback, expected, "{backend}, minimum LOD {min_lod}");
+            eprintln!("{backend}: all 32 face and mip values matched at minimum LOD {min_lod}");
+        }
+    }
+}

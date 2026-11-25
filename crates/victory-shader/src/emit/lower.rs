@@ -7120,7 +7120,8 @@ impl<'a> Lower<'a> {
             // gradients (x then y) come before the coordinates and remain
             // 32-bit floats on GFX10.3 unless the opcode is a `_g16` form.
             let spatial = coords - usize::from(kind == 6 || kind == 7);
-            let deriv_regs = if op == 63 { spatial } else { 0 };
+            let gradient_dims = if kind == 5 { 2 } else { spatial };
+            let deriv_regs = if op == 63 { gradient_dims } else { 0 };
             let coord_base = first + 2 * deriv_regs;
             let mut cs = vec![fu; 4];
             // With a16, sampling coordinates, bias (low half), LOD and clamp are f16.
@@ -7132,15 +7133,16 @@ impl<'a> Lower<'a> {
                     l.as_float(x)
                 }
             };
-            if kind == 5 && (*unorm || op == 63 || op == 81) {
-                return Err("a cube sample with texel coordinates, gradients or a level query");
+            if kind == 5 && (*unorm || op == 81) {
+                return Err("a cube sample with texel coordinates or a level query");
             }
             for (k, slot) in cs.iter_mut().enumerate().take(coords) {
                 let x = addr_packed(self, coord_base, k)?;
                 *slot = to_float(self, x);
             }
+            let face = cs[2];
             if kind == 5 {
-                let dir = self.cube_direction(cs[0], cs[1], cs[2]);
+                let dir = self.cube_direction(cs[0], cs[1], face);
                 cs[..3].copy_from_slice(&dir);
             }
             if *unorm {
@@ -7272,15 +7274,24 @@ impl<'a> Lower<'a> {
                     )
                 }
                 63 => {
-                    let mut g = vec![fu; 6];
-                    for k in 0..spatial {
-                        let x = addr_u32(self, first + k)?;
-                        g[k] = self.as_float(x);
-                        let y = addr_u32(self, first + deriv_regs + k)?;
-                        g[3 + k] = self.as_float(y);
+                    let mut g = [[fu; 3]; 2];
+                    for (axis, derivative) in g.iter_mut().enumerate() {
+                        for (k, dst) in derivative[..gradient_dims].iter_mut().enumerate() {
+                            let value = addr_u32(self, first + axis * deriv_regs + k)?;
+                            *dst = self.as_float(value);
+                        }
+                        if kind == 5 {
+                            // A unit-major direction maps back to face coordinates with a
+                            // factor of 1/2. Its derivative has a zero major component.
+                            let two = self.s.m.f32(2.0f32.to_bits());
+                            let du = self.s.m.bin(c, Bin::Mul, derivative[0], two);
+                            let dv = self.s.m.bin(c, Bin::Mul, derivative[1], two);
+                            let zero = self.s.m.f32(0);
+                            derivative.copy_from_slice(&self.cube_axes(du, dv, zero, face));
+                        }
                     }
                     args.extend(&os);
-                    args.extend(g);
+                    args.extend(g.into_iter().flatten());
                     args.push(clamp);
                     self.s.op(
                         c,
@@ -7573,18 +7584,23 @@ impl<'a> Lower<'a> {
         let u = self.s.m.bin(c, Bin::Sub, u, three);
         let v = self.s.m.bin(c, Bin::Mul, t, two);
         let v = self.s.m.bin(c, Bin::Sub, v, three);
+        let one = k(self, 1.0);
+        self.cube_axes(u, v, one, face)
+    }
+
+    /// Rotate the two face axes and the major axis into cube direction space.
+    fn cube_axes(&mut self, u: V, v: V, major: V, face: V) -> [V; 3] {
+        let c = self.cur;
         let z = self.s.m.f32(0x8000_0000);
-        let (nu, nv) = (
-            self.s.m.bin(c, Bin::Sub, z, u),
-            self.s.m.bin(c, Bin::Sub, z, v),
-        );
-        let (one, mone) = (k(self, 1.0), k(self, -1.0));
+        let nu = self.s.m.bin(c, Bin::Sub, z, u);
+        let nv = self.s.m.bin(c, Bin::Sub, z, v);
+        let negative_major = self.s.m.bin(c, Bin::Sub, z, major);
         let f = self.s.m.cast(c, Cast::FpToUi, face, self.s.t.i32);
         // Per face +x, -x, +y, -y, +z, -z.
         let table = [
-            [one, mone, u, u, u, nu],
-            [nv, nv, one, mone, nv, nv],
-            [nu, u, v, nv, one, mone],
+            [major, negative_major, u, u, u, nu],
+            [nv, nv, major, negative_major, nv, nv],
+            [nu, u, v, nv, major, negative_major],
         ];
         table.map(|row| {
             let mut r = row[0];
