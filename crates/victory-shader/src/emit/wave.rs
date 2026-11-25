@@ -412,16 +412,16 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
             (n @ ("v_permlane16_b32" | "v_permlanex16_b32"), Some(a)) => {
                 // Lane i of a row picks nibble i of {src2, src1}: from its
                 // own row (permlane16) or from the other row of its half of
-                // 32 lanes (permlanex16). Only with every lane active: the
-                // opsel bits (fi, bound_ctrl) decide what an inactive lane
-                // reads.
+                // 32 lanes (permlanex16). A pick from a lane the section
+                // leaves out reads 0 (`fi:1`: that lane's own value), which
+                // is how the compiler guards the second half of a prefix sum.
                 let sel = |k: usize| match v.src.get(k) {
                     Some(&Operand::Const(c)) => crate::resource::inline(c),
                     Some(&Operand::Literal(x)) => Some(x),
                     _ => None,
                 };
                 match (sel(1), sel(2)) {
-                    (Some(s1), Some(s2)) if exec == all => {
+                    (Some(s1), Some(s2)) => {
                         let s = u64::from(s1) | u64::from(s2) << 32;
                         (0..wave)
                             .map(|l| {
@@ -431,7 +431,12 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
                                     (l & !31) | ((l & 16) ^ 16)
                                 };
                                 let pick = (s >> (4 * (l & 15)) & 15) as u32;
-                                a[(row | pick) as usize]
+                                let from = (row | pick) as usize;
+                                if exec == all || (exec >> from & 1 != 0) || v.opsel & 1 != 0 {
+                                    a[from]
+                                } else {
+                                    Sym::K(0)
+                                }
                             })
                             .collect()
                     }
