@@ -2773,3 +2773,65 @@ fn texture_narrowed_view_matches_the_formats_function() {
         },
     );
 }
+
+/// `victory_formats::texture::Swizzle::block_log2`, the function the test below
+/// runs as console code (`u32::MAX` encodes `None`).
+fn texture_swizzle_block_log2_reference(mode: u32) -> Option<u32> {
+    Some(match mode {
+        0 => 0,
+        1 | 2 => 8,
+        5 | 6 | 21..=23 => 12,
+        9 | 10 | 17 | 18 | 24..=27 => 16,
+        _ => return None,
+    })
+}
+
+/// Mapping a GFX10 swizzle mode number to log2 of its block size in bytes,
+/// written as console code using 32-bit literal bitmasks and shift-wrap guarding
+/// (`v_lshlrev_b32`, `v_cmp_lt_u32`, `v_and_b32`, `v_cndmask_b32`), matches
+/// `victory_formats::texture::Swizzle::block_log2` on the GPU.
+#[test]
+fn texture_swizzle_block_log2_matches_the_formats_function() {
+    let vcc = sgpr(106);
+    let mut body = Vec::new();
+    // v1 = mode. v5 = if mode < 32 { 1u << mode } else { 0 } (guards v_lshlrev_b32 & 31 wrap).
+    body.extend(vop3(0x11A, 5, vgpr(1), 129, 128)); // v_lshlrev_b32 v5, v1, 1
+    body.extend(vop3(0x0C1, 106, vgpr(1), 160, 128)); // v_cmp_lt_u32 vcc, v1, 32
+    body.extend(vop3(0x101, 5, 128, vgpr(5), vcc)); // v_cndmask_b32 v5, 0, v5, vcc
+    // Default result: u32::MAX (None).
+    body.push(vop1(0x001, 0, 193)); // v_mov_b32 v0, -1
+    // mode == 0 -> 0 (linear).
+    body.extend(vop3(0x0C2, 106, vgpr(1), 128, 128)); // v_cmp_eq_u32 vcc, v1, 0
+    body.extend(vop3(0x101, 0, vgpr(0), 128, vcc)); // v_cndmask_b32 v0, v0, 0, vcc
+    // 256 B (log2 = 8): modes 1, 2.
+    body.extend([vop1(0x001, 2, 255), 0x0000_0006]); // v_mov_b32 v2, 0x00000006
+    body.extend(vop3(0x11B, 6, vgpr(5), vgpr(2), 128)); // v_and_b32 v6, v5, v2
+    body.extend(vop3(0x0C5, 106, vgpr(6), 128, 128)); // v_cmp_ne_u32 vcc, v6, 0
+    body.extend(vop3(0x101, 0, vgpr(0), 136, vcc)); // v_cndmask_b32 v0, v0, 8, vcc
+    // 4 KiB (log2 = 12): modes 5, 6, 21..=23.
+    body.extend([vop1(0x001, 2, 255), 0x00E0_0060]); // v_mov_b32 v2, 0x00E00060
+    body.extend(vop3(0x11B, 6, vgpr(5), vgpr(2), 128)); // v_and_b32 v6, v5, v2
+    body.extend(vop3(0x0C5, 106, vgpr(6), 128, 128)); // v_cmp_ne_u32 vcc, v6, 0
+    body.extend(vop3(0x101, 0, vgpr(0), 140, vcc)); // v_cndmask_b32 v0, v0, 12, vcc
+    // 64 KiB (log2 = 16): modes 9, 10, 17, 18, 24..=27.
+    body.extend([vop1(0x001, 2, 255), 0x0F06_0600]); // v_mov_b32 v2, 0x0F060600
+    body.extend(vop3(0x11B, 6, vgpr(5), vgpr(2), 128)); // v_and_b32 v6, v5, v2
+    body.extend(vop3(0x0C5, 106, vgpr(6), 128, 128)); // v_cmp_ne_u32 vcc, v6, 0
+    body.extend(vop3(0x101, 0, vgpr(0), 144, vcc)); // v_cndmask_b32 v0, v0, 16, vcc
+
+    let shader = build_valu_cs(&body);
+    let mut cases: Vec<[u32; 4]> = (0..=64u32).map(|m| [m, 0, 0, 0]).collect();
+    cases.extend([[128, 0, 0, 0], [255, 0, 0, 0], [u32::MAX, 0, 0, 0]]);
+    // Confirm every outcome (0, 8, 12, 16, and None including wrapped >= 32 modes) is covered.
+    for expected in [Some(0), Some(8), Some(12), Some(16), None] {
+        assert!(
+            cases
+                .iter()
+                .any(|&[m, ..]| texture_swizzle_block_log2_reference(m) == expected)
+        );
+    }
+    run_cases(&shader, &cases, |backend, _, [mode, ..], got| {
+        let want = texture_swizzle_block_log2_reference(mode).unwrap_or(u32::MAX);
+        assert_eq!(got, want, "{backend}: swizzle mode {mode}");
+    });
+}
