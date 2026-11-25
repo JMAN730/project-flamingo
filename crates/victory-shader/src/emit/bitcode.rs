@@ -509,6 +509,16 @@ impl Module {
             .any(|inst| matches!(inst.op, Op::Cmp(p, _, _) if p == predicate))
     }
 
+    #[cfg(test)]
+    pub(crate) fn has_bin_const(&self, op: Bin, rhs: i64) -> bool {
+        self.insts.iter().any(|inst| match inst.op {
+            Op::Bin(o, _, V::Const(cid)) if o == op => {
+                matches!(self.consts[cid as usize].1, Const::Int(n) if n == rhs)
+            }
+            _ => false,
+        })
+    }
+
     /// Start from instructions that must execute and from externally used
     /// values. The worklist keeps their operands, including loop-carried phis.
     fn live(&self, omit_unused_math: bool) -> Vec<bool> {

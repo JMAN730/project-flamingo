@@ -859,36 +859,65 @@ fn mesh_pipeline(
         samples: Sub<DXGI_SAMPLE_DESC>,
         topology: Sub<D3D12_PRIMITIVE_TOPOLOGY_TYPE>,
     }
-    let mut stream = Stream {
-        root: Sub(
+    // Zero-initialize and write each subobject's tag and payload separately so
+    // inter-field and trailing padding inside `Sub<T>` stays zeroed for
+    // `ID3D12PipelineLibrary1::LoadPipeline`.
+    let mut stream = std::mem::MaybeUninit::<Stream>::zeroed();
+    let ptr = stream.as_mut_ptr();
+    let blend = host_blend(&g.blend, &g.targets);
+    macro_rules! put {
+        ($field:ident, $tag:expr, $val:expr) => {{
+            std::ptr::addr_of_mut!((*ptr).$field.0).write($tag);
+            std::ptr::addr_of_mut!((*ptr).$field.1).write($val);
+        }};
+    }
+    // SAFETY: every `.0` and `.1` of every field of `Stream` is initialized
+    // before `assume_init`, while padding bytes remain zeroed.
+    let mut stream = unsafe {
+        put!(
+            root,
             D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE,
-            root.as_raw(),
-        ),
-        ms: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms),
-        ps: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps),
-        blend: Sub(
-            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND,
-            host_blend(&g.blend, &g.targets),
-        ),
-        mask: Sub(
+            root.as_raw()
+        );
+        put!(ms, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms);
+        put!(ps, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps);
+        put!(blend, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, blend);
+        put!(
+            mask,
             D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK,
-            g.sample_mask,
-        ),
-        raster: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, g.rasterizer),
-        depth: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, g.depth),
-        targets: Sub(
+            g.sample_mask
+        );
+        put!(
+            raster,
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER,
+            g.rasterizer
+        );
+        put!(
+            depth,
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL,
+            g.depth
+        );
+        put!(
+            targets,
             D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS,
-            g.targets,
-        ),
-        dsv: Sub(
+            g.targets
+        );
+        put!(
+            dsv,
             D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT,
-            g.depth_format,
-        ),
-        samples: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, g.samples),
-        topology: Sub(
+            g.depth_format
+        );
+        put!(
+            samples,
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC,
+            g.samples
+        );
+        put!(
+            topology,
             D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY,
-            D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
-        ),
+            D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE
+        );
+        stream.assume_init()
     };
     let desc = D3D12_PIPELINE_STATE_STREAM_DESC {
         SizeInBytes: size_of::<Stream>(),

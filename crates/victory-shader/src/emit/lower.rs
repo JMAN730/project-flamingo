@@ -54,6 +54,10 @@ pub(crate) struct Lowered {
     /// Test builds: typed loads assembled from a dword-aligned pair.
     #[cfg(test)]
     pub unaligned_typed_loads: u32,
+    #[cfg(test)]
+    pub has_and_0x1ff: bool,
+    #[cfg(test)]
+    pub has_and_0x3ff: bool,
 }
 
 pub(crate) struct Parts<'a> {
@@ -1180,8 +1184,11 @@ impl<'a> Lower<'a> {
         let has_isnan_op = self.s.m.has_dx_op("dx.op.isSpecialFloat.f32", 8);
         #[cfg(test)]
         let has_fcmp_uno = self.s.m.has_cmp(pred::UNO);
+        #[cfg(test)]
+        let has_and_0x1ff = self.s.m.has_bin_const(Bin::And, 0x1FF);
+        #[cfg(test)]
+        let has_and_0x3ff = self.s.m.has_bin_const(Bin::And, 0x3FF);
         Ok(Lowered {
-            #[cfg(test)]
             #[cfg(test)]
             unaligned_typed_loads: self.s.unaligned_typed_loads,
             cmp_samplers,
@@ -1201,6 +1208,10 @@ impl<'a> Lower<'a> {
             has_isnan_op,
             #[cfg(test)]
             has_fcmp_uno,
+            #[cfg(test)]
+            has_and_0x1ff,
+            #[cfg(test)]
+            has_and_0x3ff,
         })
     }
 
@@ -5114,6 +5125,80 @@ impl<'a> Lower<'a> {
                 let r = self.s.m.bin(c, Bin::Or, halves[0], hi);
                 int(self, r)
             }
+            "v_cvt_f32_f64" => {
+                // A double to a float, rounded to nearest even (the MODE
+                // default), in 32-bit integer arithmetic on its two dwords:
+                // the emitter has no 64-bit floats. Infinities stay
+                // infinities, NaNs become the quiet NaN, too-large values
+                // round to infinity.
+                // shortcut: results below f32's normal range (|x| < 2^-126)
+                // flush to signed zero instead of becoming f32 subnormals.
+                if matches!(v.src.first(), Some(Operand::Const(240..=248))) {
+                    // Inline float constants are f64 for this operand;
+                    // `src64` would read them as 32-bit integers.
+                    return Err("an inline float constant as a 64-bit operand");
+                }
+                let x = self.src64(inst, 0)?;
+                let (lo, hi) = self.split64(x);
+                let k = |l: &mut Self, n: u32| l.s.m.i32(n);
+                let (k0, k1, k3, k20, k23, k29) = (
+                    k(self, 0),
+                    k(self, 1),
+                    k(self, 3),
+                    k(self, 20),
+                    k(self, 23),
+                    k(self, 29),
+                );
+                let sign_bit = k(self, 0x8000_0000);
+                let sign = self.s.m.bin(c, Bin::And, hi, sign_bit);
+                // The biased 11-bit exponent and the top 23 of the 52
+                // mantissa bits (20 in `hi`, 3 from the top of `lo`).
+                let e = self.s.m.bin(c, Bin::LShr, hi, k20);
+                let m11 = k(self, 0x7FF);
+                let exp = self.s.m.bin(c, Bin::And, e, m11);
+                let m20 = k(self, 0xF_FFFF);
+                let mhi = self.s.m.bin(c, Bin::And, hi, m20);
+                let a = self.s.m.bin(c, Bin::Shl, mhi, k3);
+                let b = self.s.m.bin(c, Bin::LShr, lo, k29);
+                let m23 = self.s.m.bin(c, Bin::Or, a, b);
+                // The 29 mantissa bits dropped decide the rounding.
+                let rmask = k(self, 0x1FFF_FFFF);
+                let rem = self.s.m.bin(c, Bin::And, lo, rmask);
+                let half = k(self, 0x1000_0000);
+                let above = self.s.m.cmp(c, pred::IUGT, rem, half);
+                let tie = self.s.m.cmp(c, pred::EQ, rem, half);
+                let odd = self.s.m.bin(c, Bin::And, m23, k1);
+                let odd = self.s.m.cmp(c, pred::NE, odd, k0);
+                let tie_odd = self.s.m.bin(c, Bin::And, tie, odd);
+                let up = self.s.m.bin(c, Bin::Or, above, tie_odd);
+                let i32t = self.s.t.i32;
+                let up = self.s.m.cast(c, Cast::ZExt, up, i32t);
+                // Rebias 1023 -> 127. A carry out of the mantissa moves into
+                // the exponent, which is right (and gives infinity at the top).
+                let bias = k(self, 1023 - 127);
+                let e32 = self.s.m.bin(c, Bin::Sub, exp, bias);
+                let e32 = self.s.m.bin(c, Bin::Shl, e32, k23);
+                let r = self.s.m.bin(c, Bin::Add, e32, m23);
+                let r = self.s.m.bin(c, Bin::Add, r, up);
+                // f32 exponents 1..=254 are normal: double exponents
+                // 897..=1150. Below: zero; above (and infinity): infinity.
+                let low = self.s.m.cmp(c, pred::IULE, exp, bias);
+                let top = k(self, 1023 + 128);
+                let high = self.s.m.cmp(c, pred::IUGE, exp, top);
+                let inf = k(self, 0x7F80_0000);
+                let r = self.s.m.select(c, low, k0, r);
+                let r = self.s.m.select(c, high, inf, r);
+                let all_ones = self.s.m.cmp(c, pred::EQ, exp, m11);
+                let mbits = self.s.m.bin(c, Bin::Or, mhi, lo);
+                let some = self.s.m.cmp(c, pred::NE, mbits, k0);
+                let nan = self.s.m.bin(c, Bin::And, all_ones, some);
+                let qnan = k(self, 0x7FC0_0000);
+                let r = self.s.m.select(c, nan, qnan, r);
+                let r = self.s.m.bin(c, Bin::Or, r, sign);
+                let f32t = self.s.t.f32;
+                let r = self.s.m.cast(c, Cast::Bitcast, r, f32t);
+                float(self, r)
+            }
             "v_cvt_f32_f16" if v.opsel == 0 => {
                 let a = s(self, 0)?;
                 let r = self
@@ -8114,7 +8199,9 @@ impl<'a> Lower<'a> {
         let mut bad = self.s.m.cmp(c, pred::SLT, x, z);
         let mut idxs = [z; 3];
         for k in 0..3 {
-            let (shift, mask) = (self.s.m.i32(10 * k), self.s.m.i32(0x3FF));
+            // RDNA2 primitive export packs 9-bit vertex indices at bits 0, 10, 20;
+            // bits 9, 19, 29 are hardware edge flags.
+            let (shift, mask) = (self.s.m.i32(10 * k), self.s.m.i32(0x1FF));
             let i = self.s.m.bin(c, Bin::LShr, x, shift);
             let i = self.s.m.bin(c, Bin::And, i, mask);
             let oob = self.s.m.cmp(c, pred::IUGE, i, mv);
@@ -10274,6 +10361,82 @@ mod wave_size_tests {
                 .map(|i| if i % 2 == 0 { 16.0f32.to_bits() } else { 0 })
                 .collect();
             assert_eq!(data, expected, "{label} sparse-mask float reduction");
+        }
+    }
+
+    #[test]
+    fn mesh_primitive_export_masks_out_edge_flag_bits() {
+        // Minimal mesh shader:
+        //   v_mov_b32 v1, 1.0
+        //   exp pos0 v1, v1, v1, v1
+        //   exp prim v0, off, off, off done
+        //   s_endpgm
+        // `exp prim` packs 9-bit vertex indices at bits 0/10/20 with edge flags
+        // at bits 9/19/29; `emit_indices` must mask with 0x1FF, not 0x3FF.
+        let words: &[u32] = &[
+            0x7E02_02F2, // v_mov_b32 v1, 1.0
+            0xF800_00CF,
+            0x0101_0101, // exp pos0 v1, v1, v1, v1
+            0xF800_0941,
+            0x0000_0000, // exp prim v0, off, off, off done
+            S_ENDPGM,
+        ];
+        let native = NativeProgram {
+            stage: HwStage::Ms,
+            wave64: false,
+            vgprs: 2,
+            layout: vec![],
+            used: vec![],
+            io: crate::native::StageIo::Ms(crate::native::MeshIo {
+                outputs: vec![],
+                clip_cntl: 0,
+                threads: 32,
+                max_vertices: 3,
+                max_primitives: 1,
+                topology: 2,
+                lds_bytes: 0,
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = crate::ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+        let st = crate::structure::structure(&p).unwrap();
+        let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = crate::io::raise(&p, &native).unwrap();
+        let pos = super::SigElement {
+            name: "SV_Position".into(),
+            index: 0,
+            kind: 3,
+            comp: 9,
+            interp: 0,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage: 0xF,
+            half: false,
+        };
+        let lowered = super::lower(&super::Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![pos],
+            prims: vec![],
+            mesh_stride: 0,
+        })
+        .unwrap();
+        assert!(
+            lowered.has_and_0x1ff,
+            "mesh emitIndices must mask each vertex index with 9-bit 0x1FF"
+        );
+        assert!(
+            !lowered.has_and_0x3ff,
+            "mesh emitIndices must not include RDNA2 edge-flag bit 9 (0x3FF)"
+        );
+        #[cfg(windows)]
+        if let Some(mut v) = super::super::validator::Validator::for_test() {
+            v.validate(&mut lowered.dxil.clone()).unwrap();
         }
     }
 }
