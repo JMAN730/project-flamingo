@@ -112,6 +112,7 @@ impl Pending {
                 translate_with_view_strides(
                     &shader.container,
                     host.supports_wave32(),
+                    host.supports_barycentrics(),
                     &|binding, required| {
                         required.then(|| {
                             bindings.borrow_mut().insert(binding);
@@ -137,6 +138,7 @@ impl Pending {
                 let (host, mut used) = translate_with_view_strides(
                     &shader.container,
                     host.supports_wave32(),
+                    host.supports_barycentrics(),
                     &|binding, _| {
                         let i = self
                             .strides

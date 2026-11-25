@@ -101,22 +101,35 @@ const UNTRACKED_SELECT: Why = "a select on an untracked mask";
 
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
-    lower_with_wave32(parts, true, None, None)
+    lower_with_caps(parts, true, true, None, None)
 }
 
-pub(crate) fn lower_with_wave32(
+pub(crate) fn lower_with_caps(
     parts: &Parts,
     allow_wave32: bool,
+    allow_barycentrics: bool,
     pixel_inputs: Option<&[SigElement]>,
     view_stride: Option<ViewStride<'_>>,
 ) -> Result<Lowered, ShaderError> {
-    match lower_program(parts, false, allow_wave32, pixel_inputs, view_stride) {
+    match lower_program(
+        parts,
+        false,
+        allow_wave32,
+        allow_barycentrics,
+        pixel_inputs,
+        view_stride,
+    ) {
         Err(ShaderError::Unsupported {
             what: UNTRACKED_SELECT,
             ..
-        }) if parts.native.stage == HwStage::Cs => {
-            lower_program(parts, true, allow_wave32, pixel_inputs, view_stride)
-        }
+        }) if parts.native.stage == HwStage::Cs => lower_program(
+            parts,
+            true,
+            allow_wave32,
+            allow_barycentrics,
+            pixel_inputs,
+            view_stride,
+        ),
         result => result,
     }
 }
@@ -125,12 +138,21 @@ fn lower_program(
     parts: &Parts,
     numeric_selects: bool,
     allow_wave32: bool,
+    allow_barycentrics: bool,
     pixel_inputs: Option<&[SigElement]>,
     view_stride: Option<ViewStride<'_>>,
 ) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
     loop {
-        match Lower::new(parts, &bad, numeric_selects, allow_wave32, view_stride).run(pixel_inputs)
+        match Lower::new(
+            parts,
+            &bad,
+            numeric_selects,
+            allow_wave32,
+            allow_barycentrics,
+            view_stride,
+        )
+        .run(pixel_inputs)
         {
             Ok(l) => return Ok(l),
             Err(Stop::Retry(v, why)) => {
@@ -323,6 +345,9 @@ struct Lower<'a> {
     hand_interp: HashSet<usize>,
     /// `v_interp_p1*` sites folded into a clean host-interpolated `p2` pair.
     folded_p1: HashSet<Site>,
+    /// Whether the host adapter supports SM 6.1 `SV_Barycentrics` and
+    /// `dx.op.attributeAtVertex` (`D3D12_OPTIONS3.BarycentricsSupported`).
+    allow_barycentrics: bool,
 }
 
 /// Iterations after which a loop is left (per entry into it), unless
@@ -772,6 +797,7 @@ impl<'a> Lower<'a> {
         bad: &'a HashMap<Value, Why>,
         numeric_selects: bool,
         allow_wave32: bool,
+        allow_barycentrics: bool,
         view_stride: Option<ViewStride<'a>>,
     ) -> Self {
         let p = x.p;
@@ -983,6 +1009,7 @@ impl<'a> Lower<'a> {
             barycentric_inputs,
             hand_interp,
             folded_p1,
+            allow_barycentrics,
         }
     }
 
@@ -1773,6 +1800,9 @@ impl<'a> Lower<'a> {
     /// Loads one component of `SV_Barycentrics` (`index == 0` -> `.y` = `i`,
     /// `index == 1` -> `.z` = `j`) with `kind`'s interpolation mode.
     fn load_barycentric(&mut self, kind: Barycentric, index: u8) -> Result<Val, Why> {
+        if !self.allow_barycentrics {
+            return Err("barycentrics read directly (host lacks SV_Barycentrics)");
+        }
         let mode = barycentric_mode(kind)?;
         let col = index + 1;
         let id = match self.s.inputs.iter().position(|e| e.kind == 28) {
@@ -1799,7 +1829,7 @@ impl<'a> Lower<'a> {
             }
         };
         self.s.flags |= flags::BARYCENTRICS;
-        Ok(self.load_any_input(id, col))
+        Ok(Val::I32(self.load_input_bits(id, col)))
     }
 
     /// Loads one channel of input `id` at `vertex_id` (`0..=2`) via
@@ -7511,6 +7541,9 @@ impl<'a> Lower<'a> {
     /// or `v_interp_mov_f32`) by hand from per-vertex values loaded through
     /// `dx.op.attributeAtVertex`.
     fn interp_by_hand(&mut self, inst: &Inst, site: Site) -> Result<(), Why> {
+        if !self.allow_barycentrics {
+            return Err("hand interpolation without host SV_Barycentrics support");
+        }
         let name = inst.name();
         let attribute = match self.interps.get(&site) {
             Some(
@@ -7544,14 +7577,15 @@ impl<'a> Lower<'a> {
             _ => None,
         };
         let f16 = name.ends_with("_f16");
-        let vertex_raw = |l: &mut Self, row: u8, ch: u8, vertex_id: u8| -> Result<V, Why> {
-            let (id, col) = l
-                .find_input(row, ch)
-                .ok_or("an input the signature lacks")?;
-            Ok(l.attribute_at_vertex(id, col, vertex_id))
-        };
+        let vertex_raw =
+            |l: &mut Self, row: u8, ch: u8, vertex_id: u8| -> Result<(usize, V), Why> {
+                let (id, col) = l
+                    .find_input(row, ch)
+                    .ok_or("an input the signature lacks")?;
+                Ok((id, l.attribute_at_vertex(id, col, vertex_id)))
+            };
         let vertex_f32 = |l: &mut Self, vertex_id: u8| -> Result<V, Why> {
-            let raw = match packing {
+            let (id, raw) = match packing {
                 None if f16 || attribute.high => {
                     return Err("a 16-bit read of a 32-bit input");
                 }
@@ -7570,6 +7604,9 @@ impl<'a> Lower<'a> {
                     vertex_raw(l, row, ch, vertex_id)?
                 }
             };
+            if l.s.inputs[id].comp != 9 {
+                return Err("interpolation of an integer input");
+            }
             Ok(l.as_float(raw))
         };
         let c = self.cur;
@@ -7591,25 +7628,34 @@ impl<'a> Lower<'a> {
                 };
                 match packing {
                     None if attribute.high => return Err("a 16-bit read of a 32-bit input"),
-                    None => vertex_raw(self, attribute.row, attribute.channel, vertex_id)?,
+                    None => vertex_raw(self, attribute.row, attribute.channel, vertex_id)?.1,
                     Some((pack2, b)) => {
-                        let half = |l: &mut Self, h: u8| -> Result<Option<V>, Why> {
+                        if !self
+                            .s
+                            .inputs
+                            .iter()
+                            .any(|e| e.row == Some(u32::from(attribute.row)))
+                        {
+                            return Err("an input the signature lacks");
+                        }
+                        let half = |l: &mut Self, h: u8| -> Result<V, Why> {
                             let src = if pack2 {
                                 packed_half(&l.s.inputs, attribute.row, b, h)
                             } else {
                                 h.is_multiple_of(2).then_some((attribute.row, h / 2))
                             };
-                            let Some((row, ch)) = src else {
-                                return Ok(None);
+                            let Some((id, col)) = src.and_then(|(row, ch)| l.find_input(row, ch))
+                            else {
+                                // An unwritten half has no host input channel. Give it
+                                // the same zero as an unwritten register.
+                                return Ok(l.s.m.i32(0));
                             };
-                            let raw = vertex_raw(l, row, ch, vertex_id)?;
-                            let f = l.as_float(raw);
-                            Ok(Some(l.f16_nearest(f)))
+                            let raw = l.attribute_at_vertex(id, col, vertex_id);
+                            Ok(l.input_half(id, raw))
                         };
                         let h = 2 * attribute.channel;
-                        let z = self.s.m.i32(0);
-                        let lo = half(self, h)?.unwrap_or(z);
-                        let hi = half(self, h + 1)?.unwrap_or(z);
+                        let lo = half(self, h)?;
+                        let hi = half(self, h + 1)?;
                         let k16 = self.s.m.i32(16);
                         let hi = self.s.m.bin(c, Bin::Shl, hi, k16);
                         self.s.m.bin(c, Bin::Or, lo, hi)

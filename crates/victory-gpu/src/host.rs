@@ -956,6 +956,29 @@ impl Host {
         })
     }
 
+    /// Whether the host adapter supports SM 6.1 `SV_Barycentrics` and
+    /// `dx.op.attributeAtVertex` (`D3D12_OPTIONS3.BarycentricsSupported`);
+    /// logged once.
+    pub(crate) fn supports_barycentrics(&self) -> bool {
+        static BARYCENTRICS: OnceLock<bool> = OnceLock::new();
+        *BARYCENTRICS.get_or_init(|| {
+            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS3::default();
+            // SAFETY: query writes its own `D3D12_FEATURE_DATA_D3D12_OPTIONS3` struct.
+            let ok = unsafe {
+                self.device
+                    .CheckFeatureSupport(
+                        D3D12_FEATURE_D3D12_OPTIONS3,
+                        (&raw mut options).cast(),
+                        size_of_val(&options) as u32,
+                    )
+                    .is_ok()
+            };
+            let barycentrics = ok && options.BarycentricsSupported.as_bool();
+            tracing::info!(barycentrics, "host barycentrics support");
+            barycentrics
+        })
+    }
+
     /// A recycled host list (reset and open), or a new one when the pool is
     /// empty.
     pub(crate) fn acquire_list(&self) -> windows::core::Result<HostList> {

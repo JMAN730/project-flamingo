@@ -49,11 +49,24 @@ fn allow_wave32() -> bool {
     }
 }
 
+/// Whether the active host adapter supports SM 6.1 `SV_Barycentrics` and
+/// `dx.op.attributeAtVertex` (`D3D12_OPTIONS3.BarycentricsSupported`).
+fn allow_barycentrics() -> bool {
+    #[cfg(windows)]
+    {
+        crate::host::host().is_none_or(|h| h.supports_barycentrics())
+    }
+    #[cfg(not(windows))]
+    {
+        true
+    }
+}
+
 /// What identifies this build: the BLAKE3 of our executable file and of
 /// the translation settings it runs with (the loop limit and the clean-up
-/// passes, which a diagnostics build can change at run time, and whether
-/// Wave32 lowering is enabled for the active host adapter).
-fn build(wave32: bool) -> &'static [u8; 32] {
+/// passes, which a diagnostics build can change at run time, and the active
+/// host adapter's Wave32 and barycentrics capabilities).
+fn build(wave32: bool, barycentrics: bool) -> &'static [u8; 32] {
     static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
     BUILD.get_or_init(|| {
         let exe = std::env::current_exe().and_then(std::fs::read);
@@ -69,6 +82,7 @@ fn build(wave32: bool) -> &'static [u8; 32] {
                 bytes.extend_from_slice(&limit.to_le_bytes());
                 bytes.extend_from_slice(&victory_shader::emit::shader_opt().to_le_bytes());
                 bytes.push(u8::from(wave32));
+                bytes.push(u8::from(barycentrics));
                 *blake3::hash(&bytes).as_bytes()
             }
             Err(e) => {
@@ -87,11 +101,13 @@ fn build(wave32: bool) -> &'static [u8; 32] {
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
     let wave32 = allow_wave32();
+    let barycentrics = allow_barycentrics();
     let translate = |c: &[u8]| {
-        victory_shader::emit::translate_with_wave32(c, wave32).map_err(|e| e.to_string())
+        victory_shader::emit::translate_with_caps(c, wave32, barycentrics)
+            .map_err(|e| e.to_string())
     };
     match CACHE.get() {
-        Some(cache) => cached(cache, build(wave32), container, translate),
+        Some(cache) => cached(cache, build(wave32, barycentrics), container, translate),
         None => translate(container),
     }
 }

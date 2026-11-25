@@ -306,7 +306,18 @@ pub fn translate_with_wave32(
     container: &[u8],
     allow_wave32: bool,
 ) -> Result<HostShader, ShaderError> {
-    translate_program(container, allow_wave32, None).map(|(shader, _)| shader)
+    translate_with_caps(container, allow_wave32, true)
+}
+
+/// As [`translate_with_wave32`], also controlling whether pixel shaders may
+/// use SM 6.1 `SV_Barycentrics` and `dx.op.attributeAtVertex`. Pass `false`
+/// when the host adapter does not report `D3D12_OPTIONS3.BarycentricsSupported`.
+pub fn translate_with_caps(
+    container: &[u8],
+    allow_wave32: bool,
+    allow_barycentrics: bool,
+) -> Result<HostShader, ShaderError> {
+    translate_program(container, allow_wave32, allow_barycentrics, None).map(|(shader, _)| shader)
 }
 
 /// Translates using matching structured views for statically addressed table
@@ -316,9 +327,15 @@ pub fn translate_with_wave32(
 pub fn translate_with_view_strides(
     container: &[u8],
     allow_wave32: bool,
+    allow_barycentrics: bool,
     view_stride: ViewStride<'_>,
 ) -> Result<(HostShader, Vec<crate::UsedResource>), ShaderError> {
-    translate_program(container, allow_wave32, Some(view_stride))
+    translate_program(
+        container,
+        allow_wave32,
+        allow_barycentrics,
+        Some(view_stride),
+    )
 }
 
 /// A precompiled compute module (`FSPX`): only GFX10 code, no DXIL to start from.
@@ -330,6 +347,7 @@ const FSPX_UNSUPPORTED: ShaderError = ShaderError::Unsupported {
 fn translate_program(
     container: &[u8],
     allow_wave32: bool,
+    allow_barycentrics: bool,
     view_stride: Option<ViewStride<'_>>,
 ) -> Result<(HostShader, Vec<crate::UsedResource>), ShaderError> {
     if container.starts_with(crate::dxbc::Fspx::MAGIC) {
@@ -355,7 +373,14 @@ fn translate_program(
             offset: 0,
             what: "a container without a vertex, pixel, compute or mesh program",
         })?;
-    let shader = translate_native(&c, &native, allow_wave32, None, view_stride)?;
+    let shader = translate_native(
+        &c,
+        &native,
+        allow_wave32,
+        allow_barycentrics,
+        None,
+        view_stride,
+    )?;
     Ok((shader, native.used))
 }
 
@@ -383,13 +408,14 @@ pub fn translate_mesh_for_pixel(
     if let Some(dxil) = pixel_dxil {
         pixel_inputs = signature_part(&Container::parse(dxil)?, FourCC::ISG1)?;
     }
-    translate_native(c, native, true, Some(&pixel_inputs), None).map(Some)
+    translate_native(c, native, true, true, Some(&pixel_inputs), None).map(Some)
 }
 
 fn translate_native(
     c: &Container<'_>,
     native: &NativeProgram,
     allow_wave32: bool,
+    allow_barycentrics: bool,
     pixel_inputs: Option<&[container::SigElement]>,
     view_stride: Option<ViewStride<'_>>,
 ) -> Result<HostShader, ShaderError> {
@@ -415,7 +441,13 @@ fn translate_native(
         io: &io,
         res: &res,
     };
-    emit_with_options(parts, allow_wave32, pixel_inputs, view_stride)
+    emit_with_options(
+        parts,
+        allow_wave32,
+        allow_barycentrics,
+        pixel_inputs,
+        view_stride,
+    )
 }
 
 /// Emits a program whose earlier stages already ran.
@@ -441,6 +473,23 @@ pub fn emit_with_wave32(
     res: &resource::Resources,
     allow_wave32: bool,
 ) -> Result<HostShader, ShaderError> {
+    emit_with_caps(c, native, p, st, io, res, allow_wave32, true)
+}
+
+/// As [`emit_with_wave32`], also controlling whether pixel shaders may use
+/// SM 6.1 `SV_Barycentrics` and `dx.op.attributeAtVertex`.
+// Mirrors `emit_with_wave32`'s six stage arguments plus the two host capability flags.
+#[allow(clippy::too_many_arguments)]
+pub fn emit_with_caps(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+    allow_wave32: bool,
+    allow_barycentrics: bool,
+) -> Result<HostShader, ShaderError> {
     let parts = Emission {
         c,
         native,
@@ -449,7 +498,7 @@ pub fn emit_with_wave32(
         io,
         res,
     };
-    emit_with_options(parts, allow_wave32, None, None)
+    emit_with_options(parts, allow_wave32, allow_barycentrics, None, None)
 }
 
 struct Emission<'a> {
@@ -467,19 +516,26 @@ fn emit_with_view_strides(
     allow_wave32: bool,
     view_stride: Option<ViewStride<'_>>,
 ) -> Result<HostShader, ShaderError> {
-    emit_with_options(parts, allow_wave32, None, view_stride)
+    emit_with_options(parts, allow_wave32, true, None, view_stride)
 }
 
 fn emit_with_options(
     parts: Emission<'_>,
     allow_wave32: bool,
+    allow_barycentrics: bool,
     pixel_inputs: Option<&[container::SigElement]>,
     view_stride: Option<ViewStride<'_>>,
 ) -> Result<HostShader, ShaderError> {
     let Emission {
         c, native, p, st, ..
     } = parts;
-    let original = emit_program(parts, allow_wave32, pixel_inputs, view_stride);
+    let original = emit_program(
+        parts,
+        allow_wave32,
+        allow_barycentrics,
+        pixel_inputs,
+        view_stride,
+    );
     // Retry unsupported programs only. Threading can separate an unknown
     // register value from its apparent use on a mutually exclusive path.
     if !matches!(original, Err(ShaderError::Unsupported { .. })) {
@@ -503,6 +559,7 @@ fn emit_with_options(
             res: &res,
         },
         allow_wave32,
+        allow_barycentrics,
         pixel_inputs,
         view_stride,
     )
@@ -511,6 +568,7 @@ fn emit_with_options(
 fn emit_program(
     parts: Emission<'_>,
     allow_wave32: bool,
+    allow_barycentrics: bool,
     pixel_inputs: Option<&[container::SigElement]>,
     view_stride: Option<ViewStride<'_>>,
 ) -> Result<HostShader, ShaderError> {
@@ -601,7 +659,7 @@ fn emit_program(
         }
         _ => 0,
     };
-    let l = lower::lower_with_wave32(
+    let l = lower::lower_with_caps(
         &lower::Parts {
             native,
             p,
@@ -614,6 +672,7 @@ fn emit_program(
             mesh_stride,
         },
         allow_wave32,
+        allow_barycentrics,
         pixel_inputs,
         view_stride,
     )?;
@@ -884,7 +943,7 @@ mod tests {
             },
             code: words.into_iter().flat_map(u32::to_le_bytes).collect(),
         };
-        let host = translate_native(&c, &native, true, None, None).unwrap();
+        let host = translate_native(&c, &native, true, true, None, None).unwrap();
         let c = Container::parse(&host.dxil).unwrap();
         let inputs = signature_part(&c, FourCC::ISG1).unwrap();
         let outputs = signature_part(&c, FourCC::OSG1).unwrap();
@@ -983,7 +1042,7 @@ mod tests {
             code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
         };
         assert!(matches!(
-            translate_native(&c, &native, true, None, None),
+            translate_native(&c, &native, true, true, None, None),
             Err(ShaderError::Unsupported {
                 what: "a mesh output signature beyond the host's size limit",
                 ..
@@ -1073,7 +1132,7 @@ mod tests {
             .chain(words.last())
             .flat_map(|w| w.to_le_bytes())
             .collect();
-        let standalone = translate_native(&c, &position_only, true, None, None).unwrap();
+        let standalone = translate_native(&c, &position_only, true, true, None, None).unwrap();
         let host = Container::parse(&standalone.dxil).unwrap();
         assert_eq!(signature_part(&host, FourCC::OSG1).unwrap().len(), 1);
         assert!(signature_part(&host, FourCC::PSG1).unwrap().is_empty());
