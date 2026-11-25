@@ -24,7 +24,7 @@
 //!   [`HostShader::static_samplers`] (the same decoded into a D3D12 static
 //!   sampler description). Comparison sampling (added 2026-11-23): an
 //!   immediate sampler used for comparison has a comparison filter there
-//!   (bit 0x80); the same console words used both ways get two slots so
+//!   (reduction bits 7-8 set to 0x80); the same console words used both ways get two slots so
 //!   annotateHandle matches `dx.resources`. A heap sampler used for
 //!   comparison must be a comparison sampler on the host.
 //! * **Root CBVs and root SRVs** (raw buffers) as root descriptors
@@ -684,7 +684,7 @@ fn emit_program(
             .map(|(n, &w)| {
                 let mut s = StaticSampler::from_words(w);
                 if l.cmp_samplers >> n & 1 != 0 {
-                    s.filter |= 0x80;
+                    s.make_comparison();
                 }
                 s
             })

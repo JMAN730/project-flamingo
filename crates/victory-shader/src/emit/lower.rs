@@ -3367,10 +3367,40 @@ impl<'a> Lower<'a> {
     }
 
     /// `x` of lane `src` (in this lane's quad) through quad reads, whose
-    /// lane must be a constant.
-    fn quad_pick(&mut self, x: V, src: V) -> V {
+    /// lane must be a constant. `pattern`, a quad permutation every quad
+    /// uses (two bits per lane), lets a broadcast or an exchange take one
+    /// quad operation instead of a read of each lane.
+    fn quad_pick(&mut self, x: V, src: V, pattern: Option<u8>) -> V {
         self.s.flags |= flags::WAVE_OPS;
         let c = self.cur;
+        match pattern {
+            Some(0xE4) => return x,
+            Some(p @ (0x00 | 0x55 | 0xAA | 0xFF)) => {
+                let lane = self.s.m.i32(u32::from(p & 3));
+                return self.s.op(
+                    c,
+                    "quadReadLaneAt.i32",
+                    Attr::NoUnwind,
+                    self.s.t.i32,
+                    122,
+                    &[x, lane],
+                );
+            }
+            Some(p @ (0xB1 | 0x4E | 0x1B)) => {
+                // Lane 0 reads lane 1, 2 or 3: across x, across y or the
+                // diagonal (QuadOp 0, 1, 2), every lane its partner.
+                let direction = self.s.m.i8((p & 3) - 1);
+                return self.s.op(
+                    c,
+                    "quadOp.i32",
+                    Attr::NoUnwind,
+                    self.s.t.i32,
+                    123,
+                    &[x, direction],
+                );
+            }
+            _ => {}
+        }
         let three = self.s.m.i32(3);
         let q = self.s.m.bin(c, Bin::And, src, three);
         let mut r = x;
@@ -3601,7 +3631,8 @@ impl<'a> Lower<'a> {
                 self.s.m.bin(c, Bin::Xor, t, xor)
             };
             let r = if mesh_quad {
-                self.quad_pick(x, src)
+                let pattern = (offset & 0x8000 != 0).then_some(offset as u8);
+                self.quad_pick(x, src, pattern)
             } else {
                 self.read_lane(x, src)
             };
@@ -4459,7 +4490,12 @@ impl<'a> Lower<'a> {
                 {
                     return Ok(());
                 }
-                None if name.starts_with("s_add") || name.starts_with("s_sub") => {
+                // s_lshlN_add_u32 sets SCC to the add's carry, not to
+                // "result != 0".
+                None if name.starts_with("s_add")
+                    || name.starts_with("s_sub")
+                    || name.starts_with("s_lshl") && name.ends_with("_add_u32") =>
+                {
                     Val::Missing("the carry of a scalar operation")
                 }
                 None => {
@@ -6367,8 +6403,12 @@ impl<'a> Lower<'a> {
             return Err("a DPP operand");
         };
         let x = self.i32_of(inst.read(Reg::V(reg)).ok_or("a DPP operand")?)?;
-        // Quad permutations and DPP8 stay in groups the pixel layout shares.
-        let quad = matches!(dpp, Dpp::Row { ctrl: 0..=0xFF, .. });
+        // Quad permutations, and DPP8 where every lane picks a lane of its
+        // own quad, stay in groups the pixel layout shares.
+        let quad = match dpp {
+            Dpp::Row { ctrl, .. } => ctrl <= 0xFF,
+            Dpp::Lanes { sel, .. } => (0..8).all(|i| ((sel >> (3 * i)) ^ i) & 4 == 0),
+        };
         let fi = match dpp {
             Dpp::Lanes { fi, .. } | Dpp::Row { fi, .. } => fi,
         };
@@ -6456,7 +6496,11 @@ impl<'a> Lower<'a> {
             }
         };
         let mut r = if mesh_quad {
-            self.quad_pick(x, src)
+            let pattern = match dpp {
+                Dpp::Row { ctrl, .. } => Some(ctrl as u8),
+                Dpp::Lanes { .. } => None,
+            };
+            self.quad_pick(x, src, pattern)
         } else {
             self.read_lane(x, src)
         };
