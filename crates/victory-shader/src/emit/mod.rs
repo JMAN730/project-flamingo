@@ -559,9 +559,10 @@ fn emit_program(
     for e in interpolated {
         e.interp = match (e.kind, e.comp) {
             (3, _) => 4,
-            // Constant, as DXC declares it (the AMD compiler crashed on a
-            // front face without a mode).
-            (4 | 5 | 10 | 13, _) if pixel => 1,
+            // Constant, as DXC declares it for RT/viewport array index and
+            // (on pixel inputs) front face / sample index.
+            (4 | 5, _) => 1,
+            (10 | 13, _) if pixel => 1,
             (0 | 6 | 7, 9) => 2,
             (0, _) => 1,
             _ => 0,

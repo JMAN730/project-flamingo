@@ -225,8 +225,21 @@ fn f16_nan_widen_bits(h: u32) -> u32 {
 /// it is a sampler, and the resource properties.
 type HandleKey = (usize, Site, u8, bool, (u32, u32));
 
-/// Source element id, element-relative channel, value, and optional f16 half.
-type ExportStore = (usize, u8, Value, Option<bool>);
+/// How a dword channel maps onto a signature element.
+#[derive(Clone, Copy)]
+enum Extract {
+    /// Full 32-bit channel.
+    Full,
+    /// Packed f16 half (`true` = high 16 bits).
+    Half(bool),
+    /// Low 16 bits (SV_RenderTargetArrayIndex in the misc vector).
+    Low16,
+    /// High 16 bits (SV_ViewportArrayIndex in the misc vector).
+    High16,
+}
+
+/// Source element id, element-relative channel, value, and extraction.
+type ExportStore = (usize, u8, Value, Extract);
 
 struct Lower<'a> {
     s: Shader,
@@ -8705,8 +8718,8 @@ impl<'a> Lower<'a> {
             Usage::Other(0) if mesh => self.unnamed_row(),
             _ => Some(row),
         };
-        // (output element, channel) per exported channel; per-primitive
-        // outputs are elements of `prims`.
+        // (output element, channel, value, extraction) per exported channel;
+        // per-primitive outputs are elements of `prims`.
         let mut stores = Vec::new();
         let primitive = matches!(e.target, Target::PrimitiveParam { .. });
         let outputs = if primitive {
@@ -8715,6 +8728,11 @@ impl<'a> Lower<'a> {
             &self.x.outputs
         };
         let by_kind = |kind: u8| outputs.iter().position(|o| o.kind == kind);
+        // GFX9+/RDNA2: when the signature declares RT or viewport array
+        // index, `exp pos1` is the misc vector (not clip/cull), and clip/cull
+        // shift to pos2..=pos3.
+        let has_misc = !primitive && outputs.iter().any(|o| matches!(o.kind, 4 | 5));
+        let first_clip: u8 = if has_misc { 2 } else { 1 };
         // 16-bit vertex outputs: the halves each dword carries, as (output
         // element, channel, high half) per channel.
         let halves = match e.target {
@@ -8742,7 +8760,7 @@ impl<'a> Lower<'a> {
                     });
                     if let Some(id) = found {
                         let col = src.expect("found").1 - outputs[id].col;
-                        stores.push((id, col, value, Some(high)));
+                        stores.push((id, col, value, Extract::Half(high)));
                     }
                 }
             }
@@ -8753,6 +8771,19 @@ impl<'a> Lower<'a> {
             };
             if halves.is_some() {
                 break;
+            }
+            if has_misc && e.target == Target::Position(1) {
+                // GFX9+/RDNA2 packs SV_RenderTargetArrayIndex in the low 16
+                // bits and SV_ViewportArrayIndex in the high 16 bits of pos1.z.
+                if ch == 2 {
+                    if let Some(id) = by_kind(4) {
+                        stores.push((id, 0, value, Extract::Low16));
+                    }
+                    if let Some(id) = by_kind(5) {
+                        stores.push((id, 0, value, Extract::High16));
+                    }
+                }
+                continue;
             }
             let found = match e.target {
                 Target::Color(n) => outputs
@@ -8786,13 +8817,9 @@ impl<'a> Lower<'a> {
                         .map(|id| (id, ch - outputs[id].col))
                 }
                 Target::Null | Target::Unread => None,
-                Target::Position(n @ 1..=2) => {
-                    // shortcut: without the misc vector (point size, render
-                    // target or viewport index) pos1 and pos2 carry the clip
-                    // then cull distances, in semantic order.
-                    if outputs.iter().any(|o| matches!(o.kind, 4 | 5)) {
-                        return Err("render-target or viewport index exports");
-                    }
+                Target::Position(n) if n >= first_clip && n <= first_clip + 1 => {
+                    // Clip then cull distances in semantic order; shifted to
+                    // pos2..=pos3 when pos1 carries the misc vector.
                     let mut dists: Vec<usize> = (0..outputs.len())
                         .filter(|&i| matches!(outputs[i].kind, 6 | 7))
                         .collect();
@@ -8803,7 +8830,7 @@ impl<'a> Lower<'a> {
                         .collect();
                     // Channels past the distances the signature declares are
                     // ones the clipper does not enable (`PA_CL_VS_OUT_CNTL`).
-                    let k = usize::from(n - 1) * 4 + usize::from(ch);
+                    let k = usize::from(n - first_clip) * 4 + usize::from(ch);
                     flat.get(k).copied()
                 }
                 Target::Position(_) => return Err("clip, cull or point-size exports"),
@@ -8811,8 +8838,12 @@ impl<'a> Lower<'a> {
             };
             if let Some((id, col)) = found {
                 // Two f16 channels per dword: an odd channel the high half.
-                let half = e.compressed.then_some(ch % 2 == 1);
-                stores.push((id, col, value, half));
+                let extract = if e.compressed {
+                    Extract::Half(ch % 2 == 1)
+                } else {
+                    Extract::Full
+                };
+                stores.push((id, col, value, extract));
             }
         }
         Ok(stores)
@@ -8868,7 +8899,7 @@ impl<'a> Lower<'a> {
         }
         if stores
             .iter()
-            .any(|s| s.3.is_none() && elements(self, primitive)[s.0].half)
+            .any(|s| matches!(s.3, Extract::Full) && elements(self, primitive)[s.0].half)
         {
             return Err("a 16-bit output the stage data does not mark");
         }
@@ -8902,39 +8933,57 @@ impl<'a> Lower<'a> {
             (true, false) => ("storeVertexOutput", 171),
             (true, true) => ("storePrimitiveOutput", 172),
         };
-        for (id, col, value, half) in stores {
+        for (id, col, value, extract) in stores {
             let mut x = self.i32_of(value)?;
-            let comp = elements(self, primitive)[id].comp;
-            if let Some(high) = half {
-                let c = self.cur;
-                if high {
-                    let k16 = self.s.m.i32(16);
-                    x = self.s.m.bin(c, Bin::LShr, x, k16);
-                }
-                // The host links these channels at 32 bits.
-                match comp {
-                    4 if !e.compressed => {
+            let (kind, comp) = {
+                let el = &elements(self, primitive)[id];
+                (el.kind, el.comp)
+            };
+            let is_half = matches!(extract, Extract::Half(_));
+            match extract {
+                Extract::Full => {}
+                Extract::Half(high) => {
+                    let c = self.cur;
+                    if high {
                         let k16 = self.s.m.i32(16);
-                        let low = self.s.m.bin(c, Bin::Shl, x, k16);
-                        x = self.s.m.bin(c, Bin::AShr, low, k16);
+                        x = self.s.m.bin(c, Bin::LShr, x, k16);
                     }
-                    5 if !e.compressed => {
-                        let mask = self.s.m.i32(0xFFFF);
-                        x = self.s.m.bin(c, Bin::And, x, mask);
+                    // The host links these channels at 32 bits.
+                    match comp {
+                        4 if !e.compressed => {
+                            let k16 = self.s.m.i32(16);
+                            let low = self.s.m.bin(c, Bin::Shl, x, k16);
+                            x = self.s.m.bin(c, Bin::AShr, low, k16);
+                        }
+                        5 if !e.compressed => {
+                            let mask = self.s.m.i32(0xFFFF);
+                            x = self.s.m.bin(c, Bin::And, x, mask);
+                        }
+                        _ => {
+                            let f32t = self.s.t.f32;
+                            let f = self
+                                .s
+                                .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[x]);
+                            x = self.as_int(f);
+                        }
                     }
-                    _ => {
-                        let f32t = self.s.t.f32;
-                        let f = self
-                            .s
-                            .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[x]);
-                        x = self.as_int(f);
-                    }
+                }
+                Extract::Low16 => {
+                    let mask = self.s.m.i32(0xFFFF);
+                    x = self.s.m.bin(self.cur, Bin::And, x, mask);
+                }
+                Extract::High16 => {
+                    let k16 = self.s.m.i32(16);
+                    x = self.s.m.bin(self.cur, Bin::LShr, x, k16);
                 }
             }
             let el = &mut elements(self, primitive)[id];
             el.usage |= 1 << col;
+            if !mesh && !primitive && matches!(kind, 4 | 5) {
+                self.s.flags |= flags::VIEWPORT_RT_INDEX;
+            }
             let (suffix, x) = match comp {
-                9 if half.is_some() => (".f32", self.as_float(x)),
+                9 if is_half => (".f32", self.as_float(x)),
                 9 => {
                     let f = match self.floats.get(&value) {
                         Some(&f) => f,
@@ -9593,6 +9642,155 @@ mod tests {
             !lowered.has_fcmp_uno,
             "v_med3_f32 must not emit fcmp uno (folded away by some drivers)"
         );
+    }
+
+    /// EXP `exp target, v0, v1, v2, v3 [done] [vm]` (`en`: 4-bit channel mask).
+    fn exp_inst(target: u8, en: u8, v: [u8; 4], done: bool, vm: bool) -> [u32; 2] {
+        let w0 = 0x3E << 26
+            | (vm as u32) << 12
+            | (done as u32) << 11
+            | (target as u32 & 0x3F) << 4
+            | (en as u32 & 0xF);
+        let w1 = (v[3] as u32) << 24 | (v[2] as u32) << 16 | (v[1] as u32) << 8 | (v[0] as u32);
+        [w0, w1]
+    }
+
+    /// Lowers a synthetic VS that packs RT/viewport array indices in `exp pos1`
+    /// (and optionally a clip distance in `exp pos2`), asserting the DXIL
+    /// container carries `SHADER_FEATURE_VIEWPORT_AND_RT_ARRAY_INDEX…`.
+    fn lower_vs_misc(has_rt: bool, has_vp: bool, has_clip: bool) -> Lowered {
+        use super::super::container::SigElement;
+        let mut words = vec![
+            v_mov(0, 0x80), // pos.x = 0.0
+            v_mov(1, 0x80), // pos.y = 0.0
+            v_mov(2, 0x80), // pos.z = 0.0
+            v_mov(3, 0xF2), // pos.w = 1.0
+            v_mov(4, 0),    // pos1.z = packed (viewport << 16) | rt  from s0
+            v_mov(5, 1),    // pos2.x = clip from s1
+        ];
+        words.extend_from_slice(&exp_inst(12, 0xF, [0, 1, 2, 3], false, false)); // pos0
+        words.extend_from_slice(&exp_inst(13, 0x4, [0, 0, 4, 0], !has_clip, false)); // pos1.z
+        if has_clip {
+            words.extend_from_slice(&exp_inst(14, 0x1, [5, 0, 0, 0], true, false)); // pos2.x
+        }
+        words.push(S_ENDPGM);
+
+        let mut outputs = vec![SigElement {
+            name: "SV_Position".into(),
+            index: 0,
+            kind: 3,
+            comp: 9,
+            interp: 4,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage: 0,
+            half: false,
+        }];
+        let mut next_row = 1u32;
+        if has_rt {
+            outputs.push(SigElement {
+                name: "SV_RenderTargetArrayIndex".into(),
+                index: 0,
+                kind: 4,
+                comp: 5,
+                interp: 1,
+                row: Some(next_row),
+                col: 0,
+                cols: 1,
+                usage: 0,
+                half: false,
+            });
+            next_row += 1;
+        }
+        if has_vp {
+            outputs.push(SigElement {
+                name: "SV_ViewportArrayIndex".into(),
+                index: 0,
+                kind: 5,
+                comp: 5,
+                interp: 1,
+                row: Some(next_row),
+                col: 0,
+                cols: 1,
+                usage: 0,
+                half: false,
+            });
+            next_row += 1;
+        }
+        if has_clip {
+            outputs.push(SigElement {
+                name: "SV_ClipDistance".into(),
+                index: 0,
+                kind: 6,
+                comp: 9,
+                interp: 2,
+                row: Some(next_row),
+                col: 0,
+                cols: 1,
+                usage: 0,
+                half: false,
+            });
+        }
+
+        let native = NativeProgram {
+            stage: HwStage::Vs,
+            wave64: false,
+            vgprs: 8,
+            layout: vec![RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 2,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            }],
+            used: vec![],
+            io: StageIo::Vs {
+                inputs: Vec::new(),
+                outputs: Vec::new(),
+            },
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = ir::build(&native.code, false, native.vgprs).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: Vec::new(),
+            outputs,
+            prims: Vec::new(),
+            mesh_stride: 0,
+        })
+        .expect("VS with RT/viewport array index should lower")
+    }
+
+    #[test]
+    fn vs_rt_and_viewport_index_exports_set_sfi0() {
+        for (has_rt, has_vp, has_clip) in [
+            (true, false, false),
+            (false, true, false),
+            (true, true, true),
+        ] {
+            let lowered = lower_vs_misc(has_rt, has_vp, has_clip);
+            let sfi0 = crate::dxbc::Container::parse(&lowered.dxil)
+                .unwrap()
+                .part(crate::dxbc::FourCC::SFI0)
+                .unwrap()
+                .data;
+            let features = u64::from_le_bytes(sfi0.try_into().unwrap());
+            assert_ne!(
+                features & 0x2000,
+                0,
+                "SFI0 should set ViewPortAndRTArrayIndexFromAnyShaderFeedingRasterizer \
+                 (rt={has_rt} vp={has_vp} clip={has_clip})"
+            );
+        }
     }
 
     /// A pixel shader that exports `v0` as a render-target colour, with
