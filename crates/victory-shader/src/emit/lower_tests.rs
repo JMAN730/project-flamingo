@@ -950,6 +950,26 @@ fn a_scalar_carry_chain_reaches_the_select() {
     }
 }
 
+/// The 24-bit multiplies lower both halves of their 48-bit product:
+/// `v_mul_i32_i24` and `v_mul_u32_u24` the low dword, `v_mul_hi_i32_i24`
+/// and `v_mul_hi_u32_u24` the high one. An LDS store keeps the result live.
+#[test]
+fn the_24_bit_multiplies_lower_both_halves() {
+    // VOP2 `op v0, v1, v2`.
+    for op in [0x09u32, 0x0A, 0x0B, 0x0C] {
+        let words = [
+            0x7E02_0285,               // v_mov_b32 v1, 5
+            0x7E04_0287,               // v_mov_b32 v2, 7
+            op << 25 | 2 << 9 | 0x101, // op v0, v1, v2
+            0x7E06_0280,               // v_mov_b32 v3, 0
+            0xD834_0000,
+            0x0000_0003, // ds_write_b32 v3, v0
+            S_ENDPGM,
+        ];
+        lowers_lds(&words).unwrap_or_else(|e| panic!("VOP2 {op:#x}: {e}"));
+    }
+}
+
 /// `v_mad_u32_u16` / `v_mad_i32_i16` (with op_sel halves) and `v_lerp_u8`
 /// lower (#405). An LDS store keeps the result live.
 #[test]
