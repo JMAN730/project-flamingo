@@ -272,10 +272,18 @@ mod tests {
             let text = format!("<Game><TitleId>{id}</TitleId></Game>");
             assert_eq!(Title::from_manifest(&text).id, 0x1234_ABCD, "{id}");
         }
-        assert_eq!(
-            Title::from_manifest("<Game><TitleId>0x</TitleId></Game>").id,
-            0
-        );
+    }
+
+    #[test]
+    fn invalid_or_missing_title_ids_default_to_zero() {
+        for text in [
+            "<Game/>",
+            "<Game><TitleId>0x</TitleId></Game>",
+            "<Game><TitleId>0Xnothex</TitleId></Game>",
+            "<Game><TitleId>0x100000000</TitleId></Game>",
+        ] {
+            assert_eq!(Title::from_manifest(text).id, 0, "{text}");
+        }
     }
 
     #[test]
