@@ -1293,16 +1293,27 @@ extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags:
     if let Some(list) = host_list(this)
         && dst != 0
         && src != 0
+        && len != 0
     {
-        let len = len as usize;
-        list.defer(move || {
-            if crate::texture::committed(src as *const u8, len)
-                && crate::texture::committed(dst as *const u8, len)
-            {
-                // SAFETY: both ranges are committed title memory.
-                unsafe { std::ptr::copy(src as *const u8, dst as *mut u8, len) };
-            }
-        });
+        let disjoint = dst.checked_add(len).is_some_and(|end| end <= src)
+            || src.checked_add(len).is_some_and(|end| end <= dst);
+        if disjoint {
+            // Non-overlapping copy goes through `Step::Copy` (`copy_mapped`),
+            // avoiding `VirtualQuery` on large title pools, opening guarded
+            // blocks, and preserving per-submission write-watch coalescing.
+            list.defer_copy(dst as *mut u8, src as *const u8, len as usize);
+        } else {
+            let len = len as usize;
+            list.defer(move || {
+                if crate::texture::committed(src as *const u8, len)
+                    && crate::texture::committed(dst as *const u8, len)
+                {
+                    crate::watch::writing(dst as usize, len);
+                    // SAFETY: both ranges are committed title memory and opened for writing.
+                    unsafe { std::ptr::copy(src as *const u8, dst as *mut u8, len) };
+                }
+            });
+        }
         mark_work(this);
     }
     #[cfg(not(windows))]
@@ -1399,10 +1410,31 @@ extern "system" fn set_pipeline(this: This, pipeline: This) {
 }
 
 /// Pipeline syncs: waits for earlier work and cache flushes, at the top or
-/// bottom of the pipe `(flags, control, address, size)`. Host lists order
-/// their own work and every submission is waited for, so there is nothing
-/// to do.
-extern "system" fn sync(_: This, _flags: u32, _control: u32, _address: u64, _size: u64) {}
+/// bottom of the pipe `(flags, control, address, size)`. Within one list,
+/// shader writes before a sync are read after it (skinning writes vertices
+/// that later draws of the same list read), so it records a UAV barrier.
+/// `VICTORY_SYNC_BARRIER=0` leaves syncs out, as before.
+extern "system" fn sync(this: This, _flags: u32, _control: u32, _address: u64, _size: u64) {
+    #[cfg(windows)]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ON.get_or_init(|| std::env::var_os("VICTORY_SYNC_BARRIER").is_none_or(|v| v != "0")) {
+            return;
+        }
+        if let Some(list) = host_list(this) {
+            use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
+            list.mark_work();
+            // SAFETY: the same layout; no resource named.
+            let barrier =
+                unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
+            // SAFETY: an open list.
+            unsafe { list.list.ResourceBarrier(&[barrier]) };
+            mark_work(this);
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = this;
+}
 
 /// Reset with console flags `(allocator, pipeline, flags)`; the flags only
 /// tune the console's command memory.

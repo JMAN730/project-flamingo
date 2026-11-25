@@ -20,6 +20,7 @@ fn main() {
         ("plane_corners", "corner", "vs_6_0"),
         ("plane_steps", "plane", "ps_6_0"),
         ("plane_floats", "plane", "ps_6_0"),
+        ("rebar_hash", "main", "cs_6_0"),
     ] {
         let source = format!("shaders/{name}.hlsl");
         println!("cargo:rerun-if-changed={source}");

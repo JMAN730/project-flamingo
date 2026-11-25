@@ -134,6 +134,10 @@ fn watch_loop() {
 static MEMORY_WAITERS: Mutex<Vec<(crate::timeline::MemoryWait, Instant, Weak<Timeline>)>> =
     Mutex::new(Vec::new());
 
+/// Fast-path count of entries in `MEMORY_WAITERS` so `Fence::signal` and
+/// bottom-of-pipe `written` avoid locking `MEMORY_WAITERS` when empty.
+static MEMORY_WAITER_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 #[cfg(any(feature = "diagnostics", test))]
 fn parse_wait_timeout(value: Option<&str>) -> Duration {
     let ms = value
@@ -165,8 +169,13 @@ pub(crate) fn wait_memory(
 ) -> bool {
     let mut waiters = MEMORY_WAITERS.lock().unwrap_or_else(|e| e.into_inner());
     let weak = Arc::downgrade(timeline);
+    // Publish a non-zero count with SeqCst before checking `wait.satisfied()`
+    // so a concurrent writer's SeqCst fence + load in `scan_memory_waiters`
+    // cannot miss a waiter that observed the pre-write value.
+    MEMORY_WAITER_COUNT.store(waiters.len() + 1, Ordering::SeqCst);
     if wait.satisfied() || Instant::now() >= deadline {
         waiters.retain(|(_, _, t)| !t.ptr_eq(&weak));
+        MEMORY_WAITER_COUNT.store(waiters.len(), Ordering::SeqCst);
         return true;
     }
     if let Some(existing) = waiters.iter_mut().find(|(_, _, t)| t.ptr_eq(&weak)) {
@@ -175,6 +184,7 @@ pub(crate) fn wait_memory(
     } else {
         waiters.push((wait, deadline, weak));
     }
+    MEMORY_WAITER_COUNT.store(waiters.len(), Ordering::SeqCst);
     drop(waiters);
     watch_notify();
     false
@@ -187,9 +197,13 @@ pub(crate) fn wait_memory(
 /// deadline expiry before the watcher scans), so `scan_memory_waiters` cannot
 /// later read a retired address after post-wait work reports completion.
 pub(crate) fn cancel_memory_wait(timeline: &Arc<Timeline>) {
+    if MEMORY_WAITER_COUNT.load(Ordering::Acquire) == 0 {
+        return;
+    }
     let weak = Arc::downgrade(timeline);
     let mut waiters = MEMORY_WAITERS.lock().unwrap_or_else(|e| e.into_inner());
     waiters.retain(|(_, _, t)| !t.ptr_eq(&weak));
+    MEMORY_WAITER_COUNT.store(waiters.len(), Ordering::SeqCst);
 }
 
 #[cfg(test)]
@@ -205,6 +219,12 @@ pub(crate) fn has_memory_waiter(timeline: &Arc<Timeline>) -> bool {
 /// Checks pending GPU memory waits, waking any live timeline whose condition is
 /// satisfied or whose deadline has passed.
 fn scan_memory_waiters() -> (Vec<Arc<Timeline>>, bool) {
+    // Pair with the SeqCst count publication in `wait_memory` after the
+    // caller's Release store to fence/target memory.
+    std::sync::atomic::fence(Ordering::SeqCst);
+    if MEMORY_WAITER_COUNT.load(Ordering::Acquire) == 0 {
+        return (Vec::new(), false);
+    }
     let mut waiters = MEMORY_WAITERS.lock().unwrap_or_else(|e| e.into_inner());
     let mut woken = Vec::new();
     waiters.retain(|(wait, deadline, timeline)| {
@@ -218,6 +238,7 @@ fn scan_memory_waiters() -> (Vec<Arc<Timeline>>, bool) {
             true
         }
     });
+    MEMORY_WAITER_COUNT.store(waiters.len(), Ordering::SeqCst);
     (woken, !waiters.is_empty())
 }
 

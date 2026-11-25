@@ -559,11 +559,24 @@ fn apply_page_mappings(map: crate::resource::PageMapper, pool: u64, ops: &[PageO
     let mut ok = true;
     for &op in ops {
         ok &= match op {
-            PageOp::Copy { at, source, len } => map(at, source, len),
+            PageOp::Copy { at, source, len } => {
+                #[cfg(windows)]
+                let _remapping = crate::watch::title_memory_remapping(at as usize, len as usize);
+                map(at, source, len)
+            }
             PageOp::Fill { at, source, count } => {
+                #[cfg(windows)]
+                let _remapping = crate::watch::title_memory_remapping(
+                    at as usize,
+                    count.saturating_mul(PAGE) as usize,
+                );
                 (0..count).all(|k| map(at + k * PAGE, source, PAGE))
             }
-            PageOp::Unmap { at, len } => map(at, 0, len),
+            PageOp::Unmap { at, len } => {
+                #[cfg(windows)]
+                let _remapping = crate::watch::title_memory_remapping(at as usize, len as usize);
+                map(at, 0, len)
+            }
             PageOp::Invalid => false,
         };
     }

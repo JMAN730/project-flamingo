@@ -164,6 +164,14 @@ pub fn loop_limit() -> u32 {
     })
 }
 
+/// Whether eligible wave64 compute programs may use one 32-lane host wave,
+/// with each thread carrying the registers of two console lanes.
+pub fn wave64_double() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED
+        .get_or_init(|| std::env::var_os("VICTORY_WAVE64_DOUBLE").as_deref() == Some("1".as_ref()))
+}
+
 /// The clean-up passes that run over a translated module before it is
 /// written (`bitcode::opt`): a set of its pass bits. Every pass is exact, so
 /// the switch is for telling a lowering fault from a clean-up fault and for
