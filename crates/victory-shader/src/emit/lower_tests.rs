@@ -3093,3 +3093,33 @@ fn cmp_class_f32_modifiers_are_bitwise() {
         .any(|(name, args)| name == "dx.op.unary.f32" && args.first() == Some(&Some(6)));
     assert!(!fabs, "v_cmp_class_f32 abs must not lower to FAbs");
 }
+
+/// 16-bit SDWA destinations: WORD_0 with UNUSED_SEXT lowers (sign-extending
+/// the word); the reserved `dst_unused` 3 is refused.
+#[test]
+fn sdwa_16bit_destination_unused_modes() {
+    // v_cvt_i16_f16_sdwa v0, v1 dst_sel:WORD_0 src0_sel:WORD_0, with
+    // dst_unused UNUSED_PAD (0), UNUSED_SEXT (1), UNUSED_PRESERVE (2); then
+    // v_mov_b32 v2, 0; ds_write_b32 v2, v0, so the result is read.
+    let program = |ext: u32| {
+        [
+            0x7E00_A6F9,
+            ext,
+            0x7E04_0280,
+            0xD834_0000,
+            0x0000_0002,
+            S_ENDPGM,
+        ]
+    };
+    for unused in 0..3u32 {
+        lowers_lds(&program(0x0004_0401 | unused << 11))
+            .unwrap_or_else(|e| panic!("dst_unused {unused}: {e}"));
+    }
+    for dst_sel in [4u32, 5] {
+        let words = program(0x0004_0001 | dst_sel << 8 | 3 << 11);
+        assert!(
+            lowers_lds(&words).is_err(),
+            "dst_sel {dst_sel}, dst_unused 3"
+        );
+    }
+}

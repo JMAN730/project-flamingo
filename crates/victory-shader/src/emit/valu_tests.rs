@@ -3098,3 +3098,17 @@ fn lshl_add_carry_read_is_refused() {
         assert!(err.contains("carry"), "op {op:#x}: {err}");
     }
 }
+
+/// A 16-bit result written to WORD_0 with UNUSED_SEXT sign-extends bit 15
+/// into the high word; UNUSED_PAD zeroes it.
+#[test]
+fn sdwa_16bit_word0_sext_sign_extends() {
+    // llvm-mc -mcpu=gfx1030: v_cvt_i16_f16_sdwa v0, v1 dst_sel:WORD_0
+    // dst_unused:UNUSED_SEXT (then UNUSED_PAD) src0_sel:WORD_0.
+    for (extension, want) in [(0x0004_0C01, 0xFFFF_FFFF), (0x0004_0401, 0x0000_FFFF)] {
+        let shader = build_valu_cs(&[0x7E00_A6F9, extension]);
+        run_cases(&shader, &[[0xBC00, 0, 0, 0]], |backend, _, _, got| {
+            assert_eq!(got, want, "{backend}: {extension:#x}: {got:#010x}");
+        });
+    }
+}

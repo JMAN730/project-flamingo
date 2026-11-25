@@ -7316,16 +7316,26 @@ impl<'a> Lower<'a> {
         };
         let mut high = v.opsel >> 3 & 1 != 0;
         // SDWA: the word written, the other one kept (preserve) or zero
-        // (pad; a sign extension above the high word adds nothing).
-        let mut keep = true;
+        // (pad), or the low word's sign bit extended above it (sext; above
+        // the high word that adds nothing).
+        let (mut keep, mut sext) = (true, false);
         if let Some(sd) = v.sdwa {
             match (sd.dst_sel, sd.dst_unused) {
                 (4, 2) => {}
                 (5, 2) => high = true,
-                (4 | 6, _) => keep = false,
-                (5, _) => (high, keep) = (true, false),
+                (4, 1) => (keep, sext) = (false, true),
+                (4, 0) | (6, _) => keep = false,
+                (5, 0 | 1) => (high, keep) = (true, false),
                 _ => return Err("an SDWA destination of a 16-bit operation"),
             }
+        }
+        if sext {
+            let c = self.cur;
+            let k16 = self.s.m.i32(16);
+            let x = self.s.m.bin(c, Bin::Shl, x, k16);
+            let r = self.s.m.bin(c, Bin::AShr, x, k16);
+            self.write_placed(inst, Reg::V(reg), r, guard);
+            return Ok(());
         }
         let c = self.cur;
         let old = match inst.read(Reg::V(reg)).map(|o| self.i32_of(o)) {
