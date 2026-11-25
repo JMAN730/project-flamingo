@@ -740,6 +740,21 @@ mod tests {
         );
     }
 
+    /// VOP3P 0x18 is `v_dot8_i32_i4`, between `v_dot4_u32_u8` and
+    /// `v_dot8_u32_u4` (RDNA2 ISA). Words and text from
+    /// `llvm-mc -triple=amdgcn -mcpu=gfx1030 --disassemble`.
+    #[test]
+    fn signed_nibble_dot_product_has_its_name() {
+        assert_eq!(
+            one(&[0xCC18_4000, 0x1C0E_0501], true),
+            "v_dot8_i32_i4 v0, v1, v2, v3"
+        );
+        assert_eq!(
+            one(&[0xCC19_4000, 0x1C0E_0501], true),
+            "v_dot8_u32_u4 v0, v1, v2, v3"
+        );
+    }
+
     /// `s_atc_probe` / `s_atc_probe_buffer`: SDATA is a 7-bit immediate, the
     /// buffer resource is 4 dwords, and GLC/DLC are not operands.
     ///
