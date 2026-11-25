@@ -270,8 +270,10 @@ fn commit(
         match source {
             Source::Data(data) => write(path, data)?,
             // Files are never changed in place, so sharing one is safe.
+            // A copy (past the file system's link limit) is flushed like a
+            // new blob before the version is committed.
             Source::Kept(from) => {
-                std::fs::hard_link(from, &path).or_else(|_| std::fs::copy(from, &path).map(drop))?
+                std::fs::hard_link(from, &path).or_else(|_| write(path, &std::fs::read(from)?))?
             }
         }
         step();
@@ -1251,6 +1253,37 @@ mod tests {
             vec![("a".into(), "new a".into()), ("b".into(), "old b".into())],
         );
         assert_eq!(state(root), Some(new));
+    }
+
+    /// A kept blob that cannot be hard-linked (NTFS allows 1024 links to a
+    /// file) is copied into the new version with its exact bytes.
+    #[cfg(windows)]
+    #[test]
+    fn a_kept_blob_past_the_link_limit_is_copied() {
+        let dir = tempfile::tempdir().unwrap();
+        let links = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        assert_eq!(
+            update(root, "one", &[("a", Some("old a")), ("b", Some("old b"))]),
+            S_OK
+        );
+        const NTFS: &str = "the temp folder must be on NTFS, which allows 1024 links to a file";
+        let old_b = container_dir(root, "Slot").join("v1").join("1");
+        for i in 0..1023 {
+            std::fs::hard_link(&old_b, links.path().join(i.to_string())).expect(NTFS);
+        }
+        let full = std::fs::hard_link(&old_b, links.path().join("full")).expect_err(NTFS);
+        assert_eq!(full.kind(), std::io::ErrorKind::TooManyLinks, "{NTFS}");
+
+        assert_eq!(update(root, "two", &[("a", Some("new a"))]), S_OK);
+
+        let new = (
+            "two".into(),
+            vec![("a".into(), "new a".into()), ("b".into(), "old b".into())],
+        );
+        assert_eq!(state(root), Some(new));
+        assert!(!old_b.exists());
+        assert_eq!(std::fs::read(links.path().join("0")).unwrap(), b"old b");
     }
 
     #[test]
