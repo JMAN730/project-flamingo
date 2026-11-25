@@ -858,6 +858,18 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             if crate::texture::title_written(from) {
                 crate::texture::upload(list, src, from);
             }
+            // A texture copied onto itself (the title does so with its scene
+            // depth before the mirror pass): its texels stay as they are,
+            // and the host may not copy a resource onto itself (one texture
+            // in both copy states: it was left in the source state while
+            // written, 190 times in run w64-538b). Only what shaders wrote
+            // to a depth texture's twin is brought in, as for any read.
+            if windows::core::Interface::as_raw(to) == windows::core::Interface::as_raw(from) {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| tracing::info!(resource = ?src, "a texture copied onto itself: no host copy recorded"));
+                list.twin_use(src, false, false);
+                return;
+            }
             // Depth textures shaders also write: what they wrote, first.
             let twins = (list.twin_use(dst, false, true), list.twin_use(src, false, false));
             ensure_state(list, dst, COPY_DEST);
