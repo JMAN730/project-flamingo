@@ -1256,6 +1256,16 @@ pub(crate) fn module() -> HleModule {
     }
 }
 
+/// The held keys in the order `GetKeyState` reports them: "new keys are
+/// added at the end of the array, and when a key is released, everything
+/// shifts down to fill in the gap". Keys of `previous` still in `down` keep
+/// their place; keys of `down` not in `previous` follow, in `down`'s order.
+fn press_order(previous: &[u8], down: &[u8]) -> Vec<u8> {
+    let kept = previous.iter().filter(|vk| down.contains(vk));
+    let new = down.iter().filter(|vk| !previous.contains(vk));
+    kept.chain(new).copied().collect()
+}
+
 /// Host input: XInput pads, the keyboard while our process has focus.
 #[cfg(windows)]
 mod host {
@@ -1320,6 +1330,8 @@ mod host {
     #[derive(Default)]
     pub(super) struct Host {
         empty_until: [Option<Instant>; PADS],
+        /// The keys held at the last poll, in press order.
+        held_keys: Vec<u8>,
     }
 
     impl Source for Host {
@@ -1367,9 +1379,11 @@ mod host {
                     .collect();
                 down.extend(held);
             }
-            let state = keyboard_state(&down, caps_lock());
+            self.held_keys = press_order(&self.held_keys, &down);
+            let state = keyboard_state(&self.held_keys, caps_lock());
             let layout = layout();
-            down.iter()
+            self.held_keys
+                .iter()
                 .map(|&vk| {
                     // SAFETY: plain query.
                     let scan_code = unsafe { MapVirtualKeyW(u32::from(vk), MAPVK_VK_TO_VSC_EX) };
@@ -1718,6 +1732,25 @@ mod host {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+
+    #[test]
+    fn held_keys_keep_their_press_order() {
+        const A: u8 = 0x41;
+        const B: u8 = 0x42;
+        const Z: u8 = 0x5A;
+        // Z held, then A pressed: a scan by key code would give [A, Z].
+        let held = press_order(&[], &[Z]);
+        let held = press_order(&held, &[A, Z]);
+        assert_eq!(held, [Z, A]);
+        let held = press_order(&held, &[A, B, Z]);
+        assert_eq!(held, [Z, A, B]);
+        // Releases close the gap; a key pressed again goes to the end.
+        let held = press_order(&held, &[A]);
+        assert_eq!(held, [A]);
+        let held = press_order(&held, &[A, Z]);
+        assert_eq!(held, [A, Z]);
+        assert!(press_order(&held, &[]).is_empty());
+    }
 
     use super::*;
     use crate::HleResolver;

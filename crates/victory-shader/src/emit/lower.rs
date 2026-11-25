@@ -2434,10 +2434,18 @@ impl<'a> Lower<'a> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
         };
-        let op = *v.src.get(k).ok_or("a missing operand")?;
         if v.abs >> k & 1 != 0 || v.neg >> k & 1 != 0 {
             return Err("integer operand modifiers");
         }
+        self.raw_src(inst, k)
+    }
+
+    /// Operand `k` as its 32 bits, without looking at its modifiers.
+    fn raw_src(&mut self, inst: &Inst, k: usize) -> Result<V, Why> {
+        let Fields::Valu(v) = &inst.fields else {
+            unreachable!()
+        };
+        let op = *v.src.get(k).ok_or("a missing operand")?;
         match self.src0 {
             Some(x) if k == 0 => Ok(x),
             _ => {
@@ -2448,6 +2456,26 @@ impl<'a> Lower<'a> {
                 })
             }
         }
+    }
+
+    /// Operand `k` of a typeless `_b32` instruction: `abs` clears bit 31 and
+    /// `neg` flips it, with no float operation, so denormals and NaN payloads
+    /// pass through as on the hardware.
+    fn bits_src(&mut self, inst: &Inst, k: usize) -> Result<V, Why> {
+        let Fields::Valu(v) = &inst.fields else {
+            unreachable!()
+        };
+        let (abs, neg) = (v.abs >> k & 1 != 0, v.neg >> k & 1 != 0);
+        let mut x = self.raw_src(inst, k)?;
+        if abs {
+            let m = self.s.m.i32(0x7FFF_FFFF);
+            x = self.s.m.bin(self.cur, Bin::And, x, m);
+        }
+        if neg {
+            let m = self.s.m.i32(0x8000_0000);
+            x = self.s.m.bin(self.cur, Bin::Xor, x, m);
+        }
+        Ok(x)
     }
 
     fn unary(&mut self, op: u32, f: V) -> V {
@@ -6738,11 +6766,11 @@ impl<'a> Lower<'a> {
                 int(self, r)
             }
             "v_mov_b32" => {
-                if v.abs != 0 || v.neg != 0 || v.clamp || v.omod != 0 {
+                if v.clamp || v.omod != 0 {
                     let a = f(self, 0)?;
                     return float(self, a);
                 }
-                let a = s(self, 0)?;
+                let a = self.bits_src(inst, 0)?;
                 int(self, a)
             }
             "v_add_f32" | "v_sub_f32" | "v_subrev_f32" | "v_mul_f32" | "v_mul_legacy_f32"
@@ -6987,12 +7015,7 @@ impl<'a> Lower<'a> {
             }
             "v_cndmask_b32" => {
                 let cond = self.select_condition(inst, v.src.get(2))?;
-                if v.abs != 0 || v.neg != 0 {
-                    let (a, bb) = (f(self, 0)?, f(self, 1)?);
-                    let r = self.s.m.select(c, cond, bb, a);
-                    return float(self, r);
-                }
-                let (a, bb) = (s(self, 0)?, s(self, 1)?);
+                let (a, bb) = (self.bits_src(inst, 0)?, self.bits_src(inst, 1)?);
                 let r = self.s.m.select(c, cond, bb, a);
                 int(self, r)
             }
