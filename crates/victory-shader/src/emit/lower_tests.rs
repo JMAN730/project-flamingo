@@ -299,6 +299,11 @@ fn mesh_quad_swizzle_checks_the_host_lane_of_its_source() {
         called(&lowered, "waveGetLaneIndex"),
         "the ballot bit is the host lane's, not the console lane number"
     );
+    // A pattern every quad uses alike: the pair swap is one exchange.
+    assert!(
+        called(&lowered, "quadOp.i32"),
+        "swap across x is one QuadOp"
+    );
 }
 
 /// A Valid-Mask export on one path in, bypassed on the other, joining a
@@ -672,6 +677,30 @@ fn lower_ps_words(words: &[u32]) -> Result<Lowered, crate::ShaderError> {
 /// Lowers a pixel program with one target: whether it translates.
 fn lowers_ps(words: &[u32]) -> Result<(), crate::ShaderError> {
     lower_ps_words(words).map(|_| ())
+}
+
+/// `v_mov_b32_dpp8 v<dst>, v<src>` with lane selections `sel` (three bits
+/// per lane of each group of eight).
+const fn mov_dpp8(dst: u32, src: u32, sel: u32) -> [u32; 2] {
+    [0x7E00_02E9 | dst << 17, sel << 8 | src]
+}
+
+/// DPP8 in a pixel program where every lane picks a lane of its own quad
+/// (the two quads of a group of eight permuted differently) translates, as
+/// `quad_perm` does; DPP8 that reads across quads stays refused.
+#[test]
+fn pixel_dpp8_within_a_quad_translates_and_across_quads_is_refused() {
+    let read = |sel: u32| {
+        let [dpp0, dpp1] = mov_dpp8(1, 0, sel);
+        // v_mov_b32_dpp8 v1, v0; exp mrt0 v1, v1, v1, v1 done vm
+        lowers_ps(&[dpp0, dpp1, 0xF800_180F, 0x0101_0101, S_ENDPGM])
+    };
+    let selections = [3u32, 0, 2, 1, 4, 6, 5, 7];
+    let sel = (0..8).fold(0, |s, i| s | selections[i] << (3 * i));
+    read(sel).expect("in-quad DPP8");
+    // Lane 0 now reads lane 7, in the other quad.
+    let err = format!("{:?}", read(sel ^ 4).expect_err("cross-quad DPP8"));
+    assert!(err.contains("cross-lane"), "{err}");
 }
 
 /// A bare `v_readfirstlane_b32` in a pixel shader (not a proved waterfall
