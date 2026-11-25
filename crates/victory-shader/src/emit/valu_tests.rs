@@ -2893,3 +2893,112 @@ fn texture_swizzle_block_log2_matches_the_formats_function() {
         assert_eq!(got, want, "{backend}: swizzle mode {mode}");
     });
 }
+
+/// `victory_formats::bcpack::references`, the function the test below runs as
+/// console code.
+fn bcpack_references_reference(s: [u8; 4], paired: bool) -> (usize, usize) {
+    let (d, ix) = if paired {
+        (
+            interleave_reference(s[0], s[1]),
+            interleave_reference(s[2], s[3]),
+        )
+    } else {
+        (s[0], s[1])
+    };
+    let delta = (d >> 1) ^ (d & 1).wrapping_neg();
+    (usize::from(ix.wrapping_add(delta)), usize::from(ix))
+}
+
+/// Emits RDNA2 instructions to interleave two 4-bit symbols (`a` on even bits,
+/// `b` on odd bits) into `dst`, using `mask55` (= `0x55`) and `tmp` as scratch.
+fn emit_interleave_pair(body: &mut Vec<u32>, dst: u8, a: u8, b: u8, mask55: u8, tmp: u8) {
+    // Spread a's low 4 bits to even positions -> dst.
+    body.extend(vop3(0x11B, dst, vgpr(a), 143, 128)); // v_and_b32 dst, a, 15
+    body.extend(vop3(0x36F, tmp, vgpr(dst), 130, vgpr(dst))); // v_lshl_or_b32 tmp, dst, 2, dst
+    body.extend(vop3(0x11B, dst, vgpr(tmp), 179, 128)); // v_and_b32 dst, tmp, 0x33 (51)
+    body.extend(vop3(0x36F, tmp, vgpr(dst), 129, vgpr(dst))); // v_lshl_or_b32 tmp, dst, 1, dst
+    body.extend(vop3(0x11B, dst, vgpr(tmp), vgpr(mask55), 128)); // v_and_b32 dst, tmp, 0x55
+    // Spread b's low 4 bits to even positions -> tmp, then dst |= tmp << 1.
+    body.extend(vop3(0x11B, tmp, vgpr(b), 143, 128)); // v_and_b32 tmp, b, 15
+    body.extend(vop3(0x36F, tmp, vgpr(tmp), 130, vgpr(tmp))); // v_lshl_or_b32 tmp, tmp, 2, tmp
+    body.extend(vop3(0x11B, tmp, vgpr(tmp), 179, 128)); // v_and_b32 tmp, tmp, 0x33 (51)
+    body.extend(vop3(0x36F, tmp, vgpr(tmp), 129, vgpr(tmp))); // v_lshl_or_b32 tmp, tmp, 1, tmp
+    body.extend(vop3(0x11B, tmp, vgpr(tmp), vgpr(mask55), 128)); // v_and_b32 tmp, tmp, 0x55
+    body.extend(vop3(0x36F, dst, vgpr(tmp), 129, vgpr(dst))); // v_lshl_or_b32 dst, tmp, 1, dst
+}
+
+/// BCPack's record endpoint/index reference decoding (optional 4-bit symbol
+/// interleaving, signed zigzag delta, and 8-bit wrapping sum), written as
+/// console code, matches `victory_formats::bcpack::references` on the GPU.
+#[test]
+fn bcpack_references_match_the_formats_function() {
+    let vcc = sgpr(106);
+    let mut body = Vec::new();
+    // v1 = s[0] | (s[1] << 8) | (s[2] << 16) | (s[3] << 24), v2 = paired (0 or 1).
+    body.extend(vop3(0x148, 3, vgpr(1), 128, 136)); // v_bfe_u32 v3, v1, 0, 8   (s0)
+    body.extend(vop3(0x148, 4, vgpr(1), 136, 136)); // v_bfe_u32 v4, v1, 8, 8   (s1)
+    body.extend(vop3(0x148, 5, vgpr(1), 144, 136)); // v_bfe_u32 v5, v1, 16, 8  (s2)
+    body.extend(vop3(0x148, 6, vgpr(1), 152, 136)); // v_bfe_u32 v6, v1, 24, 8  (s3)
+    // Paired mode: d = interleave(s0, s1) -> v7, ix = interleave(s2, s3) -> v8.
+    body.extend([vop1(0x001, 9, 255), 0x0000_0055]); // v_mov_b32 v9, 0x55
+    emit_interleave_pair(&mut body, 7, 3, 4, 9, 10);
+    emit_interleave_pair(&mut body, 8, 5, 6, 9, 10);
+    // Select (d, ix) into (v3, v4) based on paired != 0.
+    body.extend(vop3(0x0C5, 106, vgpr(2), 128, 128)); // v_cmp_ne_u32 vcc, v2, 0
+    body.extend(vop3(0x101, 3, vgpr(3), vgpr(7), vcc)); // v_cndmask_b32 v3, v3, v7, vcc
+    body.extend(vop3(0x101, 4, vgpr(4), vgpr(8), vcc)); // v_cndmask_b32 v4, v4, v8, vcc
+    // delta = (d >> 1) ^ (d & 1).wrapping_neg(); ep = ix.wrapping_add(delta) as u8.
+    body.extend(vop3(0x116, 5, 129, vgpr(3), 128)); // v_lshrrev_b32 v5, 1, v3
+    body.extend(vop3(0x11B, 6, vgpr(3), 129, 128)); // v_and_b32 v6, v3, 1
+    body.extend(vop3(0x126, 6, 128, vgpr(6), 128)); // v_sub_nc_u32 v6, 0, v6
+    body.extend(vop3(0x11D, 5, vgpr(5), vgpr(6), 128)); // v_xor_b32 v5, v5, v6
+    body.extend(vop3(0x125, 5, vgpr(4), vgpr(5), 128)); // v_add_nc_u32 v5, v4, v5
+    body.extend(vop3(0x148, 5, vgpr(5), 128, 136)); // v_bfe_u32 v5, v5, 0, 8
+    // Pack (ep << 8) | ix into v0.
+    body.extend(vop3(0x36F, 0, vgpr(5), 136, vgpr(4))); // v_lshl_or_b32 v0, v5, 8, v4
+
+    let shader = build_valu_cs(&body);
+    let mut cases = Vec::new();
+    // Unpaired: cover zero, odd/even zigzag deltas, wrapping underflow/overflow, and extremes.
+    for d in [0u8, 1, 2, 3, 20, 127, 128, 254, 255] {
+        for ix in [0u8, 1, 10, 127, 128, 250, 255] {
+            let packed = u32::from_le_bytes([d, ix, 0xA5, 0x5A]);
+            cases.push([packed, 0, 0, 0]);
+        }
+    }
+    // Paired: 4-bit symbol pairs (plus upper-nibble noise to confirm masking to 4 bits).
+    for &(s0, s1) in &[
+        (0u8, 0u8),
+        (1, 0),
+        (0, 1),
+        (0x0A, 0x05),
+        (0x0F, 0x0F),
+        (0xF3, 0xE7),
+    ] {
+        for &(s2, s3) in &[(0u8, 0u8), (1, 0), (0x05, 0x0A), (0x0F, 0x0F), (0xC2, 0xD9)] {
+            let packed = u32::from_le_bytes([s0, s1, s2, s3]);
+            cases.push([packed, 1, 0, 0]);
+        }
+    }
+    // Confirm wrapping underflow (ix == 0 -> ep == 255) and paired/unpaired divergence are tested.
+    assert!(cases.iter().any(|&[p, paired, ..]| {
+        let s = p.to_le_bytes();
+        paired == 0 && bcpack_references_reference(s, false) == (255, 0)
+    }));
+    assert!(cases.iter().any(|&[p, ..]| {
+        let s = p.to_le_bytes();
+        bcpack_references_reference(s, true) != bcpack_references_reference(s, false)
+    }));
+    run_cases(&shader, &cases, |backend, _, [packed, paired, ..], got| {
+        let s = packed.to_le_bytes();
+        let (want_ep, want_ix) = bcpack_references_reference(s, paired != 0);
+        let want = ((want_ep as u32) << 8) | (want_ix as u32);
+        assert_eq!(
+            got,
+            want,
+            "{backend}: s={s:?} paired={paired}: got ({}, {}), want ({want_ep}, {want_ix})",
+            got >> 8,
+            got & 0xFF
+        );
+    });
+}
