@@ -203,11 +203,29 @@ fn interp_ps(input_addr: u32, computed: bool) -> HostShader {
 #[cfg(windows)]
 fn render_pair(vs: &HostShader, ps: &HostShader, label: &str, warp: bool) -> Option<Vec<[f32; 4]>> {
     use super::host::{Draw, Host};
+    use windows::Win32::Graphics::Direct3D12::{
+        D3D12_FEATURE_D3D12_OPTIONS3, D3D12_FEATURE_DATA_D3D12_OPTIONS3,
+    };
 
     let Ok(host) = Host::new(warp) else {
         eprintln!("no SM 6.6 {label} device; skipped");
         return None;
     };
+    let mut opts3 = D3D12_FEATURE_DATA_D3D12_OPTIONS3::default();
+    // SAFETY: query writes its own `D3D12_FEATURE_DATA_D3D12_OPTIONS3` struct.
+    let bary_ok = unsafe {
+        host.device
+            .CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS3,
+                (&raw mut opts3).cast(),
+                size_of_val(&opts3) as u32,
+            )
+            .is_ok()
+    } && opts3.BarycentricsSupported.as_bool();
+    if !bary_ok {
+        eprintln!("no BarycentricsSupported on {label} device; skipped");
+        return None;
+    }
     let (root, pso) = host
         .pipeline(vs, ps)
         .unwrap_or_else(|e| panic!("{label}: pipeline failed: {e}"));
@@ -234,8 +252,6 @@ fn render_pair(vs: &HostShader, ps: &HostShader, label: &str, warp: bool) -> Opt
 /// linear, perspective-centroid, and linear-centroid modes on hardware GPU
 /// and WARP.
 #[test]
-// The bindings need `mut` only for the Windows-only DXIL validation loop.
-#[cfg_attr(not(windows), allow(unused_mut))]
 fn hand_interpolation_matches_host_for_perspective_linear_and_centroid() {
     // (name, SPI_PS_INPUT_ADDR bit, host DXIL interp mode)
     let modes = [
@@ -261,6 +277,8 @@ fn hand_interpolation_matches_host_for_perspective_linear_and_centroid() {
                     .unwrap_or_else(|e| panic!("{name}: DXIL validation failed: {e}"));
             }
         }
+        #[cfg(not(windows))]
+        let _ = (&mut vs_host, &mut vs_hand, &mut ps_host, &mut ps_hand);
         pairs.push((name, vs_host, ps_host, vs_hand, ps_hand));
     }
 
@@ -414,4 +432,76 @@ fn direct_barycentrics_and_first_half_on_hardware() {
     }
     #[cfg(not(windows))]
     let _ = (&mut vs, &mut ps);
+}
+
+#[test]
+fn barycentrics_disabled_refuses_hand_and_direct_paths() {
+    let try_emit = |words: &[u32], allow_barycentrics: bool| {
+        let native = NativeProgram {
+            stage: HwStage::Ps,
+            wave64: false,
+            vgprs: 16,
+            layout: Vec::new(),
+            used: Vec::new(),
+            io: StageIo::Ps {
+                inputs: vec![PsInput {
+                    usage: Usage::Generic,
+                    row: 0,
+                    mask: 0b1111,
+                    attr: 0,
+                    flat: false,
+                    fp16: false,
+                    pack2: false,
+                    row2: 0,
+                }],
+                input_addr: 1 << 1,
+                db_shader_control: 0,
+                patches: Vec::new(),
+            },
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let el = |name: &str, kind, usage| SigElement {
+            name: name.into(),
+            index: 0,
+            kind,
+            comp: 9,
+            interp: 0,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage,
+            half: false,
+        };
+        let isg1 = container::signature(&[el("TEXCOORD", 0, 0)], true);
+        let osg1 = container::signature(&[el("SV_Target", 16, 15)], false);
+        let bytes = build(&[(FourCC::ISG1, &isg1), (FourCC::OSG1, &osg1)]);
+        let c = Container::parse(&bytes).unwrap();
+        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        super::emit_with_caps(&c, &native, &p, &st, &io, &res, true, allow_barycentrics)
+    };
+
+    // Normal host interpolation succeeds even without SV_Barycentrics.
+    let host_words = [p1(2, 0, 0), p2(2, 1, 0), 0xF800_180F, 0x0202_0202, S_ENDPGM];
+    assert!(try_emit(&host_words, false).is_ok());
+
+    // Computed barycentrics require SV_Barycentrics / attributeAtVertex.
+    let computed_words = [
+        add_zero(6, 0),
+        add_zero(7, 1),
+        p1(2, 6, 0),
+        p2(2, 7, 0),
+        0xF800_180F,
+        0x0202_0202,
+        S_ENDPGM,
+    ];
+    assert!(try_emit(&computed_words, false).is_err());
+    assert!(try_emit(&computed_words, true).is_ok());
+
+    // Directly read barycentrics require SV_Barycentrics.
+    let direct_words = [0xF800_180F, 0x0100_0100, S_ENDPGM];
+    assert!(try_emit(&direct_words, false).is_err());
+    assert!(try_emit(&direct_words, true).is_ok());
 }
