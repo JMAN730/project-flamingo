@@ -410,6 +410,8 @@ impl Instruction {
                 let n = data_dwords(name);
                 let (load, atomic) = (name.contains("_load_"), name.contains("_atomic_"));
                 let addr = match self.encoding {
+                    // The address is the SGPR base plus the lane's id: no VGPR.
+                    _ if name.contains("addtid") => None,
                     Encoding::Flat => Some(vector(w1 & 0xFF, 2)),
                     Encoding::Global => Some(vector(w1 & 0xFF, 1 + u8::from(saddr == NULL))),
                     // With an SGPR base, scratch takes no VGPR.

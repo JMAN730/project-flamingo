@@ -303,11 +303,13 @@ fn operands(inst: &Instruction, name: &str, fields: &Fields) -> String {
             lds,
             cache,
         } => {
-            let addr = addr.map_or("off".into(), |a| a.to_string());
+            // The `addtid` forms address by lane: they have no VGPR operand.
+            let addr =
+                (!name.contains("addtid")).then(|| addr.map_or("off".into(), |a| a.to_string()));
             out = join(
                 dst.iter()
                     .map(|o| o.to_string())
-                    .chain([addr])
+                    .chain(addr)
                     .chain(data.iter().map(|o| o.to_string()))
                     .chain(saddr.map(|o| match o {
                         Operand::Scalar { code: NULL, .. } => "off".into(),
@@ -1021,5 +1023,29 @@ mod tests {
         };
         assert_eq!(data, Operand::Vector { reg: 8, dwords: 2 });
         assert_eq!(addr.len(), 2);
+    }
+
+    /// `global_load_dword_addtid` / `global_store_dword_addtid` address the
+    /// SGPR base plus the lane's id: the VADDR field is no operand. Words
+    /// and operands from `llvm-mc -triple=amdgcn -mcpu=gfx1030`, which calls
+    /// the offset `offset:`.
+    #[test]
+    fn global_addtid_reads_no_address_vgpr() {
+        assert_eq!(
+            one(&[0xDC58_8010, 0x060A_0000], true),
+            "global_load_dword_addtid v6, s[10:11] inst_offset:16"
+        );
+        assert_eq!(
+            one(&[0xDC5C_8010, 0x000A_0400], true),
+            "global_store_dword_addtid v4, s[10:11] inst_offset:16"
+        );
+        let code: Vec<u8> = [0xDC58_8010u32, 0x060A_0000, 0xBF81_0000]
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
+        let Fields::Flat { addr, .. } = decode(&code).unwrap()[0].fields(true) else {
+            panic!("not FLAT");
+        };
+        assert_eq!(addr, None, "v0 is not read");
     }
 }
