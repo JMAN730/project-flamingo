@@ -180,9 +180,11 @@ impl Port {
 /// The thread pool behind thread-pool ports: idle workers are reused, and a
 /// new one starts whenever more tasks wait than workers idle, so a callback
 /// that blocks on another never starves it. Workers stay for reuse.
+type Job = Box<dyn FnOnce() + Send>;
+
 struct Pool {
     /// Queued tasks and the number of idle workers.
-    state: Mutex<(VecDeque<(Task, bool)>, usize)>,
+    state: Mutex<(VecDeque<Job>, usize)>,
     ready: Condvar,
 }
 
@@ -193,13 +195,13 @@ static POOL: Pool = Pool {
 
 impl Pool {
     fn submit(&'static self, task: Task) {
-        self.submit_with(task, false);
+        self.spawn(Box::new(move || task.run(false)));
     }
 
-    /// Queues `task`; `canceled` is what its callback is told when it runs.
-    fn submit_with(&'static self, task: Task, canceled: bool) {
+    /// Queues `job` to run on a pool worker.
+    fn spawn(&'static self, job: Job) {
         let mut state = lock(&self.state);
-        state.0.push_back((task, canceled));
+        state.0.push_back(job);
         if state.0.len() > state.1 {
             std::thread::spawn(move || self.work());
         } else {
@@ -217,8 +219,8 @@ impl Pool {
             }
             let task = state.0.pop_front();
             drop(state);
-            if let Some((task, canceled)) = task {
-                task.run(canceled);
+            if let Some(job) = task {
+                job();
             }
             state = lock(&self.state);
         }
@@ -453,16 +455,31 @@ pub fn XTaskQueueTerminate(
     }
     // Taken under the lock a racing submit checks `terminated` under.
     let delayed = std::mem::take(&mut *lock(&queue.delayed));
+    // Not waiting: the caller may hold a lock a canceled callback takes, so
+    // those of a thread-pool port are canceled on the pool, and the
+    // termination callback follows them there, not announcing the end while
+    // they may still touch what it frees.
+    let mut pooled = Vec::new();
     for (port, task) in delayed.into_values() {
         match queue.ports[port as usize].mode {
-            // Not waiting: the caller may hold a lock the callback takes, so
-            // it is canceled on the pool, like any thread-pool callback.
-            Mode::ThreadPool if !wait => POOL.submit_with(task, true),
+            Mode::ThreadPool if !wait => pooled.push(task),
             _ => task.run(true),
         }
     }
-    if let Some(callback) = callback {
-        callback(context);
+    let terminated = callback.map(|callback| (context as usize, callback));
+    if pooled.is_empty() {
+        if let Some((context, callback)) = terminated {
+            callback(context as *mut c_void);
+        }
+    } else {
+        POOL.spawn(Box::new(move || {
+            for task in pooled {
+                task.run(true);
+            }
+            if let Some((context, callback)) = terminated {
+                callback(context as *mut c_void);
+            }
+        }));
     }
     S_OK
 }
@@ -1863,11 +1880,14 @@ mod tests {
     #[test]
     fn terminate_without_wait_cancels_delayed_on_the_pool() {
         static HELD: Mutex<()> = Mutex::new(());
-        static CANCELED: AtomicBool = AtomicBool::new(false);
+        static EVENTS: Mutex<Vec<&str>> = Mutex::new(Vec::new());
         extern "system" fn delayed(_: *mut c_void, canceled: bool) {
             // Takes the lock its canceler's caller holds while terminating.
             let _guard = lock(&HELD);
-            CANCELED.store(canceled, Ordering::SeqCst);
+            lock(&EVENTS).push(if canceled { "canceled" } else { "ran" });
+        }
+        extern "system" fn terminated(_: *mut c_void) {
+            lock(&EVENTS).push("terminated");
         }
         let mut q = std::ptr::null();
         assert_eq!(XTaskQueueCreate(1, 1, &mut q), S_OK);
@@ -1878,18 +1898,25 @@ mod tests {
         let (done, finished) = std::sync::mpsc::channel();
         let queue = q as usize;
         std::thread::spawn(move || {
-            let hr = XTaskQueueTerminate(queue as *const Queue, false, std::ptr::null_mut(), None);
+            let queue = queue as *const Queue;
+            let hr = XTaskQueueTerminate(queue, false, std::ptr::null_mut(), Some(terminated));
             let _ = done.send(hr);
         });
         // Inline cancellation would block on `HELD` and never return.
         let hr = finished.recv_timeout(Duration::from_secs(5));
         assert_eq!(hr, Ok(S_OK), "terminate blocked on a canceled callback");
+        // The cancellation is stuck on `HELD`: termination is not announced.
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            lock(&EVENTS).is_empty(),
+            "terminated before cancellations ended"
+        );
         drop(guard);
         let start = std::time::Instant::now();
-        while !CANCELED.load(Ordering::SeqCst) && start.elapsed() < Duration::from_secs(5) {
+        while lock(&EVENTS).len() < 2 && start.elapsed() < Duration::from_secs(5) {
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert!(CANCELED.load(Ordering::SeqCst), "callback was not canceled");
+        assert_eq!(*lock(&EVENTS), ["canceled", "terminated"]);
         XTaskQueueCloseHandle(q);
     }
 }
