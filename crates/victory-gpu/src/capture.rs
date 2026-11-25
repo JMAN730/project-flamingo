@@ -8,12 +8,23 @@ use std::path::PathBuf;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
-/// The folder frames go to, if capturing.
+/// The folder frames go to, if capturing: made (with its parents) the first
+/// time it is asked for, so a folder that does not exist yet still gets
+/// frames.
 pub(crate) fn folder() -> Option<&'static PathBuf> {
     static FOLDER: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
     FOLDER
-        .get_or_init(|| std::env::var_os("VICTORY_CAPTURE").map(PathBuf::from))
+        .get_or_init(|| std::env::var_os("VICTORY_CAPTURE").map(|f| made(PathBuf::from(f))))
         .as_ref()
+}
+
+/// `folder`, after creating it if it is missing; a failure is logged and
+/// the path kept (saving each frame then reports why it could not).
+fn made(folder: PathBuf) -> PathBuf {
+    if let Err(e) = std::fs::create_dir_all(&folder) {
+        tracing::warn!(folder = %folder.display(), "capture folder not made: {e}");
+    }
+    folder
 }
 
 /// Frames listed in `VICTORY_CAPTURE_FRAMES` (comma-separated): saved
@@ -675,6 +686,16 @@ pub(crate) fn recent_levels() -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_missing_capture_folder_is_made() {
+        let root = tempfile::tempdir().unwrap();
+        let nested = root.path().join("not").join("yet");
+        assert_eq!(super::made(nested.clone()), nested);
+        assert!(nested.is_dir());
+        // An existing folder is kept as it is.
+        assert_eq!(super::made(nested.clone()), nested);
+    }
+
     #[test]
     fn crc_matches_the_png_check_value() {
         assert_eq!(super::crc32(b"IEND"), 0xae42_6082);
