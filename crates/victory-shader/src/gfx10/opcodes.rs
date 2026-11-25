@@ -715,6 +715,10 @@ pub(super) const VOP3: &[(u16, &str)] = &[
     (0x176, "v_mad_u64_u32"),
     (0x177, "v_mad_i64_i32"),
     (0x178, "v_xor3_b32"),
+    // The VOP3 (`_e64`) forms of the VINTRP interpolations.
+    (0x200, "v_interp_p1_f32"),
+    (0x201, "v_interp_p2_f32"),
+    (0x202, "v_interp_mov_f32"),
     // GFX9 opcode (Mesa); not in the public GFX10 column, but titles emit it.
     (0x203, "v_mad_f16"),
     (0x2ff, "v_lshlrev_b64"),

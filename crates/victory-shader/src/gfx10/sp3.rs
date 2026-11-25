@@ -532,7 +532,12 @@ fn valu(name: &str, v: &Valu, encoding: Encoding) -> String {
     let mix = name.starts_with("v_fma_mix");
     let src = |i: usize| {
         let o = v.src[i];
-        let mut s = o.to_string();
+        let mut s = match (name, i, o) {
+            ("v_interp_mov_f32", 1, Operand::Const(p)) => ["p10", "p20", "p0"]
+                .get(usize::from(p))
+                .map_or("p?".into(), |p| p.to_string()),
+            _ => o.to_string(),
+        };
         if let Some(sdwa) = v.sdwa
             && bit(sdwa.sext, i)
         {
@@ -753,6 +758,35 @@ mod tests {
             one(&[0xCC19_4000, 0x1C0E_0501], true),
             "v_dot8_u32_u4 v0, v1, v2, v3"
         );
+    }
+
+    /// The VOP3 forms of the f32 interpolations (VOP3 0x200-0x202): the
+    /// attribute, then the i/j VGPR or `v_interp_mov_f32`'s parameter. Words
+    /// and text from `llvm-mc -triple=amdgcn -mcpu=gfx1030`, which adds
+    /// `_e64` to the names.
+    #[test]
+    fn vop3_f32_interpolations_have_their_names_and_operands() {
+        assert_eq!(
+            one(&[0xD600_0001, 0x0202_0644], true),
+            "v_interp_p1_f32 v1, v3, attr4.y"
+        );
+        assert_eq!(
+            one(&[0xD601_8005, 0x0202_06C1], true),
+            "v_interp_p2_f32 v5, v3, attr1.w clamp"
+        );
+        assert_eq!(
+            one(&[0xD602_0001, 0x0200_0482], true),
+            "v_interp_mov_f32 v1, p0, attr2.z"
+        );
+        let code: Vec<u8> = [0xD602_0001u32, 0x0200_0482, 0xBF81_0000]
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
+        let Fields::Valu(v) = decode(&code).unwrap()[0].fields(true) else {
+            panic!("not VALU");
+        };
+        assert_eq!(v.src.len(), 2);
+        assert_eq!(v.src[1], Operand::Const(2));
     }
 
     /// `s_atc_probe` / `s_atc_probe_buffer`: SDATA is a 7-bit immediate, the
