@@ -3013,7 +3013,7 @@ fn lshl_add_carry_read_is_refused() {
             sop2(0x0a, 13, 0x81, 0x80), // s_cselect_b32 s13, 1, 0
             vop1(0x001, 0, sgpr(13)),
         ]);
-        let err = format!("{:?}", refused.err().expect("refused"));
+        let err = format!("{:?}", refused.expect_err("refused"));
         assert!(err.contains("carry"), "op {op:#x}: {err}");
     }
 }
