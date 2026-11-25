@@ -1119,6 +1119,7 @@ fn record_twin_copy(
     depth: &ID3D12Resource,
     twin: &crate::resource::Twin,
     colour: bool,
+    site: &'static str,
 ) {
     let (from, to) = if colour {
         (depth, &twin.colour.texture)
@@ -1136,6 +1137,10 @@ fn record_twin_copy(
         crate::resource::PLANES[1].fetch_add(1, Ordering::Relaxed);
     }
     let Some(through) = &twin.through else {
+        #[cfg(feature = "diagnostics")]
+        check_copy(list, to, from, || format!("twin copy {site}, into the twin: {colour}"));
+        #[cfg(not(feature = "diagnostics"))]
+        let _ = site;
         // SAFETY: an open list and two live textures.
         unsafe { list.CopyResource(to, from) };
         return;
@@ -1228,11 +1233,64 @@ fn timing() -> bool {
 /// Names a host object for the device-removed report, which names the
 /// allocations a page fault hit (only with device-removed data on).
 pub(crate) fn name(object: &impl Interface, text: impl FnOnce() -> String) {
-    if dred_on()
+    if (dred_on() || debug_on())
         && let Ok(object) = object.cast::<ID3D12Object>()
     {
         // SAFETY: a plain call on a live object.
         let _ = unsafe { object.SetName(&windows::core::HSTRING::from(text())) };
+    }
+}
+
+/// Whether the D3D12 debug layer is on (`VICTORY_D3D12_DEBUG`, diagnostics
+/// builds): its messages then name host objects too.
+pub(crate) fn debug_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_DEBUG").is_some()
+    })
+}
+
+/// Diagnostics, with the debug layer on: whether the debug layer, as it
+/// tracks `list` so far, has `to` in the copy destination state and `from`
+/// in the copy source state; a copy about to be recorded where it does not
+/// is logged with `site` (the first 16 times, then every 256th).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn check_copy(
+    list: &ID3D12GraphicsCommandList,
+    to: &ID3D12Resource,
+    from: &ID3D12Resource,
+    site: impl FnOnce() -> String,
+) {
+    static SEEN: AtomicU32 = AtomicU32::new(0);
+    if !debug_on() {
+        return;
+    }
+    let Ok(debug) = list.cast::<ID3D12DebugCommandList>() else {
+        return;
+    };
+    const ALL: u32 = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    // SAFETY: plain queries of the debug layer on live objects; a state it
+    // does not know yet is checked when the list runs.
+    let (dest, source) = unsafe {
+        (
+            debug.AssertResourceState(to, ALL, D3D12_RESOURCE_STATE_COPY_DEST.0 as u32).as_bool(),
+            debug.AssertResourceState(from, ALL, D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32).as_bool(),
+        )
+    };
+    if dest && source {
+        return;
+    }
+    let n = SEEN.fetch_add(1, Ordering::Relaxed);
+    if n < 16 || n % 256 == 0 {
+        tracing::warn!(
+            seen = n + 1,
+            dest_ok = dest,
+            source_ok = source,
+            to = ?to.as_raw(),
+            from = ?from.as_raw(),
+            "copy recorded with a texture in the wrong state: {}",
+            site()
+        );
     }
 }
 
@@ -4628,7 +4686,7 @@ impl HostList {
         };
         self.settle(from, COPY_SOURCE);
         self.settle(to, COPY_DEST);
-        record_twin_copy(&self.list, &depth.texture, twin, colour);
+        record_twin_copy(&self.list, &depth.texture, twin, colour, "in a list");
         self.settle(&twin.colour, UNORDERED_ACCESS);
     }
 
@@ -4760,7 +4818,7 @@ impl HostList {
                     list.ResourceBarrier(&to_copy);
                 }
                 for (depth, twin, colour) in &syncs {
-                    record_twin_copy(list, &depth.texture, twin, *colour);
+                    record_twin_copy(list, &depth.texture, twin, *colour, "in a prelude");
                 }
                 if !barriers.is_empty() {
                     list.ResourceBarrier(&barriers);

@@ -859,13 +859,18 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
                 crate::texture::upload(list, src, from);
             }
             // Depth textures shaders also write: what they wrote, first.
-            list.twin_use(dst, false, true);
-            list.twin_use(src, false, false);
+            let twins = (list.twin_use(dst, false, true), list.twin_use(src, false, false));
             ensure_state(list, dst, COPY_DEST);
             ensure_state(list, src, COPY_SOURCE);
             crate::texture::host_written(dst);
             #[cfg(feature = "diagnostics")]
             list.note_op(|| format!("copy resource {src:?} to {dst:?}"));
+            #[cfg(feature = "diagnostics")]
+            crate::host::check_copy(&list.list, to, from, || {
+                format!("title copy {src:?} to {dst:?}, twins {twins:?}")
+            });
+            #[cfg(not(feature = "diagnostics"))]
+            let _ = twins;
             // SAFETY: an open list and live textures.
             unsafe { list.list.CopyResource(to, from) };
         } else if let (Some((to, a)), Some((from, b))) = (
