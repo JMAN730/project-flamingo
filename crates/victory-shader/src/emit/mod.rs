@@ -1198,6 +1198,7 @@ mod tests {
             io: StageIo::Ps {
                 inputs: vec![],
                 input_addr: 0,
+                rsrc2: crate::native::PsRsrc2(0),
                 db_shader_control: 0,
                 patches: vec![],
             },
@@ -1252,7 +1253,6 @@ mod tests {
             io: StageIo::Ps {
                 inputs: vec![],
                 input_addr: 0,
-                rsrc2: crate::native::PsRsrc2(0),
                 rsrc2: PsRsrc2(rsrc2),
                 db_shader_control: 0,
                 patches: vec![],
