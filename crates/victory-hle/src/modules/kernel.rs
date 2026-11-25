@@ -172,6 +172,7 @@ pub extern "system" fn GetProcAddress(module: *mut c_void, name: *const u8) -> *
             Some(e) => e.address as *mut c_void,
             None => {
                 tracing::warn!(module = m.name, %ordinal, "GetProcAddress: not implemented");
+                host::set_last_error(ERROR_PROC_NOT_FOUND);
                 std::ptr::null_mut()
             }
         };
@@ -182,6 +183,7 @@ pub extern "system" fn GetProcAddress(module: *mut c_void, name: *const u8) -> *
         Some(e) => e.address as *mut c_void,
         None => {
             tracing::warn!(module = m.name, %name, "GetProcAddress: not implemented");
+            host::set_last_error(ERROR_PROC_NOT_FOUND);
             std::ptr::null_mut()
         }
     }
@@ -363,6 +365,7 @@ fn refuse(file: &str) {
 }
 
 const ERROR_MOD_NOT_FOUND: u32 = 126;
+const ERROR_PROC_NOT_FOUND: u32 = 127;
 
 pub(crate) fn module() -> HleModule {
     HleModule {
@@ -714,6 +717,27 @@ mod tests {
             GetProcAddress(ws2, 4 as *const u8) as usize,
             crate::registry::lookup("ws2_32.dll", "connect").unwrap()
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_missing_export_of_our_modules_sets_the_last_error() {
+        use windows_sys::Win32::Foundation::{GetLastError, SetLastError};
+        let module = LoadLibraryA(c"xgameruntime.dll".as_ptr().cast());
+        assert!(
+            !module.is_null(),
+            "xgameruntime is one of our pseudo modules"
+        );
+        // SAFETY: sets this thread's last error.
+        unsafe { SetLastError(0) };
+        assert!(GetProcAddress(module, c"NotAnExport".as_ptr().cast()).is_null());
+        // SAFETY: reads this thread's last error.
+        assert_eq!(unsafe { GetLastError() }, ERROR_PROC_NOT_FOUND);
+        // SAFETY: sets this thread's last error.
+        unsafe { SetLastError(0) };
+        assert!(GetProcAddress(module, 9999 as *const u8).is_null());
+        // SAFETY: reads this thread's last error.
+        assert_eq!(unsafe { GetLastError() }, ERROR_PROC_NOT_FOUND);
     }
 
     #[test]
