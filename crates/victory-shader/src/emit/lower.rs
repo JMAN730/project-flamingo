@@ -9028,9 +9028,9 @@ impl<'a> Lower<'a> {
             }
             // shortcut: stores are taken to write all four channels of a
             // float format (the console converts by the view's format).
-            if *dmask != 0xF {
-                return Err("an image store of some channels");
-            }
+            // The channels `dmask` selects come from consecutive data
+            // registers (halves with d16); the others are written as zero
+            // (RDNA2 ISA, MIMG stores).
             let iu = self.s.m.undef(self.s.t.i32);
             let mut cs = vec![iu; 3];
             for (k, slot) in cs.iter_mut().enumerate().take(coords) {
@@ -9040,7 +9040,12 @@ impl<'a> Lower<'a> {
                 return Err("image store data");
             };
             let mut vals = Vec::new();
-            for k in 0..4u8 {
+            let mut k = 0u8;
+            for ch in 0..4u8 {
+                if dmask >> ch & 1 == 0 {
+                    vals.push(self.s.m.f32(0));
+                    continue;
+                }
                 // d16: two f16 channels per VGPR, low half first.
                 let r = if *d16 { k / 2 } else { k };
                 let v = inst.read(Reg::V(reg + r)).ok_or("image store data")?;
@@ -9056,6 +9061,7 @@ impl<'a> Lower<'a> {
                 } else {
                     self.float_of(v)?
                 });
+                k += 1;
             }
             let h = self.handle(site, src, false, props)?;
             let at = self.begin_guarded(guard);

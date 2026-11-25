@@ -3123,3 +3123,19 @@ fn sdwa_16bit_destination_unused_modes() {
         );
     }
 }
+
+/// `image_store` of some channels: the selected ones come from consecutive
+/// data registers, the others are stored as zero.
+#[test]
+fn image_stores_of_some_channels_zero_the_others() {
+    // image_store v[12:], v[2:3], s[12:19] dim:2D; v2-v15 set (the
+    // address, then distinct data in v12-v15).
+    let mut addr = vec![F_HALF, F_HALF];
+    addr.extend((4..12).map(|_| 0));
+    addr.extend([F_ONE, 0x4000_0000, 0x4040_0000, 0x4080_0000]);
+    for dmask in [0x1, 0x3, 0x5, 0x7, 0x9, 0xF] {
+        let words = image_words(0x08, dmask, 1, false, &addr);
+        let l = lower_image(&words).unwrap_or_else(|e| panic!("dmask {dmask:#x}: {e}"));
+        assert_eq!(calls(&l, "textureStore.f32").len(), 1, "dmask {dmask:#x}");
+    }
+}
