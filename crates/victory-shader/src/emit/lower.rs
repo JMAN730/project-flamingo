@@ -3693,9 +3693,11 @@ impl<'a> Lower<'a> {
         let buffer_view = kind.is_none() && self.buffer_loads_only(src);
         let srv = kind.filter(|u| u.kind == ResourceType::Srv);
         if buffer_view || srv.is_some() {
-            // A listed structured SRV in a table is read element by element;
-            // a heap view of no listed kind is read as raw bytes.
-            let stride = self.scalar_srv_stride(src, srv);
+            // Some hosts bind the slot as a raw view (the unaligned SRV copy,
+            // or a table slot whose stride the title does not promise) and
+            // return nothing for a structured read, which renders the UI
+            // black: read raw bytes, as every host view can serve them.
+            let stride: Option<u32> = None;
             let h = match stride {
                 Some(stride) => self.handle(site, src, false, (12, stride))?,
                 None => self.handle(site, src, false, (11, 0))?,
@@ -10711,8 +10713,12 @@ mod select_tests {
         }
     }
 
+    /// A scalar load from a table SRV reads raw bytes even when the used
+    /// resource declares an element stride: the host may bind the slot as a raw
+    /// view (the unaligned SRV copy, or a stride the title does not promise),
+    /// and a structured read of that view returns nothing.
     #[test]
-    fn scalar_buffer_load_from_structured_srv_uses_structured_resource() {
+    fn scalar_buffer_load_from_structured_srv_reads_raw_bytes() {
         // Load a structured SRV descriptor (stride 24) from table s0 into s[4:7],
         // read two dwords at byte offset 8 with s_buffer_load_dwordx2, and store
         // the second dword to a raw UAV at table offset 4 dwords.
@@ -10783,9 +10789,9 @@ mod select_tests {
         #[cfg_attr(not(windows), allow(unused_mut))]
         let mut shader = lowered(24);
         assert!(!shader.dxil.is_empty());
-        // The stride is what makes the load a structured one: the same
-        // program over an SRV without one (a raw buffer) lowers differently.
-        assert_ne!(shader.dxil, lowered(0).dxil);
+        // Scalar loads always read raw bytes: the declared stride no longer
+        // changes the lowering, so both programs emit the same shader.
+        assert_eq!(shader.dxil, lowered(0).dxil);
         #[cfg(windows)]
         if let Ok(mut v) = crate::emit::validator::Validator::load(None) {
             v.validate(&mut shader.dxil)
