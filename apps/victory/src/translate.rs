@@ -382,6 +382,16 @@ impl Tally {
 type Kept = std::sync::Arc<Mutex<Vec<(String, emit::HostShader)>>>;
 
 /// The optional checks after emission, one set per thread.
+/// Dumped shaders and validator reports (`VICTORY_EMIT_DUMP`) are
+/// game-derived (rule #1), so their directory must be outside the repo, as
+/// `Config` requires of the cache and data directories.
+fn emit_dump_outside_repo(dir: Option<&std::ffi::OsStr>) -> Result<()> {
+    if let Some(dir) = dir {
+        victory_core::ensure_outside_repo(Path::new(dir))?;
+    }
+    Ok(())
+}
+
 struct Checks {
     /// Shaders named in `VICTORY_PAIRS` (`vs+ps,...`, label substrings),
     /// kept to build those pipelines after the walk.
@@ -397,6 +407,7 @@ pub fn run(
     list: bool,
     jobs: Option<usize>,
 ) -> Result<()> {
+    emit_dump_outside_repo(std::env::var_os("VICTORY_EMIT_DUMP").as_deref())?;
     let paths = crate::default_paths(paths)?;
     let dll = validate.then(Validator::default_path).flatten();
     if validate {
@@ -972,6 +983,24 @@ mod offline {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Shader dumps are game-derived, so a dump directory in the repo is
+    /// refused; one outside it, or none, is not.
+    #[test]
+    fn emit_dump_inside_repo_is_refused() {
+        let inside = Path::new(env!("CARGO_MANIFEST_DIR")).join("no-such-dump-dir");
+        let err = emit_dump_outside_repo(Some(inside.as_os_str())).unwrap_err();
+        assert!(
+            matches!(
+                err.downcast_ref(),
+                Some(victory_core::PolicyError::InsideRepo { .. })
+            ),
+            "{err}"
+        );
+        let outside = tempfile::tempdir().unwrap();
+        emit_dump_outside_repo(Some(outside.path().as_os_str())).unwrap();
+        emit_dump_outside_repo(None).unwrap();
+    }
     use victory_shader::native::{ComputeIo, StageIo};
 
     fn empty_dxbc() -> Vec<u8> {
