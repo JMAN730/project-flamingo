@@ -5523,7 +5523,7 @@ impl<'a> Lower<'a> {
 
     /// `channels` channels of the element at byte `off` of buffer `h`,
     /// converted from the GFX10 buffer format `format` as the hardware's
-    /// typed loads do (channels past the format's read 0, 0, 0, 1).
+    /// typed loads do (channels past the format's read 0, the fourth too).
     // shortcut: the descriptor's channel swizzle is taken as the identity
     // (it is for raw views and the descriptors code builds). A dynamic raw
     // address for elements of 4 bytes or more is taken as dword-aligned.
