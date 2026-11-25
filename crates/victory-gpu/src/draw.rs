@@ -2352,6 +2352,13 @@ fn readable(
             samples_depth
         }
         (View::Unordered(resource, _, _), ResourceType::Uav) => {
+            // A shader writes it, so its contents are on the host and not in
+            // title memory (as for a copy destination): the upload a later
+            // read brings textures the title fills up to date with would copy
+            // the old title memory over what the shader wrote.
+            if crate::resource::host_resource(*resource as This).is_some() {
+                crate::texture::host_written(*resource as This);
+            }
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(*resource as This);
             crate::list::ensure_state(list, *resource as This, UNORDERED_ACCESS);
