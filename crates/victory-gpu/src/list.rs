@@ -1448,17 +1448,28 @@ extern "system" fn reset_x(this: This, allocator: This, pipeline: This, _flags: 
 /// its instance descriptions there (and wrote through our old
 /// `E_NOTIMPL` as a pointer).
 extern "system" fn allocate_upload(this: This, size: u64, alignment: u64) -> *mut u8 {
-    let align = usize::try_from(alignment).unwrap_or(0).max(16);
+    // 0 asks for the default; any other alignment must be a power of two
+    // (checked before rounding up to 16, which would hide a bad one).
+    let Ok(align) = usize::try_from(alignment) else {
+        return std::ptr::null_mut();
+    };
+    if this.is_null() || align != 0 && !align.is_power_of_two() {
+        return std::ptr::null_mut();
+    }
+    let align = align.max(16);
     let Some(len) = usize::try_from(size)
         .ok()
         .and_then(|s| s.checked_add(align))
     else {
         return std::ptr::null_mut();
     };
-    if this.is_null() || !align.is_power_of_two() {
+    // Null on failure: a request too big to allocate must not abort the
+    // process (this is called from title code and cannot unwind).
+    let mut block = Vec::new();
+    if block.try_reserve_exact(len).is_err() {
         return std::ptr::null_mut();
     }
-    let mut block = vec![0u8; len];
+    block.resize(len, 0u8);
     let start = block.as_mut_ptr();
     // SAFETY: the offset is below `align`, so `size` bytes fit after it.
     let at = unsafe { start.add(start.align_offset(align)) };
@@ -2514,6 +2525,20 @@ mod tests {
             allocate_upload(list, 8, 0x30).is_null(),
             "not a power of two"
         );
+        for align in [3, 5, 6, 7, 9, 12, 15] {
+            assert!(
+                allocate_upload(list, 8, align).is_null(),
+                "{align} is not a power of two either, though below 16"
+            );
+        }
+        for align in [0, 1, 2, 4, 8] {
+            let p = allocate_upload(list, 8, align);
+            assert!(!p.is_null() && (p as usize).is_multiple_of(16), "{align}");
+        }
+        // Too big to allocate: null, not an abort across the ABI.
+        assert!(allocate_upload(list, isize::MAX as u64, 16).is_null());
+        assert!(allocate_upload(list, 16, 1 << 63).is_null());
+        assert!(allocate_upload(list, u64::MAX, 16).is_null());
         assert_eq!(reset(list, allocator, null), S_OK);
         assert!(
             // SAFETY: the list is ours.
