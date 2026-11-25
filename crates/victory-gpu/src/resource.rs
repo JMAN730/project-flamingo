@@ -858,10 +858,17 @@ pub(crate) fn host_resource<'a>(
 /// A title texture's host copy, shared, for a list to hold.
 #[cfg(windows)]
 pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
+    host_copy_ref(this).cloned()
+}
+
+/// Borrowed reference to a title texture's host copy without bumping its `Arc`
+/// refcount when callers only need to look up an already-tracked list entry.
+#[cfg(windows)]
+pub(crate) fn host_copy_ref<'a>(this: This) -> Option<&'a std::sync::Arc<HostTexture>> {
     if this.is_null() {
         return None;
     }
-    resource(this).host().cloned()
+    resource(this).host()
 }
 
 /// A host texture like the title's: same description, in GPU memory,

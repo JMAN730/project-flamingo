@@ -205,6 +205,10 @@ pub(crate) struct State {
     root_view_slots: std::collections::HashMap<(usize, RawAccess, Option<RawBufferRange>), u32>,
     /// Fast-path and incremental-sync cache for [`State::bindless_textures`].
     bindless_cache: Option<BindlessCache>,
+    /// Reusable scratch buffers for single-pass descriptor table hashing and
+    /// liveness checks in [`State::tables`].
+    table_raws: Vec<[u32; 3]>,
+    table_dead: Vec<bool>,
     /// Number of full-heap bindless walks performed on this list (for tests).
     #[cfg(test)]
     bindless_full_walks: u64,
@@ -801,7 +805,14 @@ impl State {
                 return false;
             }
             if let Some((param, dwords)) = stage.user_data {
-                let mut values = vec![0u32; dwords as usize];
+                let mut stack_values = [0u32; 64];
+                let mut heap_values = Vec::new();
+                let values: &mut [u32] = if (dwords as usize) <= stack_values.len() {
+                    &mut stack_values[..dwords as usize]
+                } else {
+                    heap_values.resize(dwords as usize, 0);
+                    &mut heap_values[..]
+                };
                 for u in &t.host.user_data {
                     let fresh = made
                         .iter()
@@ -1512,20 +1523,25 @@ impl State {
                 self.table_failed = true;
                 continue;
             }
-            // Stream the exact descriptor records in `start_slot..=max_slot` into
-            // a hash with no allocation; hits verify word-for-word equality and
-            // view liveness before reusing the compiled range.
+            // Read the descriptor headers in `start_slot..=max_slot` once into
+            // reusable scratch buffers, batch-check liveness with at most one
+            // shared read lock (and zero `View` clones), then hash and verify
+            // cache hits from those same buffers without re-locking `VIEWS`.
             let heap_ptr = std::ptr::from_ref(heap) as usize;
+            self.table_raws.clear();
+            self.table_raws.reserve(n as usize);
+            for k in start_slot..=max_slot {
+                let at = table + u64::from(k) * step_bytes;
+                // SAFETY: views are 32 bytes and samplers are 16 bytes, so `[u32; 3]`
+                // (12 bytes) fits safely inside every in-bounds slot in title memory.
+                self.table_raws
+                    .push(unsafe { (at as *const [u32; 3]).read_unaligned() });
+            }
+            crate::descriptor::check_dead_slots(&self.table_raws, &mut self.table_dead);
             let records_hash = {
                 use std::hash::{Hash, Hasher};
                 let mut h = std::collections::hash_map::DefaultHasher::new();
-                for k in start_slot..=max_slot {
-                    let at = table + u64::from(k) * step_bytes;
-                    // SAFETY: views are 32 bytes and samplers are 16 bytes, so `[u32; 3]`
-                    // (12 bytes) fits safely inside every in-bounds slot in title memory.
-                    let raw = unsafe { (at as *const [u32; 3]).read_unaligned() };
-                    let dead = raw[0] == crate::descriptor::VIEW_TAG
-                        && crate::descriptor::view(at).is_none();
+                for (raw, &dead) in self.table_raws.iter().zip(&self.table_dead) {
                     raw.hash(&mut h);
                     dead.hash(&mut h);
                 }
@@ -1556,16 +1572,15 @@ impl State {
             if let Some(entry) = self.fresh_tables.get(&key) {
                 let (prev_table, prev_start, first) = (entry.table, entry.start_slot, entry.first);
                 let mut reuse_ok = true;
+                let mut dead_cursor = 0usize;
                 for i in 0..n {
-                    let at = table + u64::from(start_slot + i) * step_bytes;
-                    // SAFETY: verified in-bounds of `heap` above.
-                    let raw = unsafe { (at as *const [u32; 3]).read_unaligned() };
+                    let idx = i as usize;
                     if prev_table != table || prev_start != start_slot {
                         let prev_at = prev_table + u64::from(prev_start + i) * step_bytes;
                         // SAFETY: `prev_table` + `prev_start + i` was verified
                         // in-bounds of the same live `heap` when recorded.
                         let prev_raw = unsafe { (prev_at as *const [u32; 3]).read_unaligned() };
-                        if raw != prev_raw {
+                        if self.table_raws[idx] != prev_raw {
                             reuse_ok = false;
                             break;
                         }
@@ -1573,9 +1588,13 @@ impl State {
                     // Compare view liveness against what was compiled into `first`:
                     // a newly released view misses and rebuilds a null slot, while
                     // an unchanged stale slot already compiled as null reuses it.
-                    let dead = raw[0] == crate::descriptor::VIEW_TAG
-                        && crate::descriptor::view(at).is_none();
-                    if dead != entry.dead_slots.binary_search(&i).is_ok() {
+                    let was_dead = if entry.dead_slots.get(dead_cursor) == Some(&i) {
+                        dead_cursor += 1;
+                        true
+                    } else {
+                        false
+                    };
+                    if self.table_dead[idx] != was_dead {
                         reuse_ok = false;
                         break;
                     }

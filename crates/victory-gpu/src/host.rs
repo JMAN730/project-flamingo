@@ -1006,6 +1006,34 @@ impl Host {
         // Where each run's lists start in `lists`.
         let mut firsts = Vec::with_capacity(runs.len());
         let mut batch = Batch::default();
+        // Coalesce `GetWriteWatch` queries across all buffer and watched-texture
+        // refreshes in this submission so repeated copy/UAV flush boundaries do
+        // not re-query the kernel thousands of times per frame.
+        struct AskOnceGuard;
+        impl Drop for AskOnceGuard {
+            fn drop(&mut self) {
+                crate::watch::ask_once_end();
+            }
+        }
+        let mut watch_ranges = Vec::new();
+        for list in runs {
+            for step in &list.deferred().copies {
+                match step {
+                    Step::Refresh(_, address, len) if *len > 0 => {
+                        watch_ranges.push((*address, address.saturating_add(*len)));
+                    }
+                    Step::Texture(staging) => {
+                        let (start, end) = staging.memory_range();
+                        if start < end {
+                            watch_ranges.push((start, end));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        crate::watch::ask_once(&watch_ranges);
+        let watch_guard = AskOnceGuard;
         {
             #[cfg(test)]
             let _scope = enter_retire_scope(exec_scope.clone());
@@ -1019,6 +1047,7 @@ impl Host {
             }
         }
         batch.flush();
+        drop(watch_guard);
         let prepared = std::time::Instant::now();
         // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`).
         #[cfg(feature = "diagnostics")]
@@ -1693,10 +1722,10 @@ impl HostList {
     /// title barrier, copy, clear, target bind, or non-bindless descriptor
     /// table), ignoring states chosen by bindless heap sweeps.
     pub(crate) fn explicit_state(&self, resource: crate::object::This) -> Option<u32> {
-        let copy = crate::resource::host_copy(resource)?;
+        let copy = crate::resource::host_copy_ref(resource)?;
         let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
         states
-            .get(&(std::sync::Arc::as_ptr(&copy) as usize))
+            .get(&(std::sync::Arc::as_ptr(copy) as usize))
             .and_then(|&(_, _, explicit, _)| explicit)
     }
 
@@ -1729,15 +1758,15 @@ impl HostList {
         wanted: u32,
         explicit: bool,
     ) -> Option<(&'static ID3D12Resource, u32)> {
-        let texture = crate::resource::host_resource(resource)?;
-        let copy = crate::resource::host_copy(resource)?;
+        let copy = crate::resource::host_copy_ref(resource)?;
+        let texture = &copy.texture;
         self.mark_work();
         let wanted = legal_state(texture, wanted);
         let (changed, result) = {
             let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
-            match states.entry(std::sync::Arc::as_ptr(&copy) as usize) {
+            match states.entry(std::sync::Arc::as_ptr(copy) as usize) {
                 std::collections::hash_map::Entry::Vacant(v) => {
-                    v.insert((wanted, wanted, explicit.then_some(wanted), copy));
+                    v.insert((wanted, wanted, explicit.then_some(wanted), copy.clone()));
                     (true, None)
                 }
                 std::collections::hash_map::Entry::Occupied(mut o) => {
@@ -2235,6 +2264,7 @@ impl HostList {
                     // The flush counted its own time; the copy starts here.
                     started = std::time::Instant::now();
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
+                    crate::watch::wrote(dst, len);
                     len
                 }
                 &Step::Fill(dst, src, len) => {
@@ -2258,6 +2288,10 @@ impl HostList {
                 Step::Run(work) | Step::Host(work) => {
                     if matches!(step, Step::Run(_)) {
                         batch.title_written();
+                        // `Step::Run` may write arbitrary title memory without
+                        // calling `watch::wrote`, so refreshes after it must ask
+                        // the kernel again.
+                        crate::watch::ask_once_end();
                         #[cfg(feature = "diagnostics")]
                         {
                             started = std::time::Instant::now();

@@ -1208,16 +1208,27 @@ extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags:
     if let Some(list) = host_list(this)
         && dst != 0
         && src != 0
+        && len != 0
     {
-        let len = len as usize;
-        list.defer(move || {
-            if crate::texture::committed(src as *const u8, len)
-                && crate::texture::committed(dst as *const u8, len)
-            {
-                // SAFETY: both ranges are committed title memory.
-                unsafe { std::ptr::copy(src as *const u8, dst as *mut u8, len) };
-            }
-        });
+        let disjoint = dst.checked_add(len).is_some_and(|end| end <= src)
+            || src.checked_add(len).is_some_and(|end| end <= dst);
+        if disjoint {
+            // Non-overlapping copy goes through `Step::Copy` (`copy_mapped`),
+            // avoiding `VirtualQuery` on large title pools, opening guarded
+            // blocks, and preserving per-submission write-watch coalescing.
+            list.defer_copy(dst as *mut u8, src as *const u8, len as usize);
+        } else {
+            let len = len as usize;
+            list.defer(move || {
+                if crate::texture::committed(src as *const u8, len)
+                    && crate::texture::committed(dst as *const u8, len)
+                {
+                    crate::watch::writing(dst as usize, len);
+                    // SAFETY: both ranges are committed title memory and opened for writing.
+                    unsafe { std::ptr::copy(src as *const u8, dst as *mut u8, len) };
+                }
+            });
+        }
         mark_work(this);
     }
     #[cfg(not(windows))]

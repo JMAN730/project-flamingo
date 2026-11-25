@@ -388,6 +388,12 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
 }
 
 impl Staging {
+    /// Title memory byte range `[start, end)` backing this texture.
+    pub(crate) fn memory_range(&self) -> (usize, usize) {
+        let start = self.memory as usize;
+        (start, start.saturating_add(self.layout.size as usize))
+    }
+
     /// Detiles the texture memory into the staging buffer if it changed
     /// since the last time (and is mapped at all).
     pub(crate) fn refresh(&self) {

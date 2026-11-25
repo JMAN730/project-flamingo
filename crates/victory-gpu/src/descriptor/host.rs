@@ -7,6 +7,7 @@
 //! through a table and finds the slot changed.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::*;
@@ -132,6 +133,7 @@ impl TexTracker {
 pub(crate) struct HostHeap {
     pub(crate) heap: ID3D12DescriptorHeap,
     cpu: usize,
+    gpu: u64,
     step: u32,
     /// Slots mirroring the title's; `spare` more follow them.
     count: u32,
@@ -149,11 +151,17 @@ pub(crate) struct HostHeap {
     /// Slots requiring submission-time title-memory refresh (`UnalignedCopy`
     /// uploads or aliased structured SRV shadows).
     refreshes: Mutex<HashMap<u32, SlotRefresh>>,
+    /// Mirrors `refreshes.len()` so `refresh_slot` and `keep` avoid locking
+    /// `refreshes` when empty.
+    refresh_count: AtomicUsize,
     /// Where the search for free dynamic slots starts, and which are taken
     /// (by lists not yet reset).
     next: Mutex<(u32, Vec<bool>)>,
     /// Leaf-only tracker of live SRV/UAV textures across title slots.
     tex_tracker: Mutex<TexTracker>,
+    /// Mirrors `tex_tracker.generation` so `tex_gen()` is lock-free on every
+    /// bindless draw.
+    tex_gen: AtomicU64,
 }
 
 /// Host heaps' GPU ranges (start, bytes, bytes per slot, sampler), for
@@ -336,6 +344,7 @@ impl HostHeap {
         let h = HostHeap {
             heap,
             cpu,
+            gpu,
             step,
             count,
             spare: extra,
@@ -343,8 +352,10 @@ impl HostHeap {
             made: Mutex::new(vec![0; count as usize]),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
             refreshes: Mutex::new(HashMap::new()),
+            refresh_count: AtomicUsize::new(0),
             next: Mutex::new((0, vec![false; extra as usize])),
             tex_tracker: Mutex::new(TexTracker::new(sampler, count)),
+            tex_gen: AtomicU64::new(0),
         };
         // A slot never written is undefined: shaders reading one (a slot
         // the title wrote in a way we do not know, or a table entry no
@@ -543,11 +554,7 @@ impl HostHeap {
 
     #[cfg(test)]
     pub(crate) fn gpu(&self, index: u32) -> D3D12_GPU_DESCRIPTOR_HANDLE {
-        // SAFETY: a live shader-visible descriptor heap.
-        let base = unsafe { self.heap.GetGPUDescriptorHandleForHeapStart() };
-        D3D12_GPU_DESCRIPTOR_HANDLE {
-            ptr: base.ptr + u64::from(index) * u64::from(self.step),
-        }
+        self.gpu_handle(index)
     }
 
     /// Makes slot `index` read nothing: a null view, or a plain sampler.
@@ -592,15 +599,17 @@ impl HostHeap {
             }
         }
         drop(slots);
-        let mut map = self.refreshes.lock().unwrap_or_else(|e| e.into_inner());
-        match refresh {
-            Some(entry) => {
-                map.insert(index, entry);
+        if refresh.is_some() || self.refresh_count.load(Ordering::Acquire) != 0 {
+            let mut map = self.refreshes.lock().unwrap_or_else(|e| e.into_inner());
+            match refresh {
+                Some(entry) => {
+                    map.insert(index, entry);
+                }
+                None => {
+                    map.remove(&index);
+                }
             }
-            None if !map.is_empty() => {
-                map.remove(&index);
-            }
-            None => {}
+            self.refresh_count.store(map.len(), Ordering::Release);
         }
     }
 
@@ -608,6 +617,9 @@ impl HostHeap {
     /// or aliased shadow range), schedules a submission-time refresh on `list`
     /// and returns `true`.
     pub(crate) fn refresh_slot(&self, index: u32, list: &HostList) -> bool {
+        if self.refresh_count.load(Ordering::Acquire) == 0 {
+            return false;
+        }
         let refresh = {
             let map = self.refreshes.lock().unwrap_or_else(|e| e.into_inner());
             if map.is_empty() {
@@ -732,10 +744,8 @@ impl HostHeap {
 
     /// The shader-visible handle of slot `index`.
     pub(crate) fn gpu_handle(&self, index: u32) -> D3D12_GPU_DESCRIPTOR_HANDLE {
-        // SAFETY: a live shader-visible heap.
-        let start = unsafe { self.heap.GetGPUDescriptorHandleForHeapStart().ptr };
         D3D12_GPU_DESCRIPTOR_HANDLE {
-            ptr: start + u64::from(index) * u64::from(self.step),
+            ptr: self.gpu + u64::from(index) * u64::from(self.step),
         }
     }
 
@@ -875,6 +885,7 @@ impl HostHeap {
             tracker.add_entry(index, res, is_uav);
         }
         tracker.generation += 1;
+        self.tex_gen.store(tracker.generation, Ordering::Release);
         if let Some((res, _)) = new_entry {
             tracker.record_change(res);
         }
@@ -908,15 +919,13 @@ impl HostHeap {
         }
         if changed {
             tracker.generation += 1;
+            self.tex_gen.store(tracker.generation, Ordering::Release);
         }
     }
 
     /// Current generation of tracked live textures in this heap.
     pub(crate) fn tex_gen(&self) -> u64 {
-        self.tex_tracker
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .generation
+        self.tex_gen.load(Ordering::Acquire)
     }
 
     /// Snapshot of `(tex_gen, live_srvs, live_uavs)` in `O(active)` time,

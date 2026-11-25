@@ -13,7 +13,11 @@
 //! after; work runs with no lock held.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+#[cfg(any(not(windows), test))]
+use std::sync::atomic::AtomicU32;
+#[cfg(any(not(windows), feature = "diagnostics", test))]
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::Instant;
 
@@ -43,14 +47,16 @@ pub(crate) fn memory_wait_timeouts() -> u64 {
 impl MemoryWait {
     /// Whether the memory location currently satisfies the wait condition.
     ///
-    /// On Windows, checks that `[address, address + width)` is committed before
-    /// reading so a freed or decommitted title address resolves cleanly instead
-    /// of faulting the process.
+    /// On Windows, reads only the 4 or 8 target bytes through the kernel
+    /// (`ReadProcessMemory`) instead of querying `VirtualQuery` first, avoiding
+    /// multi-millisecond page-table region walks on large title allocations
+    /// while still resolving uncommitted, freed, or inaccessible addresses
+    /// cleanly without faulting.
     pub(crate) fn satisfied(&self) -> bool {
         if self.address == 0 {
             return true;
         }
-        let width = usize::from(self.width);
+        let width = if self.width == 4 { 4 } else { 8 };
         if self.address.checked_add(width as u64).is_none() {
             tracing::warn!(
                 address = format_args!("{:#x}", self.address),
@@ -60,31 +66,43 @@ impl MemoryWait {
             return true;
         }
         #[cfg(windows)]
-        if !crate::texture::committed(self.address as *const u8, width) {
-            tracing::warn!(
-                address = format_args!("{:#x}", self.address),
-                width = self.width,
-                "GPU memory wait address is not committed; resolving wait"
-            );
-            return true;
-        }
-        let (lhs, rhs) = if self.width == 4 {
+        let (lhs, rhs) = {
+            let mut raw = [0u8; 8];
+            if !crate::host::read_into(self.address as *const u8, &mut raw[..width]) {
+                tracing::warn!(
+                    address = format_args!("{:#x}", self.address),
+                    width = self.width,
+                    "GPU memory wait address is not committed; resolving wait"
+                );
+                return true;
+            }
+            // Pair with Release stores from CPU or bottom-of-pipe writers.
+            std::sync::atomic::fence(Ordering::Acquire);
+            if width == 4 {
+                let val = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
+                (u64::from(val & self.mask), u64::from(self.reference as u32))
+            } else {
+                (u64::from_le_bytes(raw), self.reference)
+            }
+        };
+        #[cfg(not(windows))]
+        let (lhs, rhs) = if width == 4 {
             let val = if self.address.is_multiple_of(align_of::<AtomicU32>() as u64) {
-                // SAFETY: verified committed on Windows (or live test memory); aligned 32-bit read.
+                // SAFETY: live aligned 32-bit test memory.
                 unsafe { AtomicU32::from_ptr(self.address as *mut u32) }.load(Ordering::Acquire)
             } else {
                 std::sync::atomic::fence(Ordering::Acquire);
-                // SAFETY: verified committed on Windows (or live test memory); 32-bit read.
+                // SAFETY: live 32-bit test memory.
                 unsafe { (self.address as *const u32).read_unaligned() }
             };
             (u64::from(val & self.mask), u64::from(self.reference as u32))
         } else {
             let val = if self.address.is_multiple_of(align_of::<AtomicU64>() as u64) {
-                // SAFETY: verified committed on Windows (or live test memory); aligned 64-bit read.
+                // SAFETY: live aligned 64-bit test memory.
                 unsafe { AtomicU64::from_ptr(self.address as *mut u64) }.load(Ordering::Acquire)
             } else {
                 std::sync::atomic::fence(Ordering::Acquire);
-                // SAFETY: verified committed on Windows (or live test memory); 64-bit read.
+                // SAFETY: live 64-bit test memory.
                 unsafe { (self.address as *const u64).read_unaligned() }
             };
             (val, self.reference)
@@ -421,5 +439,65 @@ mod tests {
             "MEMORY_WAITERS entry must be unregistered before post-wait work runs"
         );
         assert!(!crate::fence::has_memory_waiter(&timeline));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn memory_wait_resolves_noaccess_committed_page_without_faulting() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, VirtualAlloc, VirtualFree,
+        };
+        // SAFETY: committing a single `PAGE_NOACCESS` page for read-safety verification.
+        let page = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                4096,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_NOACCESS,
+            )
+        };
+        assert!(!page.is_null());
+        let wait = MemoryWait {
+            address: page as u64,
+            reference: 1,
+            mask: u32::MAX,
+            width: 4,
+            comparison: 3,
+        };
+        assert!(wait.satisfied());
+        // SAFETY: freeing the page we allocated above.
+        unsafe { VirtualFree(page, 0, MEM_RELEASE) };
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn memory_wait_reads_committed_value_inside_large_allocation() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        const SIZE: usize = 16 << 20;
+        // SAFETY: a 16 MiB committed allocation freed before returning.
+        let base = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                SIZE,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE,
+            )
+        };
+        assert!(!base.is_null());
+        let wait = MemoryWait {
+            address: base as u64,
+            reference: 42,
+            mask: u32::MAX,
+            width: 4,
+            comparison: 3,
+        };
+        assert!(!wait.satisfied());
+        // SAFETY: aligned 32-bit cell at the start of our committed allocation.
+        unsafe { (*(base as *const AtomicU32)).store(42, Ordering::Release) };
+        assert!(wait.satisfied());
+        // SAFETY: freeing our allocation.
+        unsafe { VirtualFree(base, 0, MEM_RELEASE) };
     }
 }

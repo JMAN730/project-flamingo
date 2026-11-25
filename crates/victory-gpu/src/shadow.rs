@@ -17,7 +17,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use windows::Win32::Graphics::Direct3D12::{
     D3D12_RESOURCE_STATE_GENERIC_READ, D3D12_RESOURCE_STATES, ID3D12Resource,
@@ -446,15 +446,13 @@ struct Entry {
 }
 
 /// Title buffers by (start address, resource), with their copy once made.
-static BUFFERS: Mutex<BTreeMap<(u64, usize), Entry>> = Mutex::new(BTreeMap::new());
-
-fn buffers() -> std::sync::MutexGuard<'static, BTreeMap<(u64, usize), Entry>> {
-    BUFFERS.lock().unwrap_or_else(|e| e.into_inner())
-}
+/// `RwLock` allows parallel recording threads to look up existing shadows
+/// concurrently without contending on a global mutex.
+static BUFFERS: RwLock<BTreeMap<(u64, usize), Entry>> = RwLock::new(BTreeMap::new());
 
 /// A title buffer exists at `start` (`len` bytes).
 pub(crate) fn register(resource: usize, start: u64, len: u64) {
-    buffers().insert(
+    BUFFERS.write().unwrap_or_else(|e| e.into_inner()).insert(
         (start, resource),
         Entry {
             end: start + len,
@@ -467,7 +465,7 @@ pub(crate) fn register(resource: usize, start: u64, len: u64) {
 /// and any active epoch keeps it until that work completes.
 pub(crate) fn unregister(resource: usize, start: u64) {
     let shadow = {
-        let mut map = buffers();
+        let mut map = BUFFERS.write().unwrap_or_else(|e| e.into_inner());
         map.remove(&(start, resource)).and_then(|e| e.shadow)
     };
     if let Some(shadow) = shadow {
@@ -479,16 +477,41 @@ pub(crate) fn unregister(resource: usize, start: u64) {
 /// len)`, made on first use.
 pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
     let end = address.checked_add(len.max(1))?;
-    let mut map = buffers();
-    let key = map
-        .range(..=(address, usize::MAX))
-        .rev()
-        .take(64)
-        .find(|(_, e)| e.end >= end)
-        .map(|(k, _)| *k);
-    let Some(key) = key else {
-        drop(map);
+    // Fast path: concurrent read lock with a single BTreeMap lookup.
+    let missing_key = {
+        let map = BUFFERS.read().unwrap_or_else(|e| e.into_inner());
+        match map
+            .range(..=(address, usize::MAX))
+            .rev()
+            .take(64)
+            .find(|(_, e)| e.end >= end)
+        {
+            Some((_, entry)) if entry.shadow.is_some() => return entry.shadow.clone(),
+            Some((&key, _)) => Some(key),
+            None => None,
+        }
+    };
+    let Some(key) = missing_key else {
         return loose(address, end);
+    };
+    // Slow path: first use of this buffer creates its host copy under write lock.
+    let mut map = BUFFERS.write().unwrap_or_else(|e| e.into_inner());
+    let key = if map.get(&key).is_some_and(|e| e.end >= end) {
+        key
+    } else {
+        match map
+            .range(..=(address, usize::MAX))
+            .rev()
+            .take(64)
+            .find(|(_, e)| e.end >= end)
+            .map(|(k, _)| *k)
+        {
+            Some(k) => k,
+            None => {
+                drop(map);
+                return loose(address, end);
+            }
+        }
     };
     let entry = map.get_mut(&key)?;
     if entry.shadow.is_none() {
@@ -525,12 +548,19 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
 const WINDOW: u64 = 4 << 20;
 
 /// Copies of title memory outside buffers, by (start, length).
-static LOOSE: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::new());
+static LOOSE: RwLock<BTreeMap<(u64, u64), Arc<Shadow>>> = RwLock::new(BTreeMap::new());
 
 fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     let start = address & !(WINDOW - 1);
     let len = end.next_multiple_of(WINDOW) - start;
-    let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(shadow) = LOOSE
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&(start, len))
+    {
+        return Some(shadow.clone());
+    }
+    let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
     if let Some(shadow) = map.get(&(start, len)) {
         return Some(shadow.clone());
     }
@@ -551,13 +581,15 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
 /// For device-removed reports: the copy of title memory whose host range
 /// starts closest below host GPU address `va`, and where `va` is in it.
 pub(crate) fn near(va: u64) -> String {
-    let mut all: Vec<(u64, u64, u64)> = buffers()
+    let mut all: Vec<(u64, u64, u64)> = BUFFERS
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
         .values()
         .filter_map(|e| e.shadow.as_deref().map(|s| (s.gpu, s.start, s.len)))
         .collect();
     all.extend(
         LOOSE
-            .lock()
+            .read()
             .unwrap_or_else(|e| e.into_inner())
             .values()
             .map(|s| (s.gpu, s.start, s.len)),
@@ -766,5 +798,31 @@ mod tests {
         list.close();
         list.reset();
         assert_eq!(weak.strong_count(), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn concurrent_find_reads_share_the_same_shadow_under_rwlock() {
+        let _retire = crate::host::isolated_retire_scope();
+        if host().is_none() {
+            return;
+        }
+        let data = vec![0u8; 8192];
+        let start = data.as_ptr() as u64;
+        let resource = 0xdead_beef_0003_usize;
+        register(resource, start, data.len() as u64);
+        let first = find(start, 64).expect("initial shadow");
+        let handles: Vec<_> = (0..4)
+            .map(|i| {
+                let addr = start + (i * 256) as u64;
+                std::thread::spawn(move || find(addr, 64).expect("concurrent shadow"))
+            })
+            .collect();
+        for h in handles {
+            let got = h.join().expect("thread");
+            assert!(Arc::ptr_eq(&first, &got));
+        }
+        drop(first);
+        unregister(resource, start);
     }
 }
