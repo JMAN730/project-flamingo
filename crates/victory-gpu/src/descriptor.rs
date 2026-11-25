@@ -1346,7 +1346,6 @@ mod tests {
     #[test]
     fn inline_cbvs_round_trip_without_growing_view_table() {
         let null = std::ptr::null();
-        let before = VIEWS.read().unwrap_or_else(|e| e.into_inner()).list.len();
         let mut slots = [0u64; 16];
         let base = slots.as_mut_ptr() as u64;
         let at = |i: usize| base + 32 * i as u64;
@@ -1369,11 +1368,16 @@ mod tests {
             assert_eq!(raw[2] >> KIND_SHIFT, KIND_CONSTANT);
             assert_ne!(raw[2], VIEW_TAG);
         }
-        let after_inline = VIEWS.read().unwrap_or_else(|e| e.into_inner()).list.len();
-        assert_eq!(
-            after_inline, before,
-            "inline CBVs must not insert into VIEWS"
-        );
+        // Other tests add views to `VIEWS` at the same time, so its length
+        // proves nothing; the inline views themselves must not be in it.
+        let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
+        for &(addr, size) in &inline_cases {
+            assert!(
+                !views.index.contains_key(&View::Constant(addr, size)),
+                "inline CBVs must not insert into VIEWS"
+            );
+        }
+        drop(views);
 
         // Unaligned size >= 16 KiB or address >= 2^47 falls back to the table.
         let fallback_cases = [
