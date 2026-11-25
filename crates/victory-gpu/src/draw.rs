@@ -2563,13 +2563,22 @@ fn describe(view: Option<&View>) -> String {
             r[11],
             u64::from(d[10]) | u64::from(d[11]) << 32
         ),
-        // The first four values, as a colour rectangle's constants are.
-        Some(View::Constant(address, size))
-            if *size >= 16 && crate::texture::committed(*address as *const u8, 16) =>
-        {
-            // SAFETY: 16 committed bytes of title memory.
-            let v = unsafe { (*address as *const [f32; 4]).read_unaligned() };
-            format!("Constant({address:#x}, {size}) {v:?}")
+        // The first four values, as a colour rectangle's constants are. They
+        // are read through the kernel, which fails on an unmapped page:
+        // asking for the region first (`texture::committed`) walks its pages
+        // and, once per draw, made world frames ten times slower.
+        Some(View::Constant(address, size)) if *size >= 16 => {
+            let mut bytes = [0u8; 16];
+            if crate::host::read_into(*address as *const u8, &mut bytes) {
+                let v: [f32; 4] =
+                    std::array::from_fn(|i| f32::from_le_bytes(bytes.as_chunks::<4>().0[i]));
+                format!("Constant({address:#x}, {size}) {v:?}")
+            } else {
+                format!("{:?}", View::Constant(*address, *size))
+                    .chars()
+                    .take(60)
+                    .collect()
+            }
         }
         Some(v) => format!("{v:?}").chars().take(60).collect(),
     }
@@ -2601,6 +2610,25 @@ fn rect_source(first: u32, count: u32, stride: u32, size: u32) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::{expanded_vertices, rect_source};
+
+    /// A constant view's note shows its first four values when its memory
+    /// is readable, and only the view when it is not (#357).
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn constant_view_notes_read_their_values_or_fall_back() {
+        use crate::descriptor::View;
+        let values = [1.0f32, -0.0, 2.5, 4.0];
+        let address = values.as_ptr() as u64;
+        assert_eq!(
+            super::describe(Some(&View::Constant(address, 16))),
+            format!("Constant({address:#x}, 16) [1.0, -0.0, 2.5, 4.0]")
+        );
+        // Nothing is mapped at the first page.
+        assert_eq!(
+            super::describe(Some(&View::Constant(0x10, 16))),
+            "Constant(16, 16)"
+        );
+    }
 
     #[test]
     fn writable_root_extent_covers_every_representable_whole_dword() {
