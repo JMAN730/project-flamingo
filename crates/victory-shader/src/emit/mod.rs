@@ -987,7 +987,7 @@ mod tests {
             },
             code: words.into_iter().flat_map(u32::to_le_bytes).collect(),
         };
-        let host = translate_native(&c, &native, true, None, None).unwrap();
+        let host = translate_native(&c, &native, true, true, None, None).unwrap();
         let c = Container::parse(&host.dxil).unwrap();
         let inputs = signature_part(&c, FourCC::ISG1).unwrap();
         assert!(inputs.iter().all(|e| e.kind != 14), "{inputs:?}");
@@ -1093,6 +1093,7 @@ mod tests {
         let ps = translate_native(
             &Container::parse(&pixel_bytes).unwrap(),
             &pixel,
+            true,
             true,
             None,
             None,

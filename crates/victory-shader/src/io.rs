@@ -721,6 +721,35 @@ mod tests {
     }
 
     #[test]
+    fn computed_barycentrics_raise_as_hand_interpolation() {
+        // v_add_f32 v6, 0, v0; v_add_f32 v7, 0, v1 so the interp halves
+        // no longer see the loaded barycentric inputs directly.
+        let p = program(&[
+            0x0600_0080 | (6 << 17),            // v_add_f32 v6, 0.0, v0
+            0x0600_0080 | (7 << 17) | (1 << 9), // v_add_f32 v7, 0.0, v1
+            0xC808_0006,                        // v_interp_p1_f32 v2, v6, attr0.x
+            0xC809_0007,                        // v_interp_p2_f32 v2, v7, attr0.x
+            S_ENDPGM,
+        ]);
+        let io = raise(&p, &pixel(vec![TEXCOORD], 2)).unwrap();
+        assert_eq!(
+            io.interps,
+            [(
+                (0, 3),
+                Interp::Computed {
+                    attribute: Attribute {
+                        usage: Usage::Generic,
+                        row: 1,
+                        channel: 0,
+                        high: false,
+                    },
+                    first: vec![(0, 2)],
+                },
+            )]
+        );
+    }
+
+    #[test]
     fn interpolation_can_take_its_first_half_from_either_branch() {
         let p = program(&[
             0xBF84_0003, // s_cbranch_scc0 to the second branch

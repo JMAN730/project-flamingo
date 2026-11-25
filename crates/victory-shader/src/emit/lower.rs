@@ -7800,8 +7800,6 @@ impl<'a> Lower<'a> {
         (is_uint, is_sint)
     }
 
-    }
-
     /// `x` (an f16 in the low bits) as the low half of VGPR `reg`: 16-bit
     /// results keep the register's high half (GFX10).
     fn low_half(&mut self, inst: &Inst, reg: u8, x: V) -> V {
