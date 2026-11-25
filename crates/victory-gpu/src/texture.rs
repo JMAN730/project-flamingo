@@ -25,7 +25,7 @@ use crate::host::{HostList, host};
 use crate::object::This;
 
 mod placed;
-pub(crate) use placed::{Placed, Upload};
+pub(crate) use placed::{Feedback, Placed, Upload};
 
 macro_rules! once {
     ($($arg:tt)*) => {{

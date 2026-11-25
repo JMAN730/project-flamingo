@@ -784,6 +784,7 @@ struct Readback {
 /// the upload/readback buffers its GPU commands name, kept until reset.
 #[derive(Default)]
 struct Deferred {
+    placed_writes: std::collections::HashMap<usize, std::sync::Arc<crate::resource::HostTexture>>,
     /// Destination, source, bytes.
     copies: Vec<Step>,
     /// Post-submission readbacks from GPU textures into title buffers.
@@ -1020,6 +1021,10 @@ impl Host {
             }
         }
         batch.flush();
+        let feedback = crate::texture::Feedback::record(self, batch.placed_writes.values());
+        if let Some(f) = &feedback {
+            lists.push(Some(f.list.clone()));
+        }
         let prepared = std::time::Instant::now();
         // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`).
         #[cfg(feature = "diagnostics")]
@@ -1124,6 +1129,9 @@ impl Host {
         // submission, however many dispatches declared it (the world's
         // passes declare the same big ranges dozens of times).
         let copying = std::time::Instant::now();
+        if let Some(f) = feedback {
+            f.finish();
+        }
         for (shadow, address, len) in batch.gpu_writes {
             let written = shadow.copy_back(address, len);
             COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
@@ -1732,6 +1740,11 @@ impl HostList {
     ) -> Option<(&'static ID3D12Resource, u32)> {
         let texture = crate::resource::host_resource(resource)?;
         let copy = crate::resource::host_copy(resource)?;
+        if copy.placed.get().is_some() && wanted & (0x4 | 0x8 | 0x400) != 0 {
+            self.deferred()
+                .placed_writes
+                .insert(std::sync::Arc::as_ptr(&copy) as usize, copy.clone());
+        }
         self.mark_work();
         let wanted = legal_state(texture, wanted);
         let (changed, result) = {
@@ -2248,7 +2261,14 @@ impl HostList {
     fn run_deferred(&self, batch: &mut Batch) {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
-        for step in &self.deferred().copies {
+        let deferred = self.deferred();
+        batch.placed_writes.extend(
+            deferred
+                .placed_writes
+                .iter()
+                .map(|(&key, copy)| (key, copy.clone())),
+        );
+        for step in &deferred.copies {
             let mut started = std::time::Instant::now();
             let copied = match step {
                 &Step::Copy(dst, src, len) => {
@@ -2324,6 +2344,7 @@ impl HostList {
 /// once, it is checked again only after a step that writes title memory.
 #[derive(Default)]
 struct Batch {
+    placed_writes: std::collections::HashMap<usize, std::sync::Arc<crate::resource::HostTexture>>,
     placed: std::collections::HashSet<usize>,
     refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
     gpu_writes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,

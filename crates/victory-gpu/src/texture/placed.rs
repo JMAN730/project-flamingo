@@ -216,3 +216,177 @@ impl Upload {
         }
     }
 }
+
+/// GPU writes to guest-visible backing become visible before guest fence signals.
+pub(crate) struct Feedback {
+    _allocator: ID3D12CommandAllocator,
+    pub(crate) list: ID3D12CommandList,
+    copies: Vec<Readback>,
+}
+
+struct Readback {
+    copy: std::sync::Arc<crate::resource::HostTexture>,
+    buffer: ID3D12Resource,
+    data: *const u8,
+}
+
+impl Feedback {
+    pub(crate) fn record<'a>(
+        host: &crate::host::Host,
+        written: impl Iterator<Item = &'a std::sync::Arc<crate::resource::HostTexture>>,
+    ) -> Option<Self> {
+        use windows::core::Interface;
+        let copies: Vec<_> = written
+            .filter_map(|copy| {
+                let (_, bytes) = copy.placed.get()?.footprints.get()?;
+                let (buffer, data) = host.readback_buffer(*bytes as u64)?;
+                Some(Readback {
+                    copy: copy.clone(),
+                    buffer,
+                    data,
+                })
+            })
+            .collect();
+        if copies.is_empty() {
+            return None;
+        }
+        // SAFETY: the allocator and resources are held until the host fence completes.
+        unsafe {
+            let allocator: ID3D12CommandAllocator = host
+                .device
+                .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
+                .unwrap_or_else(|e| {
+                    crate::host::fail(format_args!("placed texture readback allocator: {e}"))
+                });
+            let list: ID3D12GraphicsCommandList = host
+                .device
+                .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None)
+                .unwrap_or_else(|e| {
+                    crate::host::fail(format_args!("placed texture readback list: {e}"))
+                });
+            for rb in &copies {
+                let texture = &rb.copy.texture;
+                let state = D3D12_RESOURCE_STATES(
+                    rb.copy.state.load(std::sync::atomic::Ordering::Relaxed) as i32,
+                );
+                if state != D3D12_RESOURCE_STATE_COPY_SOURCE {
+                    list.ResourceBarrier(&[crate::host::transition(
+                        texture,
+                        state,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    )]);
+                }
+                let placed = rb.copy.placed.get().unwrap();
+                for (sub, fp) in placed.footprints.get().unwrap().0.iter().enumerate() {
+                    let to = D3D12_TEXTURE_COPY_LOCATION {
+                        pResource: std::mem::transmute_copy(&rb.buffer),
+                        Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                            PlacedFootprint: *fp,
+                        },
+                    };
+                    let from = D3D12_TEXTURE_COPY_LOCATION {
+                        pResource: std::mem::transmute_copy(texture),
+                        Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                            SubresourceIndex: sub as u32,
+                        },
+                    };
+                    list.CopyTextureRegion(&to, 0, 0, 0, &from, None);
+                }
+                if state != D3D12_RESOURCE_STATE_COPY_SOURCE {
+                    list.ResourceBarrier(&[crate::host::transition(
+                        texture,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE,
+                        state,
+                    )]);
+                }
+            }
+            list.Close().unwrap_or_else(|e| {
+                crate::host::fail(format_args!("placed texture readback did not close: {e}"))
+            });
+            Some(Self {
+                _allocator: allocator,
+                list: list.cast().expect("graphics command list"),
+                copies,
+            })
+        }
+    }
+
+    pub(crate) fn finish(self) {
+        for rb in &self.copies {
+            let placed = rb.copy.placed.get().unwrap();
+            let (footprints, bytes) = placed.footprints.get().unwrap();
+            // SAFETY: the CPU-readable buffer contains this many bytes, and the GPU fence has completed.
+            let gpu = unsafe { std::slice::from_raw_parts(rb.data, *bytes) };
+            placed.finish(footprints, gpu);
+        }
+    }
+}
+
+impl Placed {
+    fn finish(&self, footprints: &[D3D12_PLACED_SUBRESOURCE_FOOTPRINT], gpu: &[u8]) {
+        let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
+        if last.image.len() != gpu.len() || last.image == gpu {
+            return;
+        }
+        let size = self.layout.size as usize;
+        super::SCRATCH.with_borrow_mut(|scratch| {
+            scratch.resize(size, 0);
+            if !crate::host::read_into(self.address as *const u8, scratch) {
+                return;
+            }
+            let mut before = scratch.clone();
+            let mut after = scratch.clone();
+            for (sub, fp) in footprints.iter().enumerate() {
+                let mip = sub as u32 % self.layout.desc.mips;
+                let slice = sub as u32 / self.layout.desc.mips;
+                let pitch = fp.Footprint.RowPitch as usize;
+                let depth_pitch = pitch * fp.Footprint.Height as usize;
+                let start = fp.Offset as usize;
+                if self
+                    .layout
+                    .tile(
+                        &mut before,
+                        mip,
+                        slice,
+                        &last.image[start..],
+                        pitch,
+                        depth_pitch,
+                    )
+                    .is_err()
+                    || self
+                        .layout
+                        .tile(&mut after, mip, slice, &gpu[start..], pitch, depth_pitch)
+                        .is_err()
+                {
+                    return;
+                }
+            }
+            // Preserve padding and CPU edits made while the submission was running.
+            let mut concurrent = false;
+            for ((out, old), &cpu) in after.iter_mut().zip(&before).zip(scratch.iter()) {
+                if cpu != *old {
+                    concurrent |= *out != cpu;
+                    *out = cpu;
+                }
+            }
+            for (page, (src, dst)) in after.chunks(4096).zip(scratch.chunks(4096)).enumerate() {
+                if src == dst {
+                    continue;
+                }
+                let first = src.iter().zip(dst).position(|(a, b)| a != b).unwrap();
+                let end = src.iter().zip(dst).rposition(|(a, b)| a != b).unwrap() + 1;
+                if !crate::host::write_title_memory(
+                    self.address + page * 4096 + first,
+                    &src[first..end],
+                ) {
+                    return;
+                }
+            }
+            last.image.copy_from_slice(gpu);
+            last.hash = (!concurrent).then(|| blake3::hash(&after));
+            last.asked = 0;
+        });
+    }
+}

@@ -318,6 +318,15 @@ fn placed_uav_dispatch_writes_its_texture() {
     // SAFETY: the adjacent texel is inside the aligned guest backing and the dispatch has completed.
     unsafe { (address as *mut [f32; 4]).add(1).write(other) };
     assert_eq!(consumer.read(host), [expected, other]);
+    // A direct CPU read after the GPU fence observes the stored texel. Reset one
+    // component to its original value; the remaining GPU-written channels survive.
+    let first = address as *mut [f32; 4];
+    // SAFETY: the mapped, aligned texel is live and both submissions completed.
+    unsafe {
+        assert_eq!(first.read(), expected, "fenced guest backing");
+        first.cast::<f32>().write(3.0);
+    }
+    assert_eq!(consumer.read(host), [[3.0, 0.5, -0.25, 2.0], other]);
     // SAFETY: the host device is live after both completed submissions.
     assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
 }
