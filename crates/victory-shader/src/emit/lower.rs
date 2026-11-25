@@ -7336,8 +7336,10 @@ impl<'a> Lower<'a> {
         if *tfe || *lwe {
             return Err("an image access with tfe or lwe");
         }
+        let store = name.starts_with("image_store");
         // A load or sample with no channel enabled returns the first.
-        let dmask = if *dmask == 0 { &1 } else { dmask };
+        // `image_store` with dmask 0 is a no-op (handled below), not a write of channel 0.
+        let dmask = if !store && *dmask == 0 { &1 } else { dmask };
         let site = (b, i);
         let guard = self.guard(b, i)?;
         let c = self.cur;
@@ -7393,7 +7395,6 @@ impl<'a> Lower<'a> {
             .get(&(site, false))
             .copied()
             .ok_or("an untracked image")?;
-        let store = name.starts_with("image_store");
         let uav = store
             || self
                 .used_kind(src)
@@ -7506,11 +7507,18 @@ impl<'a> Lower<'a> {
             if name != "image_store" {
                 return Err("an image store to a mip level");
             }
-            // shortcut: stores are taken to write all four channels of a
-            // float format (the console converts by the view's format).
-            if *dmask != 0xF {
+            if *dmask == 0 {
+                return Ok(());
+            }
+            // DXIL requires typed UAV `textureStore` to write all four
+            // components (`0xF`); accept contiguous masks from channel 0
+            // (`0x1`, `0x3`, `0x7`, `0xF`) used for 1..=4-channel UAVs and
+            // zero-pad the unused trailing channels. Sparse masks stay refused
+            // (DXIL cannot do a partial RMW without clobbering lower channels).
+            if !matches!(*dmask, 0x1 | 0x3 | 0x7 | 0xF) {
                 return Err("an image store of some channels");
             }
+            let channels = dmask.count_ones() as usize;
             let iu = self.s.m.undef(self.s.t.i32);
             let mut cs = vec![iu; 3];
             for (k, slot) in cs.iter_mut().enumerate().take(coords) {
@@ -7519,12 +7527,14 @@ impl<'a> Lower<'a> {
             let Operand::Vector { reg, .. } = *data else {
                 return Err("image store data");
             };
-            let mut vals = Vec::new();
-            for k in 0..4u8 {
+            let zero = self.s.m.f32(0);
+            let mut vals = vec![zero; 4];
+            for (k, slot) in vals.iter_mut().enumerate().take(channels) {
+                let k = k as u8;
                 // d16: two f16 channels per VGPR, low half first.
                 let r = if *d16 { k / 2 } else { k };
                 let v = inst.read(Reg::V(reg + r)).ok_or("image store data")?;
-                vals.push(if *d16 {
+                *slot = if *d16 {
                     let mut x = self.i32_of(v)?;
                     if k % 2 == 1 {
                         let k16 = self.s.m.i32(16);
@@ -7535,7 +7545,7 @@ impl<'a> Lower<'a> {
                         .op(self.cur, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[x])
                 } else {
                     self.float_of(v)?
-                });
+                };
             }
             let h = self.handle(site, src, false, props)?;
             let at = self.begin_guarded(guard);
@@ -11550,6 +11560,66 @@ mod tests {
             ];
             lowers(&words, 0).unwrap_or_else(|e| panic!("op {op:#x}: {e}"));
         }
+    }
+
+    /// MIMG `image_store vdata, vaddr, s[srsrc:srsrc+7] dmask:dmask dim:2D unorm [d16]`.
+    fn image_store_2d(vdata: u8, vaddr: u8, srsrc: u8, dmask: u8, d16: bool) -> [u32; 2] {
+        let w0 = 0x3C << 26 | 0x08 << 18 | 1 << 12 | (dmask as u32 & 0xF) << 8 | 1 << 3;
+        let w1 = (d16 as u32) << 31
+            | ((srsrc as u32 >> 2) & 0x1F) << 16
+            | (vdata as u32) << 8
+            | (vaddr as u32);
+        [w0, w1]
+    }
+
+    /// Contiguous `image_store` channel masks lower; sparse ones stay refused.
+    #[test]
+    fn image_store_accepts_contiguous_partial_dmasks() {
+        let store = |dmask: u8, d16: bool| {
+            let mut words = vec![
+                0xBE81_0380, // s_mov_b32 s1, 0
+                0xF40C_0200,
+                0xFA00_0000, // s_load_dwordx8 s[8:15], s[0:1], 0
+                0x7E02_0280, // v_mov_b32 v1, 0
+                0x7E04_0280, // v_mov_b32 v2, 0
+                0x7E06_0280, // v_mov_b32 v3, 0
+                0x7E08_0280, // v_mov_b32 v4, 0
+                0x7E0A_0280, // v_mov_b32 v5, 0
+                0x7E0C_0280, // v_mov_b32 v6, 0
+            ];
+            words.extend_from_slice(&image_store_2d(1, 5, 8, dmask, d16));
+            words.push(S_ENDPGM);
+            let layout = vec![root(RootType::Table, 0, 0)];
+            let used = vec![UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 8,
+                user_data: 0,
+                slot: 0,
+            }];
+            lower_with(&words, layout, used)
+        };
+        for dmask in [0x0, 0x1, 0x3, 0x7, 0xF] {
+            for d16 in [false, true] {
+                store(dmask, d16).unwrap_or_else(|e| panic!("dmask={dmask:#x} d16={d16}: {e}"));
+            }
+        }
+        let Err(err) = store(0x5, false) else {
+            panic!("sparse dmask 0x5 should be refused");
+        };
+        assert!(
+            matches!(
+                err,
+                crate::ShaderError::Unsupported {
+                    what: "an image store of some channels",
+                    ..
+                }
+            ),
+            "{err}"
+        );
     }
 }
 
