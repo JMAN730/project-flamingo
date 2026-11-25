@@ -208,6 +208,14 @@ The initial form handles integer register operations, dword LDS reads and
 writes, and raw UAV stores. It uses no extra LDS. Other programs retain
 their usual translation. The option has separate shader cache entries.
 
+The experimental `VICTORY_WAVE64_CONSOLE_FLOW=1` option lowers eligible
+single-wave compute groups for a host that supports 32-lane waves. It
+handles some groups that share local data or exchange values across halves.
+The cross-half console-flow retry is limited to groups of at most 64 threads.
+Larger groups can use the split-wave path when their operations stay within
+each half. Unsupported cases retry the ordinary lowering. The option is off
+by default and keys the shader cache separately.
+
 A release build has no debugging aids. Build them in with
 
 ```powershell

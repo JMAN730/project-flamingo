@@ -172,6 +172,23 @@ pub fn wave64_double() -> bool {
         .get_or_init(|| std::env::var_os("VICTORY_WAVE64_DOUBLE").as_deref() == Some("1".as_ref()))
 }
 
+#[cfg(test)]
+thread_local! {
+    static TEST_CONSOLE_FLOW: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Opt in to lowering console Wave64 compute for a Wave32 host.
+pub fn wave64_console_flow() -> bool {
+    #[cfg(test)]
+    if let Some(value) = TEST_CONSOLE_FLOW.get() {
+        return value;
+    }
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("VICTORY_WAVE64_CONSOLE_FLOW").as_deref() == Some("1".as_ref())
+    })
+}
+
 /// The clean-up passes that run over a translated module before it is
 /// written (`bitcode::opt`): a set of its pass bits. Every pass is exact, so
 /// the switch is for telling a lowering fault from a clean-up fault and for
@@ -616,22 +633,46 @@ fn emit_program(
         }
         _ => 0,
     };
-    let l = lower::lower_with_wave32(
-        &lower::Parts {
-            native,
-            p,
-            st,
-            io,
-            res,
-            inputs,
-            outputs,
-            prims,
-            mesh_stride,
-        },
-        allow_wave32,
-        pixel_inputs,
-        view_stride,
-    )?;
+    let parts = lower::Parts {
+        native,
+        p,
+        st,
+        io,
+        res,
+        inputs,
+        outputs,
+        prims,
+        mesh_stride,
+    };
+    let lower_original =
+        || lower::lower_with_wave32(&parts, allow_wave32, pixel_inputs, view_stride);
+    let l = if allow_wave32 && wave64_console_flow() && native.stage == HwStage::Cs && native.wave64
+    {
+        use lower::WaveMode::{ConsoleFlow, Wave32};
+        let lowered =
+            match lower::lower_with_wave_mode(&parts, true, pixel_inputs, view_stride, Wave32) {
+                Err(ShaderError::Unsupported { what, .. }) if what == lower::CONSOLE_FLOW => {
+                    structure::structure_console(p).and_then(|console| {
+                        let parts = lower::Parts {
+                            st: &console,
+                            ..parts.clone()
+                        };
+                        lower::lower_with_wave_mode(
+                            &parts,
+                            true,
+                            pixel_inputs,
+                            view_stride,
+                            ConsoleFlow,
+                        )
+                    })
+                }
+                result => result,
+            };
+        // The ordinary shader can still be usable on a host with Wave64.
+        lowered.or_else(|reason| lower_original().map_err(|_| reason))?
+    } else {
+        lower_original()?
+    };
     Ok(HostShader {
         stage: native.stage,
         dxil: l.dxil,
