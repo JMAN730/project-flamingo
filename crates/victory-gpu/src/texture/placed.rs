@@ -395,3 +395,66 @@ impl Placed {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use victory_formats::texture::{Desc, Dimension, Swizzle};
+
+    #[test]
+    fn feedback_preserves_cpu_edits_padding_and_other_array_levels() {
+        for swizzle in [Swizzle::LINEAR, Swizzle::SW_4KB_S] {
+            let layout = Layout::new(&Desc {
+                dimension: Dimension::Tex2d,
+                width: 65,
+                height: 35,
+                depth: 2,
+                mips: 2,
+                element_bytes: 4,
+                block: 1,
+                samples: 1,
+                swizzle,
+            })
+            .unwrap();
+            let mut backing = vec![0x33; layout.size as usize];
+            let placed = Placed::new(backing.as_mut_ptr() as usize, layout);
+            placed.last.lock().unwrap().tiled = backing.clone();
+            let mut expected = backing.clone();
+            let mut footprints = Vec::new();
+            let mut gpu = Vec::new();
+            for sub in 0..4 {
+                let mip = sub % 2;
+                let slice = sub / 2;
+                let m = &placed.layout.mips[mip as usize];
+                let pitch = (m.width * 4).next_multiple_of(256);
+                let offset = gpu.len().next_multiple_of(512);
+                let size = (pitch * (m.height - 1) + m.width * 4) as usize;
+                gpu.resize(offset + size, 0x77); // host row padding differs from guest memory
+                for y in 0..m.height {
+                    let start = offset + (y * pitch) as usize;
+                    gpu[start..start + (m.width * 4) as usize].fill(0x33);
+                }
+                footprints.push(D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                    Offset: offset as u64,
+                    Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                        Width: m.width,
+                        Height: m.height,
+                        Depth: 1,
+                        RowPitch: pitch,
+                        ..Default::default()
+                    },
+                });
+                if sub == 3 {
+                    let (x, y) = (m.width - 1, m.height - 1);
+                    let at = placed.layout.offset(mip, x, y, slice).unwrap() as usize;
+                    let start = offset + (y * pitch + x * 4) as usize;
+                    gpu[start..start + 4].copy_from_slice(&[1, 2, 3, 4]);
+                    backing[at + 1] = 0x99;
+                    expected[at..at + 4].copy_from_slice(&[1, 0x99, 3, 4]);
+                }
+            }
+            placed.finish(&footprints, &gpu);
+            assert_eq!(backing, expected, "{swizzle:?}");
+        }
+    }
+}

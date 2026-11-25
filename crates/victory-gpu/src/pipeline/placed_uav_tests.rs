@@ -219,108 +219,137 @@ impl TexelReadback {
 // preserved title data from a freshly allocated host resource.
 const TEXTURE_ALIGNMENT: usize = 64 << 10;
 
+struct Fixture {
+    pipeline: Guest,
+    views: Guest,
+    handle: u64,
+    address: u64,
+    placed: This,
+}
+
+impl Fixture {
+    fn new(host: &crate::host::Host, width: u32, height: u32) -> Option<Self> {
+        let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL {
+            HighestShaderModel: D3D_SHADER_MODEL_6_6,
+        };
+        // SAFETY: an output value of the size required for this feature query.
+        let shader_model = unsafe {
+            host.device.CheckFeatureSupport(
+                D3D12_FEATURE_SHADER_MODEL,
+                (&raw mut sm).cast(),
+                size_of_val(&sm) as u32,
+            )
+        };
+        if shader_model.is_err() || sm.HighestShaderModel.0 < D3D_SHADER_MODEL_6_6.0 {
+            eprintln!("placed UAV dispatch needs SM 6.6");
+            return None;
+        }
+
+        let mut pipeline = std::ptr::null();
+        assert_eq!(
+            hand_out(vec![store_shader()], None, &PIPELINE_IIDS[0], &mut pipeline),
+            S_OK
+        );
+        let pipeline = Guest(pipeline);
+        assert!(
+            host_pipeline(pipeline.0).is_some(),
+            "synthetic host pipeline"
+        );
+
+        #[repr(C)]
+        struct HeapDescWithPlacement(D3D12_DESCRIPTOR_HEAP_DESC, [u64; 2]);
+        let desc = HeapDescWithPlacement(
+            D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                NumDescriptors: 2,
+                Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                NodeMask: 0,
+            },
+            [0; 2],
+        );
+        let iid = ID3D12DescriptorHeap::IID;
+        let iid = guid(iid.data1, iid.data2, iid.data3, iid.data4);
+        let mut views = std::ptr::null();
+        assert_eq!(
+            crate::descriptor::create_heap(
+                std::ptr::null(),
+                std::ptr::from_ref(&desc).cast(),
+                &iid,
+                &mut views
+            ),
+            S_OK
+        );
+        let views = Guest(views);
+        let handle = crate::descriptor::heap(views.0).start + 32;
+
+        let count = (width * height * 4) as usize + TEXTURE_ALIGNMENT / 2;
+        let backing = Box::leak(vec![3.0f32; count].into_boxed_slice());
+        let address = (backing.as_mut_ptr() as usize).next_multiple_of(TEXTURE_ALIGNMENT) as u64;
+        let format = DXGI_FORMAT_R32G32B32A32_FLOAT.0 as u32;
+        let mut resource = [0; 14];
+        resource[0] = D3D12_RESOURCE_DIMENSION_TEXTURE2D.0 as u32;
+        resource[4] = width;
+        resource[6] = height;
+        resource[7] = 1 | (1 << 16); // one slice and one mip
+        resource[8] = format;
+        resource[9] = 1; // sample count
+        resource[11] = 1; // linear layout
+        resource[12] = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 as u32;
+        let mut view = [0; 16];
+        view[0] = format;
+        view[1] = D3D12_UAV_DIMENSION_TEXTURE2D.0 as u32;
+        view[10] = address as u32;
+        view[11] = (address >> 32) as u32;
+        let placed = crate::resource::texture_at(address, &resource).expect("placed texture");
+        crate::descriptor::create_placed_uav(std::ptr::null(), &resource, &view, handle);
+
+        Some(Self {
+            pipeline,
+            views,
+            handle,
+            address,
+            placed,
+        })
+    }
+
+    fn dispatch(&self, host: &crate::host::Host, expected: [f32; 4]) -> crate::host::HostList {
+        let list = host.new_list().unwrap();
+        let mut state = crate::draw::State::default();
+        state.set_pipeline(self.pipeline.0);
+        state.set_heaps(&[self.views.0]);
+        state.set_constants(true, 0, &expected.map(f32::to_bits), 0);
+        state.set_table(true, 1, self.handle);
+        let dispatched = crate::draw::dispatched();
+        state.dispatch(&list, 1, 1, 1);
+        assert!(
+            crate::draw::dispatched() > dispatched,
+            "dispatch did not record"
+        );
+        list.close();
+        list
+    }
+}
+
 #[test]
 fn placed_uav_dispatch_writes_its_texture() {
     let Some(host) = crate::host::host() else {
         return;
     };
-    let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL {
-        HighestShaderModel: D3D_SHADER_MODEL_6_6,
-    };
-    // SAFETY: an output value of the size required for this feature query.
-    let shader_model = unsafe {
-        host.device.CheckFeatureSupport(
-            D3D12_FEATURE_SHADER_MODEL,
-            (&raw mut sm).cast(),
-            size_of_val(&sm) as u32,
-        )
-    };
-    if shader_model.is_err() || sm.HighestShaderModel.0 < D3D_SHADER_MODEL_6_6.0 {
-        eprintln!("placed UAV dispatch needs SM 6.6");
+    let Some(fixture) = Fixture::new(host, 16, 1) else {
         return;
-    }
-
-    let mut pipeline = std::ptr::null();
-    assert_eq!(
-        hand_out(vec![store_shader()], None, &PIPELINE_IIDS[0], &mut pipeline),
-        S_OK
-    );
-    let pipeline = Guest(pipeline);
-    assert!(
-        host_pipeline(pipeline.0).is_some(),
-        "synthetic host pipeline"
-    );
-
-    #[repr(C)]
-    struct HeapDescWithPlacement(D3D12_DESCRIPTOR_HEAP_DESC, [u64; 2]);
-    let desc = HeapDescWithPlacement(
-        D3D12_DESCRIPTOR_HEAP_DESC {
-            Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-            NumDescriptors: 2,
-            Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
-            NodeMask: 0,
-        },
-        [0; 2],
-    );
-    let iid = ID3D12DescriptorHeap::IID;
-    let iid = guid(iid.data1, iid.data2, iid.data3, iid.data4);
-    let mut views = std::ptr::null();
-    assert_eq!(
-        crate::descriptor::create_heap(
-            std::ptr::null(),
-            std::ptr::from_ref(&desc).cast(),
-            &iid,
-            &mut views
-        ),
-        S_OK
-    );
-    let views = Guest(views);
-    let handle = crate::descriptor::heap(views.0).start + 32;
-
-    let backing = Box::leak(vec![3.0f32; TEXTURE_ALIGNMENT / 2].into_boxed_slice());
-    let address = (backing.as_mut_ptr() as usize).next_multiple_of(TEXTURE_ALIGNMENT) as u64;
-    let format = DXGI_FORMAT_R32G32B32A32_FLOAT.0 as u32;
-    let mut resource = [0; 14];
-    resource[0] = D3D12_RESOURCE_DIMENSION_TEXTURE2D.0 as u32;
-    resource[4] = 16; // width, one 256-byte RGBA32_FLOAT row
-    resource[6] = 1; // height
-    resource[7] = 1 | (1 << 16); // one slice and one mip
-    resource[8] = format;
-    resource[9] = 1; // sample count
-    resource[11] = 1; // linear layout
-    resource[12] = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 as u32;
-    let mut view = [0; 16];
-    view[0] = format;
-    view[1] = D3D12_UAV_DIMENSION_TEXTURE2D.0 as u32;
-    view[10] = address as u32;
-    view[11] = (address >> 32) as u32;
-    let placed = crate::resource::texture_at(address, &resource).expect("placed texture");
-    crate::descriptor::create_placed_uav(std::ptr::null(), &resource, &view, handle);
-
+    };
     let expected = [1.0f32, 0.5, -0.25, 2.0];
-    let list = host.new_list().unwrap();
-    let mut state = crate::draw::State::default();
-    state.set_pipeline(pipeline.0);
-    state.set_heaps(&[views.0]);
-    state.set_constants(true, 0, &expected.map(f32::to_bits), 0);
-    state.set_table(true, 1, handle);
-    let dispatched = crate::draw::dispatched();
-    state.dispatch(&list, 1, 1, 1);
-    assert!(
-        crate::draw::dispatched() > dispatched,
-        "dispatch did not record"
-    );
-    list.close();
-    let consumer = TexelReadback::new(placed);
+    let list = fixture.dispatch(host, expected);
+    let consumer = TexelReadback::new(fixture.placed);
     host.execute(&[&list]);
     assert_eq!(consumer.read(host), [expected, [3.0; 4]]);
     let other = [-0.5f32, 3.0, 4.0, 5.0];
     // SAFETY: the adjacent texel is inside the aligned guest backing and the dispatch has completed.
-    unsafe { (address as *mut [f32; 4]).add(1).write(other) };
+    unsafe { (fixture.address as *mut [f32; 4]).add(1).write(other) };
     assert_eq!(consumer.read(host), [expected, other]);
     // A direct CPU read after the GPU fence observes the stored texel. Reset one
     // component to its original value; the remaining GPU-written channels survive.
-    let first = address as *mut [f32; 4];
+    let first = fixture.address as *mut [f32; 4];
     // SAFETY: the mapped, aligned texel is live and both submissions completed.
     unsafe {
         assert_eq!(first.read(), expected, "fenced guest backing");
@@ -329,4 +358,20 @@ fn placed_uav_dispatch_writes_its_texture() {
     assert_eq!(consumer.read(host), [[3.0, 0.5, -0.25, 2.0], other]);
     // SAFETY: the host device is live after both completed submissions.
     assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    eprintln!("placed UAV readback, fenced backing and CPU channel reset verified");
+}
+
+#[test]
+#[ignore = "times fenced submissions on the selected adapter"]
+fn time_single_texel_writes_to_a_16_mib_placed_uav() {
+    let host = crate::host::host().expect("host D3D12 device");
+    let fixture = Fixture::new(host, 1024, 1024).expect("SM 6.6 adapter");
+    let mut times = [0; 10];
+    for (i, sample) in times.iter_mut().enumerate() {
+        let list = fixture.dispatch(host, [i as f32, 0.5, -0.25, 2.0]);
+        let start = std::time::Instant::now();
+        host.execute(&[&list]);
+        *sample = start.elapsed().as_micros();
+    }
+    eprintln!("placed UAV submission times in microseconds (first is cold): {times:?}");
 }
