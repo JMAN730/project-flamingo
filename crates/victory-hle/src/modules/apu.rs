@@ -539,22 +539,34 @@ fn process_convert(
             result.error = E_INVALIDARG;
             return;
         }
-        // SAFETY: the title's output buffer holds `output_length` bytes.
-        let out = unsafe { std::slice::from_raw_parts_mut(output.cast::<f32>(), len) };
+        // Written sample by sample and unaligned: the title's buffer need
+        // not be aligned for f32, and the samples between the two channels'
+        // last frames and the midpoint are left as they are.
+        let out = output.cast::<f32>();
         for (i, frame) in converted[..frames * 2]
             .as_chunks::<2>()
             .0
             .iter()
             .enumerate()
         {
-            out[i] = frame[0];
-            out[midpoint + i] = frame[1];
+            // SAFETY: `midpoint + i` is below `len`, and the title's output
+            // buffer holds `output_length` bytes, at least `len` samples.
+            unsafe {
+                out.add(i).write_unaligned(frame[0]);
+                out.add(midpoint + i).write_unaligned(frame[1]);
+            }
         }
     } else {
-        // SAFETY: the title's output buffer holds `output_length` bytes.
-        let out =
-            unsafe { std::slice::from_raw_parts_mut(output.cast::<f32>(), frames * channels) };
-        out.copy_from_slice(&converted[..frames * channels]);
+        // Copied as bytes: the title's buffer need not be aligned for f32.
+        // SAFETY: the title's output buffer holds `output_length` bytes, and
+        // `room` (so `frames`) was bounded by it above.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                converted.as_ptr().cast::<u8>(),
+                output,
+                frames * channels * 4,
+            );
+        }
     }
     result.frames = frames as u32;
     result.output_length = (frames * channels * 4) as u32;
@@ -658,6 +670,42 @@ mod tests {
             assert!(aligned.iter().any(|&b| b != 0));
             for at in 1..4 {
                 assert!(decode(options, at) == aligned, "offset {at}");
+            }
+        }
+    }
+
+    #[test]
+    fn converts_into_an_unaligned_buffer() {
+        // Sixteen interleaved stereo frames of float PCM at pitch 1: the
+        // converter writes fifteen (it keeps the last to interpolate).
+        let samples: Vec<f32> = (0..32).map(|i| i as f32).collect();
+        let input: Vec<u8> = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
+        let convert = |options: u32, at: usize| {
+            let mut buffer = vec![0u8; 16 * 8 + 8];
+            let command = Process {
+                id: id(PROCESS, 0),
+                pitch_ramp: 0.0,
+                target_pitch: 1.0,
+                first_frame: 0,
+                frame_count: 16,
+                input_length: input.len() as u32,
+                input: input.as_ptr(),
+                output_length: 16 * 8,
+                output: buffer.as_mut_ptr().wrapping_add(at),
+            };
+            // SAFETY: a zeroed result is valid.
+            let mut result: ApuResult = unsafe { std::mem::zeroed() };
+            let mut resampler = Resampler::new(2, 1.0);
+            process_convert(None, &mut resampler, 16, options, &command, &mut result);
+            let (error, frames) = (result.error, result.frames);
+            assert_eq!((error, frames), (S_OK, 15));
+            buffer[at..at + 16 * 8].to_vec()
+        };
+        for options in [0, DEINTERLEAVED_OUTPUT] {
+            let aligned = convert(options, 0);
+            assert!(aligned.iter().any(|&b| b != 0));
+            for at in 1..4 {
+                assert!(convert(options, at) == aligned, "offset {at}");
             }
         }
     }
