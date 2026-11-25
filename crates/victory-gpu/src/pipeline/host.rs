@@ -939,7 +939,7 @@ fn code_bytes(code: &D3D12_SHADER_BYTECODE) -> Vec<u8> {
 /// Windows 10's d3d12core refuses those two 1.1 flags ("Unsupported
 /// bit-flag set"), and a pipeline without such shaders works there; one
 /// with them is refused, as it cannot run on that host.
-fn root_signature(
+pub(crate) fn root_signature(
     device: &ID3D12Device,
     params: &[D3D12_ROOT_PARAMETER1],
     samplers: &[D3D12_STATIC_SAMPLER_DESC],
