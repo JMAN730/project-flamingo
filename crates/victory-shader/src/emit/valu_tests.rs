@@ -1879,6 +1879,62 @@ fn v_mad_f32_flushes_subnormals_around_omod() {
     }
 }
 
+/// The CPU model of `v_sad_*`: `c` plus the sum of the unsigned differences
+/// of `a` and `b`'s fields of `width` bits, wrapping; `hi` shifts the sum
+/// to the high half first (`v_sad_hi_u8`).
+fn sad(a: u32, b: u32, c: u32, width: u32, hi: bool) -> u32 {
+    let mask = if width == 32 {
+        u32::MAX
+    } else {
+        (1 << width) - 1
+    };
+    let sum = (0..32 / width).fold(0u32, |s, i| {
+        let (x, y) = (a >> (width * i) & mask, b >> (width * i) & mask);
+        s.wrapping_add(x.abs_diff(y))
+    });
+    (if hi { sum << 16 } else { sum }).wrapping_add(c)
+}
+
+#[test]
+fn sad_model_follows_the_isa() {
+    // |1-4| + |2-3| + |3-2| + |4-1| = 8.
+    assert_eq!(sad(0x0403_0201, 0x0102_0304, 0, 8, false), 8);
+    assert_eq!(sad(0x0403_0201, 0x0102_0304, 2, 8, true), 8 << 16 | 2);
+    // |0xFFFF - 1| + |0 - 0xFFFF| = 0x1FFFD.
+    assert_eq!(sad(0x0000_FFFF, 0xFFFF_0001, 0, 16, false), 0x1_FFFD);
+    // |1 - 0xFFFF_FFFF| + 5 wraps to 3.
+    assert_eq!(sad(1, u32::MAX, 5, 32, false), 3);
+}
+
+/// `v_sad_u8`, `v_sad_hi_u8`, `v_sad_u16` and `v_sad_u32`.
+#[test]
+fn sums_of_absolute_differences() {
+    let inputs: Vec<[u32; 4]> = [
+        [0, 0, 0, 0],
+        [0x0403_0201, 0x0102_0304, 7, 0],
+        [0xFF00_FF00, 0x00FF_00FF, 0, 0],
+        [0x0000_FFFF, 0xFFFF_0001, 0x10, 0],
+        [0x1234_5678, 0x9ABC_DEF0, 0xFFFF_FFF0, 0],
+        [1, u32::MAX, 5, 0],
+    ]
+    .to_vec();
+    for (op, width, hi, what) in [
+        (0x15A, 8, false, "v_sad_u8"),
+        (0x15B, 8, true, "v_sad_hi_u8"),
+        (0x15C, 16, false, "v_sad_u16"),
+        (0x15D, 32, false, "v_sad_u32"),
+    ] {
+        let shader = build_valu_cs(&vop3(op, 0, vgpr(1), vgpr(2), vgpr(3)));
+        run_cases(&shader, &inputs, |backend, i, x, got| {
+            let want = sad(x[0], x[1], x[2], width, hi);
+            assert_eq!(
+                got, want,
+                "{backend}: {what} case {i}: {got:#010x}, want {want:#010x}"
+            );
+        });
+    }
+}
+
 /// `v_mad_u32_u16` / `v_mad_i32_i16` (op_sel halves) and `v_lerp_u8` (#405).
 #[test]
 fn mad_u32_u16_i32_i16_and_lerp_u8() {
