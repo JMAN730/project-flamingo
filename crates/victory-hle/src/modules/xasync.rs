@@ -472,14 +472,20 @@ pub fn XTaskQueueTerminate(
             callback(context as *mut c_void);
         }
     } else {
-        POOL.spawn(Box::new(move || {
-            for task in pooled {
+        // One job each, so a callback waiting on another never starves it;
+        // whichever finishes last announces the termination.
+        let remaining = Arc::new(AtomicUsize::new(pooled.len()));
+        for task in pooled {
+            let remaining = remaining.clone();
+            POOL.spawn(Box::new(move || {
                 task.run(true);
-            }
-            if let Some((context, callback)) = terminated {
-                callback(context as *mut c_void);
-            }
-        }));
+                if remaining.fetch_sub(1, Ordering::AcqRel) == 1
+                    && let Some((context, callback)) = terminated
+                {
+                    callback(context as *mut c_void);
+                }
+            }));
+        }
     }
     S_OK
 }
@@ -1917,6 +1923,46 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert_eq!(*lock(&EVENTS), ["canceled", "terminated"]);
+        XTaskQueueCloseHandle(q);
+    }
+
+    #[test]
+    fn pooled_cancellations_may_wait_on_each_other() {
+        static SIGNAL: (Mutex<bool>, Condvar) = (Mutex::new(false), Condvar::new());
+        static EVENTS: Mutex<Vec<&str>> = Mutex::new(Vec::new());
+        extern "system" fn first(_: *mut c_void, _: bool) {
+            let (flag, cv) = &SIGNAL;
+            let (done, _) = cv
+                .wait_timeout_while(lock(flag), Duration::from_secs(5), |set| !*set)
+                .unwrap_or_else(|e| e.into_inner());
+            lock(&EVENTS).push(if *done { "first" } else { "timeout" });
+        }
+        extern "system" fn second(_: *mut c_void, _: bool) {
+            *lock(&SIGNAL.0) = true;
+            SIGNAL.1.notify_all();
+            lock(&EVENTS).push("second");
+        }
+        extern "system" fn terminated(_: *mut c_void) {
+            lock(&EVENTS).push("terminated");
+        }
+        let mut q = std::ptr::null();
+        assert_eq!(XTaskQueueCreate(1, 1, &mut q), S_OK);
+        let none = std::ptr::null_mut();
+        let hr = XTaskQueueSubmitDelayedCallback(q, WORK, 5_000, none, Some(first));
+        assert_eq!(hr, S_OK);
+        let hr = XTaskQueueSubmitDelayedCallback(q, WORK, 5_000, none, Some(second));
+        assert_eq!(hr, S_OK);
+        assert_eq!(XTaskQueueTerminate(q, false, none, Some(terminated)), S_OK);
+        let start = std::time::Instant::now();
+        while lock(&EVENTS).len() < 3 && start.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let events = lock(&EVENTS).clone();
+        assert_eq!(events.last(), Some(&"terminated"), "{events:?}");
+        assert!(
+            events.contains(&"first") && events.contains(&"second"),
+            "{events:?}"
+        );
         XTaskQueueCloseHandle(q);
     }
 }
