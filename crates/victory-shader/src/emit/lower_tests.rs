@@ -355,6 +355,108 @@ fn lower_ps(input_addr: u32) -> Result<Lowered, crate::ShaderError> {
     })
 }
 
+/// A wave32 pixel loop whose body joins a lane mask (a compare result in
+/// `s10`) with a number in `s10` and compares it with zero, before the loop's
+/// exit: the join's ballot is taken in the loop, at the edge that carries the
+/// mask, not after the loop (where it would not dominate the phi).
+#[test]
+fn a_mask_joined_with_a_number_in_a_loop_is_balloted_in_the_loop() {
+    assert_ballot_stays_in_loop(&[
+        0x7E00_02F2u32, // v_mov_b32 v0, 1.0
+        0xBE8C_0380,    // s_mov_b32 s12, 0
+        0xD405_000A,    // loop: v_cmp_lg_f32_e64 s10, v0, 0
+        0x0001_0100,
+        0xBF02_810C, // s_cmp_gt_i32 s12, 1
+        0xBF85_0001, // s_cbranch_scc1 +1 (past the next word)
+        0xBE8A_0385, // s_mov_b32 s10, 5
+        0xBF06_800A, // s_cmp_eq_u32 s10, 0
+        0x850D_8081, // s_cselect_b32 s13, 1, 0
+        0x800C_810C, // s_add_u32 s12, s12, 1
+        0xBF04_830C, // s_cmp_lt_i32 s12, 3
+        0xBF85_FFF6, // s_cbranch_scc1 loop
+        0x7E02_020D, // v_mov_b32 v1, s13
+        0xF800_180F, // exp mrt0 v0, v0, v0, v0 done
+        0,
+        S_ENDPGM,
+    ]);
+}
+
+/// The same at the loop header: `s10` is a number on entry and the mask the
+/// latch carries back, zero-tested at the top.
+#[test]
+fn a_mask_joined_with_a_number_at_a_loop_header_is_balloted_in_the_loop() {
+    assert_ballot_stays_in_loop(&[
+        0x7E00_02F2u32, // v_mov_b32 v0, 1.0
+        0xBE8A_0385,    // s_mov_b32 s10, 5
+        0xBE8C_0380,    // s_mov_b32 s12, 0
+        0xBF06_800A,    // loop: s_cmp_eq_u32 s10, 0
+        0x850D_8081,    // s_cselect_b32 s13, 1, 0
+        0x800C_810C,    // s_add_u32 s12, s12, 1
+        0xD405_000A,    // v_cmp_lg_f32_e64 s10, v0, 0
+        0x0001_0100,
+        0xBF04_830C, // s_cmp_lt_i32 s12, 3
+        0xBF85_FFF9, // s_cbranch_scc1 loop
+        0x7E02_020D, // v_mov_b32 v1, s13
+        0xF800_180F, // exp mrt0 v0, v0, v0, v0 done
+        0,
+        S_ENDPGM,
+    ]);
+}
+
+/// Lowers the wave32 pixel program `words` and checks that no join's ballot
+/// was placed after a loop.
+fn assert_ballot_stays_in_loop(words: &[u32]) {
+    use super::super::container::SigElement;
+    let native = NativeProgram {
+        stage: HwStage::Ps,
+        wave64: false,
+        vgprs: 2,
+        layout: vec![],
+        used: vec![],
+        io: StageIo::Ps {
+            inputs: vec![],
+            input_addr: 0,
+            rsrc2: Default::default(),
+            db_shader_control: 0,
+            patches: vec![],
+        },
+        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    let target = SigElement {
+        name: "SV_Target".into(),
+        index: 0,
+        kind: 16,
+        comp: 5,
+        interp: 0,
+        row: Some(0),
+        col: 0,
+        cols: 4,
+        usage: 0,
+        half: false,
+    };
+    let p = ir::build(&native.code, false, native.vgprs).unwrap();
+    let st = structure::structure(&p).unwrap();
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+    let io = io::raise(&p, &native).unwrap();
+    let lowered = lower(&Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: vec![],
+        outputs: vec![target],
+        prims: vec![],
+        mesh_stride: 0,
+    })
+    .expect("lower");
+    assert!(lowered.wave_ops, "the join's mask side is a ballot");
+    assert_eq!(
+        lowered.mask_ballots_after_loop, 0,
+        "the ballot must dominate the phi inside the loop"
+    );
+}
+
 #[test]
 fn pixel_sample_coverage_input_reads_dx_op_coverage() {
     let with = lower_ps(1 << 14).unwrap();

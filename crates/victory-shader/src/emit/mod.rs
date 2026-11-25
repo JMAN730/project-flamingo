@@ -1167,72 +1167,44 @@ mod tests {
         assert_ne!(features & 0x200, 0, "SFI0 {features:#x}: no StencilRef");
     }
 
-    /// A wave64 pixel program whose SGPR holds a lane mask's high dword (a compare result) on one
-    /// path and a number on the other, then compares it with zero: the
-    /// join's mask side was a lane mask read as data, which refused the
-    /// whole program. The ballot stands in for it (wave-size independent for
-    /// the zero test the console compiler emits).
-    #[test]
-    fn a_scalar_joining_a_lane_mask_and_a_number_lowers_in_pixel_programs() {
+    /// A pixel program whose SGPR `joined` holds a lane mask's dword (a
+    /// compare result in `s[10:11]`) on one path and a number on the other,
+    /// then compares it with zero.
+    fn joined_mask_dword_ps(joined: u32, wave64: bool) -> Result<(), ShaderError> {
         let words = [
             0x7E00_02F2u32, // v_mov_b32 v0, 1.0
             0xD405_000A,    // v_cmp_lg_f32_e64 s[10:11], v0, 0
             0x0001_0100,
-            0xBE8C_0383, // s_mov_b32 s12, 3
-            0xBF02_850C, // s_cmp_gt_i32 s12, 5
-            0xBF85_0001, // s_cbranch_scc1 +1 (past the next word)
-            0xBE8B_0385, // s_mov_b32 s11, 5
-            0xBF06_800B, // s_cmp_eq_u32 s11, 0
-            0x850D_8081, // s_cselect_b32 s13, 1, 0
-            0x7E02_020D, // v_mov_b32 v1, s13
-            0xF800_1883, // exp mrtz v0, v1, off, off done vm
+            0xBE8C_0383,                  // s_mov_b32 s12, 3
+            0xBF02_850C,                  // s_cmp_gt_i32 s12, 5
+            0xBF85_0001,                  // s_cbranch_scc1 +1 (past the next word)
+            0xBE80_0385 | (joined << 16), // s_mov_b32 s<joined>, 5
+            0xBF06_8000 | joined,         // s_cmp_eq_u32 s<joined>, 0
+            0x850D_8081,                  // s_cselect_b32 s13, 1, 0
+            0x7E02_020D,                  // v_mov_b32 v1, s13
+            0xF800_1883,                  // exp mrtz v0, v1, off, off done vm
             0x0000_0100,
             0xBF81_0000, // s_endpgm
         ];
-        let native = NativeProgram {
-            stage: HwStage::Ps,
-            wave64: true,
-            vgprs: 2,
-            layout: vec![],
-            used: vec![],
-            io: StageIo::Ps {
-                inputs: vec![],
-                input_addr: 0,
-                rsrc2: crate::native::PsRsrc2(0),
-                db_shader_control: 0,
-                patches: vec![],
-            },
-            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
-        };
-        let el = |name: &str, kind, comp| SigElement {
-            name: name.into(),
-            index: 0,
-            kind,
-            comp,
-            interp: 0,
-            row: None,
-            col: 0,
-            cols: 1,
-            usage: 1,
-            half: false,
-        };
-        let osg1 =
-            container::signature(&[el("SV_Depth", 17, 9), el("SV_StencilRef", 20, 5)], false);
-        let bytes = crate::dxbc::build(&[(FourCC::OSG1, &osg1)]);
-        let c = Container::parse(&bytes).unwrap();
-        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
-        let st = structure::structure(&p).unwrap();
-        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
-        let io = io::raise(&p, &native).unwrap();
-        // Only the Windows validator reads the DXIL.
-        #[cfg_attr(not(windows), allow(unused_variables))]
-        let out = emit(&c, &native, &p, &st, &io, &res).unwrap();
-        #[cfg(windows)]
-        if let Ok(mut v) = super::validator::Validator::load(
-            super::validator::Validator::default_path().as_deref(),
-        ) {
-            v.validate(&mut out.dxil.clone()).unwrap();
-        }
+        emit_depth_stencil_ps(&words, wave64)
+    }
+
+    /// A scalar holding a lane mask's low dword on one path and a number on
+    /// the other, then compared with zero: the join's mask side was a lane
+    /// mask read as data, which refused the whole program. The ballot stands
+    /// in for it (any lane set, the same on any host wave size).
+    #[test]
+    fn a_scalar_joining_a_lane_mask_and_a_number_lowers_in_pixel_programs() {
+        joined_mask_dword_ps(10, true).unwrap();
+        joined_mask_dword_ps(10, false).unwrap();
+    }
+
+    /// The high dword of a wave64 mask has a ballot word only on a 64-lane
+    /// host (zero on a 32-lane one, so its zero test would be true whatever
+    /// the console's upper lanes held): its join with a number stays refused.
+    #[test]
+    fn a_scalar_joining_a_wave64_mask_high_dword_and_a_number_is_refused_in_pixel_programs() {
+        assert!(joined_mask_dword_ps(11, true).is_err());
     }
 
     /// Translates the pixel program `words` (no inputs or exports) with

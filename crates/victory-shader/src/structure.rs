@@ -901,8 +901,11 @@ impl<'a> Lanes<'a> {
             let &(b, i) = self.defs.get(&v)?;
             Some(&self.p.blocks[b].insts[i])
         };
+        // The lane wraps to the wave, as `v_readlane_b32` and `v_writelane_b32`
+        // do (`& 31`, `& 63` in wave64): lanes 0 and 32 are one in wave32.
+        let wrap = if self.p.wave64 { 63 } else { 31 };
         let lane = |op: Option<&Operand>| match op {
-            Some(&Operand::Const(c @ 128..=192)) => Some(c - 128),
+            Some(&Operand::Const(c @ 128..=192)) => Some((c - 128) & wrap),
             _ => None,
         };
         let read = at(v)?;
@@ -1541,6 +1544,43 @@ mod tests {
             let select = p.blocks[0].insts[5].write(Reg::V(1)).unwrap();
             let mask = *s.masks.get(&original).expect("comparison mask");
             assert_eq!(s.select_masks.get(&select) == Some(&mask), restored);
+        }
+    }
+
+    /// In wave32 lane 32 of `v_writelane_b32` is lane 0, so a mask spilled
+    /// to lane 32 replaces the one spilled to lane 0, and either lane's
+    /// `v_readlane_b32` restores the later one.
+    #[test]
+    fn spilled_lane_indices_wrap_to_the_wave() {
+        for read_lane in [0u32, 32] {
+            let p = build(
+                &[
+                    0xD401_000B, // v_cmp_lt_f32_e64 s11, v0, 0 (A)
+                    0x0001_0100,
+                    0xD405_000A, // v_cmp_lg_f32_e64 s10, v0, 0 (B)
+                    0x0001_0100,
+                    0xD761_0001, // v_writelane_b32 v1, s11, 0
+                    0x0001_000B,
+                    0xD761_0001, // v_writelane_b32 v1, s10, 32
+                    0x0001_400A,
+                    0xD760_0002, // v_readlane_b32 s2, v1, lane 0 or 32
+                    0x0001_0101 | ((128 + read_lane) << 9),
+                    0xD501_0001,
+                    258 | (259 << 9) | (2 << 18), // v_cndmask_b32 v1, v2, v3, s2
+                    S_ENDPGM,
+                ],
+                false,
+            );
+            let s = structure(&p).unwrap();
+            let mask_of =
+                |i: usize, reg| s.masks[&p.blocks[0].insts[i].write(Reg::S(reg)).unwrap()];
+            let select = p.blocks[0].insts[5].write(Reg::V(1)).unwrap();
+            assert_eq!(
+                s.select_masks.get(&select),
+                Some(&mask_of(1, 10)),
+                "read of lane {read_lane}"
+            );
+            assert_ne!(mask_of(0, 11), mask_of(1, 10));
         }
     }
 

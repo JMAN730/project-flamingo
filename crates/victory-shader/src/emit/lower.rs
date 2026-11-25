@@ -10405,17 +10405,30 @@ impl<'a> Lower<'a> {
             let bit = phi.reg == Reg::Scc;
             let mut incoming = Vec::new();
             for (n, &q) in p.blocks[b].preds.iter().enumerate() {
-                let Some(qb) = self.tail[q] else { continue };
-                let qb = self.edges.get(&(q, b)).copied().unwrap_or(qb);
+                let Some(pred_tail) = self.tail[q] else {
+                    continue;
+                };
+                let qb = self.edges.get(&(q, b)).copied().unwrap_or(pred_tail);
                 let arg = phi.args[n];
                 let lo = self.x.st.highs.get(&arg).copied().unwrap_or(arg);
+                // A high dword's ballot word exists only on a 64-lane host; on a
+                // 32-lane one it is always zero, so a zero test of it would be
+                // true whatever the console's upper lanes held. Refused.
+                let high_of_wave64 = self.x.native.wave64 && self.x.st.highs.contains_key(&arg);
                 let ballot_ok = self.mask_data == MaskData::Host
                     && !bit
+                    && !high_of_wave64
                     && self.read_phis.contains(&phi.value)
                     && self.x.st.masks.contains_key(&lo)
-                    && self.def_block.get(&lo).is_some_and(|&d| d != self.cur_ir);
+                    && self.def_block.contains_key(&lo);
                 let ballot = if ballot_ok {
-                    self.mask_dword(arg).ok()
+                    // Every block is lowered by now: place the ballot as a read
+                    // at the end of the phi's predecessor, whose edge uses it.
+                    let saved = (self.cur, self.cur_ir);
+                    (self.cur, self.cur_ir) = (pred_tail, q);
+                    let ballot = self.mask_dword(arg).ok();
+                    (self.cur, self.cur_ir) = saved;
+                    ballot
                 } else {
                     None
                 };
