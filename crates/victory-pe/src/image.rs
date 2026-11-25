@@ -193,7 +193,15 @@ impl ImageInfo {
         };
         let delay_imports = parse_delay_imports(&file, opt.size_of_image())?;
         let exports = parse_exports(&file, opt.image_base())?;
-        let tls = parse_tls(&file, data, opt.image_base())?;
+        let tls = parse_tls(&file, data, opt.image_base(), opt.size_of_image())?;
+        // The loader calls the entry point; one outside the image would jump
+        // into whatever memory follows it.
+        let entry_rva = opt.address_of_entry_point();
+        if entry_rva >= opt.size_of_image() && entry_rva != 0 {
+            return Err(PeError::Malformed(format!(
+                "entry point {entry_rva:#x} is outside the image"
+            )));
+        }
         let codeview = file.pdb_info()?.map(|cv| CodeViewInfo {
             pdb_path: String::from_utf8_lossy(cv.path()).into_owned(),
             guid: cv.guid(),
@@ -208,7 +216,7 @@ impl ImageInfo {
             dll_characteristics: opt.dll_characteristics().0,
             image_base: opt.image_base(),
             size_of_image: opt.size_of_image(),
-            entry_rva: opt.address_of_entry_point(),
+            entry_rva,
             stack_reserve: opt.size_of_stack_reserve(),
             stack_commit: opt.size_of_stack_commit(),
             sections,
@@ -405,6 +413,7 @@ fn parse_tls(
     file: &PeFile64<'_>,
     data: &[u8],
     image_base: u64,
+    size_of_image: u32,
 ) -> Result<Option<TlsInfo>, PeError> {
     let Some(dd) = file.data_directory(pe::IMAGE_DIRECTORY_ENTRY_TLS) else {
         return Ok(None);
@@ -438,7 +447,14 @@ fn parse_tls(
                     "TLS callback count exceeds limit".into(),
                 ));
             }
-            callback_rvas.push(va_to_rva(va, image_base)?);
+            // The loader calls each callback: it must be code in the image.
+            let rva = va_to_rva(va, image_base)?;
+            if rva >= size_of_image {
+                return Err(PeError::Malformed(format!(
+                    "TLS callback at {va:#x} is outside the image"
+                )));
+            }
+            callback_rvas.push(rva);
         }
         if !terminated {
             return Err(PeError::Malformed("unterminated TLS callback array".into()));
@@ -596,6 +612,35 @@ mod tests {
     fn tls_probe_accepts_terminated_callbacks() {
         let info = ImageInfo::parse(&synthetic_tls(true)).unwrap();
         assert_eq!(info.tls.unwrap().callback_rvas, vec![0x1010]);
+    }
+
+    /// A TLS callback or entry point past the end of the image is refused
+    /// rather than called (#397).
+    #[test]
+    fn callbacks_and_entry_points_outside_the_image_are_refused() {
+        let base = 0x1_8000_0000u64;
+        let mut data = synthetic_tls(true);
+        // The callback array's one entry, past SizeOfImage (0x2000).
+        data[0x3f0..0x3f8].copy_from_slice(&(base + 0x2000).to_le_bytes());
+        assert!(matches!(
+            ImageInfo::parse(&data),
+            Err(PeError::Malformed(_))
+        ));
+        data[0x3f0..0x3f8].copy_from_slice(&(base + 0x1fff).to_le_bytes());
+        assert_eq!(
+            ImageInfo::parse(&data).unwrap().tls.unwrap().callback_rvas,
+            vec![0x1fff]
+        );
+
+        let entry = 0x58 + 16;
+        let mut data = synthetic_tls(true);
+        data[entry..entry + 4].copy_from_slice(&0x2000u32.to_le_bytes());
+        assert!(matches!(
+            ImageInfo::parse(&data),
+            Err(PeError::Malformed(_))
+        ));
+        data[entry..entry + 4].copy_from_slice(&0x1010u32.to_le_bytes());
+        assert_eq!(ImageInfo::parse(&data).unwrap().entry_rva, 0x1010);
     }
 
     #[test]

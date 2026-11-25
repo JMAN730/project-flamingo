@@ -84,7 +84,11 @@ pub fn load(prepared: &PreparedImage, dir: &Path) -> Result<LoadedImage> {
     // A DLL indexes its TLS properly; only an exe assumes index 0.
     if !loaded.info.is_dll() {
         // SAFETY: just mapped, and no title code has run.
-        unsafe { crate::tls::redirect(loaded.base(), &loaded.info) }?;
+        if let Err(e) = unsafe { crate::tls::redirect(loaded.base(), &loaded.info) } {
+            // SAFETY: nothing ran from the image, and nothing points into it.
+            unsafe { loaded.unload() };
+            return Err(e);
+        }
     }
     if std::env::var_os(crate::hooks::NO_WATCHDOG_ENV).is_some() {
         // SAFETY: just mapped, and no title code has run.
