@@ -130,6 +130,14 @@ extern "system" fn acquire_deferral(_: This, out: *mut *mut c_void) -> HRESULT {
     // SAFETY: the request we just created.
     if unsafe { PowerSetRequest(request, PowerRequestDisplayRequired) } == 0 {
         let hr = last_error();
+        // Hosts with no display route to keep on (headless, remote, some
+        // laptops) refuse the request. Keeping the display awake is only a
+        // hint, so the title still gets its deferral; closing it is harmless.
+        // shortcut: the display may then sleep while the title holds it.
+        if hr == ERROR_NOT_SUPPORTED_HRESULT {
+            tracing::info!("display deferral: the host cannot keep the display on");
+            return put(out, request);
+        }
         // SAFETY: as above; not handed out.
         unsafe { windows_sys::Win32::Foundation::CloseHandle(request) };
         return hr;
@@ -149,6 +157,10 @@ extern "system" fn close_deferral(_: This, handle: *mut c_void) {
         }
     }
 }
+
+/// `HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED)`.
+#[cfg(windows)]
+const ERROR_NOT_SUPPORTED_HRESULT: HRESULT = 0x8007_0032_u32 as i32;
 
 #[cfg(windows)]
 fn last_error() -> HRESULT {

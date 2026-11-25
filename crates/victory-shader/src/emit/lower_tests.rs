@@ -397,6 +397,28 @@ fn med3_f32_emits_dxil_isnan_instead_of_fcmp_uno() {
     );
 }
 
+/// `v_cmp_{f,tru}_{f32,f16}` are false and true whatever the operands,
+/// NaNs included; they lower as constants like the integer forms, since
+/// `fcmp false`/`fcmp true` remove the WARP device at dispatch.
+#[test]
+fn float_compares_that_are_always_false_or_true_are_constants() {
+    for op in [0x000u32, 0x00F, 0x0C8, 0x0CF] {
+        // v_cmp_*_e64 s20, v1, v2; v_cndmask_b32_e64 v0, 0, 1, s20
+        let words = [
+            0x35 << 26 | op << 16 | 20,
+            (256 + 1) | (256 + 2) << 9,
+            0x35 << 26 | 0x101 << 16,
+            128 | 129 << 9 | 20 << 18,
+            S_ENDPGM,
+        ];
+        let lowered = lower_words(&words, 0).unwrap_or_else(|e| panic!("{op:#x}: {e}"));
+        assert!(
+            !lowered.has_fcmp_constant,
+            "{op:#x} must not emit fcmp false/true"
+        );
+    }
+}
+
 /// VOP3 `v_add_f32` with output modifier `omod` in bits 28:27 of word 1.
 fn v_add_f32_omod(omod: u8) -> [u32; 3] {
     let src0 = 256 + 1u32;
