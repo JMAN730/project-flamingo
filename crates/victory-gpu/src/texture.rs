@@ -792,7 +792,9 @@ pub(crate) fn committed(at: *const u8, len: usize) -> bool {
 fn committed_prefix(at: *const u8, len: usize) -> usize {
     use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
     let mut p = at as usize;
-    let end = p + len;
+    // A range past the top of the address space (a title address and size
+    // taken as they come) is cut at the top, so it is never all committed.
+    let end = p.saturating_add(len);
     while p < end {
         // SAFETY: plain data filled in by the query.
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
@@ -801,7 +803,7 @@ fn committed_prefix(at: *const u8, len: usize) -> usize {
         if n == 0 || info.State != MEM_COMMIT {
             break;
         }
-        p = info.BaseAddress as usize + info.RegionSize;
+        p = (info.BaseAddress as usize).saturating_add(info.RegionSize);
     }
     p.min(end) - at as usize
 }
@@ -959,6 +961,14 @@ fn staging(resource: This, texture: &ID3D12Resource, requested: u32) -> Option<A
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_range_past_the_address_space_is_not_committed() {
+        let data = [0u8; 64];
+        assert!(committed(data.as_ptr(), data.len()));
+        assert!(!committed(data.as_ptr(), usize::MAX));
+        assert!(!committed(usize::MAX as *const u8, 2));
+    }
 
     #[test]
     fn watched_texture_reads_reuse_space_and_expose_only_current_bytes() {
