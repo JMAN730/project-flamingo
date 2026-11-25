@@ -60,6 +60,9 @@ pub(crate) struct Lowered {
     pub has_fcmp_uno: bool,
     #[cfg(test)]
     pub has_fcmp_oeq: bool,
+    /// Whether the program emits `fcmp false` or `fcmp true`.
+    #[cfg(test)]
+    pub has_fcmp_constant: bool,
     /// Whether the program reads the pixel coverage mask.
     #[cfg(test)]
     pub has_coverage_op: bool,
@@ -1615,6 +1618,8 @@ impl<'a> Lower<'a> {
         #[cfg(test)]
         let has_fcmp_oeq = self.s.m.has_cmp(pred::OEQ);
         #[cfg(test)]
+        let has_fcmp_constant = self.s.m.has_cmp(pred::FALSE) || self.s.m.has_cmp(pred::TRUE);
+        #[cfg(test)]
         let has_coverage_op = self.s.m.has_dx_op("dx.op.coverage.i32", 91);
         #[cfg(test)]
         let has_helper_lane_op = self.s.m.has_dx_op("dx.op.isHelperLane.i1", 221);
@@ -1660,6 +1665,8 @@ impl<'a> Lower<'a> {
             has_fcmp_uno,
             #[cfg(test)]
             has_fcmp_oeq,
+            #[cfg(test)]
+            has_fcmp_constant,
             #[cfg(test)]
             has_coverage_op,
             #[cfg(test)]
@@ -8394,6 +8401,13 @@ impl<'a> Lower<'a> {
                 self.s.m.cmp(c, pred::NE, bit, zero)
             }
             "f32" | "f16" => {
+                // False and true whatever the operands, NaNs included. As
+                // constants, like the integer forms: `fcmp false`/`fcmp true`
+                // (which DXC never emits) remove the WARP device at dispatch.
+                if matches!(op, "f" | "tru") {
+                    self.lane(inst, Some(op == "tru"));
+                    return Ok(());
+                }
                 let (a, b) = if ty == "f16" {
                     (self.half_fsrc(inst, 0)?, self.half_fsrc(inst, 1)?)
                 } else {
@@ -8409,7 +8423,6 @@ impl<'a> Lower<'a> {
                     self.s.m.bin(c, Bin::Or, lt, gt)
                 } else {
                     let p = match op {
-                        "f" => pred::FALSE,
                         "lt" => pred::OLT,
                         "eq" => pred::OEQ,
                         "le" => pred::OLE,
@@ -8423,7 +8436,6 @@ impl<'a> Lower<'a> {
                         "nle" => pred::UGT,
                         "neq" => pred::UNE,
                         "nlt" => pred::UGE,
-                        "tru" => pred::TRUE,
                         _ => return Err(inst.name()),
                     };
                     self.s.m.cmp(c, p, a, b)
