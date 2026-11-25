@@ -103,7 +103,7 @@ struct TexelReadback {
 }
 
 impl TexelReadback {
-    fn new(texture: This) -> Self {
+    fn new(texture: This, row: u32) -> Self {
         let null = std::ptr::null();
         let mut allocator = null;
         assert_eq!(
@@ -191,7 +191,8 @@ impl TexelReadback {
         let copy = slot::<
             extern "system" fn(This, &Location, u32, u32, u32, &Location, *const [u32; 6]),
         >(list.0, crate::list::test_slot(list.0, 16));
-        copy(list.0, &to, 0, 0, 0, &from, null.cast());
+        let region = [0u32, row, 0, 2, row + 1, 1];
+        copy(list.0, &to, 0, 0, 0, &from, region.as_ptr().cast());
         let close =
             slot::<extern "system" fn(This) -> i32>(list.0, crate::list::test_slot(list.0, 9));
         assert_eq!(close(list.0), S_OK);
@@ -372,7 +373,7 @@ fn check_dispatch(watched: bool) {
     };
     let expected = [1.0f32, 0.5, -0.25, 2.0];
     let list = fixture.dispatch(host, expected);
-    let consumer = TexelReadback::new(fixture.placed);
+    let consumer = TexelReadback::new(fixture.placed, 0);
     host.execute(&[&list]);
     assert_eq!(consumer.read(host), [expected, [3.0; 4]]);
     let other = [-0.5f32, 3.0, 4.0, 5.0];
@@ -391,6 +392,35 @@ fn check_dispatch(watched: bool) {
     // SAFETY: the host device is live after both completed submissions.
     assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     eprintln!("placed UAV readback, fenced backing and CPU channel reset verified");
+}
+
+#[test]
+fn placed_uav_preserves_resident_rows_around_a_remapped_page() {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_DECOMMIT, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+    };
+    let Some(host) = crate::host::host() else {
+        return;
+    };
+    // One 256-texel RGBA32_FLOAT row occupies one 4 KiB page.
+    let Some(fixture) = Fixture::new(host, 256, 32, true) else {
+        return;
+    };
+    let rows = [0, 15, 31].map(|y| TexelReadback::new(fixture.placed, y));
+    let inspect = || rows.each_ref().map(|row| row.read(host)[0]);
+    assert_eq!(inspect(), [[3.0; 4]; 3]);
+    let middle = (fixture.address as usize + 15 * 4096) as *mut std::ffi::c_void;
+    // SAFETY: this page belongs to the fixture's process-lifetime reservation.
+    assert_ne!(unsafe { VirtualFree(middle, 4096, MEM_DECOMMIT) }, 0);
+    let written = [7.0, 8.0, 9.0, 10.0];
+    host.execute(&[&fixture.dispatch(host, written)]);
+    assert_eq!(inspect(), [written, [0.0; 4], [3.0; 4]]);
+    // SAFETY: restore exactly the decommitted page before writing its first texel.
+    let restored = unsafe { VirtualAlloc(middle, 4096, MEM_COMMIT, PAGE_READWRITE) };
+    assert_eq!(restored, middle);
+    // SAFETY: the page is recommitted, writable and aligned for the texel.
+    unsafe { middle.cast::<[f32; 4]>().write([5.0; 4]) };
+    assert_eq!(inspect(), [written, [5.0; 4], [3.0; 4]]);
 }
 
 #[test]

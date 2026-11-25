@@ -43,6 +43,7 @@ impl Placed {
             // Check consecutive dirty pages together before taking a full image.
             if let Some((stamp, pages)) = &watched
                 && last.asked != 0
+                && super::committed(self.address as *const u8, size)
             {
                 let mut runs = pages
                     .split(|&(_, write)| write <= last.asked)
@@ -72,11 +73,14 @@ impl Placed {
                 scratch.resize(size, 0);
             }
             let tiled = &mut scratch[..size];
-            if !crate::host::read_into(self.address as *const u8, tiled) {
-                last.asked = 0;
-                return None;
-            }
-            let asked = watched.map_or(0, |(stamp, _)| stamp);
+            let asked = if crate::host::read_into(self.address as *const u8, tiled) {
+                watched.map_or(0, |(stamp, _)| stamp)
+            } else {
+                // Keep both sides of a streaming hole. Recheck the mappings
+                // on the next submission even if no watched CPU write occurred.
+                crate::host::read_resident_into(self.address as *const u8, tiled);
+                0
+            };
             if last.tiled == tiled {
                 last.asked = asked;
                 return None;
@@ -412,10 +416,12 @@ impl Placed {
             let cpu = &mut cpu[..page.len()];
             let merged = &mut merged[..page.len()];
             let address = self.address + start;
+            let baseline = &mut last.tiled[start..start + page.len()];
             if !crate::host::read_into(address as *const u8, cpu) {
+                baseline.copy_from_slice(&page);
+                last.asked = 0;
                 continue;
             }
-            let baseline = &mut last.tiled[start..start + page.len()];
             for i in 0..page.len() {
                 merged[i] = if cpu[i] == baseline[i] {
                     page[i]

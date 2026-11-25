@@ -1527,8 +1527,9 @@ mod state {
         if indirect != 0 {
             const MESH: u32 = 10;
             let mut ran = false;
+            let mut dropped = "";
             with_state(this, |list, s| {
-                ran = s.execute_indirect(list, (MESH, 12, 1), indirect, None);
+                ran = s.execute_indirect(list, (MESH, 12, 1), indirect, None, &mut dropped);
             });
             if !ran {
                 super::INDIRECT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1619,6 +1620,7 @@ extern "system" fn execute_indirect(
     let address = crate::resource::buffer_bytes(arguments).map(|(p, _)| p as u64 + offset);
     let counter = crate::resource::buffer_bytes(count).map(|(p, _)| p as u64 + count_offset);
     let mut ran = false;
+    let mut dropped = "";
     #[cfg(windows)]
     if let ([[kind, ..]], Some(address)) = (args, address)
         && (count.is_null() || counter.is_some())
@@ -1631,9 +1633,16 @@ extern "system" fn execute_indirect(
             *kind
         };
         with_state(this, |list, s| {
-            ran = s.execute_indirect(list, (kind, stride, max), address, counter);
+            ran = s.execute_indirect(list, (kind, stride, max), address, counter, &mut dropped);
         });
     } else {
+        dropped = if args.len() != 1 {
+            "a signature of more than one argument"
+        } else if address.is_none() {
+            "arguments outside title buffers"
+        } else {
+            "count outside title buffers"
+        };
         #[cfg(all(windows, feature = "diagnostics"))]
         crate::pipeline::note_why(format!(
             "indirect signature {args:?}: arguments in a buffer {}, count in a buffer {}",
@@ -1645,16 +1654,42 @@ extern "system" fn execute_indirect(
         return;
     }
     INDIRECT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    static SEEN: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+    // Once per signature and reason: what the records hold is only worth
+    // saying when the reason is new too.
+    static SEEN: std::sync::Mutex<Vec<(usize, &'static str)>> = std::sync::Mutex::new(Vec::new());
     let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-    if !seen.contains(&(signature as usize)) {
-        seen.push(signature as usize);
+    if !seen.contains(&(signature as usize, dropped)) {
+        seen.push((signature as usize, dropped));
+        // The records from a host copy that already exists, never one made
+        // here: its bytes are as of that copy's last refresh, before this
+        // submission and any producer earlier in this list. A buffer with no
+        // copy reads as absent rather than as zeroes.
+        #[cfg(windows)]
+        let records = address.and_then(|at| {
+            let shadow = crate::shadow::peek(at, u64::from(stride))?;
+            let bytes = shadow.bytes(at, u64::from(stride))?;
+            // A stride that is not a multiple of four leaves a tail out
+            // rather than panicking in this callback.
+            let (words, _tail) = bytes.as_chunks::<4>();
+            Some(
+                words
+                    .iter()
+                    .map(|w| u32::from_le_bytes(*w))
+                    .collect::<Vec<u32>>(),
+            )
+        });
+        #[cfg(not(windows))]
+        let records: Option<Vec<u32>> = None;
         tracing::info!(
             stride,
-            ?args,
+            // The command signature's descriptor, not the records: its
+            // fields past the type are whatever the title left in the union.
+            signature = ?args,
+            ?records,
             max,
             address = ?address.map(|a| format!("{a:#x}")),
             counted = !count.is_null(),
+            reason = dropped,
             "indirect execution dropped (first time for this signature)"
         );
     }

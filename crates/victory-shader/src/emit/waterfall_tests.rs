@@ -26,6 +26,10 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
 /// [`build`] without its checks: the shader (validated by `dxil.dll` when
 /// present) and what lowering reported.
 fn build_any(words: &[u32], buffers: bool) -> (HostShader, lower::Lowered) {
+    build_with_view(words, buffers.then_some(4))
+}
+
+fn build_with_view(words: &[u32], buffer_stride: Option<u32>) -> (HostShader, lower::Lowered) {
     let table = |user_data: u8| RootParam {
         root: RootType::Table,
         table_offset_dwords: 0,
@@ -44,8 +48,8 @@ fn build_any(words: &[u32], buffers: bool) -> (HostShader, lower::Lowered) {
         user_data,
         slot: user_data,
     };
-    let views = if buffers {
-        range(ResourceType::Srv, 0, 4, 4, 0)
+    let views = if let Some(stride) = buffer_stride {
+        range(ResourceType::Srv, 0, 4, stride, 0)
     } else {
         range(ResourceType::Srv, 0, 8, 0, 0)
     };
@@ -389,6 +393,53 @@ fn gather4_with_a_level_far_outside_the_view_reads_the_nearest_edge() {
         for (label, words) in results {
             let got: Vec<f32> = words.into_iter().map(f32::from_bits).collect();
             assert_eq!(got, vec![texel; 32], "{label}: ({u}, {v})");
+        }
+    }
+}
+
+#[test]
+fn scalar_structured_load_and_record_count_use_the_same_view() {
+    #[rustfmt::skip]
+    let words = [
+        0xbe840300, 0xbe850380,     // s[4:5] = view table
+        0xf4080202, 0xfa000000,     // s_load_dwordx4 s[8:11], s[4:5], 0
+        0xf4080302, 0xfa000040,     // s_load_dwordx4 s[12:15], s[4:5], 64
+        0xf4200404, 0xfa000014,     // s_buffer_load_dword s16, s[8:11], 20
+        0x80110a10,                 // s_add_u32 s17, s16, s10 (record count)
+        0x7e020211,                 // v_mov_b32 v1, s17
+        0x34040082,                 // v_lshlrev_b32 v2, 2, v0 (lane * 4)
+        0xe0701000, 0x80030102,     // buffer_store_dword v1, v2, s[12:15], 0 offen
+        0xbf810000,                 // s_endpgm
+    ];
+    // The second program uses descriptor word 2 only as the byte offset
+    // of the scalar buffer load that also consumes the whole descriptor.
+    let mut offset_words = words;
+    offset_words[7] = 0x14000000; // soffset = s10, immediate offset = 0
+    offset_words[8] = 0xbe910310; // s_mov_b32 s17, s16
+    let (sum, _) = build_with_view(&words, Some(16));
+    let (offset, _) = build_with_view(&offset_words, Some(16));
+    for records in [4, 8] {
+        let mut data = vec![0u32; records * 4];
+        data[1] = 0x1234;
+        data[2] = 0x5678;
+        data[5] = 0x9012;
+        let views = [
+            View::Buffer {
+                data: &data,
+                stride: Stride::Structured(16),
+            },
+            View::Texture(1, 1, &[[0.0; 4]]),
+            View::RawUav(32),
+        ];
+        for (shader, expected) in [
+            (&sum, data[5] + records as u32),
+            (&offset, data[records / 4]),
+        ] {
+            let results = run(shader, &views);
+            assert!(!results.is_empty());
+            for (label, result) in results {
+                assert_eq!(result, vec![expected; 32], "{label}");
+            }
         }
     }
 }

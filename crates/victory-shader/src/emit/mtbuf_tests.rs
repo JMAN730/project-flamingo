@@ -101,6 +101,96 @@ fn buffer_shader(
 }
 
 #[test]
+fn raw_buffer_byte_and_halfword_loads_extend_at_every_byte_offset() {
+    // One lane per byte offset. All four loads use the same address.
+    let words = [
+        0xbe81_0380, // upper half of table address
+        0xf408_0200,
+        0xfa00_0000, // SRV in s[8:11]
+        0xf408_0300,
+        0xfa00_0020, // UAV in s[12:15]
+        0xe020_1000,
+        0x8002_0100, // buffer_load_ubyte v1 at v0
+        0xe024_1000,
+        0x8002_0200, // buffer_load_sbyte v2
+        0xe028_1000,
+        0x8002_0300, // buffer_load_ushort v3
+        0xe02c_1000,
+        0x8002_0400, // buffer_load_sshort v4
+        0x3400_0084, // output byte offset = lane * 16
+        0xe078_1000,
+        0x8003_0100, // store four result dwords
+        0xbf81_0000,
+    ];
+    let shader = buffer_shader(&words, Some(0), &|_, _| None).unwrap();
+    assert!(
+        Container::parse(&shader.dxil)
+            .unwrap()
+            .part(FourCC::DXIL)
+            .is_some()
+    );
+
+    #[cfg(windows)]
+    {
+        use super::host::{Dispatch, Host, Root, Stride, View};
+        let _one = super::valu_tests::ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let bytes: Vec<u8> = (0u8..68)
+            .map(|n| n.wrapping_mul(91).wrapping_add(17))
+            .collect();
+        let data: Vec<u32> = bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .copied()
+            .map(u32::from_le_bytes)
+            .collect();
+        let expected: Vec<u32> = bytes
+            .windows(2)
+            .take(64)
+            .flat_map(|b| {
+                let half = u16::from_le_bytes([b[0], b[1]]);
+                [
+                    u32::from(b[0]),
+                    b[0] as i8 as i32 as u32,
+                    u32::from(half),
+                    half as i16 as i32 as u32,
+                ]
+            })
+            .collect();
+        let force_warp = std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
+        for &(name, warp) in super::valu_tests::backends(force_warp) {
+            let Ok(host) = Host::new(warp) else { continue };
+            let (root, pso) = host.compute_pipeline(&shader).unwrap();
+            let output = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(
+                            0,
+                            Root::Constants(vec![0; shader.user_data_dwords() as usize]),
+                        )],
+                        views: &[
+                            View::Buffer {
+                                data: &data,
+                                stride: Stride::Raw,
+                            },
+                            View::RawUav(256),
+                        ],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap();
+            assert_eq!(output[0], expected, "{name}");
+            eprintln!("{name}: verified all 256 extension results");
+        }
+    }
+}
+
+#[test]
 fn normalized_mtbuf_loads_need_no_int64() {
     for &(unorm, _) in FORMATS {
         for format in [unorm, unorm + 1] {

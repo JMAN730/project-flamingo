@@ -244,7 +244,7 @@ impl HostShader {
         let n = self
             .user_data
             .iter()
-            .map(|u| u.index + 1)
+            .map(|u| u.index + if u.indexed_buffer { 3 } else { 1 })
             .max()
             .unwrap_or(0);
         n.next_multiple_of(4)
@@ -254,6 +254,9 @@ impl HostShader {
 /// One dword of user data and the root parameter that fills it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UserData {
+    /// The root constant selects a heap buffer. At `index` the host supplies
+    /// its bounded raw SRV slot, element stride in bytes and alignment bias.
+    pub indexed_buffer: bool,
     /// Dword in the user-data buffer (the console's user-data index).
     pub index: u32,
     /// Root parameter index in the title's root signature.

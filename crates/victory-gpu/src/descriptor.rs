@@ -13,6 +13,32 @@ use crate::resource::{Memory, PAGEABLE_IIDS};
 #[cfg(windows)]
 pub(crate) mod host;
 
+/// The first index of `n` (non-zero) consecutive free slots in `taken`,
+/// searching from `cursor` on and then from the start. A run may cross the
+/// cursor but not the end of `taken`.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn find_free_run(taken: &[bool], cursor: usize, n: usize) -> Option<usize> {
+    let end = taken.len();
+    let cursor = cursor.min(end);
+    // The second pass reaches n - 1 slots past the cursor, so a run starting
+    // before it is not cut short there.
+    let second_end = cursor.saturating_add(n.saturating_sub(1)).min(end);
+    let mut run = 0;
+    let mut last = usize::MAX;
+    for at in (cursor..end).chain(0..second_end) {
+        // A run cannot wrap past the end.
+        if at != last.wrapping_add(1) {
+            run = 0;
+        }
+        last = at;
+        run = if taken[at] { 0 } else { run + 1 };
+        if run == n {
+            return Some(at + 1 - n);
+        }
+    }
+    None
+}
+
 const HEAP_IIDS: [Iid; 4] = [
     guid(
         0x8efb471d,
@@ -101,6 +127,39 @@ impl Heap {
                 Some(h)
             })
             .as_ref()
+    }
+
+    /// Resolve the buffer view selected by a shader root constant.
+    #[cfg(windows)]
+    pub(crate) fn selected_buffer(&self, index: u32) -> Option<host::BufferRead> {
+        if self.desc.kind != VIEWS_KIND || index >= self.desc.count {
+            return None;
+        }
+        let at = self.start.checked_add(u64::from(index) * 32)?;
+        let mut record = [0u32; 3];
+        crate::host::copy_mapped(
+            record.as_mut_ptr().cast(),
+            at as *const u8,
+            size_of_val(&record),
+            false,
+        );
+        let [tag, index, generation] = record;
+        let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+        let (view, current) = views.list.get(index as usize)?;
+        if tag != VIEW_TAG || *current != generation {
+            return None;
+        }
+        let pinned = if let View::Shader(resource, _) = view {
+            // SAFETY: a resource's destructor must acquire VIEWS before freeing it.
+            Some(unsafe { crate::object::Held::try_new(*resource as This) }?)
+        } else {
+            None
+        };
+        let view = view.clone();
+        drop(views);
+        let read = host::selected_buffer(&view);
+        drop(pinned);
+        read
     }
 
     /// The descriptor index of `handle` in this heap, if it lies in it.
@@ -578,6 +637,23 @@ pub(crate) extern "system" fn create_uav(
     record(handle, view);
 }
 
+/// Copy only the fields of a placed resource description. Padding can differ
+/// between two views of the same texture and the caller may leave it unwritten.
+fn placed_resource_words(desc: *const [u32; 14]) -> Option<[u32; 14]> {
+    if desc.is_null() {
+        return None;
+    }
+    let src = desc.cast::<u32>();
+    let mut fields = [0; 14];
+    // SAFETY: the caller supplies a 56-byte ResourceDesc, possibly unaligned.
+    // Dimension occupies word 0. Alignment through Flags occupy words 2..13.
+    unsafe {
+        fields[0] = src.read_unaligned();
+        fields[2..13].copy_from_slice(&src.add(2).cast::<[u32; 11]>().read_unaligned());
+    }
+    Some(fields)
+}
+
 /// Device methods 0x230 and 0x238: shader resource and unordered access
 /// views of memory the title placed itself, `(resource desc, view desc,
 /// handle)`.
@@ -587,7 +663,7 @@ pub(crate) extern "system" fn create_placed_srv(
     desc: *const [u32; 16],
     handle: u64,
 ) {
-    if let (Some(resource), Some(desc)) = (words(resource), words(desc)) {
+    if let (Some(resource), Some(desc)) = (placed_resource_words(resource), words(desc)) {
         record(handle, View::Placed(false, resource, desc));
     }
 }
@@ -598,7 +674,7 @@ pub(crate) extern "system" fn create_placed_uav(
     desc: *const [u32; 16],
     handle: u64,
 ) {
-    if let (Some(resource), Some(desc)) = (words(resource), words(desc)) {
+    if let (Some(resource), Some(desc)) = (placed_resource_words(resource), words(desc)) {
         record(handle, View::Placed(true, resource, desc));
     }
 }
@@ -805,6 +881,25 @@ mod tests {
     }
 
     #[test]
+    fn free_run_may_cross_the_search_cursor() {
+        // Free slots 1..=4 around a cursor of 3.
+        let mut taken = [true; 8];
+        taken[1..5].fill(false);
+        assert_eq!(find_free_run(&taken, 3, 4), Some(1));
+        assert_eq!(find_free_run(&taken, 3, 5), None);
+    }
+
+    #[test]
+    fn free_run_does_not_wrap_past_the_end() {
+        let mut taken = [true; 8];
+        taken[0] = false;
+        taken[7] = false;
+        assert_eq!(find_free_run(&taken, 5, 2), None);
+        assert_eq!(find_free_run(&[false; 8], 5, 8), Some(0));
+        assert_eq!(find_free_run(&[false; 8], 8, 3), Some(0));
+    }
+
+    #[test]
     fn a_null_cbv_overwrites_the_previous_descriptor() {
         let mut slot = [0u64; 4];
         let handle = slot.as_mut_ptr() as u64;
@@ -841,6 +936,35 @@ mod tests {
         let mut bad_h = null;
         assert_eq!(create(bad, none, &mut bad_h), E_INVALIDARG);
         assert_eq!(slot::<extern "system" fn(This) -> u32>(h, 0x10)(h), 0);
+    }
+
+    #[test]
+    fn placed_views_share_resources_across_description_padding() {
+        let mut slot = [0u32; 8];
+        let handle = slot.as_mut_ptr() as u64;
+        let view_desc = [0u32; 16];
+        let null = std::ptr::null();
+        let mut resource = [3, 0, 0, 0, 8, 0, 8, 0x10001, 28, 1, 0, 0, 0, 0];
+        let expected = resource;
+        for (unordered, create) in [
+            (false, create_placed_srv as extern "system" fn(_, _, _, _)),
+            (true, create_placed_uav),
+        ] {
+            create(null, &expected, &view_desc, handle);
+            let first = slot;
+            resource[1] = 0xaaaa_aaaa;
+            resource[13] = 0xbbbb_bbbb;
+            create(null, &resource, &view_desc, handle);
+            assert_eq!(slot, first);
+            assert_eq!(
+                view(handle),
+                Some(View::Placed(unordered, expected, view_desc))
+            );
+            let mut other = resource;
+            other[12] = 4;
+            create(null, &other, &view_desc, handle);
+            assert_ne!(slot, first);
+        }
     }
 
     #[test]
