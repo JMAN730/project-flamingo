@@ -63,9 +63,10 @@ extern "system" fn text_entry_async(
     let [title, description, default] =
         [title, description, default].map(|t| text(t).unwrap_or_default());
     let max_length = max_length_for(scope, max_length);
+    let password = scope == PASSWORD;
     tracing::info!(title, description, max_length, "text entry");
     xasync::pending_with(block, (&raw const TEXT).cast(), move || {
-        match ask(&title, &description, &default, max_length) {
+        match ask(&title, &description, &default, max_length, password) {
             Some(typed) => {
                 tracing::info!(length = typed.chars().count(), "text entry: done");
                 let mut bytes = limit(&typed, max_length).into_bytes();
@@ -124,22 +125,23 @@ fn limit(typed: &str, max: u32) -> String {
     typed.chars().take(max as usize).collect()
 }
 
-/// Asks the user in a modal host dialog; `None` if dismissed.
+/// Asks the user in a modal host dialog; `None` if dismissed. A
+/// `password` entry hides what is typed.
 #[cfg(all(windows, not(test)))]
-fn ask(title: &str, description: &str, default: &str, max: u32) -> Option<String> {
-    dialog::ask(title, description, default, max)
+fn ask(title: &str, description: &str, default: &str, max: u32, password: bool) -> Option<String> {
+    dialog::ask(title, description, default, max, password)
 }
 
 /// Tests answer for the user: "typed" for a title starting with "Type",
 /// cancelled otherwise.
 #[cfg(test)]
-fn ask(title: &str, _: &str, default: &str, _: u32) -> Option<String> {
+fn ask(title: &str, _: &str, default: &str, _: u32, _: bool) -> Option<String> {
     title.starts_with("Type").then(|| format!("{default}typed"))
 }
 
 /// No host dialog to ask with: as if the user dismissed it.
 #[cfg(all(not(windows), not(test)))]
-fn ask(_: &str, _: &str, _: &str, _: u32) -> Option<String> {
+fn ask(_: &str, _: &str, _: &str, _: u32, _: bool) -> Option<String> {
     None
 }
 
@@ -161,11 +163,27 @@ mod dialog {
         typed: Option<String>,
     }
 
+    /// The edit box's style: masked for a password.
+    pub(super) fn edit_style(password: bool) -> u32 {
+        let style = wm::WS_BORDER | wm::WS_TABSTOP | wm::ES_AUTOHSCROLL as u32;
+        if password {
+            style | wm::ES_PASSWORD as u32
+        } else {
+            style
+        }
+    }
+
     /// The description, an edit box with the default text, OK and Cancel,
     /// from an in-memory template (dialog units, the system font); Enter
     /// accepts, Esc cancels.
     #[allow(dead_code)] // unused in test builds
-    pub(super) fn ask(title: &str, description: &str, default: &str, max: u32) -> Option<String> {
+    pub(super) fn ask(
+        title: &str,
+        description: &str,
+        default: &str,
+        max: u32,
+        password: bool,
+    ) -> Option<String> {
         let mut t: Vec<u16> = Vec::new();
         fn dword(t: &mut Vec<u16>, v: u32) {
             t.extend([v as u16, (v >> 16) as u16]);
@@ -194,8 +212,13 @@ mod dialog {
         let (button, edit, label) = (0x80, 0x81, 0x82);
         let tab = wm::WS_TABSTOP;
         item(0, [7, 7, 226, 10], 0xffff, label, description);
-        let edit_style = wm::WS_BORDER | tab | wm::ES_AUTOHSCROLL as u32;
-        item(edit_style, [7, 20, 226, 12], EDIT as u16, edit, default);
+        item(
+            edit_style(password),
+            [7, 20, 226, 12],
+            EDIT as u16,
+            edit,
+            default,
+        );
         let ok = wm::BS_DEFPUSHBUTTON as u32 | tab;
         item(ok, [129, 40, 50, 14], wm::IDOK as u16, button, "OK");
         let cancel = wm::BS_PUSHBUTTON as u32 | tab;
@@ -286,6 +309,14 @@ mod dialog {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn a_password_entry_hides_what_is_typed() {
+            let plain = edit_style(false);
+            assert_eq!(plain & wm::ES_PASSWORD as u32, 0);
+            assert_ne!(plain & wm::ES_AUTOHSCROLL as u32, 0);
+            assert_eq!(edit_style(true), plain | wm::ES_PASSWORD as u32);
+        }
 
         #[test]
         fn unset_user_data_is_no_entry() {
