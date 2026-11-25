@@ -362,6 +362,31 @@ fn placed_uav_dispatch_writes_its_texture() {
 }
 
 #[test]
+fn placed_uav_readbacks_stay_distinct_across_submissions() {
+    let Some(host) = crate::host::host() else {
+        return;
+    };
+    let Some(a) = Fixture::new(host, 16, 1) else {
+        return;
+    };
+    let b = Fixture::new(host, 16, 1).unwrap();
+    let wider = Fixture::new(host, 128, 1).unwrap();
+    for (step, second) in [&b, &b, &wider].into_iter().enumerate() {
+        let left = [step as f32 + 1.0, 4.0, 5.0, 6.0];
+        let right = [-left[0], 7.0, 8.0, 9.0];
+        let first_list = a.dispatch(host, left);
+        let second_list = second.dispatch(host, right);
+        host.execute(&[&first_list, &second_list]);
+        // SAFETY: both fixtures own distinct aligned backing, and execute waited for the fence.
+        unsafe {
+            assert_eq!((a.address as *const [f32; 4]).read(), left);
+            assert_eq!((second.address as *const [f32; 4]).read(), right);
+        }
+    }
+    eprintln!("distinct placed UAV writebacks verified across footprint changes");
+}
+
+#[test]
 #[ignore = "times fenced submissions on the selected adapter"]
 fn time_single_texel_writes_to_a_16_mib_placed_uav() {
     let host = crate::host::host().expect("host D3D12 device");

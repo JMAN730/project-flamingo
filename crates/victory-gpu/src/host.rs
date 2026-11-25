@@ -39,12 +39,18 @@ const RTV_RING: u32 = 1024;
 /// Maximum number of detached host lists kept for reuse after pending resets.
 const LIST_POOL_CAP: usize = 64;
 
+#[derive(Default)]
+struct Submission {
+    /// The last value signalled on the host fence.
+    fence_value: u64,
+    readbacks: crate::texture::ReadbackCache,
+}
+
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
     queue: ID3D12CommandQueue,
     fence: ID3D12Fence,
-    /// The last value signalled on `fence`, behind the submission lock.
-    submitted: Mutex<u64>,
+    submitted: Mutex<Submission>,
     event: HANDLE,
     rtvs: ID3D12DescriptorHeap,
     rtv_size: u32,
@@ -444,7 +450,7 @@ fn create() -> windows::core::Result<Host> {
             device,
             queue,
             fence,
-            submitted: Mutex::new(0),
+            submitted: Mutex::default(),
             event,
             rtvs,
             rtv_size,
@@ -1021,7 +1027,11 @@ impl Host {
             }
         }
         batch.flush();
-        let feedback = crate::texture::Feedback::record(self, batch.placed_writes.values());
+        let feedback = crate::texture::Feedback::record(
+            self,
+            batch.placed_writes.values(),
+            &mut submitted.readbacks,
+        );
         if let Some(f) = &feedback {
             lists.push(Some(f.list.clone()));
         }
@@ -1040,13 +1050,16 @@ impl Host {
         #[cfg(not(feature = "diagnostics"))]
         let groups = [&lists[..]];
         for (i, group) in groups.iter().enumerate() {
-            *submitted += 1;
+            submitted.fence_value += 1;
             let started = std::time::Instant::now();
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
                 self.queue.ExecuteCommandLists(group);
-                match self.queue.Signal(&self.fence, *submitted) {
-                    Ok(()) => match self.fence.SetEventOnCompletion(*submitted, self.event) {
+                match self.queue.Signal(&self.fence, submitted.fence_value) {
+                    Ok(()) => match self
+                        .fence
+                        .SetEventOnCompletion(submitted.fence_value, self.event)
+                    {
                         Ok(()) => {
                             let waited = WaitForSingleObject(self.event, INFINITE);
                             if waited != WAIT_OBJECT_0 {
@@ -1054,7 +1067,7 @@ impl Host {
                                     wait = waited.0,
                                     "host fence event wait failed; polling fence"
                                 );
-                                self.poll_fence(*submitted);
+                                self.poll_fence(submitted.fence_value);
                             }
                         }
                         Err(e) => {
@@ -1062,7 +1075,7 @@ impl Host {
                                 error = %e,
                                 "host fence event registration failed; polling fence"
                             );
-                            self.poll_fence(*submitted);
+                            self.poll_fence(submitted.fence_value);
                         }
                     },
                     Err(e) => fail(format_args!(
@@ -1130,7 +1143,7 @@ impl Host {
         // passes declare the same big ranges dozens of times).
         let copying = std::time::Instant::now();
         if let Some(f) = feedback {
-            f.finish();
+            f.finish(&mut submitted.readbacks);
         }
         for (shadow, address, len) in batch.gpu_writes {
             let written = shadow.copy_back(address, len);

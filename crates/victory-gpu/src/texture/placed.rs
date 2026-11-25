@@ -215,26 +215,46 @@ pub(crate) struct Feedback {
     copies: Vec<Readback>,
 }
 
-struct Readback {
-    copy: std::sync::Arc<crate::resource::HostTexture>,
+/// Buffers from the previous submission, keyed by their exact footprint size.
+#[derive(Default)]
+pub(crate) struct ReadbackCache(std::collections::BTreeMap<usize, Vec<MappedReadback>>);
+
+struct MappedReadback {
     buffer: ID3D12Resource,
     data: *const u8,
+}
+
+struct Readback {
+    copy: std::sync::Arc<crate::resource::HostTexture>,
+    mapped: MappedReadback,
 }
 
 impl Feedback {
     pub(crate) fn record<'a>(
         host: &crate::host::Host,
         written: impl Iterator<Item = &'a std::sync::Arc<crate::resource::HostTexture>>,
+        cache: &mut ReadbackCache,
     ) -> Option<Self> {
         use windows::core::Interface;
-        let copies: Vec<_> = written
+        let requests: Vec<_> = written
             .filter_map(|copy| {
                 let (_, bytes) = copy.placed.get()?.footprints.get()?;
-                let (buffer, data) = host.readback_buffer(*bytes as u64)?;
+                let cached = cache.0.get_mut(bytes).and_then(Vec::pop);
+                Some((copy, *bytes, cached))
+            })
+            .collect();
+        // Release unused buffers before allocating any replacements.
+        cache.0.clear();
+        let copies: Vec<_> = requests
+            .into_iter()
+            .filter_map(|(copy, bytes, cached)| {
+                let mapped = cached.or_else(|| {
+                    let (buffer, data) = host.readback_buffer(bytes as u64)?;
+                    Some(MappedReadback { buffer, data })
+                })?;
                 Some(Readback {
                     copy: copy.clone(),
-                    buffer,
-                    data,
+                    mapped,
                 })
             })
             .collect();
@@ -270,7 +290,7 @@ impl Feedback {
                 let placed = rb.copy.placed.get().unwrap();
                 for (sub, fp) in placed.footprints.get().unwrap().0.iter().enumerate() {
                     let to = D3D12_TEXTURE_COPY_LOCATION {
-                        pResource: std::mem::transmute_copy(&rb.buffer),
+                        pResource: std::mem::transmute_copy(&rb.mapped.buffer),
                         Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
                         Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
                             PlacedFootprint: *fp,
@@ -304,13 +324,14 @@ impl Feedback {
         }
     }
 
-    pub(crate) fn finish(self) {
-        for rb in &self.copies {
+    pub(crate) fn finish(self, cache: &mut ReadbackCache) {
+        for rb in self.copies {
             let placed = rb.copy.placed.get().unwrap();
             let (footprints, bytes) = placed.footprints.get().unwrap();
             // SAFETY: the CPU-readable buffer contains this many bytes, and the GPU fence has completed.
-            let gpu = unsafe { std::slice::from_raw_parts(rb.data, *bytes) };
+            let gpu = unsafe { std::slice::from_raw_parts(rb.mapped.data, *bytes) };
             placed.finish(footprints, gpu);
+            cache.0.entry(*bytes).or_default().push(rb.mapped);
         }
     }
 }
