@@ -1063,6 +1063,9 @@ mod tests {
         let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
         let io = io::raise(&p, &native).unwrap();
         let out = emit(&c, &native, &p, &st, &io, &res).unwrap();
+        // The DXIL is only validated where the validator runs.
+        #[cfg(not(windows))]
+        let _ = out;
         #[cfg(windows)]
         if let Ok(mut v) = super::validator::Validator::load(
             super::validator::Validator::default_path().as_deref(),
@@ -1108,6 +1111,9 @@ mod tests {
         let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
         let io = io::raise(&p, &native).unwrap();
         let out = emit(&c, &native, &p, &st, &io, &res)?;
+        // The DXIL is only validated where the validator runs.
+        #[cfg(not(windows))]
+        let _ = out;
         #[cfg(windows)]
         if let Ok(mut v) = super::validator::Validator::load(
             super::validator::Validator::default_path().as_deref(),
