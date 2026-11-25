@@ -60,13 +60,21 @@ struct TexTracker {
     /// Bounded ring of `(generation, resource)` additions/overwrites so
     /// `bindless_textures` can sync newly written descriptors incrementally.
     changes: VecDeque<(u64, usize)>,
-    slot_res: Vec<Option<(usize, bool)>>,
+    slot_res: Vec<Option<(usize, bool, u32)>>,
     live_srvs: HashMap<usize, u32>,
     live_uavs: HashMap<usize, u32>,
     res_slots: HashMap<(usize, bool), HashSet<u32>>,
 }
 
 impl TexTracker {
+    fn first_mip(&self, resource: usize) -> u32 {
+        self.res_slots[&(resource, false)]
+            .iter()
+            .filter_map(|&slot| self.slot_res[slot as usize].map(|(_, _, mip)| mip))
+            .min()
+            .unwrap_or(0)
+    }
+
     fn new(sampler: bool, count: u32) -> Self {
         Self {
             generation: 0,
@@ -128,6 +136,12 @@ impl TexTracker {
         }
     }
 }
+
+type LiveTextures = (
+    u64,
+    Vec<(crate::object::Held, u32)>,
+    Vec<crate::object::Held>,
+);
 
 pub(crate) struct HostHeap {
     pub(crate) heap: ID3D12DescriptorHeap,
@@ -774,7 +788,9 @@ impl HostHeap {
             };
             let made_ok = kept.is_some();
             let new_entry = match &kept {
-                Some(Kept::Texture { title, is_uav, .. }) => Some((*title, *is_uav)),
+                Some(Kept::Texture { title, is_uav, .. }) => {
+                    Some((*title, *is_uav, placed_first_mip(&view)))
+                }
                 _ => None,
             };
             if !made_ok && !self.sampler {
@@ -839,7 +855,7 @@ impl HostHeap {
     }
 
     /// Updates the leaf-only live texture tracker for slot `index`.
-    fn track_slot(&self, index: u32, new_entry: Option<(usize, bool)>) {
+    fn track_slot(&self, index: u32, new_entry: Option<(usize, bool, u32)>) {
         if self.sampler {
             return;
         }
@@ -852,14 +868,14 @@ impl HostHeap {
             return;
         }
         *slot = new_entry;
-        if let Some((res, is_uav)) = old_entry {
+        if let Some((res, is_uav, _)) = old_entry {
             tracker.remove_entry(index, res, is_uav);
         }
-        if let Some((res, is_uav)) = new_entry {
+        if let Some((res, is_uav, _)) = new_entry {
             tracker.add_entry(index, res, is_uav);
         }
         tracker.generation += 1;
-        if let Some((res, _)) = new_entry {
+        if let Some((res, _, _)) = new_entry {
             tracker.record_change(res);
         }
     }
@@ -876,7 +892,7 @@ impl HostHeap {
             if let Some(slots) = tracker.res_slots.remove(&(resource, is_uav)) {
                 for slot in slots {
                     if let Some(entry) = tracker.slot_res.get_mut(slot as usize)
-                        && *entry == Some((resource, is_uav))
+                        && entry.is_some_and(|(r, u, _)| (r, u) == (resource, is_uav))
                     {
                         *entry = None;
                     }
@@ -906,11 +922,7 @@ impl HostHeap {
     /// Snapshot of `(tex_gen, live_srvs, live_uavs)` in `O(active)` time,
     /// pinning each live title `Resource` with [`crate::object::Held`] while
     /// `tex_tracker` is locked so concurrent releases cannot free it mid-pass.
-    pub(crate) fn live_textures(
-        &self,
-        srvs: bool,
-        uavs: bool,
-    ) -> (u64, Vec<crate::object::Held>, Vec<crate::object::Held>) {
+    pub(crate) fn live_textures(&self, srvs: bool, uavs: bool) -> LiveTextures {
         let tracker = self.tex_tracker.lock().unwrap_or_else(|e| e.into_inner());
         let pin = |r: &usize| {
             // SAFETY: while `tex_tracker` is held, any tracked `Resource` has
@@ -919,7 +931,11 @@ impl HostHeap {
             unsafe { crate::object::Held::try_new(*r as crate::object::This) }
         };
         let srv_list = if srvs {
-            tracker.live_srvs.keys().filter_map(pin).collect()
+            tracker
+                .live_srvs
+                .keys()
+                .filter_map(|r| Some((pin(r)?, tracker.first_mip(*r))))
+                .collect()
         } else {
             Vec::new()
         };
@@ -942,7 +958,7 @@ impl HostHeap {
         extra_candidates: &[usize],
         srvs: bool,
         uavs: bool,
-    ) -> Option<(u64, Vec<crate::object::Held>, Vec<crate::object::Held>)> {
+    ) -> Option<LiveTextures> {
         let tracker = self.tex_tracker.lock().unwrap_or_else(|e| e.into_inner());
         if since_gen < tracker.oldest_gen {
             return None;
@@ -973,9 +989,9 @@ impl HostHeap {
                 {
                     uav_list.push(second);
                 }
-                srv_list.push(held);
+                srv_list.push((held, tracker.first_mip(r)));
             } else if is_srv {
-                srv_list.push(held);
+                srv_list.push((held, tracker.first_mip(r)));
             } else {
                 uav_list.push(held);
             }
@@ -1947,6 +1963,20 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
     }
 }
 
+/// First mip sampled by a shader view the title placed over a single 2D texture.
+pub(crate) fn placed_first_mip(view: &View) -> u32 {
+    let View::Placed(false, _, words) = view else {
+        return 0;
+    };
+    let desc = srv_desc(words[..10].try_into().unwrap());
+    if desc.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2D {
+        // SAFETY: the dimension selects the Texture2D union member.
+        unsafe { desc.Anonymous.Texture2D.MostDetailedMip }
+    } else {
+        0
+    }
+}
+
 /// Resolves a placed texture's SRV or UAV to the resource created at its address.
 pub(crate) fn placed_texture(view: &View) -> Option<View> {
     const BUFFER: u32 = 1;
@@ -2882,7 +2912,7 @@ mod tests {
             let (g, s, u) = host_heap.live_textures(srvs, uavs);
             (
                 g,
-                s.iter().map(|h| h.get() as usize).collect::<Vec<_>>(),
+                s.iter().map(|(h, _)| h.get() as usize).collect::<Vec<_>>(),
                 u.iter().map(|h| h.get() as usize).collect::<Vec<_>>(),
             )
         };
@@ -3151,19 +3181,26 @@ mod tests {
         };
         let reused_addr = 0x1234_5678usize;
         // Resource A mirrored at slot 5, then released without rewriting slot 5.
-        heap.track_slot(5, Some((reused_addr, false)));
+        heap.track_slot(5, Some((reused_addr, false, 8)));
+        heap.track_slot(6, Some((reused_addr, false, 3)));
+        let first = || heap.tex_tracker.lock().unwrap().first_mip(reused_addr);
+        assert_eq!(first(), 3);
+        heap.track_slot(6, Some((reused_addr, false, 5)));
+        assert_eq!(first(), 5);
+        heap.track_slot(6, None);
+        assert_eq!(first(), 8);
         assert_eq!(heap.live_texture_addrs(true, false).1, vec![reused_addr]);
         heap.forget_resource(reused_addr);
         assert!(heap.live_texture_addrs(true, false).1.is_empty());
         // New resource B allocated at the same pointer and mirrored into slot 7.
-        heap.track_slot(7, Some((reused_addr, false)));
+        heap.track_slot(7, Some((reused_addr, false, 0)));
         // Later, stale slot 5 is overwritten with null/another view: slot 7 stays live!
         heap.track_slot(5, None);
         assert_eq!(heap.live_texture_addrs(true, false).1, vec![reused_addr]);
         // And UAV slots share the same ABA guarantee.
-        heap.track_slot(2, Some((reused_addr, true)));
+        heap.track_slot(2, Some((reused_addr, true, 0)));
         heap.forget_resource(reused_addr);
-        heap.track_slot(9, Some((reused_addr, true)));
+        heap.track_slot(9, Some((reused_addr, true, 0)));
         heap.track_slot(2, None);
         assert_eq!(heap.live_texture_addrs(false, true).2, vec![reused_addr]);
     }
@@ -3180,7 +3217,7 @@ mod tests {
         // Simulate a `View::Placed` texture tracked in `HostHeap::tex_tracker`
         // that never had an entry in `descriptor::VIEWS.by_resource`.
         let placed_addr = 0xfeed_face_0000usize;
-        host_heap.track_slot(3, Some((placed_addr, false)));
+        host_heap.track_slot(3, Some((placed_addr, false, 0)));
         assert_eq!(
             host_heap.live_texture_addrs(true, false).1,
             vec![placed_addr]

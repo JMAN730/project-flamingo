@@ -797,8 +797,8 @@ struct Deferred {
     /// address, bytes), and upload fills made since (destination, source,
     /// bytes): doing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
-    /// Textures whose contents the list brings up to date.
-    textures: std::collections::HashSet<usize>,
+    /// Most detailed mip this list has copied for each texture.
+    textures: std::collections::HashMap<usize, u32>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
     /// bytes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
@@ -2187,10 +2187,28 @@ impl HostList {
         self.deferred().copies.push(Step::Run(Box::new(work)));
     }
 
-    /// Whether this is the first time since the reset that the list asks
-    /// about `key` (a texture to bring up to date).
-    pub(crate) fn first_use(&self, key: usize) -> bool {
-        self.deferred().textures.insert(key)
+    /// Whether this list already covers the requested mip and all smaller ones.
+    pub(crate) fn covers_texture(&self, key: usize, first: u32) -> bool {
+        self.deferred()
+            .textures
+            .get(&key)
+            .is_some_and(|&seen| seen <= first)
+    }
+
+    /// Records coverage and reports whether the list gained any mip levels.
+    pub(crate) fn use_texture(&self, key: usize, first: u32) -> bool {
+        use std::collections::hash_map::Entry;
+        match self.deferred().textures.entry(key) {
+            Entry::Occupied(mut e) if first < *e.get() => {
+                e.insert(first);
+                true
+            }
+            Entry::Occupied(_) => false,
+            Entry::Vacant(e) => {
+                e.insert(first);
+                true
+            }
+        }
     }
 
     /// Runs `work` when the list is submitted, in order with its copies.

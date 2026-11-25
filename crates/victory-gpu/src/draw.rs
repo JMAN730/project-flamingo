@@ -1149,12 +1149,12 @@ impl State {
         // it in SRV state).
         let srv_set: Option<std::collections::HashSet<usize>> =
             (uses_heap_srv && uses_heap_uav && live_srvs.len() > 64)
-                .then(|| live_srvs.iter().map(|h| h.get() as usize).collect());
+                .then(|| live_srvs.iter().map(|(h, _)| h.get() as usize).collect());
         let in_srvs = |r: usize| {
             uses_heap_srv
                 && match &srv_set {
                     Some(set) => set.contains(&r),
-                    None => live_srvs.iter().any(|h| h.get() as usize == r),
+                    None => live_srvs.iter().any(|(h, _)| h.get() as usize == r),
                 }
         };
         let mut uav_transitioned: std::collections::HashSet<usize> =
@@ -1183,7 +1183,7 @@ impl State {
         }
         let mut depth_sampled = false;
         if uses_heap_srv {
-            for held in &live_srvs {
+            for (held, first) in &live_srvs {
                 let r = held.get() as usize;
                 if is_active_rt(r) || uav_transitioned.contains(&r) {
                     continue;
@@ -1203,7 +1203,7 @@ impl State {
                 }
                 if let Some(t) = crate::resource::host_resource(held.get()) {
                     if crate::texture::title_written(t) {
-                        crate::texture::upload(list, held.get(), t);
+                        crate::texture::upload_from(list, held.get(), t, *first);
                     }
                     crate::list::ensure_bindless_state(list, held.get(), SHADER_RESOURCE);
                 }
@@ -2302,6 +2302,7 @@ fn readable(
 ) -> bool {
     const UNORDERED_ACCESS: u32 = 0x8;
     let placed = crate::descriptor::host::placed_texture(view);
+    let first_mip = crate::descriptor::host::placed_first_mip(view);
     let view = placed.as_ref().unwrap_or(view);
     // Buffer views read title memory: their range is copied at submission;
     // what shaders write through unordered access goes back to it after.
@@ -2327,7 +2328,7 @@ fn readable(
                 && let Some(t) = crate::resource::host_resource(*resource as This)
                 && crate::texture::title_written(t)
             {
-                crate::texture::upload(list, *resource as This, t);
+                crate::texture::upload_from(list, *resource as This, t, first_mip);
             }
             // Keep the same read bits the depth target will request at draw time.
             let samples_depth = read_only_depth == Some(*resource);
@@ -4355,7 +4356,7 @@ mod bindless_tests {
             "UAV must take precedence over SRV when uses_heap_uav is true"
         );
         assert!(
-            !list.first_use(tw_tex.0 as usize),
+            list.covers_texture(tw_tex.0 as usize, 0),
             "title_written SRV must be uploaded"
         );
         assert!(
