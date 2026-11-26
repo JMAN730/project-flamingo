@@ -3314,3 +3314,82 @@ fn v_perm_b32_matches_rdna2() {
         );
     });
 }
+
+/// `s_absdiff_i32` (wrapping signed difference, absolute value, `SCC = result != 0`)
+/// and `s_pack_{ll,lh,hh}_b32_b16` (16-bit half packing, leaving `SCC` untouched).
+#[test]
+fn s_absdiff_and_pack_match_rdna2() {
+    let absdiff_cases: &[[u32; 4]] = &[
+        [0, 0, 0, 0],
+        [5, 5, 0, 0],
+        [5, 12, 0, 0],
+        [12, 5, 0, 0],
+        [(-5i32) as u32, 3, 0, 0],
+        [3, (-5i32) as u32, 0, 0],
+        [i32::MIN as u32, 0, 0, 0],
+        [i32::MAX as u32, i32::MIN as u32, 0, 0],
+    ];
+    let absdiff_val = build_valu_cs(&[
+        sop2(0x2c, 16, 0, 1), // s_absdiff_i32 s16, s0, s1
+        vop1(1, 0, sgpr(16)), // v_mov_b32 v0, s16
+    ]);
+    let absdiff_scc = build_valu_cs(&[
+        sop2(0x2c, 16, 0, 1),     // s_absdiff_i32 s16, s0, s1
+        sop2(0x0a, 17, 129, 128), // s_cselect_b32 s17, 1, 0
+        vop1(1, 0, sgpr(17)),     // v_mov_b32 v0, s17
+    ]);
+    let model_absdiff = |a: u32, b: u32| -> u32 {
+        let diff = (a as i32).wrapping_sub(b as i32);
+        diff.wrapping_abs() as u32
+    };
+    run_cases(&absdiff_val, absdiff_cases, |backend, i, x, got| {
+        let want = model_absdiff(x[0], x[1]);
+        assert_eq!(got, want, "{backend}: s_absdiff_i32 value case {i}");
+    });
+    run_cases(&absdiff_scc, absdiff_cases, |backend, i, x, got| {
+        let want = u32::from(model_absdiff(x[0], x[1]) != 0);
+        assert_eq!(got, want, "{backend}: s_absdiff_i32 scc case {i}");
+    });
+
+    let pack_cases: &[[u32; 4]] = &[
+        [0x0000_0000, 0x0000_0000, 1, 0],
+        [0x1234_5678, 0x9ABC_DEF0, 0, 0],
+        [0x1234_5678, 0x9ABC_DEF0, 1, 0],
+        [0x0000_FFFF, 0xFFFF_0000, 1, 0],
+        [0xFFFF_0000, 0x0000_FFFF, 0, 0],
+        [0xDEAD_BEEF, 0xCAFE_BABE, 1, 0],
+    ];
+    type PackCase = (u8, &'static str, fn(u32, u32) -> u32);
+    let packs: &[PackCase] = &[
+        (0x32, "s_pack_ll_b32_b16", |a, b| (a & 0xFFFF) | (b << 16)),
+        (0x33, "s_pack_lh_b32_b16", |a, b| {
+            (a & 0xFFFF) | (b & 0xFFFF_0000)
+        }),
+        (0x34, "s_pack_hh_b32_b16", |a, b| {
+            (a >> 16) | (b & 0xFFFF_0000)
+        }),
+    ];
+    for &(op, name, model) in packs {
+        let val_shader = build_valu_cs(&[
+            sop2(op, 16, 0, 1),   // s_pack_* s16, s0, s1
+            vop1(1, 0, sgpr(16)), // v_mov_b32 v0, s16
+        ]);
+        run_cases(&val_shader, pack_cases, |backend, i, x, got| {
+            let want = model(x[0], x[1]);
+            assert_eq!(
+                got, want,
+                "{backend}: {name} case {i}: {got:#010x}, want {want:#010x}"
+            );
+        });
+        // Verify s_pack_* leaves SCC untouched (even when its result is 0).
+        let scc_shader = build_valu_cs(&[
+            0xBF06_8102,              // s_cmp_eq_u32 s2, 1
+            sop2(op, 16, 0, 1),       // s_pack_* s16, s0, s1 (must preserve SCC)
+            sop2(0x0a, 17, 129, 128), // s_cselect_b32 s17, 1, 0
+            vop1(1, 0, sgpr(17)),     // v_mov_b32 v0, s17
+        ]);
+        run_cases(&scc_shader, pack_cases, |backend, i, x, got| {
+            assert_eq!(got, x[2], "{backend}: {name} scc preservation case {i}");
+        });
+    }
+}
