@@ -151,9 +151,152 @@ impl TexTracker {
 /// Buffer descriptors backed by a [`Shadow`] retain the `Arc<Shadow>` itself
 /// (not just its `ID3D12Resource`) so [`crate::shadow`] cannot evict a loose
 /// shadow window while a live descriptor slot still names its buffer.
-enum KeptBacking {
-    Resource { _resource: ID3D12Resource },
-    Shadow { _shadow: Arc<Shadow> },
+pub(crate) enum KeptObject {
+    Resource(#[allow(dead_code)] ID3D12Resource),
+    Shadow(#[allow(dead_code)] Arc<Shadow>),
+}
+
+impl KeptObject {
+    fn same_as(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Resource(a), Self::Resource(b)) => {
+                windows::core::Interface::as_raw(a) == windows::core::Interface::as_raw(b)
+            }
+            (Self::Shadow(a), Self::Shadow(b)) => Arc::ptr_eq(a, b),
+            _ => false,
+        }
+    }
+}
+
+const KEPT_PAGE_SHIFT: usize = 6;
+const KEPT_PAGE_SIZE: usize = 1 << KEPT_PAGE_SHIFT;
+const KEPT_PAGE_MASK: usize = KEPT_PAGE_SIZE - 1;
+
+struct KeptPageSlot {
+    /// Bit `i` is set iff slot `i` in this 64-slot page currently holds a
+    /// [`KeptObject`]. Mutated under `page` lock (`Release`) and queried
+    /// lock-free (`Acquire`) to skip empty slots and empty ranges.
+    occupied: AtomicU64,
+    page: Mutex<Option<Box<[Option<KeptObject>; KEPT_PAGE_SIZE]>>>,
+}
+
+impl KeptPageSlot {
+    fn new() -> Self {
+        Self {
+            occupied: AtomicU64::new(0),
+            page: Mutex::new(None),
+        }
+    }
+}
+
+/// Two-level, lock-free-bitmask paged table mapping heap slot indices
+/// `0..total_slots` to their retained [`KeptObject`]s.
+///
+/// Replaces a flat mutex-guarded `Vec` with O(1) page indexing, lazy page
+/// allocation, per-64-slot-page fine-grained locks, and lock-free skipping of
+/// empty slots and ranges.
+struct KeptTable {
+    pages: Vec<KeptPageSlot>,
+}
+
+impl KeptTable {
+    fn new(total_slots: usize) -> Self {
+        let count = total_slots.div_ceil(KEPT_PAGE_SIZE);
+        Self {
+            pages: (0..count).map(|_| KeptPageSlot::new()).collect(),
+        }
+    }
+
+    #[cfg(test)]
+    fn contains(&self, index: u32) -> bool {
+        let idx = index as usize;
+        let Some(slot) = self.pages.get(idx >> KEPT_PAGE_SHIFT) else {
+            return false;
+        };
+        let bit = 1u64 << (idx & KEPT_PAGE_MASK);
+        slot.occupied.load(Ordering::Acquire) & bit != 0
+    }
+
+    /// Replaces slot `index` with `entry` (returning any displaced
+    /// [`KeptObject`]). Returns `None` without touching the slot if both old
+    /// and new are identical (`same_as`) or if clearing an already-empty slot.
+    fn swap(&self, index: u32, entry: Option<KeptObject>) -> Option<KeptObject> {
+        let idx = index as usize;
+        let slot = self.pages.get(idx >> KEPT_PAGE_SHIFT)?;
+        let local = idx & KEPT_PAGE_MASK;
+        let bit = 1u64 << local;
+        if entry.is_none() && slot.occupied.load(Ordering::Acquire) & bit == 0 {
+            return None;
+        }
+        let mut guard = slot.page.lock().unwrap_or_else(|e| e.into_inner());
+        match entry {
+            Some(new) => {
+                let page = guard.get_or_insert_with(|| Box::new([const { None }; KEPT_PAGE_SIZE]));
+                if let Some(old) = page[local].as_ref()
+                    && new.same_as(old)
+                {
+                    return None;
+                }
+                let old = page[local].replace(new);
+                let occ = slot.occupied.load(Ordering::Relaxed);
+                if occ & bit == 0 {
+                    slot.occupied.store(occ | bit, Ordering::Release);
+                }
+                old
+            }
+            None => {
+                let occ = slot.occupied.load(Ordering::Relaxed);
+                if occ & bit == 0 {
+                    return None;
+                }
+                let old = guard.as_mut().and_then(|page| page[local].take());
+                slot.occupied.store(occ & !bit, Ordering::Release);
+                old
+            }
+        }
+    }
+
+    /// Removes and appends to `out` every [`KeptObject`] in `[start, end)`.
+    fn take_range(&self, start: u32, end: u32, out: &mut Vec<KeptObject>) {
+        if start >= end || self.pages.is_empty() {
+            return;
+        }
+        let start = start as usize;
+        let end = end as usize;
+        let first_page = start >> KEPT_PAGE_SHIFT;
+        let last_page = ((end - 1) >> KEPT_PAGE_SHIFT).min(self.pages.len() - 1);
+        for page_idx in first_page..=last_page {
+            let slot = &self.pages[page_idx];
+            let page_base = page_idx << KEPT_PAGE_SHIFT;
+            let lo = start.saturating_sub(page_base);
+            let hi = (end - page_base).min(KEPT_PAGE_SIZE);
+            let width = hi - lo;
+            let mask = if width == KEPT_PAGE_SIZE {
+                u64::MAX
+            } else {
+                ((1u64 << width) - 1) << lo
+            };
+            if slot.occupied.load(Ordering::Acquire) & mask == 0 {
+                continue;
+            }
+            let mut guard = slot.page.lock().unwrap_or_else(|e| e.into_inner());
+            let occ = slot.occupied.load(Ordering::Relaxed);
+            let mut bits = occ & mask;
+            if bits == 0 {
+                continue;
+            }
+            if let Some(page) = guard.as_mut() {
+                while bits != 0 {
+                    let b = bits.trailing_zeros() as usize;
+                    bits &= bits - 1;
+                    if let Some(old) = page[b].take() {
+                        out.push(old);
+                    }
+                }
+            }
+            slot.occupied.store(occ & !mask, Ordering::Release);
+        }
+    }
 }
 
 type LiveTextures = (
@@ -181,7 +324,9 @@ pub(crate) struct HostHeap {
     /// host resource read there is a GPU page fault (the console reads stale
     /// memory). Retaining `Arc<Shadow>` also keeps loose shadow windows pinned
     /// in the shadow cache while any descriptor slot references their buffer.
-    kept: Mutex<Vec<Option<KeptBacking>>>,
+    /// Stored in a 2-level 64-slot paged table with per-page lock-free
+    /// occupancy bitmasks.
+    kept: KeptTable,
     /// Slots requiring submission-time title-memory refresh (aliased structured
     /// SRV shadows, or a view's own copy when off an element of its host copy).
     refreshes: Mutex<HashMap<u32, SlotRefresh>>,
@@ -390,7 +535,7 @@ impl HostHeap {
             spare: extra,
             sampler,
             made: Mutex::new(vec![0; count as usize]),
-            kept: Mutex::new((0..(count + extra)).map(|_| None).collect()),
+            kept: KeptTable::new((count + extra) as usize),
             refreshes: Mutex::new(HashMap::new()),
             refresh_count: AtomicUsize::new(0),
             srv_mips: Mutex::new(HashMap::new()),
@@ -532,40 +677,54 @@ impl HostHeap {
     }
 
     /// Gives back `n` dynamic slots from `first` (an index [`dynamic`]
-    /// returned).
+    /// returned), clearing and batch-retiring any resources kept in those
+    /// slots before making the slots reusable.
     ///
     /// [`dynamic`]: HostHeap::dynamic
     pub(crate) fn release(&self, first: u32, n: u32) {
-        let Some(at) = first.checked_sub(self.count) else {
-            return;
-        };
-        let end = at.saturating_add(n).min(self.spare) as usize;
-        let slot_start = first as usize;
-        let slot_end = self.count as usize + end;
-        let retired: Vec<KeptBacking> = {
-            let mut slots = self.kept.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(slice) = slots.get_mut(slot_start..slot_end) {
-                slice.iter_mut().filter_map(Option::take).collect()
-            } else {
-                Vec::new()
+        let mut retired = Vec::new();
+        self.release_many(&[(first, n)], &mut retired);
+        crate::host::retire_executing_batch(retired);
+    }
+
+    /// Gives back multiple dynamic slot ranges `(first, n)` on this heap:
+    /// clears retained resources and refresh entries for all ranges BEFORE
+    /// marking them free under a single `self.next` lock, appending displaced
+    /// objects to `retired` so the caller retires them in one batch.
+    pub(crate) fn release_many(&self, ranges: &[(u32, u32)], retired: &mut Vec<KeptObject>) {
+        let mut to_free = Vec::with_capacity(ranges.len());
+        for &(first, n) in ranges {
+            let Some(at) = first.checked_sub(self.count) else {
+                continue;
+            };
+            let end_rel = at.saturating_add(n).min(self.spare);
+            if end_rel <= at {
+                continue;
             }
-        };
-        {
+            let start_abs = first;
+            let end_abs = self.count + end_rel;
+            self.kept.take_range(start_abs, end_abs, retired);
+            to_free.push((at, end_rel, start_abs, end_abs));
+        }
+        if to_free.is_empty() {
+            return;
+        }
+        if self.refresh_count.load(Ordering::Acquire) != 0 {
             let mut map = self.refreshes.lock().unwrap_or_else(|e| e.into_inner());
             if !map.is_empty() {
-                for index in slot_start..slot_end {
-                    map.remove(&(index as u32));
+                for &(_, _, start_abs, end_abs) in &to_free {
+                    for index in start_abs..end_abs {
+                        map.remove(&index);
+                    }
                 }
+                self.refresh_count.store(map.len(), Ordering::Release);
             }
         }
-        {
-            let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(slots) = guard.1.get_mut(at as usize..end) {
+        let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
+        for (at, end_rel, _, _) in to_free {
+            if let Some(slots) = guard.1.get_mut(at as usize..end_rel as usize) {
                 slots.fill(false);
             }
-        }
-        for old in retired {
-            crate::host::retire(old);
         }
     }
 
@@ -608,48 +767,46 @@ impl HostHeap {
 
     /// Makes slot `index` read nothing: a null view, or a plain sampler.
     pub(crate) fn make_null(&self, index: u32) {
+        self.make_null_opt(index, None);
+    }
+
+    fn make_null_opt(&self, index: u32, retired: Option<&mut Vec<KeptObject>>) {
         if self.sampler {
             self.null_sampler(index);
         } else {
             null_view(self.cpu(index));
         }
-        self.keep(index, Kept::Empty);
+        self.keep_opt(index, Kept::Empty, retired);
         self.track_buffer(index, None);
     }
 
     /// Slot `index` now views `kept` (or nothing of the host's).
     fn keep(&self, index: u32, kept: Kept) {
+        self.keep_opt(index, kept, None);
+    }
+
+    fn keep_opt(&self, index: u32, kept: Kept, retired: Option<&mut Vec<KeptObject>>) {
         let (resource, refresh, host_mips) = match kept {
             Kept::Empty => (None, None, None),
-            Kept::Resource(r) => (Some(KeptBacking::Resource { _resource: r }), None, None),
-            Kept::Shadow(s) => (Some(KeptBacking::Shadow { _shadow: s }), None, None),
+            Kept::Resource(r) => (Some(KeptObject::Resource(r)), None, None),
+            Kept::Shadow(s) => (Some(KeptObject::Shadow(s)), None, None),
             Kept::Texture {
                 resource,
                 title,
                 is_uav: false,
                 host_mips: Some(mips),
             } => (
-                Some(KeptBacking::Resource {
-                    _resource: resource,
-                }),
+                Some(KeptObject::Resource(resource)),
                 None,
                 Some((title, mips)),
             ),
-            Kept::Texture { resource, .. } => (
-                Some(KeptBacking::Resource {
-                    _resource: resource,
-                }),
-                None,
-                None,
-            ),
+            Kept::Texture { resource, .. } => (Some(KeptObject::Resource(resource)), None, None),
             Kept::AliasedShadow {
                 shadow,
                 address,
                 len,
             } => (
-                Some(KeptBacking::Shadow {
-                    _shadow: shadow.clone(),
-                }),
+                Some(KeptObject::Shadow(shadow.clone())),
                 Some(SlotRefresh::Shadow {
                     shadow,
                     address,
@@ -658,16 +815,13 @@ impl HostHeap {
                 None,
             ),
         };
-        let old = {
-            let mut slots = self.kept.lock().unwrap_or_else(|e| e.into_inner());
-            slots
-                .get_mut(index as usize)
-                .and_then(|slot| std::mem::replace(slot, resource))
-        };
-        if let Some(old) = old {
+        if let Some(old) = self.kept.swap(index, resource) {
             // A running submission may still read the old resource through
             // this slot.
-            crate::host::retire(old);
+            match retired {
+                Some(batch) => batch.push(old),
+                None => crate::host::retire_executing(old),
+            }
         }
         {
             let mut map = self.srv_mips.lock().unwrap_or_else(|e| e.into_inner());
@@ -725,17 +879,18 @@ impl HostHeap {
     /// Makes slot `index` (a dynamic one) a constant buffer view of host
     /// memory (the list's own, which it holds).
     pub(crate) fn constant_at(&self, index: u32, gpu: u64, size: u32) {
+        if let Some(host) = host() {
+            let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
+                BufferLocation: gpu,
+                SizeInBytes: size.next_multiple_of(256),
+            };
+            // SAFETY: a slot of our heap; the memory is the caller's.
+            unsafe {
+                host.device
+                    .CreateConstantBufferView(Some(&desc), self.cpu(index))
+            };
+        }
         self.keep(index, Kept::Empty);
-        let Some(host) = host() else { return };
-        let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
-            BufferLocation: gpu,
-            SizeInBytes: size.next_multiple_of(256),
-        };
-        // SAFETY: a slot of our heap; the memory is the caller's.
-        unsafe {
-            host.device
-                .CreateConstantBufferView(Some(&desc), self.cpu(index))
-        };
     }
 
     /// Makes slot `index` (a dynamic one) a raw buffer view of `len` bytes
@@ -849,17 +1004,18 @@ impl HostHeap {
     /// Makes slot `index` a raw buffer view with unordered access of no
     /// buffer: reads return zeros and writes are dropped.
     pub(crate) fn null_raw_uav_at(&self, index: u32) {
-        let Some(host) = host() else { return };
-        let desc = raw_uav_desc(0, 1);
-        // SAFETY: a slot of our heap; a null resource is allowed with a desc.
-        unsafe {
-            host.device.CreateUnorderedAccessView(
-                None::<&ID3D12Resource>,
-                None::<&ID3D12Resource>,
-                Some(&desc),
-                self.cpu(index),
-            )
-        };
+        if let Some(host) = host() {
+            let desc = raw_uav_desc(0, 1);
+            // SAFETY: a slot of our heap; a null resource is allowed with a desc.
+            unsafe {
+                host.device.CreateUnorderedAccessView(
+                    None::<&ID3D12Resource>,
+                    None::<&ID3D12Resource>,
+                    Some(&desc),
+                    self.cpu(index),
+                )
+            };
+        }
         self.keep(index, Kept::Empty);
     }
 
@@ -881,6 +1037,16 @@ impl HostHeap {
     /// views are made only for draws (`for_draw`), which also copy their
     /// data: a host copy of a buffer is made on first use.
     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
+        self.mirror_opt(index, handle, for_draw, None)
+    }
+
+    fn mirror_opt(
+        &self,
+        index: u32,
+        handle: u64,
+        for_draw: bool,
+        mut retired: Option<&mut Vec<KeptObject>>,
+    ) -> Option<View> {
         if index >= self.count {
             // Diagnostic (NVIDIA heap cap): the highest title slot past the
             // host heap seen so far.
@@ -906,7 +1072,7 @@ impl HostHeap {
             // title released): nothing to read.
             if made[index as usize] != 0 {
                 made[index as usize] = 0;
-                self.make_null(index);
+                self.make_null_opt(index, retired);
                 self.track_slot(index, None);
                 self.track_buffer(index, None);
             }
@@ -946,14 +1112,14 @@ impl HostHeap {
             if !made_ok && !self.sampler {
                 null_for(&view, self.cpu(index));
             }
-            self.keep(index, kept.unwrap_or(Kept::Empty));
+            self.keep_opt(index, kept.unwrap_or(Kept::Empty), retired.as_deref_mut());
             self.track_slot(index, new_entry);
             self.track_buffer(index, buf);
             // Close the race with `descriptor::forget` running between the initial
             // `view_at` lookup and `track_slot` before this heap's publication.
             if new_entry.is_some() && view_at(i, generation).is_none() {
                 made[index as usize] = 0;
-                self.make_null(index);
+                self.make_null_opt(index, retired);
                 self.track_slot(index, None);
                 self.track_buffer(index, None);
                 return None;
@@ -998,11 +1164,13 @@ impl HostHeap {
             }
         }
         let mut mirrored = 0;
+        let mut retired = Vec::new();
         for index in changed {
             let handle = start + u64::from(index) * step;
-            self.mirror(index, handle, for_draw);
+            self.mirror_opt(index, handle, for_draw, Some(&mut retired));
             mirrored += 1;
         }
+        crate::host::retire_executing_batch(retired);
         mirrored
     }
 
@@ -1022,6 +1190,7 @@ impl HostHeap {
                 .collect()
         };
         let mut mirrored = 0;
+        let mut retired = Vec::new();
         for (index, (title, host_mips)) in candidates {
             let handle = start + u64::from(index) * step;
             // SAFETY: slot index is below `self.count`; each descriptor is ≥16 bytes.
@@ -1030,10 +1199,11 @@ impl HostHeap {
                 continue;
             };
             if residency_widened(&view, title, host_mips) {
-                self.mirror(index, handle, for_draw);
+                self.mirror_opt(index, handle, for_draw, Some(&mut retired));
                 mirrored += 1;
             }
         }
+        crate::host::retire_executing_batch(retired);
         mirrored
     }
 
@@ -1475,7 +1645,7 @@ fn srv_desc(words: &[u32; 10]) -> D3D12_SHADER_RESOURCE_VIEW_DESC {
     }
 }
 
-fn uav_desc(words: &[u32; 10]) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
+pub(crate) fn uav_desc(words: &[u32; 10]) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
     let mut words = *words;
     words[0] = crate::resource::pc_format(words[0]);
     // SAFETY: 40 bytes in the host's layout.
@@ -4615,5 +4785,50 @@ void main() {
             0,
             "idle LRU loose window must be evicted once no descriptor slot pins it"
         );
+    }
+
+    #[test]
+    fn kept_table_straddling_pages_and_batched_release_many_pin_exec_epoch() {
+        let _retire = crate::host::isolated_retire_scope();
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return;
+        };
+
+        let backing = vec![0xA5u8; 4096];
+        let base = backing.as_ptr() as u64;
+        crate::shadow::register(base as usize, base, backing.len() as u64);
+        let shadow = crate::shadow::find(base, 256).expect("registered shadow");
+        let base_count = Arc::strong_count(&shadow);
+
+        // Allocate 130 dynamic slots so the range straddles at least 3 64-slot pages.
+        let first = heap.dynamic(130).expect("dynamic range");
+        for offset in [0u32, 1, 63, 64, 65, 127, 128, 129] {
+            heap.raw_at(first + offset, &shadow, 0, 256);
+            assert!(heap.kept.contains(first + offset));
+        }
+        // Unwritten interior slots remain empty without locking/allocating.
+        assert!(!heap.kept.contains(first + 32));
+        // Re-keeping the exact same shadow in a slot is a no-op (no duplicate pin).
+        heap.raw_at(first + 64, &shadow, 0, 256);
+        assert_eq!(Arc::strong_count(&shadow), base_count + 8);
+
+        // Split the release across two ranges via `release_many` while an exec epoch is active.
+        let exec = crate::retire::acquire_exec_guard();
+        let mut retired = Vec::new();
+        heap.release_many(&[(first, 65), (first + 65, 65)], &mut retired);
+        assert_eq!(retired.len(), 8);
+        for offset in [0u32, 1, 63, 64, 65, 127, 128, 129] {
+            assert!(!heap.kept.contains(first + offset));
+        }
+        crate::host::retire_executing_batch(retired);
+
+        // All 8 shadows stay pinned by the single batched retirement while exec epoch is active.
+        assert_eq!(Arc::strong_count(&shadow), base_count + 8);
+        drop(exec);
+        // Dropping the exec epoch drops all 8 shadows at once.
+        assert_eq!(Arc::strong_count(&shadow), base_count);
+
+        drop(shadow);
+        crate::shadow::unregister(base as usize, base);
     }
 }

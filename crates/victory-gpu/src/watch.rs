@@ -790,6 +790,12 @@ static AHEAD_ACTIVE: AtomicBool = AtomicBool::new(false);
 /// Fast lock-free mirror of `AheadState::kept`.
 static ASK_KEPT: AtomicBool = AtomicBool::new(false);
 
+/// Whether a submission-wide write-watch asking (`ask_once`) currently stands.
+#[inline]
+pub(crate) fn ask_kept() -> bool {
+    ASK_KEPT.load(Ordering::Acquire)
+}
+
 #[inline]
 fn set_ahead_flags(kept: bool, active: bool) {
     AHEAD_ACTIVE.store(active, Ordering::Release);
@@ -1435,7 +1441,6 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
     for &(p_first, p_last) in &pending_before {
         covered.retain(|&(a, b)| b <= p_first || p_last <= a);
     }
-
     let mut ahead = AHEAD.write().unwrap_or_else(|e| e.into_inner());
     if ANNOUNCED_SEQ.load(Ordering::SeqCst) != seq_before {
         // A `kernel_will_write` or `title_memory_remapped` landed concurrently
@@ -1454,7 +1459,7 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
 /// Ends the active per-submission coalesced asking so later [`writes`] calls
 /// query the kernel again.
 pub(crate) fn ask_once_end() {
-    if !ASK_KEPT.load(Ordering::Acquire) {
+    if !ask_kept() {
         return;
     }
     let mut ahead = AHEAD.write().unwrap_or_else(|e| e.into_inner());
@@ -1469,7 +1474,7 @@ pub(crate) fn ask_once_end() {
 /// coalesced asking stands, so refreshes recorded after the copy see those
 /// pages as written without ending coalescing for the rest of the submission.
 pub(crate) fn wrote(at: usize, len: usize) {
-    if !ASK_KEPT.load(Ordering::Acquire) || len == 0 {
+    if len == 0 || !ask_kept() {
         return;
     }
     let mut ahead = AHEAD.write().unwrap_or_else(|e| e.into_inner());
@@ -2568,6 +2573,7 @@ pub fn mapped_pages_written(addresses: impl Iterator<Item = usize>) {
 /// open).
 pub fn title_memory_remapped(at: usize, len: usize) {
     use windows_sys::Win32::System::Memory::PAGE_READWRITE;
+    crate::texback::remapped(at, len);
     if len == 0 {
         return;
     }
@@ -2826,10 +2832,15 @@ fn install() -> bool {
         // SAFETY: the system passes the exception being dispatched.
         let r = unsafe { &*(*info).ExceptionRecord };
         const WRITE: usize = 1;
-        if r.ExceptionCode != EXCEPTION_ACCESS_VIOLATION as NTSTATUS
-            || r.NumberParameters < 2
-            || r.ExceptionInformation[0] != WRITE
-        {
+        if r.ExceptionCode != EXCEPTION_ACCESS_VIOLATION as NTSTATUS || r.NumberParameters < 2 {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+        // SAFETY: `ContextRecord` is valid when Windows dispatches an exception.
+        let rip = unsafe { (*(*info).ContextRecord).Rip };
+        if crate::host::is_fast_copy_rip(rip) {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+        if r.ExceptionInformation[0] != WRITE {
             return EXCEPTION_CONTINUE_SEARCH;
         }
         let at = r.ExceptionInformation[1];
@@ -3066,6 +3077,7 @@ mod tests {
             )
         } as usize;
         assert_ne!(p, 0);
+        // A previous test may have used and released these virtual addresses.
         DIR.clear_written_range(p / PAGE, p / PAGE + 2);
         let (_, none) = writes(p, p + 2 * PAGE, false).expect("nothing can be written there");
         assert!(none.is_empty());
