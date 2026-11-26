@@ -668,6 +668,22 @@ pub fn title_memory_remapped(at: usize, len: usize) {
         .retain(|&(from, to), _| !(first <= from && to <= end));
 }
 
+/// The runtime left `[at, at + len)` mapped to the exact same physical pages
+/// during a page-mapping batch (`CopyPageMappingsBatchX`), skipping redundant
+/// unmap/remap syscalls. Guarded copies over the range still treat its
+/// contents as potentially updated via another alias.
+pub fn title_memory_alias_rebound(at: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let (first, end) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
+    let mut g = guards();
+    let clean: Vec<usize> = g.clean.range(first..end).copied().collect();
+    for block in clean {
+        g.clean.remove(&block);
+    }
+}
+
 /// Coordinates in-place CPU reads of title memory with mapping changes.
 ///
 /// Only used when `VICTORY_MAPPING_RANGES=0` ([`by_range`]); otherwise reads
@@ -1562,6 +1578,52 @@ mod tests {
             });
         }
         title_memory_remapped(view, 4 * BLOCK);
+    }
+
+    #[test]
+    fn alias_rebound_marks_guarded_blocks_unclean_without_unprotecting() {
+        use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_ALL_ACCESS, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
+            PAGE_READWRITE, UnmapViewOfFile,
+        };
+        // SAFETY: isolated 2-block pagefile-backed view.
+        let section = unsafe {
+            CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                (2 * BLOCK) as u32,
+                std::ptr::null(),
+            )
+        };
+        assert!(!section.is_null());
+        // SAFETY: maps our section.
+        let view =
+            unsafe { MapViewOfFile(section, FILE_MAP_ALL_ACCESS, 0, 0, 2 * BLOCK) }.Value as usize;
+        assert_ne!(view, 0);
+
+        assert_eq!(
+            guard(view, view + 2 * BLOCK),
+            Some(vec![view / PAGE, view / PAGE + 1])
+        );
+        assert_eq!(guard(view, view + 2 * BLOCK), Some(Vec::new()));
+
+        // Identical alias rebind on block 0 marks only block 0 dirty while
+        // keeping its protection intact.
+        title_memory_alias_rebound(view, BLOCK);
+        assert_eq!(guard(view, view + 2 * BLOCK), Some(vec![view / PAGE]));
+        assert_eq!(guard(view, view + 2 * BLOCK), Some(Vec::new()));
+
+        // SAFETY: clean up view and section.
+        unsafe {
+            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
+                Value: view as *mut _,
+            });
+            windows_sys::Win32::Foundation::CloseHandle(section);
+        }
+        title_memory_remapped(view, 2 * BLOCK);
     }
 }
 

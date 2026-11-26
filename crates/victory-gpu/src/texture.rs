@@ -21,6 +21,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use windows::Win32::Graphics::Direct3D12::*;
+use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8_UNORM;
 
 use crate::host::{HostList, host};
 use crate::object::This;
@@ -96,6 +97,8 @@ pub(crate) struct Staging {
     /// Top levels of the title's texture the host copy lacks.
     skipped: u32,
     memory: *const u8,
+    /// Whether unchanged view guards can defer hashing this texture.
+    guard_view: bool,
     /// Title resource this staging buffer is of: host SRVs are narrowed to
     /// its resident mip window ([`note_resident`]).
     resource: This,
@@ -659,7 +662,9 @@ impl Staging {
         let start = self.memory as usize;
         let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
         let last = &mut *last;
-        if let Some((now, written)) = crate::watch::writes(start, start + size, false) {
+        if self.guard_view
+            && let Some((now, written)) = crate::watch::writes(start, start + size, false)
+        {
             if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
                 return 0;
             }
@@ -965,6 +970,15 @@ fn create_staging(
     let host = host()?;
     // SAFETY: a live resource.
     let d = unsafe { texture.GetDesc() };
+    // Software-decoded movie planes are linear R8 textures. The decoder can
+    // write through another view of the same pages, bypassing the guards on
+    // the sampled view. Check their content on every submission so cycling
+    // through the movie's textures does not replay old frames.
+    let guard_view = !(d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
+        && d.Format == DXGI_FORMAT_R8_UNORM
+        && d.MipLevels == 1
+        && d.DepthOrArraySize == 1
+        && layout.desc.swizzle == victory_formats::texture::Swizzle::LINEAR);
     let first = first_mip(&layout, u32::from(d.MipLevels), requested);
     let tiled_bytes = layout.bytes_from(first) as usize;
     let count = if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
@@ -1007,6 +1021,7 @@ fn create_staging(
         mips: u32::from(d.MipLevels),
         skipped: crate::resource::dropped_mips(resource),
         memory,
+        guard_view,
         resource,
         last: Mutex::default(),
         born_seq: crate::host::birth_seq(),
