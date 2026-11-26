@@ -2534,58 +2534,69 @@ mod tests {
         assert_eq!(rebar_shadow_bytes(), before_shadow);
 
         // Exercise live `loose_in` allocation and eviction under the host's ReBAR loose budget.
+        // Because `try_rebar_shadow_buffer` can still fall back to shared memory under VRAM
+        // pressure or D3D12 allocation failure, derive per-window counter expectations from
+        // the backend each `loose_in` call actually returned.
+        let check_window = |shadow: &Shadow| -> bool {
+            let is_rebar = shadow.is_rebar();
+            if is_rebar {
+                let r = shadow.rebar.as_ref().expect("rebar state");
+                assert!(r.is_loose);
+                assert!(r.mirror.lock().unwrap().is_none());
+                assert!(r.hashes.lock().unwrap().is_none());
+                assert_eq!(rebar_loose_bytes(), before_loose + WINDOW);
+            } else {
+                assert!(shadow.rebar.is_none());
+                assert_eq!(rebar_loose_bytes(), before_loose);
+            }
+            assert_eq!(rebar_shadow_bytes(), before_shadow);
+            is_rebar
+        };
+
         let cache = RwLock::new(LooseCache::new());
         let base = 0x2000_0000_0000_u64;
         let avail_loose = h.rebar_loose_budget().saturating_sub(before_loose);
         if avail_loose >= WINDOW {
             let s0 = loose_in(&cache, base, base + 64, WINDOW).expect("loose win 0");
-            assert!(s0.is_rebar());
-            let r0 = s0.rebar.as_ref().expect("rebar state");
-            assert!(r0.is_loose);
-            assert!(r0.mirror.lock().unwrap().is_none());
-            assert!(r0.hashes.lock().unwrap().is_none());
-            assert_eq!(rebar_loose_bytes(), before_loose + WINDOW);
-            assert_eq!(rebar_shadow_bytes(), before_shadow);
+            let s0_rebar = check_window(&s0);
             drop(s0);
 
             // Inserting a second window evicts the first idle window and releases its ReBAR bytes.
-            // Because `loose_in` reserves ReBAR before eviction runs, `s1` only gets ReBAR when
-            // the available loose budget holds both windows concurrently; with a single-window
-            // budget (e.g. `VICTORY_REBAR_LOOSE_MB=4`), `s1` falls back to shared memory while
-            // evicting `s0` returns `rebar_loose_bytes()` to `before_loose`.
+            // Because `loose_in` reserves ReBAR before eviction runs, `s1` cannot acquire ReBAR
+            // when `s0` already consumed the only available window in the loose budget (e.g.
+            // `VICTORY_REBAR_LOOSE_MB=4`); evicting `s0` returns `rebar_loose_bytes()` to
+            // `before_loose`.
             let s1 =
                 loose_in(&cache, base + WINDOW, base + WINDOW + 64, WINDOW).expect("loose win 1");
-            let s1_rebar = avail_loose >= 2 * WINDOW;
-            assert_eq!(s1.is_rebar(), s1_rebar);
-            let expected_after_s1 = if s1_rebar {
-                before_loose + WINDOW
-            } else {
-                before_loose
-            };
-            assert_eq!(rebar_loose_bytes(), expected_after_s1);
-            assert_eq!(rebar_shadow_bytes(), before_shadow);
+            if s0_rebar && avail_loose < 2 * WINDOW {
+                assert!(
+                    !s1.is_rebar(),
+                    "single-window loose budget must reject concurrent second ReBAR reservation"
+                );
+            }
+            let s1_rebar = check_window(&s1);
             drop(s1);
             if !s1_rebar {
-                // Evicting `s0` freed the single-window budget, so a third window gets ReBAR again.
+                // Evicting `s0` freed any single-window ReBAR reservation, so a third window can
+                // reserve ReBAR again when VRAM headroom permits.
                 let s2 = loose_in(&cache, base + 2 * WINDOW, base + 2 * WINDOW + 64, WINDOW)
                     .expect("loose win 2");
-                assert!(s2.is_rebar());
-                assert_eq!(rebar_loose_bytes(), before_loose + WINDOW);
-                assert_eq!(rebar_shadow_bytes(), before_shadow);
+                let _ = check_window(&s2);
                 drop(s2);
             }
             drop(cache);
             assert_eq!(rebar_loose_bytes(), before_loose);
             assert_eq!(rebar_shadow_bytes(), before_shadow);
         } else {
-            // Opt-out (`VICTORY_REBAR_LOOSE_MB=0`) or low-VRAM / non-ReBAR fallback:
+            // Opt-out (`VICTORY_REBAR_LOOSE_MB=0`) or insufficient remaining loose budget:
             // `loose_in` cleanly falls back to system RAM with zero ReBAR loose accounting.
             let s0 = loose_in(&cache, base, base + 64, WINDOW).expect("loose win fallback");
             assert!(!s0.is_rebar());
-            assert_eq!(rebar_loose_bytes(), before_loose);
-            assert_eq!(rebar_shadow_bytes(), before_shadow);
+            let _ = check_window(&s0);
             drop(s0);
             drop(cache);
+            assert_eq!(rebar_loose_bytes(), before_loose);
+            assert_eq!(rebar_shadow_bytes(), before_shadow);
         }
     }
 
