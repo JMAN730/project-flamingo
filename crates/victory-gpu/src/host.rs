@@ -1641,19 +1641,43 @@ impl Host {
         // in-flight allocator.
         let late = late && batches.len() == 1;
 
+        // Safe pre-lock prep outside `self.submitted`: purely inspect closed
+        // `runs` without touching `LINE` or mutable `Shadow` submission state.
+        let watch_ranges = crate::watch::once().then(|| collect_ask_once_ranges(runs));
+        let (back, mut rebar_entries, non_rebar_writes) = collect_submission_writes(runs, late);
+        let card_declared = crate::shadow::cards().then(|| collect_card_declared(&back));
+
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
-        let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        // If another thread holds `self.submitted`, drain pending descriptor
+        // heap syncs while waiting so descriptor prep overlaps with the holder.
+        let mut submitted = match self.submitted.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                crate::descriptor::sync_all_heaps();
+                self.submitted.lock().unwrap_or_else(|e| e.into_inner())
+            }
+            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+        };
         let mut deferred_woken = crate::fence::Woken::default();
         if !late {
             deferred_woken.add(self.settle(&mut submitted, relay::WHY_SYNC));
-        } else if let Some(why) = relay::late_blocked(runs) {
-            if why == relay::WHY_READ && relay::relay_exact() {
-                relay::relay_wait(relay::WHY_READ, |line| {
-                    relay::blocked_ranges(&line.written, runs, false).is_none()
-                });
-            } else {
-                deferred_woken.add(self.settle(&mut submitted, why));
+        } else if let Some(block) = relay::late_blocked(runs) {
+            match block {
+                relay::LateBlock::Read(ranges) if relay::range_settle() && relay::relay_exact() => {
+                    // Only until flights whose `back` / `readback_ranges`
+                    // overlap the conflicting copy/fill/host-read/texture
+                    // ranges have landed.
+                    relay::relay_wait(relay::WHY_READ, |line| {
+                        !relay::line_overlaps_read(line, &ranges)
+                    });
+                }
+                relay::LateBlock::Read(_) => {
+                    deferred_woken.add(self.settle(&mut submitted, relay::WHY_READ));
+                }
+                relay::LateBlock::Run => {
+                    deferred_woken.add(self.settle(&mut submitted, relay::WHY_RUN));
+                }
             }
         }
         let behind = late && relay::flying();
@@ -1689,15 +1713,29 @@ impl Host {
                 crate::watch::ask_once_end();
             }
         }
-        let watch_ranges = collect_ask_once_ranges(runs);
-        crate::watch::ask_once(&watch_ranges);
+        if let Some(ranges) = &watch_ranges {
+            crate::watch::ask_once(ranges);
+        }
         let watch_guard = AskOnceGuard;
-        if behind && relay::stale_under_flights(runs) {
-            let settling = std::time::Instant::now();
-            deferred_woken.add(self.settle(&mut submitted, relay::WHY_STALE));
-            settled += settling.elapsed();
-            crate::watch::ask_once_void();
-            crate::watch::ask_once(&watch_ranges);
+        // Behind flights: the title wrote memory that a flight's shaders may
+        // write too, and this submission refreshes it. Only the flights whose
+        // `back` overlaps the stale ranges are waited on (or all flights under
+        // `VICTORY_RANGE_SETTLE=0`), and then the asking is voided and made
+        // again so copy-back writes into private title memory are observed.
+        if behind {
+            let stale = relay::stale_under_flights(runs);
+            if !stale.is_empty() {
+                let settling = std::time::Instant::now();
+                deferred_woken.add(self.settle_stale(&mut submitted, &stale));
+                settled += settling.elapsed();
+                // `settle_stale` may land GPU writes into private write-watched
+                // title memory without updating `DIR`, so void any standing
+                // `VICTORY_ASK_SHARED` asking before re-asking.
+                crate::watch::ask_once_void();
+                if let Some(ranges) = &watch_ranges {
+                    crate::watch::ask_once(ranges);
+                }
+            }
         }
         if prep::ahead_of_writes() {
             batch.refresh_ahead(runs);
@@ -1720,27 +1758,13 @@ impl Host {
                 last_notes(runs)
             ));
         }
-        let (back, mut rebar_entries, non_rebar_writes) =
-            collect_declared_writes(batch.gpu_writes, late);
-        let card_declared: Vec<relay::Declared> = if crate::shadow::cards() {
-            back.iter()
-                .filter(|(s, _)| s.carded())
-                .map(|(s, r)| (s.clone(), r.clone()))
-                .collect()
-        } else {
-            Vec::new()
-        };
         let flown = late && relay::relay();
         if flown && self.card_results_low() {
             let settling = std::time::Instant::now();
             deferred_woken.add(self.settle(&mut submitted, relay::WHY_MOST));
             settled += settling.elapsed();
         }
-        let card = self.card_before(card_declared, flown);
-        for entry in &mut rebar_entries {
-            entry.declared_spans = merge_ranges(std::mem::take(&mut entry.declared_spans));
-            entry.piece_runs = spans_to_piece_runs(&entry.declared_spans);
-        }
+        let card = self.card_before(card_declared.unwrap_or_default(), flown);
         let mut rebar_hash_plan = if rebar_entries.is_empty() {
             RebarHashPlan::default()
         } else {
@@ -2050,6 +2074,46 @@ pub(super) fn read_backs(list: &HostList) {
     for back in &deferred.texture_backs {
         crate::texback::land(back);
     }
+}
+
+/// Pre-lock inspection of `Step::GpuWrite` declarations in closed `runs`,
+/// deduplicated per `(shadow_ptr, address, len)` to match [`Batch::gpu_write`]
+/// and grouped in O(R) via [`collect_declared_writes`].
+fn collect_submission_writes(
+    runs: &[&HostList],
+    late: bool,
+) -> (
+    Vec<relay::Declared>,
+    Vec<RebarWriteEntry>,
+    Vec<DeclaredWrite>,
+) {
+    let mut seen = std::collections::HashSet::new();
+    let mut writes = Vec::new();
+    for list in runs {
+        for step in &list.deferred().copies {
+            let Step::GpuWrite(shadow, address, len) = step else {
+                continue;
+            };
+            let (address, len) = (*address, *len);
+            if seen.insert((std::sync::Arc::as_ptr(shadow) as usize, address, len)) {
+                writes.push((shadow.clone(), address, len));
+            }
+        }
+    }
+    let (back, mut rebar_entries, non_rebar_writes) = collect_declared_writes(writes, late);
+    for entry in &mut rebar_entries {
+        entry.declared_spans = merge_ranges(std::mem::take(&mut entry.declared_spans));
+        entry.piece_runs = spans_to_piece_runs(&entry.declared_spans);
+    }
+    (back, rebar_entries, non_rebar_writes)
+}
+
+/// Subset of `back` belonging to card-backed host copies.
+fn collect_card_declared(back: &[relay::Declared]) -> Vec<relay::Declared> {
+    back.iter()
+        .filter(|(s, _)| s.carded())
+        .map(|(s, r)| (s.clone(), r.clone()))
+        .collect()
 }
 
 fn collect_ask_once_ranges(runs: &[&HostList]) -> Vec<(usize, usize)> {
@@ -4160,9 +4224,10 @@ impl HostList {
                     if matches!(step, Step::Run(_)) {
                         batch.title_written();
                         // `Step::Run` may write arbitrary title memory without
-                        // calling `watch::wrote`, so refreshes after it must ask
-                        // the kernel again.
-                        crate::watch::ask_once_end();
+                        // calling `watch::wrote`, so void any standing asking
+                        // (including `VICTORY_ASK_SHARED=1`) so subsequent
+                        // refreshes and submissions query the kernel again.
+                        crate::watch::ask_once_void();
                         #[cfg(feature = "diagnostics")]
                         {
                             started = std::time::Instant::now();
@@ -4214,7 +4279,6 @@ impl HostList {
 #[derive(Default)]
 struct Batch {
     refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
-    gpu_writes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
     declared_writes: std::collections::HashSet<(usize, usize, usize)>,
     /// Staging buffers (by address) refreshed since the last title write,
     /// mapped to the highest mapped-byte baseline refreshed so far.
@@ -4253,7 +4317,6 @@ impl Batch {
             }) {
                 self.rebar_init_failed = true;
             }
-            self.gpu_writes.push((shadow.clone(), address, len));
         }
     }
 

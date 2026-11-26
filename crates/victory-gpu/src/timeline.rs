@@ -232,7 +232,30 @@ impl Timeline {
         }
     }
 
-    fn run<'a>(self: &'a Arc<Self>, mut s: MutexGuard<'a, State>) {
+    fn run<'a>(self: &'a Arc<Self>, s: MutexGuard<'a, State>) {
+        #[cfg(windows)]
+        let use_late = crate::host::late();
+        #[cfg(not(windows))]
+        let use_late = false;
+        self.run_with(s, use_late, |wait| {
+            #[cfg(windows)]
+            {
+                crate::host::late_met(wait)
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = wait;
+                false
+            }
+        });
+    }
+
+    fn run_with<'a>(
+        self: &'a Arc<Self>,
+        mut s: MutexGuard<'a, State>,
+        use_late_met: bool,
+        check_late_met: impl Fn(&MemoryWait) -> bool,
+    ) {
         s.busy = true;
         s.held = false;
         while let Some(op) = s.ops.pop_front() {
@@ -249,13 +272,12 @@ impl Timeline {
                 Op::WaitMemory(wait, deadline) => {
                     let was_registered = deadline.is_some();
                     let mut met = wait.satisfied();
-                    #[cfg(windows)]
-                    if !met && crate::host::late() {
+                    if !met && use_late_met {
                         // Drop `Timeline::state` before `late_met` -> `settle_now`
                         // (`Host::submitted` + `LINE_LANDED`) so concurrent wakes
                         // never deadlock or invert lock order.
                         drop(s);
-                        met = crate::host::late_met(&wait);
+                        met = check_late_met(&wait);
                         s = self.lock();
                     }
                     if !met {
@@ -550,5 +572,67 @@ mod tests {
         assert!(wait.satisfied());
         // SAFETY: freeing our allocation.
         unsafe { VirtualFree(base, 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn wait_memory_drops_timeline_state_before_late_met() {
+        let timeline = Arc::new(Timeline::default());
+        let cell = AtomicU32::new(0);
+        let wait = MemoryWait {
+            address: (&raw const cell) as u64,
+            reference: 1,
+            mask: u32::MAX,
+            width: 4,
+            comparison: 3,
+        };
+        let ran = Arc::new(AtomicBool::new(false));
+        let ran_work = ran.clone();
+
+        {
+            let mut s = timeline.lock();
+            s.ops.push_back(Op::WaitMemory(wait, None));
+            s.ops.push_back(Op::Run(Box::new(move || {
+                ran_work.store(true, Ordering::Release);
+            })));
+            s.pushed = 2;
+
+            let tl_cb = timeline.clone();
+            let late_called = AtomicBool::new(false);
+            timeline.run_with(s, true, |_w| {
+                late_called.store(true, Ordering::Release);
+                // 1. `Timeline::state` must NOT be held across `late_met` / `settle_now`.
+                assert!(
+                    tl_cb.state.try_lock().is_ok(),
+                    "Timeline::state must be dropped before calling late_met"
+                );
+                // 2. Re-entrant `wake()` (e.g. from `settle_now` -> `woken.run()`)
+                //    must acquire `Timeline::state` cleanly without deadlocking.
+                tl_cb.wake();
+                // 3. Another thread must also be able to lock `Timeline::state`
+                //    while `late_met` is in flight (zero AB-BA lock inversion).
+                let tl_other = tl_cb.clone();
+                let other_locked = std::thread::spawn(move || {
+                    let guard = tl_other.state.try_lock();
+                    let ok = guard.is_ok();
+                    drop(guard);
+                    tl_other.wake();
+                    ok
+                })
+                .join()
+                .expect("concurrent wake thread panicked");
+                assert!(
+                    other_locked,
+                    "concurrent thread must acquire Timeline::state during late_met"
+                );
+                cell.store(1, Ordering::Release);
+                true
+            });
+            assert!(late_called.load(Ordering::Acquire));
+        }
+
+        assert!(
+            ran.load(Ordering::Acquire),
+            "post-wait work must run once late_met satisfies the memory wait"
+        );
     }
 }

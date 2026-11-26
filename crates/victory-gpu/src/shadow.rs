@@ -1072,7 +1072,7 @@ fn last_difference(a: &[u8], b: &[u8]) -> Option<usize> {
         .map(|i| chunk * DIFF_CHUNK + i)
 }
 
-/// Statistics for [`Shadow::merge_under_writes`]:
+/// Statistics for [`Shadow::merge_ranges_under_writes`]:
 /// `[0]` pages compared, `[1]` changed runs put in, `[2]` bytes put in, and
 /// fallback counts `[3]` unwatched, `[4]` no_watch, `[5]` runs_cap, `[6]` no_ref.
 static MERGED: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
@@ -2480,15 +2480,25 @@ impl Shadow {
             .collect()
     }
 
-    /// Returns whether any page inside `[address, address + len)` that overlaps
-    /// a pending shader write was modified by the title since it was last copied.
-    pub(crate) fn stale_under_writes(&self, address: usize, len: usize) -> bool {
+    /// Collects the subranges of `[address, address + len)` where [`Shadow::update`]
+    /// would leave title bytes behind because an in-flight shader write overlaps a
+    /// page the title wrote since the copy last took it.
+    ///
+    /// For submissions sent to the card without a wait (`crate::host::late`):
+    /// callers settle only flights whose `flight.back` overlaps these ranges.
+    pub(crate) fn stale_ranges_under_writes(
+        &self,
+        address: usize,
+        len: usize,
+        out: &mut Vec<(usize, usize)>,
+    ) {
         let busy = self.busy_pending(address, len);
         if busy.is_empty() {
-            return false;
+            return;
         }
         if self.watched.load(Ordering::Relaxed) == NOT_WATCHED {
-            return true;
+            out.extend(busy);
+            return;
         }
         let base = self.start as usize / PAGE;
         let shadow_ptr = self as *const Shadow as usize;
@@ -2504,54 +2514,73 @@ impl Shadow {
         for (a, e) in busy {
             match crate::watch::asked(a, e) {
                 Some((_, written)) => {
-                    if stale_pages_in(base, &copied, a, e, &written)
-                        .into_iter()
-                        .any(|page| owned.binary_search(&page).is_err())
-                    {
-                        return true;
+                    for page in stale_pages_in(base, &copied, a, e, &written) {
+                        if owned.binary_search(&page).is_ok() {
+                            continue;
+                        }
+                        let (lo, hi) = ((page * PAGE).max(a), ((page + 1) * PAGE).min(e));
+                        if lo < hi {
+                            out.push((lo, hi));
+                        }
                     }
                 }
-                None => return true,
+                None => out.push((a, e)),
             }
         }
-        false
     }
 
     /// Merges CPU writes into a copy under pending shader writes (`late_exact`):
     /// writes only changed bytes into ReBAR WC VRAM + mirror, card staging, or
-    /// PC copy + snapshot. Returns `true` if any stale range could not be merged
-    /// in place and requires settling flights.
-    pub(crate) fn merge_under_writes(
+    /// PC copy + snapshot.
+    ///
+    /// Any stale subranges that could not be merged in place (unwatched memory,
+    /// missing journal/snapshot, or exhausted card `runs_left`) are appended to
+    /// `out` so the caller can settle only the overlapping flights.
+    pub(crate) fn merge_ranges_under_writes(
         &self,
         address: usize,
         len: usize,
         runs_left: &mut usize,
-    ) -> bool {
+        out: &mut Vec<(usize, usize)>,
+    ) {
         let busy = self.busy_pending(address, len);
         if busy.is_empty() {
-            return false;
+            return;
         }
         if self.watched.load(Ordering::Relaxed) == NOT_WATCHED {
+            out.extend(busy);
             MERGED[3].fetch_add(1, Ordering::Relaxed);
-            return true;
+            return;
         }
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let base = start / PAGE;
         let shadow_ptr = self as *const Shadow as usize;
         let mut title = vec![0u8; PAGE];
+        let push_unmerged =
+            |stale: &[usize], a: usize, e: usize, out: &mut Vec<(usize, usize)>| -> bool {
+                let before_len = out.len();
+                for &p in stale {
+                    let (lo, hi) = ((p * PAGE).max(a), ((p + 1) * PAGE).min(e));
+                    if lo < hi {
+                        out.push((lo, hi));
+                    }
+                }
+                out.len() > before_len
+            };
         for (a, e) in busy {
             let Some((now, written)) = crate::watch::writes(a, e, true) else {
+                out.push((a, e));
                 MERGED[4].fetch_add(1, Ordering::Relaxed);
-                return true;
+                continue;
             };
-            let stale = {
+            let mut stale = {
                 let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
                 stale_pages_in(base, &copied, a, e, &written)
             };
-            for page in stale {
-                if crate::lazy_back::active() && crate::lazy_back::owns_block(shadow_ptr, page) {
-                    continue;
-                }
+            if !stale.is_empty() && crate::lazy_back::active() {
+                stale.retain(|&page| !crate::lazy_back::owns_block(shadow_ptr, page));
+            }
+            for (idx, page) in stale.iter().copied().enumerate() {
                 let (lo, hi) = ((page * PAGE).max(a), ((page + 1) * PAGE).min(e));
                 if lo >= hi {
                     continue;
@@ -2561,6 +2590,9 @@ impl Shadow {
                 let at = lo - start;
                 if let Some(rebar) = &self.rebar {
                     let mut dirty_runs = Vec::new();
+                    // ReBAR writes directly to mapped WC VRAM + cached RAM mirror
+                    // with zero D3D12 `CopyBufferRegion` overhead, so it must not
+                    // be capped by or consume `runs_left` (reserved for `card`).
                     let failed = {
                         let Some(mut mirror) = lock_and_read(
                             || rebar.mirror.lock().unwrap_or_else(|e| e.into_inner()),
@@ -2594,8 +2626,10 @@ impl Shadow {
                         }
                     };
                     if failed {
-                        MERGED[6].fetch_add(1, Ordering::Relaxed);
-                        return true;
+                        if push_unmerged(&stale[idx..], a, e, out) {
+                            MERGED[6].fetch_add(1, Ordering::Relaxed);
+                        }
+                        break;
                     }
                     for (off, len) in dirty_runs {
                         rebar.mark_dirty_range(off, len);
@@ -2651,8 +2685,10 @@ impl Shadow {
                     };
                     drop(before);
                     if let Some(reason) = fail_reason {
-                        MERGED[reason].fetch_add(1, Ordering::Relaxed);
-                        return true;
+                        if push_unmerged(&stale[idx..], a, e, out) {
+                            MERGED[reason].fetch_add(1, Ordering::Relaxed);
+                        }
+                        break;
                     }
                 }
                 if (page * PAGE).max(start) >= a && ((page + 1) * PAGE).min(end) <= e {
@@ -2663,7 +2699,25 @@ impl Shadow {
                 }
             }
         }
-        false
+    }
+
+    /// Whether [`Shadow::merge_ranges_under_writes`] leaves any unmerged ranges
+    /// that require settling flights.
+    #[cfg(test)]
+    pub(crate) fn merge_under_writes(
+        &self,
+        address: usize,
+        len: usize,
+        runs_left: &mut usize,
+    ) -> bool {
+        let mut unmerged = Vec::new();
+        self.merge_ranges_under_writes(address, len, runs_left, &mut unmerged);
+        !unmerged.is_empty()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mark_unwatched_for_test(&self) {
+        self.watched.store(NOT_WATCHED, Ordering::Relaxed);
     }
 
     /// ReBAR counterpart to [`Shadow::copy_back`]: merges post-submission GPU
@@ -6573,6 +6627,269 @@ mod tests {
         drop(shadow_c);
         drop(shadow_b);
         drop(shadow_a);
+        // SAFETY: free test allocation.
+        unsafe { VirtualFree(title.cast(), 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn stale_and_merge_ranges_under_writes_scope_to_conflicting_subranges_only() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        const MEM_TOP_DOWN: u32 = 0x10_0000;
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+
+        let pages = 4usize;
+        let len = pages * PAGE;
+        // SAFETY: isolated write-watched test buffer freed at the end of the test.
+        // Use `MEM_TOP_DOWN` so freed test VAs are not reused by bottom-up `watch` tests.
+        let title = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                len,
+                MEM_RESERVE | MEM_COMMIT | MEM_TOP_DOWN | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+            .cast::<u8>()
+        };
+        assert!(!title.is_null());
+        // SAFETY: committed above.
+        unsafe { std::ptr::write_bytes(title, 0x11, len) };
+        let va0 = title as usize;
+
+        let mut side = vec![0x11u8; len];
+        let Some(shadow) = Shadow::new_card_for_test(
+            side.as_mut_ptr(),
+            va0 as u64,
+            len as u64,
+            Vec::new(),
+            Vec::new(),
+        ) else {
+            // SAFETY: cleanup.
+            unsafe { VirtualFree(title.cast(), 0, MEM_RELEASE) };
+            return;
+        };
+
+        // Mark all pages copied once.
+        let initial_ask = crate::watch::writes(va0, va0 + len, true)
+            .expect("watched")
+            .0;
+        shadow.copied.lock().unwrap().fill(initial_ask);
+
+        // Declare two disjoint pending GPU write ranges: page 0 and page 2.
+        shadow.writing(va0, PAGE, |_, _| None);
+        shadow.writing(va0 + 2 * PAGE, PAGE, |_, _| None);
+
+        // Title writes only page 0 and page 3 (page 3 is not pending; page 2 is clean).
+        // SAFETY: within committed buffer.
+        unsafe {
+            std::ptr::write_bytes(title.add(16), 0x5A, 64);
+            std::ptr::write_bytes(title.add(3 * PAGE + 16), 0x7E, 64);
+        }
+
+        // `stale_ranges_under_writes` via `ask_once` must report ONLY page 0.
+        crate::watch::ask_once(&[(va0, va0 + len)]);
+        let mut stale = Vec::new();
+        shadow.stale_ranges_under_writes(va0, len, &mut stale);
+        crate::watch::ask_once_end();
+        assert_eq!(stale, vec![(va0, va0 + PAGE)]);
+
+        // With `runs_left == 0`, `merge_ranges_under_writes` fails to merge page 0
+        // and reports ONLY page 0 (not page 2 or page 3).
+        let mut runs_left = 0usize;
+        let mut unmerged = Vec::new();
+        shadow.merge_ranges_under_writes(va0, len, &mut runs_left, &mut unmerged);
+        assert_eq!(unmerged, vec![(va0, va0 + PAGE)]);
+
+        // With sufficient `runs_left`, page 0 merges cleanly and `unmerged` is empty.
+        let mut runs_left = 16usize;
+        unmerged.clear();
+        shadow.merge_ranges_under_writes(va0, len, &mut runs_left, &mut unmerged);
+        assert!(unmerged.is_empty());
+        assert_eq!(&side[16..80], &[0x5Au8; 64]);
+
+        // SAFETY: free test allocation.
+        unsafe { VirtualFree(title.cast(), 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn rebar_merge_ranges_under_writes_handles_many_strided_runs_without_consuming_runs_left() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        const MEM_TOP_DOWN: u32 = 0x10_0000;
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+
+        let Some(h) = host() else {
+            return;
+        };
+        let len = PAGE;
+        // SAFETY: isolated write-watched test buffer freed at the end of the test.
+        let title = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                len,
+                MEM_RESERVE | MEM_COMMIT | MEM_TOP_DOWN | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+            .cast::<u8>()
+        };
+        assert!(!title.is_null());
+        // SAFETY: committed above.
+        unsafe { std::ptr::write_bytes(title, 0x11, len) };
+        let va0 = title as usize;
+
+        let Some((buffer, data)) = h.shared_buffer(len as u64) else {
+            // SAFETY: cleanup.
+            unsafe { VirtualFree(title.cast(), 0, MEM_RELEASE) };
+            return;
+        };
+        // SAFETY: `data` maps `len` bytes.
+        unsafe { std::ptr::write_bytes(data, 0x11, len) };
+        // SAFETY: live D3D12 buffer.
+        let gpu_va = unsafe { buffer.GetGPUVirtualAddress() };
+        let shadow = Shadow::new(buffer, data, gpu_va, va0 as u64, len as u64, Some(0));
+
+        // Seed copied epoch and pending shader-write range with ReBAR mirror.
+        let initial_ask = crate::watch::writes(va0, va0 + len, true)
+            .expect("watched")
+            .0;
+        shadow.copied.lock().unwrap().fill(initial_ask);
+        shadow.writing(va0, len, |_, size| Some(vec![0x11u8; size as usize]));
+
+        // Simulate 700 strided CPU writes (4 bytes every 16 bytes -> 700 separate runs,
+        // exceeding old 512 cap) while a GPU shader wrote 0xCC into untouched bytes between them.
+        for i in 0..700usize {
+            let off = i * 16;
+            // SAFETY: `700 * 16 = 11200 < PAGE (65536)`.
+            unsafe {
+                std::ptr::write_bytes(title.add(off), 0x5A, 4);
+                std::ptr::write_bytes(data.add(off + 8), 0xCC, 4);
+            }
+        }
+
+        // Even with `runs_left == 0` (reserved for `card`), ReBAR must merge all 700 runs
+        // directly into WC VRAM + mirror without forcing `WHY_STALE` or touching GPU bytes.
+        let mut runs_left = 0usize;
+        let mut unmerged = Vec::new();
+        shadow.merge_ranges_under_writes(va0, len, &mut runs_left, &mut unmerged);
+        assert!(
+            unmerged.is_empty(),
+            "ReBAR merge must not fail on runs_left"
+        );
+        assert_eq!(runs_left, 0, "ReBAR merge must not consume card runs_left");
+
+        let mirror = shadow
+            .rebar
+            .as_ref()
+            .unwrap()
+            .mirror
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap();
+        // SAFETY: `data` maps `len` bytes.
+        let vram = unsafe { std::slice::from_raw_parts(data, len) };
+        for i in 0..700usize {
+            let off = i * 16;
+            assert_eq!(&vram[off..off + 4], &[0x5Au8; 4]);
+            assert_eq!(&mirror[off..off + 4], &[0x5Au8; 4]);
+            assert_eq!(
+                &vram[off + 8..off + 12],
+                &[0xCCu8; 4],
+                "concurrent GPU write between CPU strides must stay intact"
+            );
+            assert_eq!(&mirror[off + 8..off + 12], &[0x11u8; 4]);
+        }
+
+        shadow.clear_pending_rebar();
+        // SAFETY: free test allocation.
+        unsafe { VirtualFree(title.cast(), 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn merge_ranges_under_writes_records_fallback_reasons() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        const MEM_TOP_DOWN: u32 = 0x10_0000;
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+
+        let Some(h) = host() else {
+            return;
+        };
+        let len = PAGE;
+        // SAFETY: isolated write-watched test buffer freed at the end of the test.
+        let title = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                len,
+                MEM_RESERVE | MEM_COMMIT | MEM_TOP_DOWN | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+            .cast::<u8>()
+        };
+        assert!(!title.is_null());
+        // SAFETY: committed above.
+        unsafe { std::ptr::write_bytes(title, 0x11, len) };
+        let va0 = title as usize;
+
+        // 1. `runs_cap` on card shadow when `runs_left == 0`.
+        let mut side = vec![0x11u8; len];
+        let Some(card_shadow) = Shadow::new_card_for_test(
+            side.as_mut_ptr(),
+            va0 as u64,
+            len as u64,
+            Vec::new(),
+            Vec::new(),
+        ) else {
+            // SAFETY: cleanup.
+            unsafe { VirtualFree(title.cast(), 0, MEM_RELEASE) };
+            return;
+        };
+        let ask = crate::watch::writes(va0, va0 + len, true)
+            .expect("watched")
+            .0;
+        card_shadow.copied.lock().unwrap().fill(ask);
+        card_shadow.writing(va0, len, |_, _| None);
+        // SAFETY: within committed buffer.
+        unsafe { std::ptr::write_bytes(title.add(16), 0x77, 16) };
+
+        let _ = merged_stats();
+        let mut runs_left = 0usize;
+        let mut unmerged = Vec::new();
+        card_shadow.merge_ranges_under_writes(va0, len, &mut runs_left, &mut unmerged);
+        assert_eq!(unmerged, vec![(va0, va0 + len)]);
+        let stats = merged_stats();
+        assert_eq!(stats[5], 1, "card runs overflow must count runs_cap");
+
+        // 2. `no_ref` on ReBAR shadow when `rebar.mirror` is `None`.
+        let Some((buffer, data)) = h.shared_buffer(len as u64) else {
+            // SAFETY: cleanup.
+            unsafe { VirtualFree(title.cast(), 0, MEM_RELEASE) };
+            return;
+        };
+        // SAFETY: live D3D12 buffer.
+        let gpu_va = unsafe { buffer.GetGPUVirtualAddress() };
+        let rebar_shadow = Shadow::new(buffer, data, gpu_va, va0 as u64, len as u64, Some(0));
+        rebar_shadow.copied.lock().unwrap().fill(ask);
+        rebar_shadow.writing(va0, len, |_, _| None);
+        unmerged.clear();
+        let mut runs_left = 64usize;
+        rebar_shadow.merge_ranges_under_writes(va0, len, &mut runs_left, &mut unmerged);
+        assert_eq!(unmerged, vec![(va0, va0 + len)]);
+        let stats = merged_stats();
+        assert_eq!(stats[6], 1, "missing ReBAR mirror must count no_ref");
+
+        // 3. `unwatched` when `self.watched == NOT_WATCHED`.
+        card_shadow.mark_unwatched_for_test();
+        unmerged.clear();
+        card_shadow.merge_ranges_under_writes(va0, len, &mut runs_left, &mut unmerged);
+        assert_eq!(unmerged, vec![(va0, va0 + len)]);
+        let stats = merged_stats();
+        assert_eq!(stats[3], 1, "NOT_WATCHED shadow must count unwatched");
+
+        rebar_shadow.clear_pending_rebar();
         // SAFETY: free test allocation.
         unsafe { VirtualFree(title.cast(), 0, MEM_RELEASE) };
     }

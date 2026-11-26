@@ -1981,8 +1981,93 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
     if !once() {
         return;
     }
+    let submits = TITLE_SUBMITS.load(Ordering::Acquire);
+    if ask_shared() {
+        use Ordering::Relaxed;
+        let stamp = current_stamp();
+        let can_share = stamp != 0 && stamp <= ASK_STAMP.load(Relaxed);
+        if can_share {
+            let missing = {
+                let ahead = AHEAD.read().unwrap_or_else(|e| e.into_inner());
+                if ahead.ranges.is_empty() || ahead.epoch == 0 {
+                    None
+                } else {
+                    let missing: Vec<(usize, usize)> = ranges
+                        .iter()
+                        .copied()
+                        .filter(|&(s, e)| {
+                            s < e && !ahead_covers(&ahead.ranges, s / PAGE, e.div_ceil(PAGE))
+                        })
+                        .collect();
+                    Some(missing)
+                }
+            };
+            if let Some(missing) = missing {
+                let (seq_before, extra_epoch, mut extra) = if missing.is_empty() {
+                    (0, 0, Vec::new())
+                } else {
+                    let seq_before = ANNOUNCED_SEQ.load(Ordering::SeqCst);
+                    let pending_before = snapshot_announced();
+                    let (extra_epoch, mut extra) = collect_and_ask_batch(&missing, true);
+                    for &(p_first, p_last) in &pending_before {
+                        extra.retain(|&(a, b)| b <= p_first || p_last <= a);
+                    }
+                    (seq_before, extra_epoch, extra)
+                };
+                let mut ahead = AHEAD.write().unwrap_or_else(|e| e.into_inner());
+                if !ahead.ranges.is_empty() {
+                    if !extra.is_empty() && ANNOUNCED_SEQ.load(Ordering::SeqCst) != seq_before {
+                        extra.clear();
+                    }
+                    if !extra.is_empty() {
+                        ahead.epoch = ahead.epoch.max(extra_epoch);
+                        ahead.ranges.extend(extra);
+                        ahead.ranges.sort_unstable();
+                        let mut merged = Vec::with_capacity(ahead.ranges.len());
+                        for (a, b) in ahead.ranges.drain(..) {
+                            push_merged_interval(&mut merged, a, b);
+                        }
+                        ahead.ranges = merged;
+                    }
+                    ahead.kept = true;
+                    set_ahead_flags(true, true);
+                    SHARED[0].fetch_add(1, Relaxed);
+                    return;
+                }
+            }
+        }
+        let n = SHARED[1].fetch_add(1, Relaxed) + 1;
+        if n >= 256 && (n.is_power_of_two() || n.is_multiple_of(1024)) {
+            let shared = SHARED[0].load(Relaxed);
+            let prev_shared = SHARED_LAST[0].swap(shared, Relaxed);
+            let prev_asked = SHARED_LAST[1].swap(n, Relaxed);
+            let window_shared = shared.saturating_sub(prev_shared);
+            let window_asked = n.saturating_sub(prev_asked);
+            let window_total = window_shared + window_asked;
+            let window_hit_pct = if window_total > 0 {
+                (window_shared as f64 * 100.0) / window_total as f64
+            } else {
+                0.0
+            };
+            tracing::info!(
+                shared,
+                asked = n,
+                window_shared,
+                window_asked,
+                window_hit_pct = format_args!("{window_hit_pct:.1}"),
+                "submissions that took the asking before them, and that asked anew (VICTORY_ASK_SHARED=1)"
+            );
+        }
+        {
+            let mut ahead = AHEAD.write().unwrap_or_else(|e| e.into_inner());
+            ahead.kept = false;
+            ahead.ranges.clear();
+            set_ahead_flags(false, false);
+        }
+    }
     ask_once_end();
     if ranges.is_empty() {
+        ASK_STAMP.store(0, Ordering::Relaxed);
         return;
     }
     // Snapshot active kernel-read announcements and the monotonic sequence
@@ -2002,9 +2087,10 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
         // ahead interval.
         covered.clear();
     }
+    let kept = !covered.is_empty();
+    ASK_STAMP.store(if kept { submits } else { 0 }, Ordering::Relaxed);
     ahead.epoch = now;
     ahead.ranges = covered;
-    let kept = !ahead.ranges.is_empty();
     ahead.kept = kept;
     set_ahead_flags(kept, kept);
 }
@@ -2012,6 +2098,9 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
 /// The submission's one asking stands no longer: its refreshes are done,
 /// or title memory was written in a way the journal was not told.
 pub(crate) fn ask_once_end() {
+    if ask_shared() {
+        return;
+    }
     if !ask_kept() {
         return;
     }
@@ -2023,15 +2112,49 @@ pub(crate) fn ask_once_end() {
     }
 }
 
-/// Title memory was written in a way the journal was not told: no asking stands.
+/// Title memory was written in a way the journal was not told: no asking
+/// stands, with [`ask_shared`] too.
 pub(crate) fn ask_once_void() {
-    if !ask_kept() {
-        return;
-    }
+    ASK_STAMP.store(0, Ordering::Relaxed);
     let mut ahead = AHEAD.write().unwrap_or_else(|e| e.into_inner());
     ahead.kept = false;
     ahead.ranges.clear();
     set_ahead_flags(false, false);
+}
+
+/// Submissions the title has given, counted when it gives them.
+pub(crate) static TITLE_SUBMITS: AtomicU64 = AtomicU64::new(0);
+std::thread_local! {
+    /// [`TITLE_SUBMITS`] as it was when the submission currently being prepared
+    /// on this thread was given (`0`: not known). Thread-local so concurrent
+    /// queues on separate threads never overwrite or leak each other's stamps.
+    static CURRENT_STAMP: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Returns the submission stamp currently active on this thread (`0` if none).
+#[inline]
+pub(crate) fn current_stamp() -> u64 {
+    CURRENT_STAMP.with(std::cell::Cell::get)
+}
+
+/// Replaces this thread's active submission stamp with `stamp` and returns the
+/// previous value.
+#[inline]
+pub(crate) fn swap_current_stamp(stamp: u64) -> u64 {
+    CURRENT_STAMP.with(|cell| cell.replace(stamp))
+}
+
+/// [`TITLE_SUBMITS`] when the asking that stands was made.
+static ASK_STAMP: AtomicU64 = AtomicU64::new(0);
+static SHARED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+static SHARED_LAST: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// `VICTORY_ASK_SHARED=1` (opt-in, with `VICTORY_ASYNC_SUBMIT=1`): one
+/// asking of the kernel stands for every submission the title gave before
+/// it was made.
+fn ask_shared() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ASK_SHARED").is_some_and(|v| v == "1"))
 }
 
 /// We wrote title memory `[at, at + len)` while a submission's one asking
