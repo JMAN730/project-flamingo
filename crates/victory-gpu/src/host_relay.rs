@@ -310,10 +310,17 @@ void main(uint3 group : SV_GroupID, uint t : SV_GroupIndex) {
 
 /// Whether the pieces hashed again after ranges were sent up to a copy in
 /// the card's memory are hashed in coalesced piece runs
-/// (`VICTORY_CARD_REHASH_RUNS=1` enables; off by default in the foundation).
+/// (on by default; `VICTORY_CARD_REHASH_RUNS=0` disables), and not in a pass
+/// per range sent up.
+pub(super) fn rehash_runs_enabled(setting: Option<&str>) -> bool {
+    setting.is_none_or(|v| v != "0")
+}
+
 fn rehash_runs() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_REHASH_RUNS").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| {
+        rehash_runs_enabled(std::env::var("VICTORY_CARD_REHASH_RUNS").ok().as_deref())
+    })
 }
 
 /// Since the last frame-rate line, of our own passes over copies in the
@@ -322,8 +329,10 @@ fn rehash_runs() -> bool {
 pub(super) static CARD_PASSES: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
 /// Whether what shaders wrote to copies in the card's memory is merged
-/// into title memory on several threads during synchronous `card_back`
-/// (`VICTORY_WIDE_MERGE=0` disables; `=1` forces; on by default on 4+ logical CPUs).
+/// into title memory on several threads (`VICTORY_WIDE_MERGE=0` disables;
+/// `=1` forces; on by default on 4+ logical CPUs). Used by both synchronous
+/// [`Host::card_back`] and the relay thread's [`Host::relay_fetch_back`] /
+/// [`Host::relay_card_inflight`].
 fn wide_merge() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
@@ -334,12 +343,141 @@ fn wide_merge() -> bool {
     })
 }
 
-fn wide_merge_enabled(setting: Option<&str>, logical_cpus: Option<usize>) -> bool {
+pub(super) fn wide_merge_enabled(setting: Option<&str>, logical_cpus: Option<usize>) -> bool {
     match setting {
         Some("1") => true,
         Some("0") => false,
         _ => logical_cpus.is_some_and(|n| n >= 4),
     }
+}
+
+/// One fetched piece of a card-backed shadow ready to merge on the relay thread.
+pub(super) struct RelayCardPiece {
+    pub(super) shadow: std::sync::Arc<crate::shadow::Shadow>,
+    pub(super) lo: usize,
+    pub(super) hi: usize,
+    /// Pointer to `hi - lo` readable fetched GPU bytes, valid for the duration
+    /// of [`relay_merge_card_pieces`].
+    pub(super) gpu_ptr: usize,
+    pub(super) after: u64,
+}
+
+/// Merges fetched card-copy pieces into title memory via
+/// [`crate::shadow::Shadow::card_merge_relay`], fanning out across
+/// [`crate::shadow::wide_run`] when `parallel` is enabled and there are either
+/// multiple distinct card shadows or at least 16 total pieces.
+///
+/// Any pieces whose title address ranges `[start + lo, start + hi)` overlap
+/// (for example, two in-flight plans touching the same 64 KiB piece) are placed
+/// in the same worker bucket in their original relative order so concurrent
+/// workers only ever mutate strictly disjoint slices of `Shadow::data` and
+/// title memory.
+pub(super) fn relay_merge_card_pieces(pieces: Vec<RelayCardPiece>, parallel: bool) -> usize {
+    if pieces.is_empty() {
+        return 0;
+    }
+    let run_seq = |items: &[RelayCardPiece]| -> usize {
+        let mut title = Vec::new();
+        let mut written = 0usize;
+        for p in items {
+            // SAFETY: caller guarantees `p.gpu_ptr` points to `p.hi - p.lo`
+            // readable bytes that stay live until this function returns.
+            let gpu = unsafe { std::slice::from_raw_parts(p.gpu_ptr as *const u8, p.hi - p.lo) };
+            written += p.shadow.card_merge_relay(p.lo, gpu, p.after, &mut title);
+        }
+        written
+    };
+
+    let first_shadow = std::sync::Arc::as_ptr(&pieces[0].shadow) as usize;
+    let multi_shadow = pieces
+        .iter()
+        .skip(1)
+        .any(|p| std::sync::Arc::as_ptr(&p.shadow) as usize != first_shadow);
+    if !parallel || pieces.len() < 2 || (!multi_shadow && pieces.len() < 16) {
+        return run_seq(&pieces);
+    }
+
+    // Group overlapping title-address intervals `[start + lo, start + hi)`
+    // into disjoint units while preserving original order inside each unit.
+    let mut order: Vec<usize> = (0..pieces.len()).collect();
+    order.sort_unstable_by_key(|&idx| {
+        let p = &pieces[idx];
+        ((p.shadow.span().0 as usize).saturating_add(p.lo), idx)
+    });
+    let mut groups: Vec<(usize, Vec<usize>)> = Vec::new();
+    let mut cur_end = 0usize;
+    for idx in order {
+        let p = &pieces[idx];
+        let base = p.shadow.span().0 as usize;
+        let t_lo = base.saturating_add(p.lo);
+        let t_hi = base.saturating_add(p.hi);
+        let bytes = p.hi - p.lo;
+        match groups.last_mut() {
+            Some((g_bytes, g_indices)) if t_lo < cur_end => {
+                g_indices.push(idx);
+                *g_bytes += bytes;
+                cur_end = cur_end.max(t_hi);
+            }
+            _ => {
+                groups.push((bytes, vec![idx]));
+                cur_end = t_hi;
+            }
+        }
+    }
+    if groups.len() < 2 {
+        return run_seq(&pieces);
+    }
+    for (_, g_indices) in &mut groups {
+        if g_indices.len() > 1 {
+            g_indices.sort_unstable();
+        }
+    }
+
+    // Pack disjoint groups into up to 16 balanced buckets (LPT by bytes) so
+    // large single-shadow megabuffer piece lists spread evenly across workers
+    // with dynamic work stealing.
+    groups.sort_unstable_by_key(|a| std::cmp::Reverse(a.0));
+    let num_buckets = groups.len().min(16);
+    let mut bucket_load = vec![(0usize, 0usize); num_buckets];
+    let mut bucket_indices: Vec<Vec<usize>> = (0..num_buckets).map(|_| Vec::new()).collect();
+    for (g_bytes, g_indices) in groups {
+        let best = bucket_load
+            .iter()
+            .enumerate()
+            .min_by_key(|&(_, &load)| load)
+            .map_or(0, |(i, _)| i);
+        bucket_load[best].0 += g_bytes;
+        bucket_load[best].1 += g_indices.len();
+        bucket_indices[best].extend(g_indices);
+    }
+
+    let mut slots: Vec<Option<RelayCardPiece>> = pieces.into_iter().map(Some).collect();
+    let written = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let jobs: Vec<Box<dyn FnOnce() + Send>> = bucket_indices
+        .into_iter()
+        .filter(|b| !b.is_empty())
+        .map(|indices| {
+            let bucket: Vec<RelayCardPiece> = indices
+                .into_iter()
+                .filter_map(|idx| slots[idx].take())
+                .collect();
+            let written = written.clone();
+            Box::new(move || {
+                let mut title = Vec::new();
+                let mut local = 0usize;
+                for p in bucket {
+                    // SAFETY: caller guarantees `p.gpu_ptr` points to `p.hi - p.lo`
+                    // readable bytes that stay live until `wide_run` returns.
+                    let gpu =
+                        unsafe { std::slice::from_raw_parts(p.gpu_ptr as *const u8, p.hi - p.lo) };
+                    local += p.shadow.card_merge_relay(p.lo, gpu, p.after, &mut title);
+                }
+                written.fetch_add(local, Ordering::Relaxed);
+            }) as Box<dyn FnOnce() + Send>
+        })
+        .collect();
+    crate::shadow::wide_run(jobs);
+    written.load(Ordering::Relaxed)
 }
 
 /// One declared range of a copy in the card's memory, in a submission.
@@ -574,7 +712,7 @@ pub(super) struct Line {
     /// Last fence value signalled behind a queued flight.
     target: u64,
     /// True while a settle or `relay_land` is actively draining flights.
-    settling: bool,
+    pub(super) settling: bool,
     /// Signals `victory-late-wait` to drain landed lists / woken timelines.
     poke: bool,
     /// Finished flights' `InFlight` lists queued for async reset/recycle.
@@ -584,6 +722,23 @@ pub(super) struct Line {
     /// Timelines woken by `Late::Write` / `Late::Signal`, drained outside
     /// `Host::submitted` and never on `victory-relay`.
     pending_woken: Vec<crate::fence::Woken>,
+}
+
+#[cfg(test)]
+impl Line {
+    pub(super) fn new_for_test() -> Self {
+        Self {
+            line: Vec::new(),
+            written: Vec::new(),
+            lists: 0,
+            target: 0,
+            settling: false,
+            poke: false,
+            landed: Vec::new(),
+            in_hand: Vec::new(),
+            pending_woken: Vec::new(),
+        }
+    }
 }
 
 // SAFETY: D3D12 objects, `InFlight`, `Held`, and `Woken` are safe to transfer
@@ -1296,24 +1451,75 @@ fn late_threads() {
     });
 }
 
-/// Waits on `LINE_LANDED` until `done(&line)` holds. Safe while holding
-/// `Host::submitted` because `victory-relay` never acquires `Host::submitted`.
-pub(super) fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) {
-    let mut line = line();
+/// Waits on `cv` under `line_lock` until `done(&line)` holds, returning
+/// `Some(elapsed_us)` when it had to wait or `None` if `done` already held.
+pub(super) fn wait_on_line(
+    line_lock: &Mutex<Line>,
+    cv: &Condvar,
+    why: usize,
+    record_stats: bool,
+    done: impl Fn(&Line) -> bool,
+) -> Option<u64> {
+    let mut line = line_lock.lock().unwrap_or_else(|e| e.into_inner());
     if done(&line) {
-        return;
+        return None;
     }
-    LATE_STATS[1].fetch_add(1, Ordering::Relaxed);
-    LATE_STATS[why].fetch_add(1, Ordering::Relaxed);
+    if record_stats {
+        LATE_STATS[1].fetch_add(1, Ordering::Relaxed);
+        LATE_STATS[why].fetch_add(1, Ordering::Relaxed);
+    }
     let waiting = std::time::Instant::now();
     while !done(&line) {
-        line = LINE_LANDED.wait(line).unwrap_or_else(|e| e.into_inner());
+        line = cv.wait(line).unwrap_or_else(|e| e.into_inner());
     }
     drop(line);
     let us = waiting.elapsed().as_micros() as u64;
-    LATE_STATS[12].fetch_add(us, Ordering::Relaxed);
-    LATE_WAITED[why.min(10)].fetch_add(us, Ordering::Relaxed);
-    SUBMISSION_US[1].fetch_add(us, Ordering::Relaxed);
+    if record_stats {
+        LATE_STATS[12].fetch_add(us, Ordering::Relaxed);
+        LATE_WAITED[why.min(10)].fetch_add(us, Ordering::Relaxed);
+        SUBMISSION_US[1].fetch_add(us, Ordering::Relaxed);
+    }
+    Some(us)
+}
+
+/// Waits on `LINE_LANDED` until `done(&line)` holds. Safe while holding
+/// `Host::submitted` because `victory-relay` never acquires `Host::submitted`.
+pub(super) fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) {
+    wait_on_line(&LINE, &LINE_LANDED, why, true, done);
+}
+
+/// Settles in-flight relay submissions whose declared writes may overlap
+/// `(shadow_ptr, from, to)` so `Shadow::update_busy` can upload a single
+/// contiguous range instead of hundreds of thousands of byte-diff fragments.
+///
+/// Caller MUST drop `Shadow::before` and `list.deferred()` before calling so
+/// `victory-relay` can finish `relay_merge_card_pieces`, `read_backs`, and
+/// `copy_back_done` without lock-order inversion.
+pub(crate) fn settle_card_busy(shadow_ptr: usize, from: usize, to: usize) -> bool {
+    if !relay() || !late() {
+        return false;
+    }
+    let waited = if relay_exact() {
+        wait_on_line(&LINE, &LINE_LANDED, WHY_STALE, true, |line| {
+            !line.settling
+                && !line.line.iter().any(|l| {
+                    matches!(l, Late::Run(flight) if flight.back.iter().any(|(shadow, ranges)| {
+                        std::sync::Arc::as_ptr(shadow) as usize == shadow_ptr
+                            && ranges.iter().any(|&(a, b)| a < to && from < b)
+                    }))
+                })
+        })
+        .is_some()
+    } else {
+        wait_on_line(&LINE, &LINE_LANDED, WHY_STALE, true, |line| {
+            !line.settling && !line.line.iter().any(|l| matches!(l, Late::Run(_)))
+        })
+        .is_some()
+    };
+    if waited {
+        crate::watch::ask_once_void();
+    }
+    waited
 }
 
 /// Resources owned by the `"victory-relay"` worker thread for DMA readback of
@@ -2300,15 +2506,17 @@ impl Host {
                 CARD_STATS[5].fetch_add(1, Ordering::Relaxed);
                 CARD_STATS[6].fetch_add(us, Ordering::Relaxed);
             }
-            let mut title = Vec::new();
-            let mut written = 0usize;
-            for (shadow, lo, hi, at) in pieces {
-                // SAFETY: DMA fence completed and `data` covers `total` bytes.
-                let gpu = unsafe {
-                    std::slice::from_raw_parts((data + at as usize) as *const u8, hi - lo)
-                };
-                written += shadow.card_merge_relay(lo, gpu, after, &mut title);
-            }
+            let merge_pieces: Vec<RelayCardPiece> = pieces
+                .into_iter()
+                .map(|(shadow, lo, hi, at)| RelayCardPiece {
+                    shadow,
+                    lo,
+                    hi,
+                    gpu_ptr: data + at as usize,
+                    after,
+                })
+                .collect();
+            let written = relay_merge_card_pieces(merge_pieces, wide_merge());
             COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
             let mark = fallback_fetched_mark(inflight_fetch(), after, landed_max);
             crate::shadow::relay_fetched(mark);
@@ -2344,7 +2552,7 @@ impl Host {
 
     fn relay_card_inflight(&self, plans: &[&CardPlan]) -> bool {
         use std::sync::Arc;
-        let mut pieces: Vec<(Arc<crate::shadow::Shadow>, usize, usize, usize, u64)> = Vec::new();
+        let mut pieces: Vec<RelayCardPiece> = Vec::new();
         {
             let work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
             let Some(work) = work.as_ref() else {
@@ -2426,21 +2634,22 @@ impl Host {
                             .map(|b| (b.1, b.2))
                             .collect();
                         for (a, b) in crate::shadow::outside(lo, hi, newer) {
-                            pieces.push((r.shadow.clone(), a, b, slot + (a - from), plan.sent_as));
+                            pieces.push(RelayCardPiece {
+                                shadow: r.shadow.clone(),
+                                lo: a,
+                                hi: b,
+                                gpu_ptr: slot + (a - from),
+                                after: plan.sent_as,
+                            });
                         }
                     }
                 }
             }
         }
+        // Outside `CARD_WORK`: slots remain pinned until `inflight_tickets_landed` runs after this.
         let piece_count = pieces.len() as u64;
-        let bytes: u64 = pieces.iter().map(|p| (p.2 - p.1) as u64).sum();
-        let mut title = Vec::new();
-        let mut written = 0usize;
-        for (shadow, lo, hi, gpu_ptr, after) in pieces {
-            // SAFETY: slots remain pinned until `inflight_tickets_landed` runs after this.
-            let gpu = unsafe { std::slice::from_raw_parts(gpu_ptr as *const u8, hi - lo) };
-            written += shadow.card_merge_relay(lo, gpu, after, &mut title);
-        }
+        let bytes: u64 = pieces.iter().map(|p| (p.hi - p.lo) as u64).sum();
+        let written = relay_merge_card_pieces(pieces, wide_merge());
         for plan in plans {
             for r in &plan.ranges {
                 crate::shadow::CARD_STATS[2].fetch_add(u64::from(r.span.pieces), Ordering::Relaxed);

@@ -4040,10 +4040,33 @@ impl HostList {
     /// Runs the list's submission-time steps; refreshes go into `batch`
     /// (the title's big buffers, a 174 MB one among them, are read by most
     /// lists of a submission, through many ranges).
+    ///
+    /// Releases `self.deferred` before executing steps (restoring `copies` via
+    /// a drop guard so closed lists remain resubmittable) so `batch.flush()` ->
+    /// `Shadow::update_busy()` -> `settle_card_busy()` (`LINE` / `LINE_LANDED`)
+    /// never holds `list.deferred()` across a relay wait (`Host::relay_land`
+    /// acquires `list.deferred()` in `read_backs`, and `Host::submit` acquires
+    /// `LINE -> list.deferred()` in `WHY_READ`).
     fn run_deferred(&self, batch: &mut Batch, host: &Host, submitted: &mut u64) {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
-        for step in &self.deferred().copies {
+        struct RestoreCopies<'a> {
+            list: &'a HostList,
+            copies: Vec<Step>,
+        }
+        impl Drop for RestoreCopies<'_> {
+            fn drop(&mut self) {
+                let mut deferred = self.list.deferred();
+                if deferred.copies.is_empty() {
+                    deferred.copies = std::mem::take(&mut self.copies);
+                }
+            }
+        }
+        let guard = RestoreCopies {
+            list: self,
+            copies: std::mem::take(&mut self.deferred().copies),
+        };
+        for step in &guard.copies {
             let mut started = std::time::Instant::now();
             let copied = match step {
                 &Step::Copy(dst, src, len) => {
