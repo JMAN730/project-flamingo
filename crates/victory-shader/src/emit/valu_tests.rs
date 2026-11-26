@@ -3212,3 +3212,105 @@ fn sdwa_16bit_word0_sext_sign_extends() {
         });
     }
 }
+
+/// `v_perm_b32`: byte `i` of the result is byte `S` of `{src0, src1}` (`src1`
+/// low) for `S < 8`, sign-fill of bytes 1 and 3 of `src1` then `src0` for
+/// `8..=11`, `0x00` for `12`, and `0xFF` for `13..=255` (RDNA2 ISA VOP3).
+/// Checks both runtime VGPR selectors and the literal constant-selector path.
+#[test]
+fn v_perm_b32_matches_rdna2() {
+    fn perm_byte(src0: u32, src1: u32, sel: u32) -> u32 {
+        match sel & 0xFF {
+            0..=3 => (src1 >> (8 * (sel & 3))) & 0xFF,
+            4..=7 => (src0 >> (8 * (sel & 3))) & 0xFF,
+            8 => {
+                if (src1 >> 15) & 1 != 0 {
+                    0xFF
+                } else {
+                    0
+                }
+            }
+            9 => {
+                if (src1 >> 31) & 1 != 0 {
+                    0xFF
+                } else {
+                    0
+                }
+            }
+            10 => {
+                if (src0 >> 15) & 1 != 0 {
+                    0xFF
+                } else {
+                    0
+                }
+            }
+            11 => {
+                if (src0 >> 31) & 1 != 0 {
+                    0xFF
+                } else {
+                    0
+                }
+            }
+            12 => 0x00,
+            _ => 0xFF,
+        }
+    }
+    fn perm(src0: u32, src1: u32, sel: u32) -> u32 {
+        (0..4).fold(0u32, |acc, k| {
+            acc | (perm_byte(src0, src1, sel >> (8 * k)) << (8 * k))
+        })
+    }
+
+    let words = [
+        0x0000_0000u32,
+        0x7F7F_7F7F,
+        0x8080_8080,
+        0x817E_00FF,
+        0x12A4_7F80,
+        0xFE01_807F,
+    ];
+    let selectors = [
+        0x0302_0100u32, // bytes 0..=3 of src1
+        0x0706_0504,    // bytes 0..=3 of src0
+        0x0B0A_0908,    // sign-fill of bytes 1,3 of src1 then src0
+        0xFF0E_0D0C,    // 12 -> 0x00, 13/14/255 -> 0xFF
+        0x0C09_0401,    // mixed bytes, sign-fill, zero
+        0x100B_0806,    // mixed bytes, sign-fill, 0xFF
+    ];
+
+    let mut dyn_cases = Vec::new();
+    for &a in &words {
+        for &b in &words {
+            for &sel in &selectors {
+                dyn_cases.push([a, b, sel, 0]);
+            }
+        }
+    }
+    let dyn_shader = build_valu_cs(&vop3(0x344, 0, vgpr(1), vgpr(2), vgpr(3)));
+    run_cases(&dyn_shader, &dyn_cases, |backend, i, x, got| {
+        let want = perm(x[0], x[1], x[2]);
+        assert_eq!(
+            got, want,
+            "{backend}: dynamic v_perm_b32 case {i} ({:#010x}, {:#010x}, {:#010x}): {got:#010x}, want {want:#010x}",
+            x[0], x[1], x[2],
+        );
+    });
+
+    let const_sel = 0x0D0C_0904u32;
+    let [lo, hi] = vop3(0x344, 0, vgpr(1), vgpr(2), 255);
+    let const_shader = build_valu_cs(&[lo, hi, const_sel]);
+    let mut const_cases = Vec::new();
+    for &a in &words {
+        for &b in &words {
+            const_cases.push([a, b, 0, 0]);
+        }
+    }
+    run_cases(&const_shader, &const_cases, |backend, i, x, got| {
+        let want = perm(x[0], x[1], const_sel);
+        assert_eq!(
+            got, want,
+            "{backend}: literal v_perm_b32 case {i} ({:#010x}, {:#010x}): {got:#010x}, want {want:#010x}",
+            x[0], x[1],
+        );
+    });
+}
