@@ -5365,30 +5365,27 @@ fn install() -> bool {
             }
         }
         // Read-only, in a view we were told of, and not noted guarded: only we
-        // make title views read-only, so it is ours to give back. Never reopen
-        // a block still tracked as `lazy_back` (e.g. after a failed DMA).
-        if view_guard()
-            && !DIR.is_lazy_armed(at / BLOCK)
-            && !crate::lazy_back::has_block(at / BLOCK)
-            && crate::inplace::has_view_at(at)
-        {
-            let mut old = 0;
-            let block = at - at % BLOCK;
-            // SAFETY: only the protection of title view memory changes.
-            let opened = unsafe {
-                windows_sys::Win32::System::Memory::VirtualProtect(
-                    block as *const _,
-                    BLOCK,
-                    windows_sys::Win32::System::Memory::PAGE_READWRITE,
-                    &mut old,
-                )
-            } != 0;
-            if opened {
-                tracing::warn!(
-                    at = format_args!("{at:#x}"),
-                    "a read-only view block that no guard knew was opened"
-                );
-                return EXCEPTION_CONTINUE_EXECUTION;
+        // make title views read-only, so it is ours to give back. Hold the
+        // block's guard shard across rechecking lazy ownership, verifying the
+        // page is still read-only, and calling `VirtualProtect(..., PAGE_READWRITE)`
+        // so a concurrent armer cannot transition the block to `PAGE_NOACCESS`
+        // between our check and `VirtualProtect`.
+        if view_guard() && crate::inplace::has_view_at(at) {
+            match fallback_reopen_unguarded_view(at, block, shard) {
+                FallbackReopen::Opened => {
+                    tracing::warn!(
+                        at = format_args!("{at:#x}"),
+                        "a read-only view block that no guard knew was opened"
+                    );
+                    return EXCEPTION_CONTINUE_EXECUTION;
+                }
+                FallbackReopen::AlreadyWritable => return EXCEPTION_CONTINUE_EXECUTION,
+                FallbackReopen::LazyOwned => {
+                    if crate::lazy_back::handle_fault(at, true) {
+                        return EXCEPTION_CONTINUE_EXECUTION;
+                    }
+                }
+                FallbackReopen::Unhandled => {}
             }
         }
         EXCEPTION_CONTINUE_SEARCH
@@ -5398,6 +5395,54 @@ fn install() -> bool {
         // SAFETY: the handler only touches our guard state and protections.
         unsafe { !AddVectoredExceptionHandler(1, Some(on_write)).is_null() }
     })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FallbackReopen {
+    Opened,
+    AlreadyWritable,
+    LazyOwned,
+    Unhandled,
+}
+
+/// Fallback reopen path for a registered read-only view block with no guard
+/// metadata. Acquires `guard_shard(shard)` across the lazy-ownership recheck,
+/// protection check, and `VirtualProtect(..., PAGE_READWRITE)` so concurrent
+/// `try_arm_lazy_under_guards` / `attach_new_alias_on_failed_materialize`
+/// calls on `block` are mutually excluded.
+fn fallback_reopen_unguarded_view(at: usize, block: usize, shard: usize) -> FallbackReopen {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_READONLY, PAGE_READWRITE, VirtualProtect,
+        VirtualQuery,
+    };
+    let _g = guard_shard(shard);
+    if DIR.is_lazy_armed(block) || crate::lazy_back::has_block(block) {
+        return FallbackReopen::LazyOwned;
+    }
+    // SAFETY: plain data filled in by `VirtualQuery`.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: valid out pointer of the right size.
+    let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+    if n == 0 || info.State != MEM_COMMIT {
+        return FallbackReopen::Unhandled;
+    }
+    if info.Protect == PAGE_READWRITE {
+        return FallbackReopen::AlreadyWritable;
+    }
+    if info.Protect != PAGE_READONLY {
+        return FallbackReopen::Unhandled;
+    }
+    let mut old = 0u32;
+    let block_va = block * BLOCK;
+    // SAFETY: `_g` excludes lazy arming on `block` and only this view's
+    // `PAGE_READONLY` protection is restored to `PAGE_READWRITE`.
+    let opened =
+        unsafe { VirtualProtect(block_va as *const _, BLOCK, PAGE_READWRITE, &mut old) } != 0;
+    if opened {
+        FallbackReopen::Opened
+    } else {
+        FallbackReopen::Unhandled
+    }
 }
 
 /// Whether `at` is committed read-write memory now.
@@ -8097,6 +8142,144 @@ mod tests {
             windows_sys::Win32::Foundation::CloseHandle(section);
         }
         title_memory_remapped(view, 2 * BLOCK);
+    }
+
+    #[test]
+    fn fallback_reopen_unguarded_view_excludes_lazy_armer_on_guard_shard() {
+        use std::sync::{Arc, Condvar, Mutex};
+        use std::time::Duration;
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE,
+            VirtualProtect, VirtualQuery,
+        };
+
+        let alloc = WatchedAllocGuard::new(1);
+        let va = alloc.base;
+        let block = va / BLOCK;
+        let shard = shard_of(block);
+        let query_protect = |addr: usize| -> u32 {
+            // SAFETY: zero-initialized `MEMORY_BASIC_INFORMATION`.
+            let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            // SAFETY: querying page protection with valid out pointer.
+            let n = unsafe { VirtualQuery(addr as *const _, &mut info, size_of_val(&info)) };
+            assert_ne!(n, 0);
+            assert_eq!(info.State, MEM_COMMIT);
+            info.Protect
+        };
+
+        // 1. Unowned read-only block with no guard metadata is reopened to RW.
+        let mut old = 0u32;
+        assert_ne!(
+            // SAFETY: test-owned allocation.
+            unsafe { VirtualProtect(va as *const _, BLOCK, PAGE_READONLY, &mut old) },
+            0
+        );
+        assert_eq!(
+            fallback_reopen_unguarded_view(va, block, shard),
+            FallbackReopen::Opened
+        );
+        assert_eq!(query_protect(va), PAGE_READWRITE);
+
+        // 2. An armer holding `guard_shard(shard)` blocks `fallback_reopen_unguarded_view`
+        //    until it finishes setting `PAGE_NOACCESS` and marking `DIR.set_lazy_armed`;
+        //    once released, fallback sees `FallbackReopen::LazyOwned` and does NOT
+        //    clobber `PAGE_NOACCESS` back to `PAGE_READWRITE`.
+        assert_ne!(
+            // SAFETY: set page read-only before concurrent arming race.
+            unsafe { VirtualProtect(va as *const _, BLOCK, PAGE_READONLY, &mut old) },
+            0
+        );
+        let entered_arm = Arc::new((Mutex::new(false), Condvar::new()));
+        let release_arm = Arc::new((Mutex::new(false), Condvar::new()));
+        let entered_t = entered_arm.clone();
+        let release_t = release_arm.clone();
+
+        let armer = std::thread::spawn(move || {
+            let armed = try_arm_lazy_under_guards(&[block], |_| {
+                {
+                    let mut g = entered_t.0.lock().unwrap();
+                    *g = true;
+                    entered_t.1.notify_all();
+                }
+                let mut r = release_t.0.lock().unwrap();
+                while !*r {
+                    r = release_t.1.wait(r).unwrap();
+                }
+                let mut old_p = 0u32;
+                assert_ne!(
+                    // SAFETY: test-owned allocation armed to PAGE_NOACCESS under guard shard.
+                    unsafe { VirtualProtect(va as *const _, BLOCK, PAGE_NOACCESS, &mut old_p) },
+                    0
+                );
+                DIR.set_bits_range(
+                    block,
+                    block + 1,
+                    BitField::LazyArmed,
+                    true,
+                    Ordering::SeqCst,
+                );
+                true
+            });
+            assert!(armed);
+        });
+
+        {
+            let mut g = entered_arm.0.lock().unwrap();
+            while !*g {
+                g = entered_arm.1.wait(g).unwrap();
+            }
+        }
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let reopen_thread = std::thread::spawn(move || {
+            let outcome = fallback_reopen_unguarded_view(va, block, shard);
+            let _ = tx.send(outcome);
+        });
+
+        // While the armer holds `guard_shard(shard)`, fallback MUST remain blocked.
+        assert!(
+            rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "fallback_reopen_unguarded_view must block on guard_shard while lazy arm is in progress"
+        );
+        {
+            let mut r = release_arm.0.lock().unwrap();
+            *r = true;
+            release_arm.1.notify_all();
+        }
+        armer.join().unwrap();
+        let outcome = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("fallback_reopen_unguarded_view must complete after armer releases shard");
+        reopen_thread.join().unwrap();
+        assert_eq!(
+            outcome,
+            FallbackReopen::LazyOwned,
+            "fallback must see lazy ownership instead of clobbering PAGE_NOACCESS"
+        );
+        assert_eq!(
+            query_protect(va),
+            PAGE_NOACCESS,
+            "PAGE_NOACCESS applied by armer must not be overwritten to PAGE_READWRITE"
+        );
+
+        // 3. Clean up lazy bit; a plain PAGE_NOACCESS block is still left `Unhandled`.
+        DIR.set_bits_range(
+            block,
+            block + 1,
+            BitField::LazyArmed,
+            false,
+            Ordering::SeqCst,
+        );
+        assert_eq!(
+            fallback_reopen_unguarded_view(va, block, shard),
+            FallbackReopen::Unhandled
+        );
+        assert_eq!(query_protect(va), PAGE_NOACCESS);
+        assert_ne!(
+            // SAFETY: restore RW before `alloc` drop.
+            unsafe { VirtualProtect(va as *const _, BLOCK, PAGE_READWRITE, &mut old) },
+            0
+        );
     }
 }
 

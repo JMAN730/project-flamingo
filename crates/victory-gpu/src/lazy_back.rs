@@ -310,7 +310,7 @@ fn current_thread_materializing(block: usize) -> bool {
 }
 
 struct MaterializeBatchScope {
-    blocks: Vec<usize>,
+    blocks: Vec<(usize, bool)>,
     finished: bool,
 }
 
@@ -318,8 +318,14 @@ impl MaterializeBatchScope {
     fn enter(blocks: Vec<usize>) -> Self {
         IN_MATERIALIZE.with(|v| v.borrow_mut().extend_from_slice(&blocks));
         Self {
-            blocks,
+            blocks: blocks.into_iter().map(|b| (b, false)).collect(),
             finished: false,
+        }
+    }
+
+    fn mark_merged(&mut self, block: usize) {
+        if let Some(slot) = self.blocks.iter_mut().find(|(b, _)| *b == block) {
+            slot.1 = true;
         }
     }
 }
@@ -405,34 +411,40 @@ impl Drop for MaterializeBatchScope {
     fn drop(&mut self) {
         IN_MATERIALIZE.with(|v| {
             let mut list = v.borrow_mut();
-            for &block in self.blocks.iter().rev() {
+            for &(block, _) in self.blocks.iter().rev() {
                 if let Some(pos) = list.iter().rposition(|&b| b == block) {
                     list.remove(pos);
                 }
             }
         });
         if !self.finished {
-            // Unwind safety: restore access on every armed VA BEFORE removing
-            // entries and waking `LAZY_CV` waiters so no waiter can resume its
-            // faulting instruction against `PAGE_NOACCESS` with a missing entry.
-            // If `VirtualProtect` fails for any VA of an entry, retain that entry
-            // with `restore_failed = true` so waiters observe failure instead of
-            // treating the fault as handled.
-            let block_vas: Vec<(usize, Vec<ArmedVa>)> = {
+            // Unwind safety:
+            // - For blocks whose GPU bytes have NOT merged into RAM (`merged == false`),
+            //   keep the entry armed at `PAGE_NOACCESS`, clear `materializing = false`,
+            //   and wake `LAZY_CV` waiters so they retry and fetch the real GPU bytes
+            //   instead of reading stale RAM.
+            // - For blocks whose GPU bytes HAVE merged (`merged == true`), restore
+            //   `PAGE_READWRITE` on every armed VA BEFORE removing the entry and waking
+            //   waiters. If `VirtualProtect` fails for any VA, retain that entry with
+            //   `restore_failed = true` and `materializing = false`.
+            let mut unmerged_blocks = Vec::new();
+            let merged_block_vas: Vec<(usize, Vec<ArmedVa>)> = {
                 let table = LAZY_STATE.lock().unwrap_or_else(|e| e.into_inner());
-                self.blocks
-                    .iter()
-                    .filter_map(|&block| {
-                        table
-                            .pages
-                            .get(&block)
-                            .map(|entry| (block, entry.armed_vas.clone()))
-                    })
-                    .collect()
+                let mut merged = Vec::new();
+                for &(block, is_merged) in &self.blocks {
+                    if is_merged {
+                        if let Some(entry) = table.pages.get(&block) {
+                            merged.push((block, entry.armed_vas.clone()));
+                        }
+                    } else {
+                        unmerged_blocks.push(block);
+                    }
+                }
+                merged
             };
-            let mut restored_blocks = Vec::with_capacity(block_vas.len());
+            let mut restored_blocks = Vec::with_capacity(merged_block_vas.len());
             let mut failed_blocks = Vec::new();
-            for (block, vas) in block_vas {
+            for (block, vas) in merged_block_vas {
                 let mut all_restored = true;
                 for armed in vas {
                     if !restore_page_readwrite(armed) {
@@ -452,6 +464,11 @@ impl Drop for MaterializeBatchScope {
             let mut removed = Vec::with_capacity(restored_blocks.len());
             {
                 let mut table = LAZY_STATE.lock().unwrap_or_else(|e| e.into_inner());
+                for block in unmerged_blocks {
+                    if let Some(entry) = table.pages.get_mut(&block) {
+                        entry.materializing = false;
+                    }
+                }
                 for block in restored_blocks {
                     if let Some(entry) = remove_entry_locked_no_notify(&mut table, block, true) {
                         removed.push(entry);
@@ -802,6 +819,8 @@ std::thread_local! {
     static LAST_DETACHED_SOURCE_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static BEFORE_FETCH_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
+    static AFTER_MERGE_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
     static BEFORE_LAZY_CV_WAIT_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
     static AFTER_OWN_VIEW_CHECK_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
@@ -815,6 +834,11 @@ std::thread_local! {
 #[cfg(test)]
 pub(crate) fn set_before_fetch_hook_for_test(hook: Option<Box<dyn FnOnce()>>) {
     BEFORE_FETCH_HOOK.with(|h| *h.borrow_mut() = hook);
+}
+
+#[cfg(test)]
+pub(crate) fn set_after_merge_hook_for_test(hook: Option<Box<dyn FnOnce()>>) {
+    AFTER_MERGE_HOOK.with(|h| *h.borrow_mut() = hook);
 }
 
 #[cfg(test)]
@@ -1476,6 +1500,11 @@ fn materialize_claimed_batch(claimed: Vec<ClaimedBlock>, reason: MaterializeReas
                 };
 
                 if merged_via_own {
+                    scope.mark_merged(item.primary_block);
+                    #[cfg(test)]
+                    if let Some(hook) = AFTER_MERGE_HOOK.with(|h| h.borrow_mut().take()) {
+                        hook();
+                    }
                     if restore_prot(&item.restore_vas) {
                         if reason == (MaterializeReason::CpuFault { is_write: true }) {
                             for &armed in &item.restore_vas {
@@ -1580,7 +1609,10 @@ fn materialize_primary(primary_block: usize, reason: MaterializeReason) -> Mater
                         offset: entry.offset,
                         len: entry.len,
                         fetched_after: entry.fetched_after,
-                        own_va: primary_block * PAGE,
+                        own_va: entry
+                            .armed_vas
+                            .first()
+                            .map_or(primary_block * PAGE, |a| a.va),
                         restore_vas: entry.armed_vas.clone(),
                     };
                     match reason {
@@ -1726,7 +1758,10 @@ fn materialize_ranges_inner(ranges: &[(usize, usize)], check_active: bool) -> bo
                         offset: entry.offset,
                         len: entry.len,
                         fetched_after: entry.fetched_after,
-                        own_va: primary_block * PAGE,
+                        own_va: entry
+                            .armed_vas
+                            .first()
+                            .map_or(primary_block * PAGE, |a| a.va),
                         restore_vas: entry.armed_vas.clone(),
                     });
                     if do_promote {
@@ -1806,7 +1841,10 @@ pub(crate) fn materialize_shadow(shadow_ptr: usize) -> bool {
                         offset: entry.offset,
                         len: entry.len,
                         fetched_after: entry.fetched_after,
-                        own_va: primary_block * PAGE,
+                        own_va: entry
+                            .armed_vas
+                            .first()
+                            .map_or(primary_block * PAGE, |a| a.va),
                         restore_vas: entry.armed_vas.clone(),
                     });
                 }
@@ -1865,7 +1903,29 @@ fn detach_remapped_vas_locked(
     if surviving.is_empty() {
         return (Some(entry), None);
     }
-    let new_primary = surviving[0].va / PAGE;
+    // Prefer a surviving alias covering the full `entry.len`; otherwise pick the
+    // longest surviving alias and clamp `entry.len` so `own_view_ptr` never
+    // rejects future merges against a shorter promoted view.
+    let best_idx = surviving
+        .iter()
+        .enumerate()
+        .find(|(_, a)| a.va.is_multiple_of(PAGE) && a.len >= entry.len)
+        .or_else(|| surviving.iter().enumerate().max_by_key(|(_, a)| a.len))
+        .map(|(i, _)| i)
+        .unwrap_or(0);
+    if best_idx != 0 {
+        surviving.swap(0, best_idx);
+    }
+    let promoted = surviving[0];
+    let new_primary = promoted.va / PAGE;
+    let sub_off = promoted.va % PAGE;
+    if sub_off != 0 {
+        entry.offset = entry.offset.saturating_add(sub_off);
+        entry.len = entry.len.saturating_sub(sub_off);
+    }
+    if promoted.len < entry.len {
+        entry.len = promoted.len;
+    }
     entry.armed_vas = surviving;
     for &armed in &entry.armed_vas {
         table.alias_to_primary.insert(armed.va / PAGE, new_primary);
@@ -1935,7 +1995,7 @@ pub(crate) fn discard_range(at: usize, len: usize) {
                         offset: entry.offset,
                         len: entry.len,
                         fetched_after: entry.fetched_after,
-                        own_va: new_primary * PAGE,
+                        own_va: entry.armed_vas.first().map_or(new_primary * PAGE, |a| a.va),
                         restore_vas: entry.armed_vas.clone(),
                     });
                 }
@@ -3490,17 +3550,26 @@ mod tests {
 
         // 1. Production watermark computation when every changed card page is
         //    deferred (`has_card == false`) advances past `fetched_after = 1`
-        //    rather than pinning the watermark to the deferred page.
-        let wm15 = crate::host::relay_no_card_fetch_watermark(true, true, Some(15), 15, 0)
+        //    rather than pinning the watermark to the deferred page, while NEVER
+        //    covering a later incomplete DIRECT upload (`sent_as = 20`) whose
+        //    fence has not completed yet (`completed_order = 15`).
+        let wm15 = crate::host::relay_no_card_fetch_watermark(true, Some(15), 15)
             .expect("inflight watermark");
         assert_eq!(wm15, 15);
-        assert_eq!(
-            crate::host::relay_no_card_fetch_watermark(false, true, Some(15), 15, 0),
-            Some(15)
+        let wm15_direct = crate::host::relay_no_card_fetch_watermark(false, Some(15), 15)
+            .expect("non-inflight watermark");
+        assert_eq!(wm15_direct, 15);
+        assert!(
+            shadow.card_sent_has_after_for_test(wm15_direct),
+            "later incomplete DIRECT upload (sent_as=20) must remain in-flight above completed_order=15"
         );
-        let wm25 = crate::host::relay_no_card_fetch_watermark(true, true, Some(25), 25, 0)
+        let wm25 = crate::host::relay_no_card_fetch_watermark(true, Some(25), 25)
             .expect("inflight watermark 25");
         assert_eq!(wm25, 25);
+        assert!(
+            !shadow.card_sent_has_after_for_test(wm25),
+            "once completed_order reaches 25, upload at 20 is no longer in-flight"
+        );
 
         // 2. Production `card_dirty` empty-dirty fast path (`card_dirty_with`)
         //    prunes `sent_as <= 15` on this isolated fixture while page 0 stays
@@ -4150,11 +4219,12 @@ mod tests {
         let entered_t1 = entered.clone();
         let release_t1 = release_panic.clone();
 
-        // Thread 1 claims the block (`materializing = true`), waits for Thread 2
-        // to block on `LAZY_CV`, and then panics so `MaterializeBatchScope::drop`
+        // Thread 1 claims the block (`materializing = true`), merges GPU bytes
+        // into RAM (`merged = true`), waits for Thread 2 to block on `LAZY_CV`,
+        // and then panics before `restore_prot` so `MaterializeBatchScope::drop`
         // attempts `VirtualProtect` restoration (which fails for `va`).
         let t1 = std::thread::spawn(move || {
-            BEFORE_FETCH_HOOK.with(|hook| {
+            AFTER_MERGE_HOOK.with(|hook| {
                 *hook.borrow_mut() = Some(Box::new(move || {
                     {
                         let mut g = entered_t1.0.lock().unwrap();
@@ -4165,7 +4235,7 @@ mod tests {
                     while !*r {
                         r = release_t1.1.wait(r).unwrap();
                     }
-                    panic!("simulated unwind during materialization");
+                    panic!("simulated post-merge unwind during materialization");
                 }));
             });
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -5619,7 +5689,9 @@ mod tests {
             let got_b = unsafe { std::slice::from_raw_parts(va_b as *const u8, 32) };
             assert_eq!(got_b, &[0xCD; 32]);
 
-            // 2. Unwind path (`MaterializeBatchScope::drop`) must also restore exact `SUB_LEN`.
+            // 2. Unwind BEFORE GPU merge (`BEFORE_FETCH_HOOK`): must keep the
+            //    entry armed at `PAGE_NOACCESS` (never exposing stale `0xCD` RAM),
+            //    clear `materializing`, and allow a retry to merge real GPU `0xEF`.
             clear_hot_for_test(blk_a);
             clear_hot_for_test(blk_b);
             crate::inplace::views_gone(va_b, SUB_LEN);
@@ -5634,17 +5706,77 @@ mod tests {
             ));
             assert!(!is_readable_now(va_b));
             set_before_fetch_hook_for_test(Some(Box::new(|| {
-                panic!("simulated unwind with sub-64 KiB alias");
+                panic!("simulated pre-merge unwind with sub-64 KiB alias");
             })));
             let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let _ = materialize_range(va_a, PAGE);
             }));
             assert!(res.is_err());
             assert!(
+                has_block(blk_a) && has_block(blk_b),
+                "pre-merge unwind must keep entry armed so stale RAM is never exposed"
+            );
+            assert!(
+                !is_readable_now(va_a) && !is_readable_now(va_b),
+                "pre-merge unwind must keep both views PAGE_NOACCESS until GPU bytes land"
+            );
+            assert!(
+                materialize_range(va_a, PAGE),
+                "retry after pre-merge unwind must succeed cleanly"
+            );
+            assert!(!has_block(blk_a) && !has_block(blk_b));
+            assert!(is_readable_now(va_a) && is_readable_now(va_b));
+            // SAFETY: both views are PAGE_READWRITE and hold merged GPU `0xEF`.
+            unsafe {
+                assert_eq!(
+                    std::slice::from_raw_parts(va_a as *const u8, 32),
+                    &[0xEF; 32]
+                );
+                assert_eq!(
+                    std::slice::from_raw_parts(va_b as *const u8, 32),
+                    &[0xEF; 32]
+                );
+            }
+
+            // 3. Unwind AFTER GPU merge (`AFTER_MERGE_HOOK`): GPU bytes (`0x5A`)
+            //    have landed in RAM, so `MaterializeBatchScope::drop` restores exact
+            //    `SUB_LEN` on B and `PAGE` on A and removes the entry cleanly.
+            clear_hot_for_test(blk_a);
+            clear_hot_for_test(blk_b);
+            crate::inplace::views_gone(va_b, SUB_LEN);
+            gpu_write_shadow(&shadow, 0, &[0x5A; 32]);
+            assert!(try_defer_page_inner(&shadow, 0, PAGE, 0));
+            set_fail_next_fetches_for_test(1);
+            assert!(!crate::inplace::title_memory_view(
+                va_b,
+                SUB_LEN,
+                section as usize,
+                0
+            ));
+            assert!(!is_readable_now(va_b));
+            set_after_merge_hook_for_test(Some(Box::new(|| {
+                panic!("simulated post-merge unwind with sub-64 KiB alias");
+            })));
+            let res_post = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = materialize_range(va_a, PAGE);
+            }));
+            assert!(res_post.is_err());
+            assert!(
                 !has_block(blk_a) && !has_block(blk_b),
-                "unwind restore of sub-64 KiB alias must succeed and remove entry cleanly"
+                "post-merge unwind restore of sub-64 KiB alias must succeed and remove entry cleanly"
             );
             assert!(is_readable_now(va_a) && is_readable_now(va_b));
+            // SAFETY: both views are PAGE_READWRITE and hold merged GPU `0x5A`.
+            unsafe {
+                assert_eq!(
+                    std::slice::from_raw_parts(va_a as *const u8, 32),
+                    &[0x5A; 32]
+                );
+                assert_eq!(
+                    std::slice::from_raw_parts(va_b as *const u8, 32),
+                    &[0x5A; 32]
+                );
+            }
             drop(shadow);
         }
 
@@ -5817,15 +5949,35 @@ mod tests {
             let shadow_ptr = Arc::as_ptr(&shadow) as usize;
             let single_ptr_id = Arc::as_ptr(&single_shadow) as usize;
 
+            // Retry boundedly ONLY when an unrelated parallel test bumps
+            // `inplace::generation()` between `try_defer_page_inner`'s snapshot
+            // and recheck, re-establishing guards before each attempt.
+            fn arm_with_retry(target: &Arc<Shadow>, mut setup_guards: impl FnMut()) {
+                for _ in 0..16 {
+                    setup_guards();
+                    let gen_before = crate::inplace::generation();
+                    if try_defer_page_inner(target, 0, PAGE, 0) {
+                        return;
+                    }
+                    assert_ne!(
+                        crate::inplace::generation(),
+                        gen_before,
+                        "try_defer_page_inner failed without an unrelated inplace::generation() change"
+                    );
+                }
+                panic!("try_defer_page_inner failed after 16 retries due to concurrent view churn");
+            }
+
             {
                 let _no_vg = crate::watch::disable_view_guard_for_test();
 
                 // 1. With `VICTORY_VIEW_GUARD=0`, guarding primary A leaves alias B writable
                 //    (`PAGE_READWRITE`). Arming A MUST invalidate `cpu_clean_after` (`None`).
-                assert!(crate::watch::writes(va_a, va_a + PAGE, true).is_some());
-                assert_eq!(query_protect(va_a), PAGE_READONLY);
-                assert_eq!(query_protect(va_b), PAGE_READWRITE);
-                assert!(try_defer_page_inner(&shadow, 0, PAGE, 0));
+                arm_with_retry(&shadow, || {
+                    assert!(crate::watch::writes(va_a, va_a + PAGE, true).is_some());
+                    assert_eq!(query_protect(va_a), PAGE_READONLY);
+                    assert_eq!(query_protect(va_b), PAGE_READWRITE);
+                });
                 assert_eq!(query_protect(va_a), PAGE_NOACCESS);
                 assert_eq!(query_protect(va_b), PAGE_NOACCESS);
                 assert_eq!(
@@ -5838,11 +5990,12 @@ mod tests {
 
                 // 2. Even if both A and B were independently guarded while `VICTORY_VIEW_GUARD=0`,
                 //    cross-alias write tracking is off, so `cpu_clean_after` MUST still be `None`.
-                assert!(crate::watch::writes(va_a, va_a + PAGE, true).is_some());
-                assert!(crate::watch::writes(va_b, va_b + PAGE, true).is_some());
-                assert_eq!(query_protect(va_a), PAGE_READONLY);
-                assert_eq!(query_protect(va_b), PAGE_READONLY);
-                assert!(try_defer_page_inner(&shadow, 0, PAGE, 0));
+                arm_with_retry(&shadow, || {
+                    assert!(crate::watch::writes(va_a, va_a + PAGE, true).is_some());
+                    assert!(crate::watch::writes(va_b, va_b + PAGE, true).is_some());
+                    assert_eq!(query_protect(va_a), PAGE_READONLY);
+                    assert_eq!(query_protect(va_b), PAGE_READONLY);
+                });
                 assert_eq!(
                     owned_blocks_with_clean_in(shadow_ptr, blk_a, blk_a + 1),
                     vec![(blk_a, None)],
@@ -5853,9 +6006,10 @@ mod tests {
 
                 // 3. A single guarded view (no aliases) STILL retains its zero-DMA clean proof
                 //    even when `VICTORY_VIEW_GUARD=0`.
-                assert!(crate::watch::writes(single_va, single_va + PAGE, true).is_some());
-                assert_eq!(query_protect(single_va), PAGE_READONLY);
-                assert!(try_defer_page_inner(&single_shadow, 0, PAGE, 0));
+                arm_with_retry(&single_shadow, || {
+                    assert!(crate::watch::writes(single_va, single_va + PAGE, true).is_some());
+                    assert_eq!(query_protect(single_va), PAGE_READONLY);
+                });
                 let single_clean =
                     owned_blocks_with_clean_in(single_ptr_id, single_blk, single_blk + 1);
                 assert_eq!(single_clean.len(), 1);
@@ -5871,10 +6025,11 @@ mod tests {
             // 4. With view-guarding enabled, guarding A guards BOTH A and B read-only, so
             //    arming A preserves the zero-DMA clean proof (`Some(_)`).
             if crate::watch::view_guard_enabled_for_test() {
-                assert!(crate::watch::writes(va_a, va_a + PAGE, true).is_some());
-                assert_eq!(query_protect(va_a), PAGE_READONLY);
-                assert_eq!(query_protect(va_b), PAGE_READONLY);
-                assert!(try_defer_page_inner(&shadow, 0, PAGE, 0));
+                arm_with_retry(&shadow, || {
+                    assert!(crate::watch::writes(va_a, va_a + PAGE, true).is_some());
+                    assert_eq!(query_protect(va_a), PAGE_READONLY);
+                    assert_eq!(query_protect(va_b), PAGE_READONLY);
+                });
                 let aliased_clean = owned_blocks_with_clean_in(shadow_ptr, blk_a, blk_a + 1);
                 assert_eq!(aliased_clean.len(), 1);
                 assert_eq!(aliased_clean[0].0, blk_a);
@@ -6018,6 +6173,101 @@ mod tests {
         clear_hot_for_test(blk_b);
         crate::watch::title_memory_remapped(va_a, PAGE);
         crate::watch::title_memory_remapped(va_b, PAGE);
+        // SAFETY: cleanup.
+        unsafe {
+            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
+                Value: view_b.Value,
+            });
+            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
+                Value: view_a.Value,
+            });
+            CloseHandle(section);
+        }
+        h.log_messages();
+        assert_eq!(h.d3d12_errors(), errors_before);
+    }
+
+    #[test]
+    fn lazy_discard_primary_with_shorter_surviving_alias_clamps_and_merges() {
+        const SUB_LEN: usize = 4096;
+        let Some(h) = crate::host::host() else {
+            return;
+        };
+        let errors_before = h.d3d12_errors();
+        // SAFETY: 1-page (64 KiB) anonymous section mapped at primary A (64 KiB)
+        // and surviving short alias B (4 KiB).
+        let section: HANDLE = unsafe {
+            CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                ptr::null(),
+                PAGE_READWRITE,
+                0,
+                PAGE as u32,
+                ptr::null(),
+            )
+        };
+        assert!(!section.is_null());
+        // SAFETY: mapping 64 KiB primary A.
+        let view_a = unsafe { MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, PAGE) };
+        // SAFETY: mapping 4 KiB alias B.
+        let view_b = unsafe { MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, SUB_LEN) };
+        assert!(!view_a.Value.is_null() && !view_b.Value.is_null());
+        let va_a = view_a.Value as usize;
+        let va_b = view_b.Value as usize;
+        let blk_a = va_a / PAGE;
+        let blk_b = va_b / PAGE;
+        clear_hot_for_test(blk_a);
+        clear_hot_for_test(blk_b);
+        crate::inplace::title_memory_section(section as usize, PAGE as u64, true);
+        assert!(crate::inplace::title_memory_view(
+            va_a,
+            PAGE,
+            section as usize,
+            0
+        ));
+        // SAFETY: seed physical page with `0x11`.
+        unsafe { ptr::write_bytes(va_a as *mut u8, 0x11, PAGE) };
+
+        if let Some((shadow, _side)) = make_card_shadow_at(va_a as u64, 1, 0x11) {
+            gpu_write_shadow(&shadow, 0, &[0xAB; 64]);
+            assert!(try_defer_page_inner(&shadow, 0, PAGE, 0));
+            // Attach 4 KiB alias B while the 64 KiB entry is armed.
+            set_fail_next_fetches_for_test(1);
+            assert!(!crate::inplace::title_memory_view(
+                va_b,
+                SUB_LEN,
+                section as usize,
+                0
+            ));
+            assert!(has_block(blk_a) && has_block(blk_b));
+            assert!(!is_readable_now(va_b));
+
+            // Discard primary A while only 4 KiB alias B survives: `detach_remapped_vas_locked`
+            // must clamp `entry.len` to `SUB_LEN` so `own_view_ptr` succeeds through B
+            // and merges GPU bytes into RAM instead of wedging at `PAGE_NOACCESS`.
+            crate::inplace::views_gone(va_a, PAGE);
+            discard_range(va_a, PAGE);
+            assert!(!has_block(blk_a));
+            assert!(
+                !has_block(blk_b),
+                "discarding primary A must promote and materialize through surviving 4 KiB alias B"
+            );
+            assert!(is_readable_now(va_b));
+            // SAFETY: B is now PAGE_READWRITE and holds merged GPU bytes.
+            let got_b = unsafe { std::slice::from_raw_parts(va_b as *const u8, 64) };
+            assert_eq!(got_b, &[0xAB; 64]);
+
+            // Restore RW on A before cleanup.
+            let mut old = 0u32;
+            // SAFETY: A is still mapped in this test until UnmapViewOfFile below.
+            unsafe { VirtualProtect(va_a as *const _, PAGE, PAGE_READWRITE, &mut old) };
+            drop(shadow);
+        }
+
+        clear_hot_for_test(blk_a);
+        clear_hot_for_test(blk_b);
+        crate::watch::title_memory_remapped(va_a, PAGE);
+        crate::watch::title_memory_remapped(va_b, SUB_LEN);
         // SAFETY: cleanup.
         unsafe {
             UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {

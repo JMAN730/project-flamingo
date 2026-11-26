@@ -1231,39 +1231,71 @@ enum LockRead<G> {
 thread_local! {
     static BEFORE_LOCK_AND_READ_RAW_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
+    static AFTER_LOCK_AND_READ_FAIL_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// Materializes any deferred `lazy_back` blocks in `[addr, addr + buf.len())`
 /// outside the per-`Shadow` lock, then acquires `acquire()` and reads via
-/// `read_into_raw`. If a concurrent relay thread re-deferred the block before
-/// the lock was acquired, drops the lock, materializes once, and retries.
+/// `read_into_raw`. If a concurrent relay thread re-deferred the block (or
+/// another thread materialized it between the failed read and the lazy table
+/// lookup), drops the lock, materializes as needed, and retries boundedly so a
+/// newly readable page is never misclassified as `LockRead::Unmapped`.
 fn lock_and_read<G>(acquire: impl Fn() -> G, addr: usize, buf: &mut [u8]) -> LockRead<G> {
-    if crate::lazy_back::active() && !crate::lazy_back::materialize_range(addr, buf.len()) {
-        return LockRead::LazyFailed;
-    }
-    #[cfg(test)]
-    if let Some(hook) = BEFORE_LOCK_AND_READ_RAW_HOOK.with(|h| h.borrow_mut().take()) {
-        hook();
-    }
-    let guard = acquire();
-    if crate::host::read_into_raw(addr as *const u8, buf) {
-        return LockRead::Ok(guard);
-    }
-    drop(guard);
-    if crate::lazy_back::has_block_in_range(addr, buf.len()) {
-        if !crate::lazy_back::materialize_range(addr, buf.len()) {
+    const MAX_LAZY_RETRIES: usize = 8;
+    let lazy_possible = crate::lazy_back::can_arm() || crate::lazy_back::active();
+    for attempt in 0..=MAX_LAZY_RETRIES {
+        if (attempt > 0 || crate::lazy_back::active())
+            && !crate::lazy_back::materialize_range(addr, buf.len())
+        {
             return LockRead::LazyFailed;
+        }
+        let gen_before = if lazy_possible {
+            crate::lazy_back::remove_generation()
+        } else {
+            0
+        };
+        #[cfg(test)]
+        if attempt == 0
+            && let Some(hook) = BEFORE_LOCK_AND_READ_RAW_HOOK.with(|h| h.borrow_mut().take())
+        {
+            hook();
         }
         let guard = acquire();
         if crate::host::read_into_raw(addr as *const u8, buf) {
             return LockRead::Ok(guard);
         }
         drop(guard);
-        if crate::lazy_back::has_block_in_range(addr, buf.len()) {
+        #[cfg(test)]
+        if attempt == 0
+            && let Some(hook) = AFTER_LOCK_AND_READ_FAIL_HOOK.with(|h| h.borrow_mut().take())
+        {
+            hook();
+        }
+        if !lazy_possible {
+            return LockRead::Unmapped;
+        }
+        let has_block = crate::lazy_back::has_block_in_range(addr, buf.len());
+        let gen_changed = crate::lazy_back::remove_generation() != gen_before;
+        if !has_block && !gen_changed {
+            // Confirm once under `acquire()` in case a concurrent arm rolled
+            // back between the failed read and `has_block_in_range`.
+            let guard = acquire();
+            if crate::host::read_into_raw(addr as *const u8, buf) {
+                return LockRead::Ok(guard);
+            }
+            drop(guard);
+            if !crate::lazy_back::has_block_in_range(addr, buf.len())
+                && crate::lazy_back::remove_generation() == gen_before
+            {
+                return LockRead::Unmapped;
+            }
+        }
+        if attempt == MAX_LAZY_RETRIES {
             return LockRead::LazyFailed;
         }
     }
-    LockRead::Unmapped
+    LockRead::LazyFailed
 }
 
 /// Scans `work` (`(shadow, from, to)` title-address spans of PC-backed shadows)
@@ -2723,58 +2755,78 @@ impl Shadow {
                 let title = &mut title[..n];
                 let at = lo - start;
                 if let Some(rebar) = &self.rebar {
+                    enum RebarMergeStep {
+                        Merged,
+                        MirrorMissing,
+                        LazyFailed,
+                        Unmapped,
+                    }
                     let mut dirty_runs = Vec::new();
                     // ReBAR writes directly to mapped WC VRAM + cached RAM mirror
                     // with zero D3D12 `CopyBufferRegion` overhead, so it must not
                     // be capped by or consume `runs_left` (reserved for `card`).
-                    let failed = {
-                        let LockRead::Ok(mut mirror) = lock_and_read(
-                            || rebar.mirror.lock().unwrap_or_else(|e| e.into_inner()),
-                            lo,
-                            title,
-                        ) else {
-                            continue;
-                        };
-                        MERGED[0].fetch_add(1, Ordering::Relaxed);
-                        if let Some(held_all) = mirror.as_mut()
-                            && at + n <= held_all.len()
-                        {
-                            let held = &mut held_all[at..at + n];
-                            for (r, m) in changed_runs(title, held) {
-                                // SAFETY: inside ReBAR WC VRAM mapping (`at + r + m <= self.len`).
-                                unsafe {
-                                    std::ptr::copy_nonoverlapping(
-                                        title.as_ptr().add(r),
-                                        self.data.add(at + r),
-                                        m,
-                                    );
+                    let step = match lock_and_read(
+                        || rebar.mirror.lock().unwrap_or_else(|e| e.into_inner()),
+                        lo,
+                        title,
+                    ) {
+                        LockRead::Ok(mut mirror) => {
+                            MERGED[0].fetch_add(1, Ordering::Relaxed);
+                            if let Some(held_all) = mirror.as_mut()
+                                && at + n <= held_all.len()
+                            {
+                                let held = &mut held_all[at..at + n];
+                                for (r, m) in changed_runs(title, held) {
+                                    // SAFETY: inside ReBAR WC VRAM mapping (`at + r + m <= self.len`).
+                                    unsafe {
+                                        std::ptr::copy_nonoverlapping(
+                                            title.as_ptr().add(r),
+                                            self.data.add(at + r),
+                                            m,
+                                        );
+                                    }
+                                    held[r..r + m].copy_from_slice(&title[r..r + m]);
+                                    dirty_runs.push((at + r, m));
+                                    MERGED[1].fetch_add(1, Ordering::Relaxed);
+                                    MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
                                 }
-                                held[r..r + m].copy_from_slice(&title[r..r + m]);
-                                dirty_runs.push((at + r, m));
-                                MERGED[1].fetch_add(1, Ordering::Relaxed);
-                                MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
+                                RebarMergeStep::Merged
+                            } else {
+                                RebarMergeStep::MirrorMissing
                             }
-                            false
-                        } else {
-                            true
                         }
+                        LockRead::LazyFailed => RebarMergeStep::LazyFailed,
+                        LockRead::Unmapped => RebarMergeStep::Unmapped,
                     };
-                    if failed {
-                        if push_unmerged(&stale[idx..], a, e, out) {
-                            MERGED[6].fetch_add(1, Ordering::Relaxed);
+                    match step {
+                        RebarMergeStep::Merged => {}
+                        RebarMergeStep::MirrorMissing => {
+                            if push_unmerged(&stale[idx..], a, e, out) {
+                                MERGED[6].fetch_add(1, Ordering::Relaxed);
+                            }
+                            break;
                         }
-                        break;
+                        RebarMergeStep::LazyFailed => {
+                            out.push((lo, hi));
+                            continue;
+                        }
+                        RebarMergeStep::Unmapped => continue,
                     }
                     for (off, len) in dirty_runs {
                         rebar.mark_dirty_range(off, len);
                     }
                 } else {
-                    let LockRead::Ok(mut before) = lock_and_read(
+                    let mut before = match lock_and_read(
                         || self.before.write().unwrap_or_else(|e| e.into_inner()),
                         lo,
                         title,
-                    ) else {
-                        continue;
+                    ) {
+                        LockRead::Ok(guard) => guard,
+                        LockRead::LazyFailed => {
+                            out.push((lo, hi));
+                            continue;
+                        }
+                        LockRead::Unmapped => continue,
                     };
                     MERGED[0].fetch_add(1, Ordering::Relaxed);
                     let fail_reason = if self.card.is_some() {
@@ -3981,6 +4033,16 @@ impl Shadow {
     pub(crate) fn card_sent_len_for_test(&self) -> usize {
         self.card.as_ref().map_or(0, |c| {
             c.sent.read().unwrap_or_else(|e| e.into_inner()).len()
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn card_sent_has_after_for_test(&self, fetched: u64) -> bool {
+        self.card.as_ref().is_some_and(|c| {
+            c.sent
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .has_after(fetched)
         })
     }
 
@@ -9383,10 +9445,11 @@ mod tests {
                 .expect("card shadow");
             shadow.clear_card_dirty_for_test();
 
-            let entered_gap = Arc::new((Mutex::new(false), Condvar::new()));
+            // (entered_hook, refresh_finished) so `merge_thread` exits cleanly
+            // instead of deadlocking at `join` if a refresh skips the hook.
+            let entered_gap = Arc::new((Mutex::new((false, false)), Condvar::new()));
             let merge_ready = Arc::new(Barrier::new(2));
             let lock_was_exclusive = Arc::new(std::sync::atomic::AtomicBool::new(false));
-
             let entered_cb = entered_gap.clone();
             let ready_cb = merge_ready.clone();
             let exclusive_cb = lock_was_exclusive.clone();
@@ -9399,7 +9462,7 @@ mod tests {
                     exclusive_cb.store(shadow_cb.before.try_read().is_err(), Ordering::SeqCst);
                     {
                         let mut g = entered_cb.0.lock().unwrap();
-                        *g = true;
+                        g.0 = true;
                         entered_cb.1.notify_all();
                     }
                     ready_cb.wait();
@@ -9410,11 +9473,25 @@ mod tests {
             let entered_t2 = entered_gap.clone();
             let ready_t2 = merge_ready.clone();
             let merge_thread = std::thread::spawn(move || {
-                {
+                let hook_fired = {
                     let mut g = entered_t2.0.lock().unwrap();
-                    while !*g {
-                        g = entered_t2.1.wait(g).unwrap();
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                    while !g.0 && !g.1 {
+                        let remaining =
+                            deadline.saturating_duration_since(std::time::Instant::now());
+                        if remaining.is_zero() {
+                            break;
+                        }
+                        let (guard, timeout) = entered_t2.1.wait_timeout(g, remaining).unwrap();
+                        g = guard;
+                        if timeout.timed_out() {
+                            break;
+                        }
                     }
+                    g.0
+                };
+                if !hook_fired {
+                    return None;
                 }
                 ready_t2.wait();
                 // Stale GPU bytes (`0x11`, matching old staging) arrive right as staging
@@ -9423,33 +9500,50 @@ mod tests {
                 // overwriting title RAM `0x77` back to `0x11`.
                 let stale_gpu = vec![0x11u8; PAGE];
                 let mut scratch = Vec::new();
-                shadow_t2
-                    .card_merge_relay_via_own_at(0, va, &stale_gpu, 0, &mut scratch)
-                    .expect("relay merge")
+                Some(
+                    shadow_t2
+                        .card_merge_relay_via_own_at(0, va, &stale_gpu, 0, &mut scratch)
+                        .expect("relay merge"),
+                )
             });
 
-            if use_batch {
-                // Include a second empty-span shadow so `refresh_batch` takes
-                // the multi-shadow batch path (`items.len() >= 2`) rather than
-                // the single-item `update_checked` shortcut.
-                let mut dummy_side = vec![0u8; PAGE];
-                let dummy = Shadow::new_card_sized_for_test(
-                    dummy_side.as_mut_ptr(),
-                    va as u64,
-                    PAGE as u64,
-                )
-                .expect("dummy card shadow");
-                let items = vec![(shadow.clone(), va, va + PAGE), (dummy, va, va)];
-                let (bytes, ok) = refresh_batch(items, false);
-                assert!(ok);
-                assert_eq!(bytes, PAGE);
-            } else {
-                let (bytes, ok) = shadow.copy_runs_with_epochs(&[(va, va + PAGE)], &[]);
-                assert!(ok);
-                assert_eq!(bytes, PAGE);
+            struct FinishGapGuard(Arc<(Mutex<(bool, bool)>, Condvar)>);
+            impl Drop for FinishGapGuard {
+                fn drop(&mut self) {
+                    let mut g = self.0.0.lock().unwrap();
+                    g.1 = true;
+                    self.0.1.notify_all();
+                }
             }
+            {
+                let _finish_gap = FinishGapGuard(entered_gap.clone());
+                if use_batch {
+                    // Include a second empty-span shadow so `refresh_batch` takes
+                    // the multi-shadow batch path (`items.len() >= 2`) rather than
+                    // the single-item `update_checked` shortcut.
+                    let mut dummy_side = vec![0u8; PAGE];
+                    let dummy = Shadow::new_card_sized_for_test(
+                        dummy_side.as_mut_ptr(),
+                        va as u64,
+                        PAGE as u64,
+                    )
+                    .expect("dummy card shadow");
+                    let items = vec![(shadow.clone(), va, va + PAGE), (dummy, va, va)];
+                    let (bytes, ok) = refresh_batch(items, false);
+                    assert!(ok);
+                    assert_eq!(bytes, PAGE);
+                } else {
+                    let (bytes, ok) = shadow.copy_runs_with_epochs(&[(va, va + PAGE)], &[]);
+                    assert!(ok);
+                    assert_eq!(bytes, PAGE);
+                }
+            }
+            BETWEEN_PUBLISH_AND_DIRTY_HOOK.with(|h| *h.borrow_mut() = None);
 
-            let merged = merge_thread.join().unwrap();
+            let merged = merge_thread
+                .join()
+                .unwrap()
+                .expect("BETWEEN_PUBLISH_AND_DIRTY_HOOK must fire during card refresh");
             assert!(
                 lock_was_exclusive.load(Ordering::SeqCst),
                 "self.before.write() must be held across staging publication and dirty marking (batch={use_batch})"
@@ -9472,6 +9566,247 @@ mod tests {
                 UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: view.Value });
                 CloseHandle(section);
             }
+        }
+    }
+
+    #[test]
+    fn lock_and_read_retries_when_page_materialized_between_failed_read_and_block_lookup() {
+        use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
+            PAGE_READWRITE, UnmapViewOfFile,
+        };
+
+        let Some(_h) = host() else {
+            return;
+        };
+        // SAFETY: 1-page anonymous section.
+        let section: HANDLE = unsafe {
+            CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                PAGE as u32,
+                std::ptr::null(),
+            )
+        };
+        assert!(!section.is_null());
+        // SAFETY: map 1 page.
+        let view = unsafe { MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, PAGE) };
+        assert!(!view.Value.is_null());
+        let ptr = view.Value.cast::<u8>();
+        let va = ptr as usize;
+        let blk = va / PAGE;
+        crate::lazy_back::clear_hot_for_test_pub(blk);
+        crate::inplace::title_memory_section(section as usize, PAGE as u64, true);
+        assert!(crate::inplace::title_memory_view(
+            va,
+            PAGE,
+            section as usize,
+            0
+        ));
+        // SAFETY: seed initial title bytes with `0x22`.
+        unsafe { std::ptr::write_bytes(ptr, 0x22, PAGE) };
+
+        let rebar_src = Shadow::new_rebar_for_test(va as u64, PAGE as u64, 0x11)
+            .expect("rebar shadow for gpu bytes");
+        rebar_src.write_test_bytes(0, &[0x9E; 32]);
+        let shadow_for_arm = rebar_src.clone();
+        BEFORE_LOCK_AND_READ_RAW_HOOK.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move || {
+                // Page arms AFTER pre-pass, causing the first `read_into_raw` to fail.
+                assert!(crate::lazy_back::try_defer_page_for_test(
+                    &shadow_for_arm,
+                    0,
+                    PAGE,
+                    0
+                ));
+            }));
+        });
+        AFTER_LOCK_AND_READ_FAIL_HOOK.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move || {
+                // Another thread materializes the page BEFORE `has_block_in_range` runs!
+                assert!(crate::lazy_back::materialize_range(va, PAGE));
+                assert!(!crate::lazy_back::has_block(blk));
+            }));
+        });
+
+        let mut buf = vec![0u8; PAGE];
+        let outcome = lock_and_read(|| (), va, &mut buf);
+        BEFORE_LOCK_AND_READ_RAW_HOOK.with(|h| *h.borrow_mut() = None);
+        AFTER_LOCK_AND_READ_FAIL_HOOK.with(|h| *h.borrow_mut() = None);
+        assert!(
+            matches!(outcome, LockRead::Ok(())),
+            "lock_and_read must retry and return Ok instead of Unmapped when page materialized after first failed read"
+        );
+        assert_eq!(
+            &buf[..32],
+            &[0x9E; 32],
+            "retried read must observe materialized GPU bytes"
+        );
+
+        drop(rebar_src);
+        crate::lazy_back::clear_hot_for_test_pub(blk);
+        crate::watch::title_memory_remapped(va, PAGE);
+        // SAFETY: cleanup.
+        unsafe {
+            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: view.Value });
+            CloseHandle(section);
+        }
+    }
+
+    #[test]
+    fn merge_ranges_under_writes_reports_lazy_failed_page_without_skipping_other_pages() {
+        use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MEM_RELEASE, MEM_RESERVE,
+            MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile, PAGE_NOACCESS, PAGE_READWRITE,
+            UnmapViewOfFile, VirtualAlloc, VirtualFree,
+        };
+
+        let Some(_h) = host() else {
+            return;
+        };
+        let len = 2 * PAGE;
+        // SAFETY: 2-page anonymous section.
+        let section: HANDLE = unsafe {
+            CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                len as u32,
+                std::ptr::null(),
+            )
+        };
+        assert!(!section.is_null());
+        // SAFETY: map 2 contiguous pages.
+        let view = unsafe { MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, len) };
+        assert!(!view.Value.is_null());
+        let ptr = view.Value.cast::<u8>();
+        let va0 = ptr as usize;
+        let va1 = va0 + PAGE;
+        let blk0 = va0 / PAGE;
+        crate::lazy_back::clear_hot_for_test_pub(blk0);
+        crate::inplace::title_memory_section(section as usize, len as u64, true);
+        assert!(crate::inplace::title_memory_view(
+            va0,
+            len,
+            section as usize,
+            0
+        ));
+        // SAFETY: seed page 0 = `0x22`, page 1 = `0x55`.
+        unsafe {
+            std::ptr::write_bytes(ptr, 0x22, PAGE);
+            std::ptr::write_bytes(ptr.add(PAGE), 0x55, PAGE);
+        }
+
+        // Another shadow owns page 0 and defers it.
+        let mut owner_side = vec![0x11u8; PAGE];
+        let owner =
+            Shadow::new_card_sized_for_test(owner_side.as_mut_ptr(), va0 as u64, PAGE as u64)
+                .expect("owner card shadow");
+
+        // 1. Card branch of `merge_ranges_under_writes`:
+        //    page 0 fails lazy materialization (`LockRead::LazyFailed`) -> must be
+        //    reported in `out` with its `copied` epoch unchanged, while page 1
+        //    is still merged and its `copied` epoch advances.
+        let mut card_side = vec![0x11u8; len];
+        let card = Shadow::new_card_sized_for_test(card_side.as_mut_ptr(), va0 as u64, len as u64)
+            .expect("target card shadow");
+        card.pending.lock().unwrap().push((va0, va0 + len));
+        assert!(crate::lazy_back::try_defer_page_for_test(
+            &owner, 0, PAGE, 0
+        ));
+        crate::lazy_back::set_fail_next_fetches_for_test(1);
+        let mut runs_left = 64usize;
+        let mut out = Vec::new();
+        card.merge_ranges_under_writes(va0, len, &mut runs_left, &mut out);
+        crate::lazy_back::set_fail_next_fetches_for_test(0);
+        assert_eq!(
+            out,
+            vec![(va0, va1)],
+            "card merge_ranges_under_writes must report LazyFailed page 0 in out for settlement"
+        );
+        assert_eq!(
+            &card_side[PAGE..PAGE + 32],
+            &[0x55; 32],
+            "card merge_ranges_under_writes must still merge healthy page 1"
+        );
+        {
+            let epochs = card.copied.lock().unwrap();
+            assert_eq!(epochs[0], 0, "failed page 0 epoch must not advance");
+            assert_ne!(epochs[1], 0, "merged page 1 epoch must advance");
+        }
+        assert!(crate::lazy_back::materialize_range(va0, PAGE));
+        crate::lazy_back::clear_hot_for_test_pub(blk0);
+        drop(card);
+
+        // 2. ReBAR branch of `merge_ranges_under_writes`: same scenario.
+        // SAFETY: restore page 1 bytes in case anything touched them.
+        unsafe { std::ptr::write_bytes(ptr.add(PAGE), 0x66, PAGE) };
+        let rebar =
+            Shadow::new_rebar_for_test(va0 as u64, len as u64, 0x11).expect("target rebar shadow");
+        rebar.pending.lock().unwrap().push((va0, va0 + len));
+        assert!(crate::lazy_back::try_defer_page_for_test(
+            &owner, 0, PAGE, 0
+        ));
+        crate::lazy_back::set_fail_next_fetches_for_test(1);
+        let mut rebar_runs = 64usize;
+        let mut rebar_out = Vec::new();
+        rebar.merge_ranges_under_writes(va0, len, &mut rebar_runs, &mut rebar_out);
+        crate::lazy_back::set_fail_next_fetches_for_test(0);
+        assert_eq!(
+            rebar_out,
+            vec![(va0, va1)],
+            "rebar merge_ranges_under_writes must report LazyFailed page 0 in out for settlement"
+        );
+        {
+            let epochs = rebar.copied.lock().unwrap();
+            assert_eq!(epochs[0], 0, "rebar failed page 0 epoch must not advance");
+            assert_ne!(epochs[1], 0, "rebar merged page 1 epoch must advance");
+            let mirror = rebar.rebar.as_ref().unwrap().mirror.lock().unwrap();
+            assert_eq!(
+                &mirror.as_ref().unwrap()[PAGE..PAGE + 32],
+                &[0x66; 32],
+                "rebar merge_ranges_under_writes must still merge healthy page 1"
+            );
+        }
+        assert!(crate::lazy_back::materialize_range(va0, PAGE));
+        drop(rebar);
+        drop(owner);
+
+        // 3. Ordinary unmapped hole without a lazy block stays skippable (not added to `out`).
+        // SAFETY: reserved uncommitted 64 KiB region.
+        let hole = unsafe { VirtualAlloc(std::ptr::null(), PAGE, MEM_RESERVE, PAGE_NOACCESS) };
+        assert!(!hole.is_null());
+        let hole_va = hole as usize;
+        let mut hole_side = vec![0x11u8; PAGE];
+        let hole_card =
+            Shadow::new_card_sized_for_test(hole_side.as_mut_ptr(), hole_va as u64, PAGE as u64)
+                .expect("hole card shadow");
+        hole_card
+            .pending
+            .lock()
+            .unwrap()
+            .push((hole_va, hole_va + PAGE));
+        let mut hole_runs = 64usize;
+        let mut hole_out = Vec::new();
+        hole_card.merge_ranges_under_writes(hole_va, PAGE, &mut hole_runs, &mut hole_out);
+        assert!(
+            hole_out.is_empty(),
+            "ordinary unmapped hole without lazy block must stay skippable"
+        );
+        drop(hole_card);
+
+        // SAFETY: cleanup.
+        unsafe {
+            VirtualFree(hole, 0, MEM_RELEASE);
+            crate::lazy_back::clear_hot_for_test_pub(blk0);
+            crate::watch::title_memory_remapped(va0, len);
+            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: view.Value });
+            CloseHandle(section);
         }
     }
 }

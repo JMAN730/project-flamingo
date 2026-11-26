@@ -538,7 +538,7 @@ pub extern "system" fn ReadFile(
     };
     if !prepare_kernel_write(buffer as usize, len as usize) {
         victory_gpu::kernel_wrote(buffer as usize, len as usize);
-        if overlapped.is_null() {
+        if !read.is_null() {
             let _ = write_checked_u32(read, 0);
         }
         // SAFETY: sets thread-local Win32 last error on failure return.
@@ -1130,6 +1130,28 @@ mod tests {
                 overlapped.as_mut_ptr().cast(),
             ),
             0
+        );
+        // SAFETY: reads thread-local Win32 last error.
+        assert_eq!(unsafe { GetLastError() }, ERROR_NOACCESS);
+
+        // 3b. Synchronous handle with non-null `overlapped` (offset) and non-null
+        //     `read` must still clear `*read` to `0` on prepare failure.
+        let mut n_ov = 10u32;
+        // SAFETY: clearing thread-local last error before call.
+        unsafe { SetLastError(0) };
+        assert_eq!(
+            ReadFile(
+                handle,
+                out.as_mut_ptr(),
+                10,
+                &mut n_ov,
+                overlapped.as_mut_ptr().cast(),
+            ),
+            0
+        );
+        assert_eq!(
+            n_ov, 0,
+            "ReadFile failure with non-null overlapped and non-null read must clear *read to 0"
         );
         // SAFETY: reads thread-local Win32 last error.
         assert_eq!(unsafe { GetLastError() }, ERROR_NOACCESS);

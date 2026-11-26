@@ -699,19 +699,21 @@ pub(crate) fn fallback_fetched_mark(inflight: bool, after: u64, landed: Option<u
 /// Computes the `relay_fetched` watermark when a relay landing has no eager
 /// card pieces left to DMA (including when every changed card page was
 /// deferred by `lazy_back`). Deferred pages never pin this watermark.
+///
+/// Without an eager readback fence on `Host::queue`, only flights in `plans`
+/// are proven complete on the GPU, so both the copy-queue and direct-queue
+/// non-inflight paths derive the watermark from `completed_order` rather than
+/// live `QUEUE_TIMELINE` submitted order (which could include a later DIRECT
+/// upload whose fence has not yet completed).
 pub(crate) fn relay_no_card_fetch_watermark(
     inflight: bool,
-    has_copy_queue: bool,
     max_sent_as: Option<u64>,
     completed_order: u64,
-    queue_order: u64,
 ) -> Option<u64> {
     if inflight {
         max_sent_as
-    } else if has_copy_queue {
-        Some(completed_order)
     } else {
-        Some(queue_order)
+        Some(completed_order)
     }
 }
 
@@ -2723,18 +2725,9 @@ impl Host {
         let completed_order = plans.iter().map(|p| p.order_after).max().unwrap_or(0);
         if !card_done_inflight && !has_card {
             let max_sent_as = plans.iter().map(|p| p.sent_as).max();
-            let queue_order = if !inflight_fetch() && self.copy_queue.is_none() {
-                *QUEUE_TIMELINE.lock_queue_order()
-            } else {
-                0
-            };
-            if let Some(mark) = relay_no_card_fetch_watermark(
-                inflight_fetch(),
-                self.copy_queue.is_some(),
-                max_sent_as,
-                completed_order,
-                queue_order,
-            ) {
+            if let Some(mark) =
+                relay_no_card_fetch_watermark(inflight_fetch(), max_sent_as, completed_order)
+            {
                 crate::shadow::relay_fetched(mark);
             }
         }

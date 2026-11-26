@@ -5249,6 +5249,68 @@ pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) -> Option<u
     None
 }
 
+/// Core piece-splitting implementation for [`write_mapped_raw_with`].
+///
+/// `write(at, n)` returns `(succeeded, bytes_transferred)`. Whenever a failed
+/// call reports `bytes_transferred > 0`, that prefix is immediately credited to
+/// `on_piece` and `written`, and fallback continues only on the remaining tail.
+fn write_mapped_raw_impl(
+    base: usize,
+    len: usize,
+    mut write: impl FnMut(usize, usize) -> (bool, usize),
+    mut on_piece: impl FnMut(usize, usize),
+) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    let (ok, done) = write(base, len);
+    if ok {
+        on_piece(0, len);
+        return len;
+    }
+    let mut written = 0usize;
+    let mut rem_base = base;
+    let mut rem_len = len;
+    let prefix = done.min(rem_len);
+    if prefix > 0 {
+        on_piece(0, prefix);
+        written += prefix;
+        rem_base += prefix;
+        rem_len -= prefix;
+    }
+    if rem_len == 0 {
+        return written;
+    }
+    for_pieces(rem_base, rem_len, 64 << 10, |at, n| {
+        let (ok, done) = write(at, n);
+        if ok {
+            on_piece(at - base, n);
+            written += n;
+            return;
+        }
+        let mut tail_at = at;
+        let mut tail_n = n;
+        let partial = done.min(tail_n);
+        if partial > 0 {
+            on_piece(tail_at - base, partial);
+            written += partial;
+            tail_at += partial;
+            tail_n -= partial;
+        }
+        if tail_n > 0 {
+            for_pieces(tail_at, tail_n, 4 << 10, |sub_at, sub_n| {
+                let (sub_ok, sub_done) = write(sub_at, sub_n);
+                let credited = if sub_ok { sub_n } else { sub_done.min(sub_n) };
+                if credited > 0 {
+                    on_piece(sub_at - base, credited);
+                    written += credited;
+                }
+            });
+        }
+    });
+    written
+}
+
 /// [`write_mapped`] without calling [`crate::lazy_back::materialize_range`],
 /// invoking `on_piece(offset_from_dst, piece_len)` for every confirmed-written
 /// sub-piece. Safe to call while holding `Shadow` locks after materializing
@@ -5257,8 +5319,9 @@ pub(crate) fn write_mapped_raw_with(
     dst: *mut u8,
     src: *const u8,
     len: usize,
-    mut on_piece: impl FnMut(usize, usize),
+    on_piece: impl FnMut(usize, usize),
 ) -> usize {
+    use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     if len == 0 {
         return 0;
@@ -5267,44 +5330,41 @@ pub(crate) fn write_mapped_raw_with(
         return 0;
     };
     let base = dst as usize;
-    let write = |at: usize, n: usize| {
-        let from = src.wrapping_add(at - base);
-        let CopyBack::NativeWrite(call) = method else {
-            return read(from, at as *mut u8, n);
-        };
-        let mut done = 0;
-        // SAFETY: the source is our mapped host copy; the kernel checks the
-        // destination.
-        unsafe {
-            // STATUS_SUCCESS only: a partial copy is a failure here too.
-            call(
-                GetCurrentProcess() as isize,
-                at as _,
-                from.cast(),
-                n,
-                &mut done,
-            ) == 0
-        }
-    };
-    if write(base, len) {
-        on_piece(0, len);
-        return len;
-    }
-    let mut written = 0usize;
-    for_pieces(base, len, 64 << 10, |at, n| {
-        if write(at, n) {
-            on_piece(at - base, n);
-            written += n;
-        } else {
-            for_pieces(at, n, 4 << 10, |at, n| {
-                if write(at, n) {
-                    on_piece(at - base, n);
-                    written += n;
+    write_mapped_raw_impl(
+        base,
+        len,
+        |at, n| {
+            let from = src.wrapping_add(at - base);
+            let mut done = 0usize;
+            match method {
+                CopyBack::NativeWrite(call) => {
+                    // SAFETY: the source is our mapped host copy; the kernel
+                    // checks the destination and writes the exact transferred
+                    // prefix count into `done` even on `STATUS_PARTIAL_COPY`.
+                    let ok = unsafe {
+                        call(
+                            GetCurrentProcess() as isize,
+                            at as _,
+                            from.cast(),
+                            n,
+                            &mut done,
+                        ) == 0
+                    };
+                    (ok, if ok { n } else { done.min(n) })
                 }
-            });
-        }
-    });
-    written
+                CopyBack::WineRead => {
+                    // SAFETY: same-process checked copy; `ReadProcessMemory`
+                    // reports any transferred prefix in `done` on partial copy.
+                    let ok = unsafe {
+                        ReadProcessMemory(GetCurrentProcess(), from.cast(), at as _, n, &mut done)
+                            != 0
+                    };
+                    (ok, if ok { n } else { done.min(n) })
+                }
+            }
+        },
+        on_piece,
+    )
 }
 
 /// [`write_mapped`] without calling [`crate::lazy_back::materialize_range`].
@@ -5481,6 +5541,109 @@ mod title_copies {
         eprintln!(
             "1024 x 4 KiB copy-backs, median {:?}",
             (samples[3] + samples[4]) / 2
+        );
+    }
+
+    #[test]
+    fn write_mapped_raw_credits_partial_prefix_before_inaccessible_page() {
+        const OS_PAGE: usize = 4096;
+        // 1. Live OS test: `[RW page 0, PAGE_NOACCESS page 1, RW page 2]` starting
+        //    mid-page so the initial NT write transfers a partial writable prefix
+        //    before failing with `STATUS_PARTIAL_COPY`.
+        // SAFETY: fresh private 3-page region; page 1 is set to PAGE_NOACCESS.
+        let base = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                3 * OS_PAGE,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE,
+            )
+            .cast::<u8>()
+        };
+        assert!(!base.is_null());
+        // SAFETY: seeding committed pages and protecting middle page NOACCESS.
+        unsafe {
+            base.write_bytes(0xEE, 3 * OS_PAGE);
+            let mut old = 0u32;
+            assert_ne!(
+                VirtualProtect(base.add(OS_PAGE).cast(), OS_PAGE, PAGE_NOACCESS, &mut old),
+                0
+            );
+        }
+        let start_off = 1234usize;
+        let total_len = 2 * OS_PAGE; // crosses page 0 tail -> page 1 NOACCESS -> page 2 head
+        let src: Vec<u8> = (0..total_len).map(|i| ((i % 251) + 1) as u8).collect();
+        let mut pieces = Vec::new();
+        // SAFETY: `base.add(start_off)` lies inside our 3-page reservation.
+        let written = super::write_mapped_raw_with(
+            unsafe { base.add(start_off) },
+            src.as_ptr(),
+            total_len,
+            |off, n| pieces.push((off, n)),
+        );
+        let first_expected = OS_PAGE - start_off;
+        let second_expected = total_len - first_expected - OS_PAGE;
+        assert_eq!(written, first_expected + second_expected);
+        assert_eq!(
+            pieces,
+            vec![
+                (0, first_expected),
+                (first_expected + OS_PAGE, second_expected)
+            ],
+            "on_piece must credit the writable prefix and trailing writable page without double-counting"
+        );
+        // SAFETY: page 0 and page 2 remain PAGE_READWRITE.
+        unsafe {
+            assert_eq!(
+                std::slice::from_raw_parts(base, start_off),
+                &vec![0xEE; start_off][..]
+            );
+            assert_eq!(
+                std::slice::from_raw_parts(base.add(start_off), first_expected),
+                &src[..first_expected]
+            );
+            assert_eq!(
+                std::slice::from_raw_parts(base.add(2 * OS_PAGE), second_expected),
+                &src[first_expected + OS_PAGE..]
+            );
+            assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
+        }
+
+        // 2. Simulated partial-copy failure at both 64 KiB and 4 KiB granularities
+        //    (where retrying the same address returns 0): every reported prefix
+        //    must be credited once and fallback must advance to the tail.
+        let mut calls = Vec::new();
+        let mut sim_pieces = Vec::new();
+        let sim_base = 0x1000_0000usize;
+        let sim_written = super::write_mapped_raw_impl(
+            sim_base,
+            2 * OS_PAGE,
+            |at, n| {
+                calls.push((at - sim_base, n));
+                match calls.len() {
+                    // Top-level write fails with 0 progress.
+                    1 => (false, 0),
+                    // 64 KiB piece writes 1024-byte prefix then fails.
+                    2 => (false, 1024),
+                    // First 4 KiB tail piece (`1024..4096`) writes 512 bytes then fails.
+                    3 => (false, 512),
+                    // Second 4 KiB piece (`4096..8192`) succeeds completely.
+                    4 => (true, n),
+                    _ => (false, 0),
+                }
+            },
+            |off, n| sim_pieces.push((off, n)),
+        );
+        assert_eq!(sim_written, 1024 + 512 + OS_PAGE);
+        assert_eq!(sim_pieces, vec![(0, 1024), (1024, 512), (OS_PAGE, OS_PAGE)]);
+        assert_eq!(
+            calls,
+            vec![
+                (0, 2 * OS_PAGE),
+                (0, 2 * OS_PAGE),
+                (1024, OS_PAGE - 1024),
+                (OS_PAGE, OS_PAGE),
+            ]
         );
     }
 
