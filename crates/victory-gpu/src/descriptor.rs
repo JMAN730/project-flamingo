@@ -199,27 +199,69 @@ impl Heap {
         }
         let start = self.start as usize;
         let end = start.saturating_add(mirrored_count as usize * step as usize);
+        let desc_fast = host::descriptor_fast();
         let mut last_watch = self.sync_watch.lock().unwrap_or_else(|e| e.into_inner());
         let mirrored = if let Some((now, pages)) = crate::watch::writes(start, end, false) {
             let prev = *last_watch;
-            let mut mirrored = 0;
-            for (page, written_at) in pages {
-                if written_at <= prev {
-                    continue;
+            let mirrored = if desc_fast {
+                let mut page_ranges: Vec<(usize, usize)> = Vec::new();
+                for (page, written_at) in pages {
+                    if written_at <= prev {
+                        continue;
+                    }
+                    let page_start = page * crate::watch::PAGE;
+                    let page_end = page_start + crate::watch::PAGE;
+                    let from = page_start.max(start);
+                    let to = page_end.min(end);
+                    if from < to {
+                        page_ranges.push((from, to));
+                    }
                 }
-                let page_start = page * crate::watch::PAGE;
-                let page_end = page_start + crate::watch::PAGE;
-                let lo = page_start.max(start) - start;
-                let hi = page_end.min(end) - start;
-                let first_slot = (lo / step as usize) as u32;
-                let end_slot = hi.div_ceil(step as usize).min(mirrored_count as usize) as u32;
-                mirrored += host.sync_slots(self.start, step, first_slot, end_slot, for_draw);
-            }
+                if page_ranges.is_empty() {
+                    0
+                } else {
+                    host.mirror_copied_pages(
+                        self.start,
+                        step,
+                        mirrored_count,
+                        &page_ranges,
+                        for_draw,
+                    )
+                    .2 as usize
+                }
+            } else {
+                let mut mirrored = 0;
+                for (page, written_at) in pages {
+                    if written_at <= prev {
+                        continue;
+                    }
+                    let page_start = page * crate::watch::PAGE;
+                    let page_end = page_start + crate::watch::PAGE;
+                    let lo = page_start.max(start) - start;
+                    let hi = page_end.min(end) - start;
+                    let first_slot = (lo / step as usize) as u32;
+                    let end_slot = hi.div_ceil(step as usize).min(mirrored_count as usize) as u32;
+                    mirrored += host.sync_slots(self.start, step, first_slot, end_slot, for_draw);
+                }
+                mirrored
+            };
             *last_watch = now;
             mirrored
         } else {
             drop(last_watch);
-            host.sync_slots(self.start, step, 0, mirrored_count, for_draw)
+            if desc_fast {
+                let mut page_ranges = Vec::new();
+                let mut cur = start;
+                while cur < end {
+                    let next = cur.saturating_add(crate::watch::PAGE).min(end);
+                    page_ranges.push((cur, next));
+                    cur = next;
+                }
+                host.mirror_copied_pages(self.start, step, mirrored_count, &page_ranges, for_draw)
+                    .2 as usize
+            } else {
+                host.sync_slots(self.start, step, 0, mirrored_count, for_draw)
+            }
         };
         // Streamed-mip SRVs can widen without a descriptor write; remake them
         // even when write-watch only touched other pages (or none).
@@ -424,6 +466,15 @@ const RTV_TAG: u32 = u32::from_le_bytes(*b"vRTV");
 const _: () = assert!(size_of::<RtvRecord>() <= 112);
 
 impl RtvRecord {
+    /// All the view it records is made from: records with equal keys have
+    /// equal views (of the same host texture).
+    #[cfg(windows)]
+    pub(crate) fn key(&self) -> (usize, [u32; 7]) {
+        let mut words = [self.described; 7];
+        words[1..].copy_from_slice(&self.desc);
+        (self.resource as usize, words)
+    }
+
     /// The view description in the host's type (the same layout).
     #[cfg(windows)]
     pub(crate) fn desc(
@@ -754,17 +805,91 @@ fn forget_host_resources(resource: usize) {
     }
 }
 
-/// The view of entry `i` if `generation` is still its own (or an inline CBV).
-fn view_at(i: u32, generation: u32) -> Option<View> {
+/// The view of entry `i` if `generation` is still its own (or an inline CBV),
+/// given an already-acquired read lock on [`VIEWS`].
+fn view_at_in(views: &Views, i: u32, generation: u32) -> Option<View> {
     match generation >> KIND_SHIFT {
         KIND_CONSTANT => Some(decode_constant(i, generation)),
         0 => {
-            let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
             let (view, current) = views.list.get(i as usize)?;
             (*current == generation).then(|| view.clone())
         }
         _ => None,
     }
+}
+
+/// The view of entry `i` if `generation` is still its own (or an inline CBV).
+fn view_at(i: u32, generation: u32) -> Option<View> {
+    match generation >> KIND_SHIFT {
+        KIND_CONSTANT => Some(decode_constant(i, generation)),
+        0 => view_at_in(
+            &VIEWS.read().unwrap_or_else(|e| e.into_inner()),
+            i,
+            generation,
+        ),
+        _ => None,
+    }
+}
+
+/// Whether `(i, generation)` still names a live view (or an inline CBV),
+/// without cloning the [`View`].
+#[cfg(windows)]
+pub(super) fn is_view_alive(i: u32, generation: u32) -> bool {
+    match generation >> KIND_SHIFT {
+        KIND_CONSTANT => true,
+        0 => {
+            let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
+            views
+                .list
+                .get(i as usize)
+                .is_some_and(|&(_, current)| current == generation)
+        }
+        _ => false,
+    }
+}
+
+/// Resolves a batch of `(i, generation)` records into `out` while locking
+/// `VIEWS` at most once (and skipping the lock entirely if every record is
+/// an inline constant or invalid kind).
+#[cfg(windows)]
+pub(super) fn resolve_views(records: &[[u32; 2]], out: &mut Vec<Option<View>>) {
+    out.clear();
+    out.reserve(records.len());
+    let needs_lock = records
+        .iter()
+        .any(|&[_, generation]| (generation >> KIND_SHIFT) == 0);
+    if !needs_lock {
+        for &[i, generation] in records {
+            out.push(
+                (generation >> KIND_SHIFT == KIND_CONSTANT).then(|| decode_constant(i, generation)),
+            );
+        }
+        return;
+    }
+    let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
+    for &[i, generation] in records {
+        out.push(view_at_in(&views, i, generation));
+    }
+}
+
+/// The words of the record at `handle`, if they are a view's.
+#[cfg(all(windows, test))]
+pub(crate) fn record_at(handle: u64) -> Option<[u32; 3]> {
+    if handle == 0 {
+        return None;
+    }
+    // SAFETY: the handle is a descriptor slot the title passes back.
+    let words = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+    (words[0] == VIEW_TAG).then_some(words)
+}
+
+/// Registers `view` in `VIEWS` (or encodes an inline CBV) and returns its
+/// `(w1, w2)` descriptor record words (tests).
+#[cfg(all(windows, test))]
+pub(super) fn words_for(view: View) -> [u32; 2] {
+    let mut slot = [0u32; 8];
+    record(slot.as_mut_ptr() as u64, view);
+    [slot[1], slot[2]]
 }
 
 /// For each raw descriptor header `[tag, w1, w2]`, sets `dead_out[idx]` to
@@ -906,41 +1031,101 @@ pub(crate) extern "system" fn create_sampler_x(_: This, desc: *const [u32; 27], 
     }
 }
 
+/// Mirrors `count` contiguous descriptors of stride `step` starting at `dst`
+/// with a single `SHADER_HEAPS` lookup when `[dst, dst + count * step)` lies
+/// inside one shader-visible heap (skipping CPU-only heaps immediately).
+#[cfg(windows)]
+fn mirror_range(dst: u64, count: u32, step: u64) {
+    if count == 0 || step == 0 {
+        return;
+    }
+    if !host::descriptor_fast() || count == 1 {
+        for i in 0..u64::from(count) {
+            mirror(dst + i * step);
+        }
+        return;
+    }
+    let Some(end_addr) = u64::from(count)
+        .checked_mul(step)
+        .and_then(|len| dst.checked_add(len))
+    else {
+        for i in 0..u64::from(count) {
+            mirror(dst + i * step);
+        }
+        return;
+    };
+    let (any_overlap, single) = {
+        let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+        let mut any_overlap = false;
+        let mut single: Option<(&Heap, u32)> = None;
+        for &(start, end, at) in heaps.iter() {
+            if dst < end && end_addr > start {
+                any_overlap = true;
+                if dst >= start && end_addr <= end {
+                    // SAFETY: registered heaps are live (removed when dropped).
+                    let heap = unsafe { &*(at as *const Heap) };
+                    if let Some(first) = heap.index(dst)
+                        && first.saturating_add(count) <= heap.desc.count
+                    {
+                        single = Some((heap, first));
+                    }
+                    break;
+                }
+            }
+        }
+        (any_overlap, single)
+    };
+    if !any_overlap {
+        return;
+    }
+    if let Some((heap, first)) = single {
+        let host = if let Some(host) = heap.host.get() {
+            host.as_ref()
+        } else {
+            let mut pending = heap.pending.lock().unwrap_or_else(|e| e.into_inner());
+            match heap.host.get() {
+                None => {
+                    pending.extend(first..first + count);
+                    return;
+                }
+                Some(host) => host.as_ref(),
+            }
+        };
+        if let Some(host) = host {
+            host.mirror_range(first, dst, step, count);
+        }
+        return;
+    }
+    for i in 0..u64::from(count) {
+        mirror(dst + i * step);
+    }
+}
+
+/// Whether [`copy_simple`] skips writing when `dst` already holds the exact
+/// bytes at `src` (avoiding write-watch dirtying and VEH faults on guarded
+/// heap pages). On by default; `VICTORY_SAME_RECORDS=0` writes every time.
+fn same_records() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SAME_RECORDS").is_none_or(|v| v != "0"))
+}
+
 /// Device method: `count` descriptors of `kind` from `src` to `dst`.
 pub(crate) extern "system" fn copy_simple(_: This, count: u32, dst: u64, src: u64, kind: u32) {
     let step = u64::from(increment(kind).unwrap_or(0));
     let len = u64::from(count) * step;
-    if dst != 0 && src != 0 {
+    if dst != 0 && src != 0 && len > 0 {
         // SAFETY: both ranges are descriptor slots the title owns.
-        unsafe { std::ptr::copy(src as *const u8, dst as *mut u8, len as usize) };
-        #[cfg(windows)]
-        if count > 0 && step > 0 {
-            if let Some((heap, start_index)) = shader_slot(dst)
-                && u64::from(start_index) + u64::from(count) <= u64::from(heap.desc.count)
-            {
-                let host = if let Some(host) = heap.host.get() {
-                    host.as_ref()
-                } else {
-                    let mut pending = heap.pending.lock().unwrap_or_else(|e| e.into_inner());
-                    match heap.host.get() {
-                        None => {
-                            pending.extend(start_index..start_index + count);
-                            return;
-                        }
-                        Some(host) => host.as_ref(),
-                    }
-                };
-                if let Some(host) = host {
-                    for i in 0..count {
-                        host.mirror(start_index + i, dst + u64::from(i) * step, false);
-                    }
-                }
-            } else {
-                for i in 0..u64::from(count) {
-                    mirror(dst + i * step);
-                }
+        unsafe {
+            let same = same_records()
+                && (dst == src
+                    || std::slice::from_raw_parts(dst as *const u8, len as usize)
+                        == std::slice::from_raw_parts(src as *const u8, len as usize));
+            if !same {
+                std::ptr::copy(src as *const u8, dst as *mut u8, len as usize);
             }
         }
+        #[cfg(windows)]
+        mirror_range(dst, count, step);
     }
 }
 
@@ -1555,5 +1740,136 @@ mod tests {
         );
         assert_eq!(heap_bind_id(0), 0);
         assert_eq!(heap_bind_id(ROOT_VIEW_HEAP), u64::MAX);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn copy_simple_batched_mirrors_shader_visible_range_and_resolve_views_matches_view_at() {
+        let null = std::ptr::null();
+        let mut memory = vec![0u8; 8 * 32];
+        let address = memory.as_mut_ptr() as u64;
+        let desc = HeapDesc {
+            kind: VIEWS_KIND,
+            count: 8,
+            flags: SHADER_VISIBLE,
+            nodes: 1,
+        };
+        let mut h: This = null;
+        assert_eq!(
+            create(
+                desc,
+                Placement {
+                    address,
+                    size: 8 * 32,
+                },
+                &mut h
+            ),
+            S_OK
+        );
+        let Some(host) = heap(h).host() else {
+            slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
+            return;
+        };
+
+        // Source staging slots (CPU-only memory, not in SHADER_HEAPS).
+        let mut src_mem = vec![0u8; 4 * 32];
+        let src_base = src_mem.as_mut_ptr() as u64;
+        create_srv(null, null, std::ptr::null(), src_base);
+        create_cbv(null, &[0x2000, 1, 256, 0], src_base + 32);
+        create_srv(null, null, std::ptr::null(), src_base + 64);
+        create_cbv(null, &[0x4000, 1, 512, 0], src_base + 96);
+
+        // Copy 4 descriptors into the shader-visible heap via `copy_simple`.
+        copy_simple(null, 4, address + 2 * 32, src_base, VIEWS_KIND);
+        assert!(host.made(2), "SRV slot 2 must be mirrored");
+        assert!(!host.made(3), "CBV slot 3 stays deferred");
+        assert!(host.made(4), "SRV slot 4 must be mirrored");
+        assert!(!host.made(5), "CBV slot 5 stays deferred");
+
+        // Verify `resolve_views` matches `view_at` for inline CBV, table entry, and invalid records.
+        let mut records = Vec::new();
+        for k in 0..4u64 {
+            // SAFETY: slots 2..6 lie inside `memory`.
+            let [tag, i, generation] = unsafe { *((address + (2 + k) * 32) as *const [u32; 3]) };
+            assert_eq!(tag, VIEW_TAG);
+            records.push([i, generation]);
+        }
+        records.push([0, 3 << KIND_SHIFT]); // invalid kind
+        let mut resolved = Vec::new();
+        resolve_views(&records, &mut resolved);
+        for (rec, got) in records.iter().zip(&resolved) {
+            assert_eq!(got, &view_at(rec[0], rec[1]));
+        }
+
+        // Non-shader-visible `copy_simple` completes cleanly without touching `host`.
+        let mut cpu_dst = vec![0u8; 4 * 32];
+        copy_simple(null, 4, cpu_dst.as_mut_ptr() as u64, src_base, VIEWS_KIND);
+        assert_eq!(view(cpu_dst.as_ptr() as u64 + 32), view(src_base + 32));
+
+        slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn rtv_key_and_record_at_and_same_records_copy_simple() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        let null = std::ptr::null();
+
+        // `RtvRecord::key` distinguishes resource, described flag, and desc words.
+        let mut rtv_slots = [[0u64; 16]; 3];
+        let r0 = rtv_slots[0].as_mut_ptr() as u64;
+        let r1 = rtv_slots[1].as_mut_ptr() as u64;
+        let r2 = rtv_slots[2].as_mut_ptr() as u64;
+        let res = 0x4444_0000usize as This;
+        let d_a = [28, 4, 0, 0, 0, 0];
+        let d_b = [28, 4, 1, 0, 0, 0];
+        create_rtv(null, res, &d_a, r0);
+        create_rtv(null, res, &d_a, r1);
+        create_rtv(null, res, &d_b, r2);
+        assert_eq!(rtv_record(r0).unwrap().key(), rtv_record(r1).unwrap().key());
+        assert_ne!(rtv_record(r0).unwrap().key(), rtv_record(r2).unwrap().key());
+
+        // `record_at` returns Some for valid view records and None for zero/untagged.
+        let mut slots = [0u64; 8];
+        let s0 = slots.as_mut_ptr() as u64;
+        assert_eq!(record_at(0), None);
+        assert_eq!(record_at(s0), None);
+        create_cbv(null, &[0x1000, 0, 256, 0], s0);
+        assert!(record_at(s0).is_some());
+
+        // `copy_simple` skips writing when `dst` bytes already equal `src` bytes,
+        // leaving a write-watched destination page clean (`VICTORY_SAME_RECORDS=1`).
+        // SAFETY: allocates a single write-watched page owned by this test.
+        let memory = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                crate::watch::PAGE,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        };
+        assert!(!memory.is_null());
+        let dst = memory as u64;
+        // First copy writes bytes and dirties the page.
+        copy_simple(null, 1, dst, s0, VIEWS_KIND);
+        let (t1, pages1) =
+            crate::watch::writes(dst as usize, dst as usize + crate::watch::PAGE, false).unwrap();
+        assert!(!pages1.is_empty());
+        // Second identical copy skips writing when `same_records()` is active.
+        if same_records() {
+            copy_simple(null, 1, dst, s0, VIEWS_KIND);
+            let (_, pages2) =
+                crate::watch::writes(dst as usize, dst as usize + crate::watch::PAGE, false)
+                    .unwrap();
+            assert!(
+                pages2.iter().all(|&(_, at)| at <= t1),
+                "identical copy_simple must not dirty write-watched page"
+            );
+        }
+        // SAFETY: allocation belongs to this test.
+        unsafe { VirtualFree(memory, 0, MEM_RELEASE) };
     }
 }
