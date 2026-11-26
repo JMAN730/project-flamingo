@@ -4519,9 +4519,10 @@ enum Held<G> {
 pub(crate) static REMAPS: [std::sync::atomic::AtomicU64; 3] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
-/// Monotonic counter bumped whenever a title-memory mapping change finishes
-/// (`Remapping::drop`, `title_memory_remapped`, `title_memory_alias_rebound`),
-/// so unlocked texture reads can detect concurrent mapping churn.
+/// Monotonic counter bumped whenever a title-memory mapping change starts or
+/// finishes (`title_memory_remapping`, `Remapping::drop`,
+/// `title_memory_remapped`, `title_memory_alias_rebound`), so unlocked texture
+/// reads can detect concurrent mapping churn.
 static REMAP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Current monotonic mapping-change sequence number.
@@ -4572,6 +4573,7 @@ pub fn title_memory_remapping(at: usize, len: usize) -> Remapping {
     } else {
         Held::All(MAPPING.write().unwrap_or_else(|e| e.into_inner()))
     };
+    REMAP_SEQ.fetch_add(1, Ordering::SeqCst);
     REMAPS[0].fetch_add(1, Relaxed);
     REMAPS[1].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
     Remapping {
