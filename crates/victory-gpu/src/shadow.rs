@@ -1227,6 +1227,12 @@ enum LockRead<G> {
     LazyFailed,
 }
 
+#[cfg(test)]
+thread_local! {
+    static BEFORE_LOCK_AND_READ_RAW_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// Materializes any deferred `lazy_back` blocks in `[addr, addr + buf.len())`
 /// outside the per-`Shadow` lock, then acquires `acquire()` and reads via
 /// `read_into_raw`. If a concurrent relay thread re-deferred the block before
@@ -1234,6 +1240,10 @@ enum LockRead<G> {
 fn lock_and_read<G>(acquire: impl Fn() -> G, addr: usize, buf: &mut [u8]) -> LockRead<G> {
     if crate::lazy_back::active() && !crate::lazy_back::materialize_range(addr, buf.len()) {
         return LockRead::LazyFailed;
+    }
+    #[cfg(test)]
+    if let Some(hook) = BEFORE_LOCK_AND_READ_RAW_HOOK.with(|h| h.borrow_mut().take()) {
+        hook();
     }
     let guard = acquire();
     if crate::host::read_into_raw(addr as *const u8, buf) {
@@ -9178,6 +9188,147 @@ mod tests {
         // SAFETY: cleanup.
         unsafe {
             VirtualFree(hole, 0, MEM_RELEASE);
+            crate::lazy_back::clear_hot_for_test_pub(blk0);
+            crate::watch::title_memory_remapped(va0, len);
+            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: view.Value });
+            CloseHandle(section);
+        }
+    }
+
+    #[test]
+    fn update_busy_reports_failure_when_page_armed_after_ownership_check() {
+        use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
+            PAGE_READWRITE, UnmapViewOfFile,
+        };
+
+        let Some(_h) = host() else {
+            return;
+        };
+        let len = 2 * PAGE;
+        // SAFETY: 2-page anonymous section.
+        let section: HANDLE = unsafe {
+            CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                len as u32,
+                std::ptr::null(),
+            )
+        };
+        assert!(!section.is_null());
+        // SAFETY: map 2 contiguous pages.
+        let view = unsafe { MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, len) };
+        assert!(!view.Value.is_null());
+        let ptr = view.Value.cast::<u8>();
+        let va0 = ptr as usize;
+        let blk0 = va0 / PAGE;
+        crate::lazy_back::clear_hot_for_test_pub(blk0);
+        crate::inplace::title_memory_section(section as usize, len as u64, true);
+        assert!(crate::inplace::title_memory_view(
+            va0,
+            len,
+            section as usize,
+            0
+        ));
+        // SAFETY: seed page 0 = `0x22`, page 1 = `0x55`.
+        unsafe {
+            std::ptr::write_bytes(ptr, 0x22, PAGE);
+            std::ptr::write_bytes(ptr.add(PAGE), 0x55, PAGE);
+        }
+
+        // 1. Card-backed shadow: page 0 is NOT armed at the start of `update_busy`
+        //    (passing both `owned_blocks_with_clean_in` and `owns_block`), then gets
+        //    armed right before `lock_and_read`'s `read_into_raw` with failing DMA.
+        //    `lock_and_read` must return `LockRead::LazyFailed` -> `all_ok == false`.
+        let mut side_a = vec![0x11u8; len];
+        let card_a = Shadow::new_card_sized_for_test(side_a.as_mut_ptr(), va0 as u64, len as u64)
+            .expect("card shadow");
+        let card_for_hook = card_a.clone();
+        BEFORE_LOCK_AND_READ_RAW_HOOK.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move || {
+                assert!(crate::lazy_back::try_defer_page_for_test(
+                    &card_for_hook,
+                    0,
+                    PAGE,
+                    0
+                ));
+                crate::lazy_back::set_fail_next_fetches_for_test(1);
+            }));
+        });
+        let (copied_card, ok_card) = card_a.update_busy(va0, va0 + len);
+        BEFORE_LOCK_AND_READ_RAW_HOOK.with(|h| *h.borrow_mut() = None);
+        crate::lazy_back::set_fail_next_fetches_for_test(0);
+        assert!(
+            !ok_card,
+            "card update_busy must report failure when page 0 is armed after ownership check and fails materialization"
+        );
+        assert_eq!(copied_card, PAGE, "good page 1 bytes must still be copied");
+        {
+            let copied_epochs = card_a.copied.lock().unwrap();
+            assert_eq!(copied_epochs[0], 0, "failed page 0 epoch must stay pending");
+            assert_ne!(copied_epochs[1], 0, "good page 1 epoch must advance");
+        }
+        assert!(crate::lazy_back::materialize_range(va0, PAGE));
+        crate::lazy_back::clear_hot_for_test_pub(blk0);
+        drop(card_a);
+
+        // 2. ReBAR-backed shadow: same post-ownership-check arming race with failing DMA.
+        let rebar_a =
+            Shadow::new_rebar_for_test(va0 as u64, len as u64, 0x11).expect("rebar shadow");
+        let rebar_for_hook = rebar_a.clone();
+        BEFORE_LOCK_AND_READ_RAW_HOOK.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move || {
+                assert!(crate::lazy_back::try_defer_page_for_test(
+                    &rebar_for_hook,
+                    0,
+                    PAGE,
+                    0
+                ));
+                crate::lazy_back::set_fail_next_fetches_for_test(1);
+            }));
+        });
+        let (copied_rebar, ok_rebar) = rebar_a.update_busy(va0, va0 + len);
+        BEFORE_LOCK_AND_READ_RAW_HOOK.with(|h| *h.borrow_mut() = None);
+        crate::lazy_back::set_fail_next_fetches_for_test(0);
+        assert!(
+            !ok_rebar,
+            "ReBAR update_busy must report failure when page 0 is armed after ownership check and fails materialization"
+        );
+        assert_eq!(copied_rebar, PAGE, "good page 1 bytes must still be copied");
+        {
+            let copied_epochs = rebar_a.copied.lock().unwrap();
+            assert_eq!(copied_epochs[0], 0, "failed page 0 epoch must stay pending");
+            assert_ne!(copied_epochs[1], 0, "good page 1 epoch must advance");
+        }
+        assert!(crate::lazy_back::materialize_range(va0, PAGE));
+        crate::lazy_back::clear_hot_for_test_pub(blk0);
+
+        // 3. When materialization succeeds after post-ownership-check arming,
+        //    `lock_and_read` retries cleanly and returns `Ok` (`all_ok == true`).
+        let rebar_retry_hook = rebar_a.clone();
+        BEFORE_LOCK_AND_READ_RAW_HOOK.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move || {
+                assert!(crate::lazy_back::try_defer_page_for_test(
+                    &rebar_retry_hook,
+                    0,
+                    PAGE,
+                    0
+                ));
+            }));
+        });
+        let (_, ok_retry) = rebar_a.update_busy(va0, va0 + PAGE);
+        BEFORE_LOCK_AND_READ_RAW_HOOK.with(|h| *h.borrow_mut() = None);
+        assert!(
+            ok_retry,
+            "update_busy must succeed when post-ownership-check arming materializes cleanly on retry"
+        );
+        drop(rebar_a);
+
+        // SAFETY: cleanup.
+        unsafe {
             crate::lazy_back::clear_hot_for_test_pub(blk0);
             crate::watch::title_memory_remapped(va0, len);
             UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: view.Value });

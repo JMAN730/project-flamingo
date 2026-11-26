@@ -3387,8 +3387,12 @@ pub(crate) fn is_guard_protected_for_test(block: usize) -> bool {
 /// Atomically checks pin state, keeps views read-only across `arm(cpu_clean_after)`
 /// so the transition is directly `PAGE_READONLY -> PAGE_NOACCESS` with zero
 /// writable window, and clears guard/cold metadata under all affected guard shards
-/// (`GUARD_SHARDS_TABLE (ascending) -> LAZY_STATE` lock order). On rejection
-/// (`arm` returns `false`), clears guard/cold metadata and restores `PAGE_READWRITE`.
+/// (`GUARD_SHARDS_TABLE (ascending) -> LAZY_STATE` lock order). `cpu_clean_after`
+/// is only captured when every view in `blocks` is actively guarded read-only (and,
+/// when aliases exist, `view_guard()` is enabled); whenever any alias could be
+/// writable or unguarded (including `VICTORY_VIEW_GUARD=0`), `cpu_clean_after` is
+/// invalidated (`None`). On rejection (`arm` returns `false`), clears guard/cold
+/// metadata and restores `PAGE_READWRITE`.
 pub(crate) fn try_arm_lazy_under_guards(
     blocks: &[usize],
     arm: impl FnOnce(Option<u64>) -> bool,
@@ -3403,7 +3407,10 @@ pub(crate) fn try_arm_lazy_under_guards(
         return false;
     }
     let primary_block = blocks[0];
-    let was_clean_view = DIR.is_guard_protected(primary_block) && DIR.is_guard_clean(primary_block);
+    let has_aliases = blocks.iter().any(|&b| b != primary_block);
+    let all_views_guarded =
+        (!has_aliases || view_guard()) && blocks.iter().all(|&b| DIR.is_guard_protected(b));
+    let was_clean_view = all_views_guarded && DIR.is_guard_clean(primary_block);
     let cpu_clean_after = was_clean_view.then(|| DIR.written_epoch(primary_block));
     let mut sorted = blocks.to_vec();
     sorted.sort_unstable();
@@ -4076,9 +4083,39 @@ fn protect_with_access(
 /// Views of one page past which its views are not guarded together.
 pub(crate) const MANY_VIEWS: usize = 64;
 
+#[cfg(test)]
+thread_local! {
+    static FORCE_VIEW_GUARD_OFF_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) struct DisableViewGuardGuard(bool);
+
+#[cfg(test)]
+impl Drop for DisableViewGuardGuard {
+    fn drop(&mut self) {
+        FORCE_VIEW_GUARD_OFF_FOR_TEST.with(|c| c.set(self.0));
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn disable_view_guard_for_test() -> DisableViewGuardGuard {
+    let prev = FORCE_VIEW_GUARD_OFF_FOR_TEST.with(|c| c.replace(true));
+    DisableViewGuardGuard(prev)
+}
+
+#[cfg(test)]
+pub(crate) fn view_guard_enabled_for_test() -> bool {
+    view_guard()
+}
+
 /// Whether all the views of a guarded page are guarded together
 /// (`VICTORY_VIEW_GUARD`).
 fn view_guard() -> bool {
+    #[cfg(test)]
+    if FORCE_VIEW_GUARD_OFF_FOR_TEST.with(|c| c.get()) {
+        return false;
+    }
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_VIEW_GUARD").is_none_or(|v| v != "0"))
 }
@@ -6705,13 +6742,31 @@ mod tests {
         assert!(writable(b0 * BLOCK));
         assert!(writable(b2 * BLOCK));
 
-        // Acceptance path: re-guard, then return `true` without opening RW first.
+        // If any alias/co-armed block is not guarded (`b1` is RW here), the
+        // clean proof MUST be invalidated (`None`).
+        assert!(guard(one, one + BLOCK).is_some());
+        assert!(!writable(b0 * BLOCK));
+        assert!(writable(b1 * BLOCK));
+        assert!(!writable(b2 * BLOCK));
+        let unguarded_alias_rejected = try_arm_lazy_under_guards(&blocks, |cpu_clean_after| {
+            assert!(
+                cpu_clean_after.is_none(),
+                "clean proof must be invalidated when any block in the arm set is unguarded"
+            );
+            false
+        });
+        assert!(!unguarded_alias_rejected);
+        assert!(writable(b0 * BLOCK));
+        assert!(writable(b2 * BLOCK));
+
+        // Acceptance path: re-guard `b0` and its alias `b2`, then return `true`
+        // without opening RW first.
         assert!(guard(one, one + BLOCK).is_some());
         assert!(!writable(b0 * BLOCK));
         assert!(!writable(b2 * BLOCK));
-        let ok = try_arm_lazy_under_guards(&blocks, |cpu_clean_after| {
-            assert!(cpu_clean_after.is_some());
-            for &b in &blocks {
+        let ok = try_arm_lazy_under_guards(&[b0, b2], |cpu_clean_after| {
+            assert_eq!(cpu_clean_after.is_some(), view_guard());
+            for &b in &[b0, b2] {
                 assert!(!DIR.is_guard_protected(b));
                 assert!(!DIR.is_guard_clean(b));
                 assert!(!DIR.get_bit(b, BitField::GuardAliased, Ordering::SeqCst));

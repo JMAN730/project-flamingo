@@ -2010,11 +2010,6 @@ impl Host {
     }
 
     #[cfg(test)]
-    pub(crate) fn lock_queue_order_for_test(&self) -> std::sync::MutexGuard<'static, u64> {
-        QUEUE_TIMELINE.lock_queue_order()
-    }
-
-    #[cfg(test)]
     pub(crate) fn last_signalled_for_test(&self) -> (u64, u64) {
         QUEUE_TIMELINE.last_signalled()
     }

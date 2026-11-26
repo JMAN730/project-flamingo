@@ -4694,27 +4694,18 @@ mod tests {
 
     #[test]
     fn lazy_note_signalled_uses_submitted_queue_order_without_locking_queue_order() {
-        // 1. Live lock-order check: holding `QUEUE_TIMELINE.queue_order` must NOT
-        //    block `direct_submit_guard()` + `note_signalled` (eliminating ABBA
-        //    deadlock between `card_before` and `submit_helper_list`).
-        if let Some(h) = crate::host::host() {
-            let _order_guard = h.lock_queue_order_for_test();
-            {
-                let _submit_guard = direct_submit_guard();
-                h.note_signalled(0);
-            }
-        }
-
-        // 2. Exercise the exact production `QueueOrderTimeline` candidate,
-        //    submission, and fence-watermark bookkeeping against a 100% isolated
-        //    test-owned timeline (zero race against parallel tests).
+        // Exercise the exact production `QueueOrderTimeline` lock-order,
+        // candidate, submission, and fence-watermark bookkeeping against a 100%
+        // isolated test-owned timeline (zero race and zero lock-order inversion
+        // against `Host::card_before` under parallel tests).
         let timeline = crate::host::QueueOrderTimeline::new();
         let (prev_order, candidate) = timeline.next_candidate();
         assert_eq!((prev_order, candidate), (0, 1));
 
-        // While holding `queue_order` (before `candidate` is submitted), a
-        // concurrent DIRECT signal (`fence = 10`) calling `note_signalled(10)`
-        // must NOT block on `queue_order` and must record submitted order `0 < candidate`.
+        // While holding the non-reentrant `timeline.queue_order` mutex (before
+        // `candidate` is submitted), calling `note_signalled(10)` (the exact
+        // path `Host::note_signalled` calls under `direct_submit_guard()`) MUST
+        // NOT lock `queue_order` and must record submitted order `0 < candidate`.
         let mut order_guard = timeline.lock_queue_order();
         timeline.note_signalled(10);
         assert_eq!(timeline.last_signalled(), (10, 0));
@@ -5747,6 +5738,170 @@ mod tests {
         clear_hot_for_test(block);
         // SAFETY: cleanup.
         unsafe { free_watch_pages(ptr) };
+        h.log_messages();
+        assert_eq!(h.d3d12_errors(), errors_before);
+    }
+
+    #[test]
+    fn lazy_arm_invalidates_clean_proof_when_alias_is_unguarded_or_view_guard_disabled() {
+        use windows_sys::Win32::System::Memory::{
+            MEMORY_BASIC_INFORMATION, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE, VirtualQuery,
+        };
+
+        let Some(h) = crate::host::host() else {
+            return;
+        };
+        let errors_before = h.d3d12_errors();
+        let query_protect = |addr: usize| -> u32 {
+            // SAFETY: zero-initialized `MEMORY_BASIC_INFORMATION`.
+            let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            // SAFETY: querying page protection with valid out pointer.
+            let n = unsafe { VirtualQuery(addr as *const _, &mut info, size_of_val(&info)) };
+            assert_ne!(n, 0);
+            info.Protect
+        };
+
+        // Map a 1-page anonymous section at two section aliases A (primary) and B (alias).
+        // SAFETY: creating a 1-page anonymous section.
+        let section: HANDLE = unsafe {
+            CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                ptr::null(),
+                PAGE_READWRITE,
+                0,
+                PAGE as u32,
+                ptr::null(),
+            )
+        };
+        assert!(!section.is_null());
+        // SAFETY: mapping view A.
+        let view_a = unsafe { MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, PAGE) };
+        // SAFETY: mapping view B.
+        let view_b = unsafe { MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, PAGE) };
+        assert!(!view_a.Value.is_null() && !view_b.Value.is_null());
+        let va_a = view_a.Value as usize;
+        let va_b = view_b.Value as usize;
+        let blk_a = va_a / PAGE;
+        let blk_b = va_b / PAGE;
+        clear_hot_for_test(blk_a);
+        clear_hot_for_test(blk_b);
+        crate::inplace::title_memory_section(section as usize, PAGE as u64, true);
+        assert!(crate::inplace::title_memory_view(
+            va_a,
+            PAGE,
+            section as usize,
+            0
+        ));
+        assert!(crate::inplace::title_memory_view(
+            va_b,
+            PAGE,
+            section as usize,
+            0
+        ));
+        // SAFETY: seed section bytes.
+        unsafe { ptr::write_bytes(view_a.Value.cast::<u8>(), 0x22, PAGE) };
+
+        // Also allocate an unaliased single-view page to confirm single views keep
+        // their zero-DMA clean proof even with `VICTORY_VIEW_GUARD=0`.
+        let single_ptr = alloc_watch_pages(1);
+        // SAFETY: `single_ptr` owns `PAGE` bytes.
+        unsafe { ptr::write_bytes(single_ptr, 0x33, PAGE) };
+        let single_va = single_ptr as usize;
+        let single_blk = single_va / PAGE;
+        clear_hot_for_test(single_blk);
+
+        if let (Some((shadow, _side)), Some((single_shadow, _single_side))) = (
+            make_card_shadow_at(va_a as u64, 1, 0x22),
+            make_card_shadow_at(single_va as u64, 1, 0x33),
+        ) {
+            let shadow_ptr = Arc::as_ptr(&shadow) as usize;
+            let single_ptr_id = Arc::as_ptr(&single_shadow) as usize;
+
+            {
+                let _no_vg = crate::watch::disable_view_guard_for_test();
+
+                // 1. With `VICTORY_VIEW_GUARD=0`, guarding primary A leaves alias B writable
+                //    (`PAGE_READWRITE`). Arming A MUST invalidate `cpu_clean_after` (`None`).
+                assert!(crate::watch::writes(va_a, va_a + PAGE, true).is_some());
+                assert_eq!(query_protect(va_a), PAGE_READONLY);
+                assert_eq!(query_protect(va_b), PAGE_READWRITE);
+                assert!(try_defer_page_inner(&shadow, 0, PAGE, 0));
+                assert_eq!(query_protect(va_a), PAGE_NOACCESS);
+                assert_eq!(query_protect(va_b), PAGE_NOACCESS);
+                assert_eq!(
+                    owned_blocks_with_clean_in(shadow_ptr, blk_a, blk_a + 1),
+                    vec![(blk_a, None)],
+                    "clean proof must be invalidated when alias B was writable under VICTORY_VIEW_GUARD=0"
+                );
+                assert!(materialize_range(va_a, PAGE));
+                clear_hot_for_test(blk_a);
+
+                // 2. Even if both A and B were independently guarded while `VICTORY_VIEW_GUARD=0`,
+                //    cross-alias write tracking is off, so `cpu_clean_after` MUST still be `None`.
+                assert!(crate::watch::writes(va_a, va_a + PAGE, true).is_some());
+                assert!(crate::watch::writes(va_b, va_b + PAGE, true).is_some());
+                assert_eq!(query_protect(va_a), PAGE_READONLY);
+                assert_eq!(query_protect(va_b), PAGE_READONLY);
+                assert!(try_defer_page_inner(&shadow, 0, PAGE, 0));
+                assert_eq!(
+                    owned_blocks_with_clean_in(shadow_ptr, blk_a, blk_a + 1),
+                    vec![(blk_a, None)],
+                    "clean proof must stay invalidated for aliased pages under VICTORY_VIEW_GUARD=0"
+                );
+                assert!(materialize_range(va_a, PAGE));
+                clear_hot_for_test(blk_a);
+
+                // 3. A single guarded view (no aliases) STILL retains its zero-DMA clean proof
+                //    even when `VICTORY_VIEW_GUARD=0`.
+                assert!(crate::watch::writes(single_va, single_va + PAGE, true).is_some());
+                assert_eq!(query_protect(single_va), PAGE_READONLY);
+                assert!(try_defer_page_inner(&single_shadow, 0, PAGE, 0));
+                let single_clean =
+                    owned_blocks_with_clean_in(single_ptr_id, single_blk, single_blk + 1);
+                assert_eq!(single_clean.len(), 1);
+                assert_eq!(single_clean[0].0, single_blk);
+                assert!(
+                    single_clean[0].1.is_some(),
+                    "single guarded view must retain its clean proof"
+                );
+                assert!(materialize_range(single_va, PAGE));
+                clear_hot_for_test(single_blk);
+            }
+
+            // 4. With view-guarding enabled, guarding A guards BOTH A and B read-only, so
+            //    arming A preserves the zero-DMA clean proof (`Some(_)`).
+            if crate::watch::view_guard_enabled_for_test() {
+                assert!(crate::watch::writes(va_a, va_a + PAGE, true).is_some());
+                assert_eq!(query_protect(va_a), PAGE_READONLY);
+                assert_eq!(query_protect(va_b), PAGE_READONLY);
+                assert!(try_defer_page_inner(&shadow, 0, PAGE, 0));
+                let aliased_clean = owned_blocks_with_clean_in(shadow_ptr, blk_a, blk_a + 1);
+                assert_eq!(aliased_clean.len(), 1);
+                assert_eq!(aliased_clean[0].0, blk_a);
+                assert!(
+                    aliased_clean[0].1.is_some(),
+                    "aliased page with all views guarded read-only must preserve its clean proof"
+                );
+                assert!(materialize_range(va_a, PAGE));
+                clear_hot_for_test(blk_a);
+            }
+
+            drop(single_shadow);
+            drop(shadow);
+        }
+
+        clear_hot_for_test(blk_a);
+        clear_hot_for_test(blk_b);
+        clear_hot_for_test(single_blk);
+        crate::watch::title_memory_remapped(va_a, PAGE);
+        crate::watch::title_memory_remapped(va_b, PAGE);
+        // SAFETY: cleanup views, section, and single-view page.
+        unsafe {
+            free_watch_pages(single_ptr);
+            UnmapViewOfFile(view_a);
+            UnmapViewOfFile(view_b);
+            CloseHandle(section);
+        }
         h.log_messages();
         assert_eq!(h.d3d12_errors(), errors_before);
     }
