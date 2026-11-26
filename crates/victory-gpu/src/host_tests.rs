@@ -1870,7 +1870,7 @@ mod title_memory_io {
         let base = region();
         let data = vec![0xabu8; 3 * PAGE];
         // The third page is not committed: its piece is skipped, the others land.
-        write_mapped(base, data.as_ptr(), 3 * PAGE);
+        assert_eq!(write_mapped(base, data.as_ptr(), 3 * PAGE), Some(2 * PAGE));
         // SAFETY: the two committed pages of `region`.
         let written = unsafe { std::slice::from_raw_parts(base, 2 * PAGE) };
         assert!(written.iter().all(|&b| b == 0xab));

@@ -457,8 +457,15 @@ pub extern "system" fn ReadFile(
     read: *mut u32,
     overlapped: *mut c_void,
 ) -> i32 {
-    use windows_sys::Win32::Foundation::{ERROR_IO_PENDING, GetLastError};
-    victory_gpu::kernel_will_write(buffer as usize, len as usize);
+    use windows_sys::Win32::Foundation::{
+        ERROR_IO_PENDING, ERROR_NOACCESS, GetLastError, SetLastError,
+    };
+    if !victory_gpu::kernel_will_write(buffer as usize, len as usize) {
+        victory_gpu::kernel_wrote(buffer as usize, len as usize);
+        // SAFETY: sets thread-local Win32 last error on failure return.
+        unsafe { SetLastError(ERROR_NOACCESS) };
+        return 0;
+    }
     let done = host!("kernel32.dll", "ReadFile": extern "system" fn(*mut c_void, *mut u8, u32, *mut u32, *mut c_void) -> i32)(
         file, buffer, len, read, overlapped,
     );
@@ -473,11 +480,15 @@ pub extern "system" fn ReadFile(
 
 /// The host CRT reads large requests straight into the caller's buffer.
 pub extern "C" fn fread(buffer: *mut u8, size: usize, count: usize, stream: File) -> usize {
-    victory_gpu::kernel_will_write(buffer as usize, size.saturating_mul(count));
+    let bytes = size.saturating_mul(count);
+    if !victory_gpu::kernel_will_write(buffer as usize, bytes) {
+        victory_gpu::kernel_wrote(buffer as usize, bytes);
+        return 0;
+    }
     let n = host!("ucrtbase.dll", "fread": extern "C" fn(*mut u8, usize, usize, File) -> usize)(
         buffer, size, count, stream,
     );
-    victory_gpu::kernel_wrote(buffer as usize, size.saturating_mul(count));
+    victory_gpu::kernel_wrote(buffer as usize, bytes);
     n
 }
 

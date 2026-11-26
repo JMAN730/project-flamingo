@@ -482,7 +482,10 @@ pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
 
 /// The runtime mapped `[at, at + len)` as a view of `section` from
 /// `offset` on. Call after [`crate::title_memory_remapped`] of the range.
-pub fn title_memory_view(at: usize, len: usize, section: usize, offset: u64) {
+/// Returns `false` if an overlapping deferred lazy copy-back could not be
+/// materialized (in which case `[at, at + len)` is armed at `PAGE_NOACCESS`
+/// so stale RAM is never exposed).
+pub fn title_memory_view(at: usize, len: usize, section: usize, offset: u64) -> bool {
     {
         let mut v = views();
         if let Some((_, s, o)) = v.views.insert(at, (len, section, offset)) {
@@ -502,10 +505,11 @@ pub fn title_memory_view(at: usize, len: usize, section: usize, offset: u64) {
         }
     }
     GENERATION.fetch_add(1, Ordering::SeqCst);
-    // This view is writable from now on: a guard over the same bytes at
-    // another view must look at them again, and the pages are noted written
-    // there (`crate::watch`).
-    crate::watch::views_mapped(section, offset, len);
+    // This view is writable from now on (unless lazy materialization failed
+    // and armed it at `PAGE_NOACCESS`): a guard over the same bytes at another
+    // view must look at them again, and the pages are noted written there
+    // (`crate::watch`).
+    crate::watch::views_mapped(at, len, section, offset)
 }
 
 /// What `[at, at + len)` showed is gone ([`crate::title_memory_remapped`]):

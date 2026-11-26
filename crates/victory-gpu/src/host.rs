@@ -2052,7 +2052,14 @@ impl Host {
             ));
         }
         for list in runs {
-            read_backs(list);
+            if !read_backs(list) {
+                fail(format_args!(
+                    "host readback failed: lazy copy-back materialization failed after a submission of {} lists{}{}",
+                    runs.len(),
+                    self.removal_data(runs),
+                    last_notes(runs)
+                ));
+            }
         }
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
         // Queues these writes release run their work once no lock is held.
@@ -2077,29 +2084,48 @@ impl Host {
 }
 
 /// Copies a finished list's texture-to-buffer and texture readbacks into title memory.
-pub(super) fn read_backs(list: &HostList) {
+/// Returns `false` if lazy materialization failed for any readback destination;
+/// rows that could not be materialized or written are never counted in `COPY_BACK[1]`.
+pub(super) fn read_backs(list: &HostList) -> bool {
     let deferred = list.deferred();
+    let mut ok = true;
     for rb in &deferred.readbacks {
         let written = if rb.dst_pitch == rb.src_pitch {
             crate::watch::writing(rb.dst, rb.total);
-            write_mapped(rb.dst as *mut u8, rb.src as *const u8, rb.total);
-            rb.total
+            match write_mapped(rb.dst as *mut u8, rb.src as *const u8, rb.total) {
+                Some(n) => n,
+                None => {
+                    ok = false;
+                    0
+                }
+            }
         } else {
             let mut n = 0;
             for line in 0..rb.lines {
                 let to = rb.dst + line * rb.dst_pitch;
                 let from = rb.src + line * rb.src_pitch;
                 crate::watch::writing(to, rb.row_bytes);
-                write_mapped(to as *mut u8, from as *const u8, rb.row_bytes);
-                n += rb.row_bytes;
+                match write_mapped(to as *mut u8, from as *const u8, rb.row_bytes) {
+                    Some(bytes) => n += bytes,
+                    None => {
+                        ok = false;
+                        break;
+                    }
+                }
             }
             n
         };
-        COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+        if written > 0 {
+            COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+        }
+    }
+    if !ok {
+        return false;
     }
     for back in &deferred.texture_backs {
         crate::texback::land(back);
     }
+    true
 }
 
 /// Pre-lock inspection of `Step::GpuWrite` declarations in closed `runs`,
@@ -5068,7 +5094,10 @@ pub fn write_title_memory(destination: usize, bytes: &[u8]) -> bool {
     if bytes.is_empty() {
         return true;
     }
-    crate::watch::kernel_will_write(destination, bytes.len());
+    if !crate::watch::kernel_will_write(destination, bytes.len()) {
+        crate::watch::kernel_wrote(destination, bytes.len());
+        return false;
+    }
     let written = read(bytes.as_ptr(), destination as *mut u8, bytes.len());
     crate::watch::kernel_wrote(destination, bytes.len());
     written
@@ -5116,20 +5145,39 @@ type NtWrite = unsafe extern "system" fn(
 /// Wine uses the checked read into the destination. Native Windows uses
 /// the NT write directly, avoiding the region query and temporary changes
 /// to read-only page protections that WriteProcessMemory can perform.
-pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
+///
+/// Returns `None` if lazy copy-back materialization failed for any page in
+/// `[dst, dst + len)` (without calling `write_mapped_raw`), or `Some(written)`
+/// with the exact count of bytes written into mapped destination pages.
+#[must_use]
+pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) -> Option<usize> {
     if len == 0 {
-        return;
+        return Some(0);
     }
-    crate::lazy_back::materialize_range(dst as usize, len);
-    write_mapped_raw(dst, src, len);
+    if !crate::lazy_back::materialize_range(dst as usize, len) {
+        return None;
+    }
+    let written = write_mapped_raw(dst, src, len);
+    if written < len && crate::lazy_back::has_block_in_range(dst as usize, len) {
+        // A concurrent lazy arm landed between materialization and the raw write.
+        if !crate::lazy_back::materialize_range(dst as usize, len) {
+            return None;
+        }
+        return Some(write_mapped_raw(dst, src, len));
+    }
+    Some(written)
 }
 
 /// [`write_mapped`] without calling [`crate::lazy_back::materialize_range`].
 /// Safe to call while holding `Shadow` locks after materializing outside.
-pub(crate) fn write_mapped_raw(dst: *mut u8, src: *const u8, len: usize) {
+/// Returns the exact count of bytes successfully written into mapped pages.
+pub(crate) fn write_mapped_raw(dst: *mut u8, src: *const u8, len: usize) -> usize {
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    if len == 0 {
+        return 0;
+    }
     let Some(method) = copy_back_method() else {
-        return;
+        return 0;
     };
     let write = |at: usize, n: usize| {
         let from = src.wrapping_add(at - dst as usize);
@@ -5150,16 +5198,22 @@ pub(crate) fn write_mapped_raw(dst: *mut u8, src: *const u8, len: usize) {
             ) == 0
         }
     };
-    if len == 0 || write(dst as usize, len) {
-        return;
+    if write(dst as usize, len) {
+        return len;
     }
+    let mut written = 0usize;
     for_pieces(dst as usize, len, 64 << 10, |at, n| {
-        if !write(at, n) {
+        if write(at, n) {
+            written += n;
+        } else {
             for_pieces(at, n, 4 << 10, |at, n| {
-                write(at, n);
+                if write(at, n) {
+                    written += n;
+                }
             });
         }
     });
+    written
 }
 
 /// Calls `f` with the pieces of `[start, start + len)` cut at multiples of
@@ -5314,7 +5368,10 @@ mod title_copies {
             dest.fill(0);
             let start = std::time::Instant::now();
             for offset in (0..source.len()).step_by(ROW) {
-                write_mapped(dest[offset..].as_mut_ptr(), source[offset..].as_ptr(), ROW);
+                assert_eq!(
+                    write_mapped(dest[offset..].as_mut_ptr(), source[offset..].as_ptr(), ROW),
+                    Some(ROW)
+                );
             }
             let elapsed = start.elapsed();
             assert_eq!(dest, source);
@@ -5333,14 +5390,18 @@ mod title_copies {
     fn copy_back_writes_mapped_pages_only() {
         let from = pattern();
         let to = holed(0xee);
-        write_mapped(to, from.as_ptr(), 3 * BLOCK);
+        assert_eq!(write_mapped(to, from.as_ptr(), 3 * BLOCK), Some(2 * BLOCK));
         assert_eq!(block(to, 0), &from[..BLOCK]);
         assert_eq!(block(to, 2), &from[2 * BLOCK..]);
         release(to);
         // Neither aligned nor whole: the bytes around the range stay.
         let to = holed(0xee);
         // SAFETY: inside the first block.
-        write_mapped(unsafe { to.add(100) }, from.as_ptr(), BLOCK - 300);
+        let dst_off = unsafe { to.add(100) };
+        assert_eq!(
+            write_mapped(dst_off, from.as_ptr(), BLOCK - 300),
+            Some(BLOCK - 300)
+        );
         let first = block(to, 0);
         assert_eq!(first[100..BLOCK - 200], from[..BLOCK - 300]);
         let around = first[..100].iter().chain(&first[BLOCK - 200..]);
@@ -5353,7 +5414,8 @@ mod title_copies {
             unsafe { VirtualProtect(to.add(2 * BLOCK).cast(), BLOCK, PAGE_READONLY, &mut old) };
         assert_ne!(protected, 0);
         // SAFETY: the third block.
-        write_mapped(unsafe { to.add(2 * BLOCK) }, from.as_ptr(), BLOCK);
+        let third_block = unsafe { to.add(2 * BLOCK) };
+        assert_eq!(write_mapped(third_block, from.as_ptr(), BLOCK), Some(0));
         assert!(block(to, 2).iter().all(|&b| b == 0xee));
         release(to);
     }

@@ -577,10 +577,21 @@ pub(super) fn relay_copy_queue() -> bool {
 static RELAY_MOVED: Condvar = Condvar::new();
 static LINE_LANDED: Condvar = Condvar::new();
 
-/// With [`relay`], the monotonic count of sends of changed ranges to copies
-/// in the card's memory (`Host::card_before`). Held while recording & queueing
-/// a sync list and while queueing a direct-queue fallback fetch.
+/// With [`relay`], the monotonic count of sends of changed ranges whose sync
+/// command lists have ACTUALLY been submitted to `Host::queue`
+/// (`Host::card_before`). Held while queueing a card sync list and while
+/// queueing a direct-queue fallback fetch.
+///
+/// Lock order: `FETCHER` (`direct_submit_guard()`) -> `QUEUE_ORDER` -> `last_signalled`.
 pub(super) static QUEUE_ORDER: Mutex<u64> = Mutex::new(0);
+
+/// Lock-free mirror of the highest `QUEUE_ORDER` value whose card sync upload
+/// command list has been submitted to `Host::queue`. Updated strictly inside
+/// `QUEUE_ORDER` right after `ExecuteCommandLists` so `note_signalled` can
+/// record the submitted watermark without ever locking `QUEUE_ORDER` (preventing
+/// ABBA deadlock with `direct_submit_guard()` and ensuring unsubmitted plans are
+/// never included in a fence watermark).
+pub(super) static SUBMITTED_QUEUE_ORDER: AtomicU64 = AtomicU64::new(0);
 
 static RELAY_STATS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 static INFLIGHT_STATS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
@@ -1902,10 +1913,23 @@ pub(super) fn log_stats(frames: f64) {
 }
 
 impl Host {
-    /// Records `(fence_val, current QUEUE_ORDER)` after `self.queue.Signal`.
-    pub(super) fn note_signalled(&self, fence_val: u64) {
-        let order = *QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner());
+    /// Records `(fence_val, current SUBMITTED_QUEUE_ORDER)` after `self.queue.Signal`.
+    /// Reads the lock-free `SUBMITTED_QUEUE_ORDER` so only card uploads whose
+    /// command lists were already submitted to `self.queue` are included and
+    /// `QUEUE_ORDER` is never acquired inside `direct_submit_guard()`.
+    pub(crate) fn note_signalled(&self, fence_val: u64) {
+        let order = SUBMITTED_QUEUE_ORDER.load(Ordering::Acquire);
         self.note_signalled_with_order(fence_val, order);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn lock_queue_order_for_test(&self) -> std::sync::MutexGuard<'static, u64> {
+        QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn submitted_queue_order_for_test(&self) -> u64 {
+        SUBMITTED_QUEUE_ORDER.load(Ordering::Acquire)
     }
 
     pub(super) fn note_signalled_with_order(&self, fence_val: u64, order: u64) {
@@ -2075,15 +2099,19 @@ impl Host {
         if !crate::shadow::cards() {
             return None;
         }
-        let mut order = relay().then(|| QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner()));
-        let sent_as = match order.as_mut() {
-            Some(order) => {
-                **order += 1;
-                **order
-            }
-            None => 0,
+        let prev_order = if relay() {
+            SUBMITTED_QUEUE_ORDER.load(Ordering::Acquire)
+        } else {
+            0
         };
-        let mut dirty = crate::shadow::card_dirty(sent_as);
+        let candidate_sent_as = if relay() { prev_order + 1 } else { 0 };
+        let mut dirty = crate::shadow::card_dirty(candidate_sent_as);
+        let has_uploads = !dirty.is_empty();
+        let sent_as = if has_uploads {
+            candidate_sent_as
+        } else {
+            prev_order
+        };
         if declared.is_empty() && dirty.is_empty() {
             return None;
         }
@@ -2206,15 +2234,24 @@ impl Host {
                     }
                     list.Close()?;
                     {
+                        // Lock order: `FETCHER` (`direct_submit_guard()`) -> `QUEUE_ORDER` -> `last_signalled`.
                         let _lazy_order = crate::lazy_back::direct_submit_guard();
+                        let mut order =
+                            relay().then(|| QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner()));
                         self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
-                        if crate::lazy_back::ever_active() {
+                        let submitted_order = if let Some(order) = order.as_mut() {
+                            if has_uploads {
+                                **order = (**order).max(sent_as);
+                                SUBMITTED_QUEUE_ORDER.store(**order, Ordering::Release);
+                            }
+                            **order
+                        } else {
+                            0
+                        };
+                        if crate::lazy_back::can_arm() || crate::lazy_back::ever_active() {
                             *submitted += 1;
                             self.queue.Signal(&self.fence, *submitted)?;
-                            self.note_signalled_with_order(
-                                *submitted,
-                                order.as_deref().copied().unwrap_or(0),
-                            );
+                            self.note_signalled_with_order(*submitted, submitted_order);
                         }
                     }
                     Ok(())
@@ -2227,8 +2264,11 @@ impl Host {
             }
             used.push((false, sync));
         }
-        let order_after = order.as_deref().copied().unwrap_or(0);
-        drop(order);
+        let order_after = if relay() {
+            SUBMITTED_QUEUE_ORDER.load(Ordering::Acquire)
+        } else {
+            0
+        };
         let mut plan = CardPlan {
             ranges: Vec::new(),
             sent_as,
@@ -2747,7 +2787,12 @@ impl Host {
                         }
                     })
                     .collect();
-                written += entry.shadow.relay_merge_rebar(&entry.spans, &slices);
+                let Some(merged) = entry.shadow.relay_merge_rebar(&entry.spans, &slices) else {
+                    fail(format_args!(
+                        "relay ReBAR readback merge failed: title read or lazy materialization failed (VICTORY_RELAY)"
+                    ));
+                };
+                written += merged;
                 entry.shadow.mark_rebar_dirty_spans(&entry.spans);
             }
             COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
@@ -2936,7 +2981,11 @@ impl Host {
                 Late::Run(flight) => {
                     last = flight.number;
                     for entry in &flight.lists {
-                        read_backs(entry.list());
+                        if !read_backs(entry.list()) {
+                            fail(format_args!(
+                                "relay readback failed: lazy copy-back materialization failed (VICTORY_RELAY)"
+                            ));
+                        }
                     }
                     if let Some(card) = flight.card {
                         self.card_done(card);
@@ -3379,7 +3428,11 @@ impl Host {
                     Late::Run(flight) => {
                         last = flight.number;
                         for entry in &flight.lists {
-                            read_backs(entry.list());
+                            if !read_backs(entry.list()) {
+                                fail(format_args!(
+                                    "settle readback failed: lazy copy-back materialization failed"
+                                ));
+                            }
                         }
                         if let Some(card) = flight.card {
                             self.card_done(card);
