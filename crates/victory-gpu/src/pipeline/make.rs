@@ -22,7 +22,7 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use super::{Shader, Translated};
-use victory_shader::emit::{StructuredBinding, translate_with_view_strides};
+use victory_shader::emit::{StructuredBinding, translate_with_view_strides_for_hash};
 use victory_shader::{ResourceType, RootType, UsedResource};
 
 type Strides = Vec<(StructuredBinding, u32)>;
@@ -109,9 +109,10 @@ impl Pending {
             if shader.translated().is_none() {
                 // Probe lowering with a valid annotation. Only the binding
                 // locations survive the probe; its DXIL never reaches D3D12.
-                translate_with_view_strides(
+                translate_with_view_strides_for_hash(
                     &shader.container,
                     host.supports_wave32(),
+                    &shader.hash,
                     &|binding, required| {
                         required.then(|| {
                             bindings.borrow_mut().insert(binding);
@@ -134,9 +135,10 @@ impl Pending {
                     return Some(shader.clone());
                 }
                 let accessed = std::cell::RefCell::new(BTreeSet::new());
-                let (host, mut used) = translate_with_view_strides(
+                let (host, mut used) = translate_with_view_strides_for_hash(
                     &shader.container,
                     host.supports_wave32(),
+                    &shader.hash,
                     &|binding, _| {
                         let i = self
                             .strides
@@ -184,11 +186,29 @@ impl Pending {
                         });
                     }
                 }
+                let (does_store, addr_store) = victory_shader::Container::parse(&shader.container)
+                    .ok()
+                    .and_then(|c| {
+                        c.part(victory_shader::FourCC::DXIL)
+                            .map(|p| p.data.to_vec())
+                    })
+                    .and_then(|dxil| victory_shader::native_programs(&dxil).ok())
+                    .map_or((true, true), |programs| {
+                        (
+                            programs.is_empty() || programs.iter().any(super::stores),
+                            programs.is_empty() || programs.iter().any(super::stores_by_address),
+                        )
+                    });
                 Some(Arc::new(Shader {
                     stage: shader.stage,
                     hash: shader.hash.clone(),
                     container: Vec::new(),
-                    translated: OnceLock::from(Some(Translated { host, used })),
+                    translated: OnceLock::from(Some(Translated {
+                        host,
+                        used,
+                        stores: does_store,
+                        address_stores: addr_store,
+                    })),
                     #[cfg(feature = "diagnostics")]
                     wave64: OnceLock::new(),
                 }))

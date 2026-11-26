@@ -361,6 +361,8 @@ impl Shader {
         else {
             return Ok(self.clone());
         };
+        let does_store = super::stores(&native);
+        let addr_store = super::stores_by_address(&native);
         Ok(Arc::new(Self {
             stage: self.stage,
             hash: self.hash.clone(),
@@ -370,6 +372,8 @@ impl Shader {
             translated: Some(Translated {
                 host,
                 used: native.used,
+                stores: does_store,
+                address_stores: addr_store,
             })
             .into(),
             #[cfg(feature = "diagnostics")]
@@ -397,6 +401,11 @@ pub(crate) struct HostPipeline {
     pub(crate) mesh: bool,
     /// The geometry stage completes rectangle-list primitives after vertex shading.
     pub(crate) rects: bool,
+    /// For a mesh pipeline, the same with our amplification stage before
+    /// it ([`amplifier`]), and the root parameters of the argument buffer
+    /// (a root UAV) and of the record's byte offset in it (one constant).
+    /// A pipeline of its own: other mesh draws keep the plain one.
+    pub(crate) amplify: Option<(ID3D12PipelineState, u32, u32)>,
     pub(crate) pso: ID3D12PipelineState,
     pub(crate) root: ID3D12RootSignature,
     /// Vertex, then pixel stage, or the compute stage.
@@ -626,6 +635,33 @@ impl HostPipeline {
             }
             bound.push(stage);
         }
+        // Our amplification stage's two (`amplifier`), for a mesh pipeline.
+        let mut amplify: Option<(u32, u32)> = None;
+        if mesh.is_some() && compute.is_none() && amplifier().is_some() {
+            amplify = Some((params.len() as u32, params.len() as u32 + 1));
+            params.push(D3D12_ROOT_PARAMETER1 {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_UAV,
+                Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                    Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                        ShaderRegister: 0,
+                        RegisterSpace: AMPLIFY_SPACE,
+                        Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
+                    },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_AMPLIFICATION,
+            });
+            params.push(D3D12_ROOT_PARAMETER1 {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+                Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                    Constants: D3D12_ROOT_CONSTANTS {
+                        ShaderRegister: 0,
+                        RegisterSpace: AMPLIFY_SPACE,
+                        Num32BitValues: 1,
+                    },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_AMPLIFICATION,
+            });
+        }
         let (root, root_blob) =
             match root_signature(&host.device, &params, &samplers, compute.is_some(), heaps) {
                 Ok(root) => root,
@@ -677,6 +713,7 @@ impl HostPipeline {
                 structured_strides: structured_strides.to_vec(),
                 name: format!("{shaders:?}"),
                 rects: false,
+                amplify: None,
                 slots: 0,
                 inputs: Vec::new(),
             });
@@ -696,7 +733,47 @@ impl HostPipeline {
                 &[&code_bytes(&code(0)), &code_bytes(&code(1))],
                 &state,
             );
-            let pso = match mesh_pipeline(&host.device, &root, code(0), code(1), g, &name) {
+            let made = mesh_pipeline(&host.device, &root, None, code(0), code(1), g, &name);
+            let amplify = match (amplify, amplifier()) {
+                (Some((buffer_at, offset_at)), Some(stage)) if made.is_ok() => {
+                    let with = super::library::name(
+                        "mesh triangles amplified",
+                        &root_blob,
+                        &[stage, &code_bytes(&code(0)), &code_bytes(&code(1))],
+                        &state,
+                    );
+                    let stage = D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: stage.as_ptr().cast(),
+                        BytecodeLength: stage.len(),
+                    };
+                    match mesh_pipeline(
+                        &host.device,
+                        &root,
+                        Some(stage),
+                        code(0),
+                        code(1),
+                        g,
+                        &with,
+                    ) {
+                        Ok(pso) => Some((pso, buffer_at, offset_at)),
+                        Err(e) => {
+                            static SAID: std::sync::atomic::AtomicU32 =
+                                std::sync::atomic::AtomicU32::new(0);
+                            if SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
+                                tracing::warn!(
+                                    error = %e,
+                                    ?shaders,
+                                    "host mesh pipeline refused with the amplification stage: the plain one alone"
+                                );
+                                host.log_messages();
+                            }
+                            None
+                        }
+                    }
+                }
+                _ => None,
+            };
+            let pso = match made {
                 Ok(pso) => pso,
                 Err(e) => {
                     tracing::warn!(error = %e, ?shaders, "host mesh pipeline refused");
@@ -715,6 +792,7 @@ impl HostPipeline {
                 structured_strides: structured_strides.to_vec(),
                 name: format!("{shaders:?}"),
                 rects: false,
+                amplify,
                 slots: 0,
                 inputs: Vec::new(),
             });
@@ -855,6 +933,7 @@ impl HostPipeline {
             structured_strides: structured_strides.to_vec(),
             name: format!("{shaders:?}"),
             rects: rect_gs.is_some(),
+            amplify: None,
             slots: g.slots(),
             inputs: g.elements(),
         })
@@ -875,6 +954,7 @@ impl HostPipeline {
 fn mesh_pipeline(
     device: &ID3D12Device,
     root: &ID3D12RootSignature,
+    amplification: Option<D3D12_SHADER_BYTECODE>,
     ms: D3D12_SHADER_BYTECODE,
     ps: D3D12_SHADER_BYTECODE,
     g: &GraphicsState,
@@ -887,6 +967,7 @@ fn mesh_pipeline(
     #[repr(C)]
     struct Stream {
         root: Sub<*mut std::ffi::c_void>,
+        amplification: Sub<D3D12_SHADER_BYTECODE>,
         ms: Sub<D3D12_SHADER_BYTECODE>,
         ps: Sub<D3D12_SHADER_BYTECODE>,
         blend: Sub<D3D12_BLEND_DESC>,
@@ -902,6 +983,11 @@ fn mesh_pipeline(
         root: Sub(
             D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE,
             root.as_raw(),
+        ),
+        // (No code: no such stage.)
+        amplification: Sub(
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS,
+            amplification.unwrap_or_default(),
         ),
         ms: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms),
         ps: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps),
@@ -941,6 +1027,84 @@ fn mesh_pipeline(
         // SAFETY: as above.
         || unsafe { device.CreatePipelineState(&desc) },
     )
+}
+
+/// The register space of our amplification stage's buffer and constant.
+const AMPLIFY_SPACE: u32 = 31245;
+
+/// On by default (`VICTORY_INDIRECT_AMPLIFY=0` disables): the amplification
+/// stage that stands for `ExecuteIndirect` on one-record indirect mesh draws.
+/// It reads the record (three group counts) from the title's argument buffer
+/// at the byte offset a root constant gives, bounds it as the argument
+/// clamp does (65,535 groups by 1 by 1) and dispatches the mesh shader
+/// that many times. The draw is then a direct `DispatchMesh(1, 1, 1)`:
+/// no clamp pass and no `ExecuteIndirect`, and the card reads the record
+/// when it runs the draw, whoever wrote it.
+///
+/// Compiled once with the PC `dxc.exe` (`VICTORY_PC_DXC`, else the newest
+/// Windows SDK's); `None` when disabled or without a compiler.
+pub(crate) fn amplifier() -> Option<&'static [u8]> {
+    const SOURCE: &str = "struct Nothing { uint none; };
+RWByteAddressBuffer records : register(u0, space31245);
+cbuffer Record : register(b0, space31245) { uint at; };
+[numthreads(1, 1, 1)]
+void main() {
+    Nothing nothing;
+    nothing.none = 0;
+    uint3 g = records.Load3(at);
+    g = uint3(min(g.x, 65535u), min(g.y, 1u), min(g.z, 1u));
+    DispatchMesh(g.x, g.y, g.z, nothing);
+}
+";
+    static CODE: std::sync::OnceLock<Option<Vec<u8>>> = std::sync::OnceLock::new();
+    CODE.get_or_init(|| {
+        if !victory_shader::emit::indirect_amplify_enabled() {
+            return None;
+        }
+        let dxc = match std::env::var_os("VICTORY_PC_DXC") {
+            Some(p) => std::path::PathBuf::from(p),
+            None => victory_shader::emit::validator::Validator::default_path()?
+                .with_file_name("dxc.exe"),
+        };
+        let dir = std::env::temp_dir();
+        let (hlsl, out) = (
+            dir.join(format!("victory-amplify-{}.hlsl", std::process::id())),
+            dir.join(format!("victory-amplify-{}.dxil", std::process::id())),
+        );
+        std::fs::write(&hlsl, SOURCE).ok()?;
+        let ran = std::process::Command::new(&dxc)
+            .args(["-nologo", "-T", "as_6_5", "-E", "main", "-Fo"])
+            .arg(&out)
+            .arg(&hlsl)
+            .output();
+        let code = match ran {
+            Ok(o) if o.status.success() => std::fs::read(&out).ok(),
+            Ok(o) => {
+                tracing::warn!(
+                    "VICTORY_INDIRECT_AMPLIFY: dxc failed: {}",
+                    String::from_utf8_lossy(&o.stderr)
+                );
+                None
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    dxc = %dxc.display(),
+                    "VICTORY_INDIRECT_AMPLIFY: no dxc"
+                );
+                None
+            }
+        };
+        let _ = (std::fs::remove_file(&hlsl), std::fs::remove_file(&out));
+        if let Some(code) = &code {
+            tracing::info!(
+                bytes = code.len(),
+                "the amplification stage for one-record indirect mesh draws is compiled (VICTORY_INDIRECT_AMPLIFY=0 disables)"
+            );
+        }
+        code
+    })
+    .as_deref()
 }
 
 /// The bytes of shader code (none for an absent stage).
@@ -1140,9 +1304,10 @@ mod tests {
         g.targets.NumRenderTargets = 1;
         g.targets.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
         let name = super::super::library::name("mesh test", &root_blob, &[&ms, &ps], &g.describe());
-        mesh_pipeline(&host.device, &root, code(&ms), code(&ps), &g, &name).expect("made");
+        mesh_pipeline(&host.device, &root, None, code(&ms), code(&ps), &g, &name).expect("made");
         let loaded = super::super::library::LOADED.load(Ordering::Relaxed);
-        mesh_pipeline(&host.device, &root, code(&ms), code(&ps), &g, &name).expect("made again");
+        mesh_pipeline(&host.device, &root, None, code(&ms), code(&ps), &g, &name)
+            .expect("made again");
         assert!(
             super::super::library::LOADED.load(Ordering::Relaxed) > loaded,
             "the mesh pipeline was compiled again instead of loaded from the library"
@@ -1203,5 +1368,24 @@ mod tests {
         let mut t = targets(&[DXGI_FORMAT_R8G8B8A8_UNORM]);
         t.RTFormats[1] = DXGI_FORMAT_R8_UINT;
         assert_eq!(host_blend(&blending(false), &t), blending(false));
+    }
+
+    #[test]
+    fn indirect_amplify_defaults_on_and_disables_with_zero() {
+        use std::ffi::OsStr;
+        use victory_shader::emit::parse_indirect_amplify;
+
+        assert!(parse_indirect_amplify(None));
+        assert!(parse_indirect_amplify(Some(OsStr::new("1"))));
+        assert!(parse_indirect_amplify(Some(OsStr::new("true"))));
+        assert!(parse_indirect_amplify(Some(OsStr::new("on"))));
+        assert!(parse_indirect_amplify(Some(OsStr::new(""))));
+
+        assert!(!parse_indirect_amplify(Some(OsStr::new("0"))));
+        assert!(!parse_indirect_amplify(Some(OsStr::new(" 0 "))));
+        assert!(!parse_indirect_amplify(Some(OsStr::new("false"))));
+        assert!(!parse_indirect_amplify(Some(OsStr::new("FALSE"))));
+        assert!(!parse_indirect_amplify(Some(OsStr::new("no"))));
+        assert!(!parse_indirect_amplify(Some(OsStr::new("off"))));
     }
 }

@@ -21,6 +21,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use windows::Win32::Graphics::Direct3D12::*;
+use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8_UNORM;
 
 use crate::host::{HostList, host};
 use crate::object::This;
@@ -82,10 +83,9 @@ macro_rules! once {
 /// A texture's upload state: the staging buffer laid out as the host
 /// texture's subresources, and what was last detiled.
 pub(crate) struct Staging {
-    buffer: ID3D12Resource,
+    upload: crate::upload_pool::PooledUpload,
     /// Bytes in the host mapping (`GetCopyableFootprints` total).
     size: u64,
-    data: *mut u8,
     footprints: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
     rows: Vec<u32>,
     layout: victory_formats::texture::Layout,
@@ -101,6 +101,8 @@ pub(crate) struct Staging {
     /// descriptor-table draw later samples it.
     once: AtomicBool,
     memory: *const u8,
+    /// Whether unchanged view guards can defer hashing this texture.
+    guard_view: bool,
     /// Title resource this staging buffer is of: host SRVs are narrowed to
     /// its resident mip window ([`note_resident`]).
     resource: This,
@@ -132,13 +134,13 @@ unsafe impl Sync for Staging {}
 ///
 /// Evicted entries with `Arc::strong_count == 1` are safe to drop directly
 /// without going through [`crate::host::retire`]:
-/// - `Staging.buffer` is only used by [`upload`]/[`upload_from`], which
+/// - `Staging.upload` is only used by [`upload`]/[`upload_from`], which
 ///   immediately move their `Arc<Staging>` into `list.deferred.copies` via
 ///   `list.defer_texture(staging)` until `list.reset()` or `list.drop()`.
 /// - `Host::execute` holds `&HostList` until the GPU fence completes, so any
 ///   staging buffer referenced by an open or in-flight command list has
 ///   `Arc::strong_count >= 2` and is skipped by eviction.
-/// - No descriptor heap ever references `Staging.buffer`.
+/// - No descriptor heap ever references `Staging.upload`.
 #[derive(Default)]
 struct StagingCache {
     entries: HashMap<usize, Vec<Arc<Staging>>>,
@@ -146,14 +148,16 @@ struct StagingCache {
 }
 
 impl StagingCache {
-    fn insert(&mut self, key: usize, staging: Arc<Staging>) {
+    fn insert(&mut self, key: usize, staging: Arc<Staging>) -> Option<Arc<Staging>> {
         self.total_bytes = self.total_bytes.saturating_add(staging.size);
         let ranges = self.entries.entry(key).or_default();
         if let Some(existing) = ranges.iter_mut().find(|s| s.first == staging.first) {
             let previous = std::mem::replace(existing, staging);
             self.total_bytes = self.total_bytes.saturating_sub(previous.size);
+            Some(previous)
         } else {
             ranges.push(staging);
+            None
         }
     }
 
@@ -227,6 +231,32 @@ thread_local! {
     /// Texture memory read for hashing and detiling: one per submitting
     /// thread, as large as the largest texture it read.
     static SCRATCH: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Calls `f` with `size` bytes of this thread's scratch buffer (their contents
+/// are whatever the last texture left). Moves the buffer out of the
+/// thread-local `RefCell` during `f` so same-thread VEH re-entrancy can never
+/// panic with `RefCell already borrowed`. Keeps the initialized length so
+/// alternating large and small textures do not re-zero the tail.
+fn with_scratch<R>(size: usize, f: impl FnOnce(&mut [u8]) -> R) -> R {
+    let mut read = SCRATCH.with(|slot| {
+        slot.try_borrow_mut()
+            .map(|mut b| std::mem::take(&mut *b))
+            .unwrap_or_default()
+    });
+    if size > read.len() {
+        read.reserve_exact(size - read.len());
+        read.resize(size, 0);
+    }
+    let out = f(&mut read[..size]);
+    SCRATCH.with(|slot| {
+        if let Ok(mut saved) = slot.try_borrow_mut()
+            && read.capacity() > saved.capacity()
+        {
+            *saved = read;
+        }
+    });
+    out
 }
 
 /// Textures the host GPU wrote by a copy or resolve: their contents are on
@@ -531,9 +561,9 @@ pub(crate) fn forget(resource: usize) {
         }
     }
     note_resident(resource as This, None);
-    for staging in stagings {
-        let born = staging.born_seq;
-        crate::host::retire_born(staging, born);
+    if !stagings.is_empty() {
+        let born = crate::retire::safe_batch_born_seq(stagings.iter().map(|s| s.born_seq));
+        crate::host::retire_batch_born(stagings, born);
     }
     let mut through = THROUGH.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(through) = through.as_mut() {
@@ -715,7 +745,12 @@ pub(crate) fn upload_from(list: &HostList, resource: This, texture: &ID3D12Resou
         {
             let f = footprint.Footprint;
             // SAFETY: live resources.
-            let (gpu, d) = unsafe { (staging.buffer.GetGPUVirtualAddress(), texture.GetDesc()) };
+            let (gpu, d) = unsafe {
+                (
+                    staging.upload.buffer().GetGPUVirtualAddress(),
+                    texture.GetDesc(),
+                )
+            };
             let len = staging.footprint_bytes(i) as u64;
             list.note_read(
                 || {
@@ -748,7 +783,7 @@ pub(crate) fn upload_from(list: &HostList, resource: This, texture: &ID3D12Resou
         };
         let from = D3D12_TEXTURE_COPY_LOCATION {
             // SAFETY: as above.
-            pResource: unsafe { std::mem::transmute_copy(&staging.buffer) },
+            pResource: unsafe { std::mem::transmute_copy(staging.upload.buffer()) },
             Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
             Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
                 PlacedFootprint: *footprint,
@@ -791,10 +826,13 @@ impl Staging {
         let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
         let last = &mut *last;
         let alone = self.once.load(Ordering::Relaxed);
-        if alone && last.hash.is_some() {
+        if alone && self.guard_view && last.hash.is_some() {
             return 0;
         }
-        if !alone && let Some((now, written)) = crate::watch::writes(start, start + size, false) {
+        if !alone
+            && self.guard_view
+            && let Some((now, written)) = crate::watch::writes(start, start + size, false)
+        {
             if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
                 return 0;
             }
@@ -837,8 +875,7 @@ impl Staging {
         // Read through the kernel, as above: the title may unmap the pages
         // (evicting a texture a big table lists) while we read them, and a
         // direct read would fault. The copy is reused, not kept per texture.
-        SCRATCH.with_borrow_mut(|tiled| {
-            tiled.resize(size, 0);
+        with_scratch(size, |tiled| {
             crate::host::copy_mapped(tiled.as_mut_ptr(), self.memory, size, false);
             self.changed(last, tiled, self.first)
         })
@@ -973,7 +1010,10 @@ impl Staging {
             let len = self.footprint_bytes(i);
             // SAFETY: the subresource's part of the mapped staging buffer.
             let linear = unsafe {
-                std::slice::from_raw_parts_mut(self.data.add(footprint.Offset as usize), len)
+                std::slice::from_raw_parts_mut(
+                    self.upload.data().add(footprint.Offset as usize),
+                    len,
+                )
             };
             if sub < first {
                 linear.fill(0);
@@ -994,15 +1034,9 @@ impl Staging {
     }
 }
 
-/// Reads a texture for the duration of its detile. Keep the initialized
-/// length so alternating large and small textures do not re-zero the tail.
+/// Reads a texture for the duration of its detile.
 fn with_tiled_copy(memory: *const u8, size: usize, detile: impl FnOnce(&[u8])) {
-    SCRATCH.with_borrow_mut(|read| {
-        if size > read.len() {
-            read.reserve_exact(size - read.len());
-            read.resize(size, 0);
-        }
-        let tiled = &mut read[..size];
+    with_scratch(size, |tiled| {
         crate::host::copy_mapped(tiled.as_mut_ptr(), memory, size, false);
         detile(tiled);
     });
@@ -1041,11 +1075,85 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
 /// Whether `[at, at + len)` is committed memory (streamed textures may be
 /// unmapped until their pages arrive).
 pub(crate) fn committed(at: *const u8, len: usize) -> bool {
+    if len == 0 {
+        return true;
+    }
+    // A range past the top of the address space is never all committed.
+    if (at as usize).checked_add(len).is_none() {
+        return false;
+    }
     committed_prefix(at, len) == len
 }
 
+/// Whether residency probes (`committed`, `committed_prefix`) fall back to
+/// `VirtualQuery` instead of batched `K32QueryWorkingSetEx`
+/// (`VICTORY_COMMITTED_QUERY=1` restores legacy `VirtualQuery`).
+fn by_query() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_COMMITTED_QUERY").is_some_and(|v| v == "1"))
+}
+
 fn committed_prefix(at: *const u8, len: usize) -> usize {
-    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    if len == 0 {
+        return 0;
+    }
+    if by_query() {
+        return committed_prefix_by_query(at, len);
+    }
+    readable_prefix(at as usize, len)
+}
+
+/// Contiguous readable prefix length of `[start, start.saturating_add(len))`
+/// using batched 256-page `K32QueryWorkingSetEx` syscalls (with
+/// [`crate::host::read_into_probe`] fallback for pages not yet in the working
+/// set), avoiding `VirtualQuery`'s full-region page-table walks.
+fn readable_prefix(start: usize, len: usize) -> usize {
+    use windows_sys::Win32::System::ProcessStatus::{
+        K32QueryWorkingSetEx, PSAPI_WORKING_SET_EX_INFORMATION,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    const KERNEL_PAGE: usize = 4096;
+    let end = start.saturating_add(len);
+    if start >= end {
+        return 0;
+    }
+    let first = start / KERNEL_PAGE;
+    let last = (end - 1) / KERNEL_PAGE;
+    // SAFETY: plain data filled by `K32QueryWorkingSetEx`.
+    let mut info: [PSAPI_WORKING_SET_EX_INFORMATION; 256] = unsafe { std::mem::zeroed() };
+    let mut page = first;
+    while page <= last {
+        let n = (last - page + 1).min(info.len());
+        for (i, entry) in info[..n].iter_mut().enumerate() {
+            entry.VirtualAddress = ((page + i) * KERNEL_PAGE) as *mut _;
+        }
+        // SAFETY: `n` entries of the given size; our own process.
+        let asked = unsafe {
+            K32QueryWorkingSetEx(
+                GetCurrentProcess(),
+                info.as_mut_ptr().cast(),
+                (n * size_of::<PSAPI_WORKING_SET_EX_INFORMATION>()) as u32,
+            )
+        } != 0;
+        for (i, entry) in info[..n].iter().enumerate() {
+            // Bit 0 of the answer: the page is in the working set.
+            // SAFETY: plain data filled by the query.
+            let valid = asked && unsafe { entry.VirtualAttributes.Flags } & 1 != 0;
+            let page_addr = (page + i) * KERNEL_PAGE;
+            let mut byte = [0u8];
+            if !(valid || crate::host::read_into_probe(page_addr as *const u8, &mut byte)) {
+                return page_addr.saturating_sub(start);
+            }
+        }
+        page += n;
+    }
+    end - start
+}
+
+fn committed_prefix_by_query(at: *const u8, len: usize) -> usize {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery,
+    };
     let mut p = at as usize;
     // A range past the top of the address space (a title address and size
     // taken as they come) is cut at the top, so it is never all committed.
@@ -1055,7 +1163,8 @@ fn committed_prefix(at: *const u8, len: usize) -> usize {
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
         // SAFETY: a valid out pointer of the right size.
         let n = unsafe { VirtualQuery(p as *const _, &mut info, size_of_val(&info)) };
-        if n == 0 || info.State != MEM_COMMIT {
+        if n == 0 || info.State != MEM_COMMIT || (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0
+        {
             break;
         }
         p = (info.BaseAddress as usize).saturating_add(info.RegionSize);
@@ -1136,6 +1245,15 @@ fn create_staging(
     let host = host()?;
     // SAFETY: a live resource.
     let d = unsafe { texture.GetDesc() };
+    // Software-decoded movie planes are linear R8 textures. The decoder can
+    // write through another view of the same pages, bypassing the guards on
+    // the sampled view. Check their content on every submission so cycling
+    // through the movie's textures does not replay old frames.
+    let guard_view = !(d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
+        && d.Format == DXGI_FORMAT_R8_UNORM
+        && d.MipLevels == 1
+        && d.DepthOrArraySize == 1
+        && layout.desc.swizzle == victory_formats::texture::Swizzle::LINEAR);
     let first = first_mip(&layout, u32::from(d.MipLevels), requested);
     let tiled_bytes = layout.bytes_from(first) as usize;
     let count = if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
@@ -1159,8 +1277,8 @@ fn create_staging(
             Some(&mut total),
         );
     }
-    let (buffer, data) = host.upload_buffer(total)?;
-    crate::host::name(&buffer, || {
+    let upload = crate::upload_pool::acquire(host, total)?;
+    crate::host::name(upload.buffer(), || {
         format!(
             "staging of {resource:?} {}x{}x{} f{}",
             d.Width, d.Height, d.DepthOrArraySize, d.Format.0
@@ -1168,18 +1286,18 @@ fn create_staging(
     });
     tracing::debug!(?desc, total, "texture contents uploaded from title memory");
     Some(Arc::new(Staging {
-        buffer,
+        upload,
         size: total,
         first,
         tiled_bytes,
-        data,
         footprints,
         rows,
         layout,
         mips: u32::from(d.MipLevels),
         skipped: crate::resource::dropped_mips(resource),
-        once: AtomicBool::new(once() && PICKING.get().is_some()),
+        once: AtomicBool::new(once() && guard_view && PICKING.get().is_some()),
         memory,
+        guard_view,
         resource,
         last: Mutex::default(),
         expected: AtomicU64::new(0),
@@ -1192,7 +1310,7 @@ fn create_staging(
 /// eviction).
 fn staging(resource: This, texture: &ID3D12Resource, requested: u32) -> Option<Arc<Staging>> {
     let key = resource as usize;
-    let (s, evicted) = {
+    let (s, replaced, evicted) = {
         let mut cache = STAGING.lock().unwrap_or_else(|e| e.into_inner());
         let cache = cache.get_or_insert_with(StagingCache::default);
         if let Some(s) = cache.entries.get(&key).and_then(|ranges| {
@@ -1205,13 +1323,13 @@ fn staging(resource: This, texture: &ID3D12Resource, requested: u32) -> Option<A
         }
         let s = create_staging(resource, texture, requested)?;
         let keep_first = s.first;
-        cache.insert(key, s.clone());
+        let replaced = cache.insert(key, s.clone());
         let evicted = cache.evict_to_budget(staging_budget(), key, keep_first);
-        (s, evicted)
+        (s, replaced, evicted)
     };
-    // Drop evicted staging buffers after releasing `STAGING` so freeing D3D12
-    // upload resources does not stall concurrent cache lookups.
-    drop(evicted);
+    // Drop replaced/evicted staging buffers after releasing `STAGING` so freeing
+    // D3D12 upload resources does not stall concurrent cache lookups.
+    drop((replaced, evicted));
     Some(s)
 }
 
@@ -1470,7 +1588,7 @@ mod tests {
         );
         assert!(s.last.lock().unwrap().hash.is_some());
         // SAFETY: staging mapping covers the entire first subresource footprint.
-        let staged = unsafe { std::slice::from_raw_parts(s.data, s.footprint_bytes(0)) };
+        let staged = unsafe { std::slice::from_raw_parts(s.upload.data(), s.footprint_bytes(0)) };
         assert!(
             staged.contains(&0x7c),
             "retried upload must detile newly arrived tail bytes instead of staying zeroed"
@@ -1491,6 +1609,76 @@ mod tests {
         assert_eq!(release(resource), 0);
         // SAFETY: freeing our reservation.
         assert_ne!(unsafe { VirtualFree(memory, 0, MEM_RELEASE) }, 0);
+    }
+
+    #[test]
+    fn batched_query_working_set_prefix_spans_multiple_batches_and_stops_at_holes() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc,
+            VirtualFree, VirtualProtect,
+        };
+        const MEM_TOP_DOWN: u32 = 0x10_0000;
+        const KERNEL_PAGE: usize = 4096;
+        // > 256 pages so `readable_prefix` crosses multiple 256-entry
+        // `K32QueryWorkingSetEx` batches (300 pages = 1.2 MiB).
+        const TOTAL_PAGES: usize = 300;
+        const COMMIT_PAGES: usize = 270;
+        const TOTAL_BYTES: usize = TOTAL_PAGES * KERNEL_PAGE;
+        const COMMIT_BYTES: usize = COMMIT_PAGES * KERNEL_PAGE;
+
+        // SAFETY: isolated reservation freed at the end of the test.
+        let base = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                TOTAL_BYTES,
+                MEM_RESERVE | MEM_TOP_DOWN,
+                PAGE_NOACCESS,
+            )
+            .cast::<u8>()
+        };
+        assert!(!base.is_null());
+        // SAFETY: commit the first 270 pages; leave pages 270..300 reserved.
+        let mapped = unsafe { VirtualAlloc(base.cast(), COMMIT_BYTES, MEM_COMMIT, PAGE_READWRITE) };
+        assert_eq!(mapped, base.cast());
+
+        // Touch only the first half so the second half exercises the
+        // `read_into_probe` fallback for committed pages not yet in working set.
+        // SAFETY: pages 0..135 are committed and writable.
+        unsafe { base.write_bytes(0x5A, 135 * KERNEL_PAGE) };
+
+        assert_eq!(readable_prefix(base as usize, TOTAL_BYTES), COMMIT_BYTES);
+        assert_eq!(
+            readable_prefix(base as usize + 123, TOTAL_BYTES - 123),
+            COMMIT_BYTES - 123
+        );
+        assert!(committed(base, COMMIT_BYTES));
+        assert!(!committed(base, TOTAL_BYTES));
+        // Unmapped start returns 0 immediately.
+        assert_eq!(
+            readable_prefix(base as usize + COMMIT_BYTES, 16 * KERNEL_PAGE),
+            0
+        );
+
+        // `PAGE_NOACCESS` mid-range stops `readable_prefix` before the protected page.
+        let mut old = 0u32;
+        // SAFETY: page 260 is committed within our reservation.
+        let protected = unsafe {
+            VirtualProtect(
+                base.add(260 * KERNEL_PAGE).cast(),
+                KERNEL_PAGE,
+                PAGE_NOACCESS,
+                &mut old,
+            )
+        };
+        assert_ne!(protected, 0);
+        assert_eq!(
+            readable_prefix(base as usize, TOTAL_BYTES),
+            260 * KERNEL_PAGE
+        );
+        assert!(!committed(base, COMMIT_BYTES));
+
+        // SAFETY: release our reservation.
+        assert_ne!(unsafe { VirtualFree(base.cast(), 0, MEM_RELEASE) }, 0);
     }
 
     #[test]
@@ -1646,7 +1834,7 @@ mod tests {
                 .iter()
                 .map(|fp| {
                     // SAFETY: each footprint begins within the live mapped staging buffer.
-                    unsafe { s.data.add(fp.Offset as usize).read() }
+                    unsafe { s.upload.data().add(fp.Offset as usize).read() }
                 })
                 .collect::<Vec<_>>()
         };
@@ -1888,9 +2076,15 @@ mod tests {
             let row_bytes = fp.Footprint.Width as usize * 4;
             let rows = s.rows[0] as usize;
             let mut out = Vec::with_capacity(row_bytes * rows);
-            // SAFETY: `s.data` is a mapped upload buffer covering footprint 0.
-            let mapped =
-                unsafe { std::slice::from_raw_parts(s.data.add(fp.Offset as usize), pitch * rows) };
+            if rows == 0 {
+                return out;
+            }
+            let span = (rows - 1) * pitch + row_bytes;
+            assert!(fp.Offset as usize + span <= s.size as usize);
+            // SAFETY: `s.upload.data()` is a mapped upload buffer covering `fp.Offset..fp.Offset + span`.
+            let mapped = unsafe {
+                std::slice::from_raw_parts(s.upload.data().add(fp.Offset as usize), span)
+            };
             for row in 0..rows {
                 out.extend_from_slice(&mapped[row * pitch..row * pitch + row_bytes]);
             }
@@ -1909,9 +2103,14 @@ mod tests {
         assert_eq!(s3.size, entry_bytes);
 
         let mut cache = StagingCache::default();
-        cache.insert(t1 as usize, s1.clone());
-        cache.insert(t2 as usize, s2.clone());
-        cache.insert(t3 as usize, s3.clone());
+        assert!(cache.insert(t1 as usize, s1.clone()).is_none());
+        // Re-inserting the same key returns the replaced entry to the caller so it
+        // can be dropped after releasing the `STAGING` lock.
+        let s1_dup = s1.clone();
+        assert!(cache.insert(t1 as usize, s1_dup).is_some());
+        assert_eq!(cache.total_bytes, entry_bytes);
+        assert!(cache.insert(t2 as usize, s2.clone()).is_none());
+        assert!(cache.insert(t3 as usize, s3.clone()).is_none());
         assert_eq!(cache.total_bytes, 3 * entry_bytes);
 
         // Touch `t1` so LRU order is `t2` (oldest) < `t3` < `t1` (newest).
@@ -1934,7 +2133,7 @@ mod tests {
         // Insert `t4`, pushing `total_bytes` to 4 * `entry_bytes`.
         let s4 = create_staging(t4, h4, 0).expect("staging 4");
         assert_eq!(s4.size, entry_bytes);
-        cache.insert(t4 as usize, s4);
+        assert!(cache.insert(t4 as usize, s4).is_none());
         assert_eq!(cache.total_bytes, 4 * entry_bytes);
 
         // Budget of 3 entries must skip in-use `t2` and evict oldest idle `t3`,
@@ -2362,5 +2561,19 @@ mod resident_tests {
         assert_eq!(resident(resource), None);
         // Leave no cross-test residue in the process-wide sets.
         forget(resource as usize);
+    }
+
+    #[test]
+    fn with_scratch_is_reentrant_safe() {
+        let outer = super::with_scratch(64, |outer_buf| {
+            outer_buf.fill(0xaa);
+            let inner = super::with_scratch(256, |inner_buf| {
+                inner_buf.fill(0x55);
+                inner_buf.len()
+            });
+            assert!(outer_buf.iter().all(|&b| b == 0xaa));
+            (outer_buf.len(), inner)
+        });
+        assert_eq!(outer, (64, 256));
     }
 }

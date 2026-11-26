@@ -64,6 +64,8 @@ pub mod queue;
 #[cfg(windows)]
 mod rectangles;
 pub mod resource;
+#[cfg(windows)]
+pub(crate) mod retire;
 pub mod root;
 #[cfg(windows)]
 mod sampler;
@@ -74,8 +76,12 @@ mod shadow;
 pub mod signature;
 mod switch;
 #[cfg(windows)]
+mod texback;
+#[cfg(windows)]
 mod texture;
 mod timeline;
+#[cfg(windows)]
+mod upload_pool;
 #[cfg(windows)]
 mod watch;
 
@@ -84,5 +90,6 @@ pub use host::{HdrDisplayInfo, display_hdr_info, on_failure, write_title_memory}
 #[cfg(windows)]
 pub use watch::{
     Reading, Remapping, kernel_will_write, kernel_wrote, mapped_pages_written,
-    title_memory_reading, title_memory_reading_now, title_memory_remapped, title_memory_remapping,
+    title_memory_alias_rebound, title_memory_reading, title_memory_reading_now,
+    title_memory_remapped, title_memory_remapping,
 };
