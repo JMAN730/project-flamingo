@@ -1218,27 +1218,42 @@ fn join_runs(runs: Vec<(usize, usize)>, gap: usize) -> Vec<(usize, usize)> {
     out
 }
 
+enum LockRead<G> {
+    Ok(G),
+    /// Destination is unmapped/unreadable with no overlapping deferred lazy block.
+    Unmapped,
+    /// Read failed because an overlapping deferred lazy block (owned by this
+    /// shadow or another) failed to materialize or remained armed.
+    LazyFailed,
+}
+
 /// Materializes any deferred `lazy_back` blocks in `[addr, addr + buf.len())`
 /// outside the per-`Shadow` lock, then acquires `acquire()` and reads via
 /// `read_into_raw`. If a concurrent relay thread re-deferred the block before
 /// the lock was acquired, drops the lock, materializes once, and retries.
-fn lock_and_read<G>(acquire: impl Fn() -> G, addr: usize, buf: &mut [u8]) -> Option<G> {
-    if crate::lazy_back::active() {
-        crate::lazy_back::materialize_range(addr, buf.len());
+fn lock_and_read<G>(acquire: impl Fn() -> G, addr: usize, buf: &mut [u8]) -> LockRead<G> {
+    if crate::lazy_back::active() && !crate::lazy_back::materialize_range(addr, buf.len()) {
+        return LockRead::LazyFailed;
     }
     let guard = acquire();
     if crate::host::read_into_raw(addr as *const u8, buf) {
-        return Some(guard);
+        return LockRead::Ok(guard);
     }
     drop(guard);
     if crate::lazy_back::has_block_in_range(addr, buf.len()) {
-        crate::lazy_back::materialize_range(addr, buf.len());
+        if !crate::lazy_back::materialize_range(addr, buf.len()) {
+            return LockRead::LazyFailed;
+        }
         let guard = acquire();
         if crate::host::read_into_raw(addr as *const u8, buf) {
-            return Some(guard);
+            return LockRead::Ok(guard);
+        }
+        drop(guard);
+        if crate::lazy_back::has_block_in_range(addr, buf.len()) {
+            return LockRead::LazyFailed;
         }
     }
-    None
+    LockRead::Unmapped
 }
 
 /// Scans `work` (`(shadow, from, to)` title-address spans of PC-backed shadows)
@@ -2234,20 +2249,27 @@ impl Shadow {
             return Some(0);
         }
         if crate::host::read_into_raw((start + sub_at) as *const u8, title) {
-            if merge_piece(gpu, old, title) {
+            let mut merged_old = old.to_vec();
+            if merge_piece(gpu, &mut merged_old, title) {
                 crate::host::shaders_write(start + sub_at, &title[..]);
                 if self.put_back_own(start + sub_at, &title[..]) {
+                    old.copy_from_slice(&merged_old);
                     return Some(sub_n);
                 }
                 crate::watch::writing(start + sub_at, sub_n);
-                let written = crate::host::write_mapped_raw(
+                let written = crate::host::write_mapped_raw_with(
                     (start + sub_at) as *mut u8,
                     title.as_ptr(),
                     sub_n,
+                    |piece_off, piece_len| {
+                        old[piece_off..piece_off + piece_len]
+                            .copy_from_slice(&merged_old[piece_off..piece_off + piece_len]);
+                    },
                 );
                 *wrote_fallback = true;
-                return Some(written);
+                return (written == sub_n).then_some(written);
             }
+            old.copy_from_slice(&merged_old);
             return Some(0);
         }
         // Title read failed: leave `old` (the mirror) untouched and report
@@ -2696,7 +2718,7 @@ impl Shadow {
                     // with zero D3D12 `CopyBufferRegion` overhead, so it must not
                     // be capped by or consume `runs_left` (reserved for `card`).
                     let failed = {
-                        let Some(mut mirror) = lock_and_read(
+                        let LockRead::Ok(mut mirror) = lock_and_read(
                             || rebar.mirror.lock().unwrap_or_else(|e| e.into_inner()),
                             lo,
                             title,
@@ -2737,7 +2759,7 @@ impl Shadow {
                         rebar.mark_dirty_range(off, len);
                     }
                 } else {
-                    let Some(mut before) = lock_and_read(
+                    let LockRead::Ok(mut before) = lock_and_read(
                         || self.before.write().unwrap_or_else(|e| e.into_inner()),
                         lo,
                         title,
@@ -3212,12 +3234,17 @@ impl Shadow {
             if let Some(rebar) = &self.rebar {
                 let mut dirty_runs = Vec::new();
                 {
-                    let Some(mut mirror) = lock_and_read(
+                    let mut mirror = match lock_and_read(
                         || rebar.mirror.lock().unwrap_or_else(|e| e.into_inner()),
                         lo,
                         title,
-                    ) else {
-                        continue;
+                    ) {
+                        LockRead::Ok(guard) => guard,
+                        LockRead::LazyFailed => {
+                            all_ok = false;
+                            continue;
+                        }
+                        LockRead::Unmapped => continue,
                     };
                     if let Some(held_all) = mirror.as_mut()
                         && at + n <= held_all.len()
@@ -3243,12 +3270,17 @@ impl Shadow {
                     rebar.mark_dirty_range(off, len);
                 }
             } else {
-                let Some(mut before) = lock_and_read(
+                let mut before = match lock_and_read(
                     || self.before.write().unwrap_or_else(|e| e.into_inner()),
                     lo,
                     title,
-                ) else {
-                    continue;
+                ) {
+                    LockRead::Ok(guard) => guard,
+                    LockRead::LazyFailed => {
+                        all_ok = false;
+                        continue;
+                    }
+                    LockRead::Unmapped => continue,
                 };
                 if self.card.is_some() {
                     while prot_idx < protected.len() && protected[prot_idx].1 <= lo {
@@ -3283,14 +3315,18 @@ impl Shadow {
                                 .older_ranges(preparing, lo, to);
                             prot_idx = 0;
                         }
-                        let Some(refreshed) = lock_and_read(
+                        before = match lock_and_read(
                             || self.before.write().unwrap_or_else(|e| e.into_inner()),
                             lo,
                             title,
-                        ) else {
-                            continue;
+                        ) {
+                            LockRead::Ok(guard) => guard,
+                            LockRead::LazyFailed => {
+                                all_ok = false;
+                                continue;
+                            }
+                            LockRead::Unmapped => continue,
                         };
-                        before = refreshed;
                         // SAFETY: inside staging mapping, write lock on `self.before` held.
                         held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
                         page_runs.clear();
@@ -3776,12 +3812,40 @@ impl Shadow {
                 ok[idx] = passed;
             }
         }
-        publish_staged_card_segs(&segs, &staged);
         let (succeeded, failed, bytes) = partition_copy_segs(&segs, &ok);
         let all_ok = failed.is_empty();
-        self.finish_copy_segs(start, &succeeded, &touched);
+        self.publish_and_finish_copy_segs(start, &segs, &staged, &succeeded, &touched);
         self.commit_copied_epochs(epochs, &failed);
         (bytes, all_ok)
+    }
+
+    /// Publishes staged card bytes into `card.staging` and records the matching
+    /// `card.dirty` ranges atomically under `self.before.write()` (matching
+    /// `card_merge_relay_inner`'s `self.before.read() -> card.dirty.read()` lock
+    /// order) so no concurrent card relay merge can observe published staging
+    /// bytes without their corresponding `card.dirty` metadata.
+    fn publish_and_finish_copy_segs(
+        &self,
+        start: usize,
+        segs: &[CopySeg],
+        staged: &[(usize, Vec<u8>)],
+        succeeded: &[CopySeg],
+        touched_rebar: &[CopySeg],
+    ) {
+        if self.card.is_some() {
+            let _before = self.before.write().unwrap_or_else(|e| e.into_inner());
+            publish_staged_card_segs(segs, staged);
+            #[cfg(test)]
+            BETWEEN_PUBLISH_AND_DIRTY_HOOK.with(|h| {
+                if let Some(cb) = h.borrow_mut().take() {
+                    cb();
+                }
+            });
+            self.finish_copy_segs(start, succeeded, touched_rebar);
+        } else {
+            publish_staged_card_segs(segs, staged);
+            self.finish_copy_segs(start, succeeded, touched_rebar);
+        }
     }
 
     /// Post-copy metadata invalidation for non-mirrored `segs`, acquiring each
@@ -4305,6 +4369,12 @@ struct CopySegsResult {
     staged: Vec<(usize, Vec<u8>)>,
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static BETWEEN_PUBLISH_AND_DIRTY_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// Copies successfully staged card refresh buffers into their target
 /// `card.staging` mappings right before publishing matching `card.dirty` ranges.
 fn publish_staged_card_segs(segs: &[CopySeg], staged: &[(usize, Vec<u8>)]) {
@@ -4677,13 +4747,18 @@ pub(crate) fn refresh_batch(
             .zip(staged_by_shadow.iter())
         {
             let (shadow, _, _, plan) = &planned[idx];
-            publish_staged_card_segs(&all_segs, shadow_staged);
             let (succeeded, failed, bytes) =
                 partition_copy_segs(&all_segs[seg_lo..seg_hi], &ok[seg_lo..seg_hi]);
             if !failed.is_empty() {
                 all_ok = false;
             }
-            shadow.finish_copy_segs(shadow.start as usize, &succeeded, shadow_touched);
+            shadow.publish_and_finish_copy_segs(
+                shadow.start as usize,
+                &all_segs,
+                shadow_staged,
+                &succeeded,
+                shadow_touched,
+            );
             shadow.commit_copied_epochs(&plan.epochs, &failed);
             item_copied[idx] = bytes;
             total_copied += bytes;
@@ -8712,20 +8787,22 @@ mod tests {
 
         let shadow =
             Shadow::new_rebar_for_test(va0 as u64, len as u64, 0x11).expect("rebar test shadow");
-        // Start with ZERO armed lazy blocks (`!lazy_back::active()`), then arm
+        // Isolate this thread's view of `lazy_back::active()` to `false` across
+        // destination selection (so parallel lazy tests cannot affect this test
+        // AND a regression from `can_arm()` back to `active()` deterministically
+        // selects direct `seg.mirror` and fails), then clear the override and arm
         // page 1 *mid-copy* right after `execute_copy_seg_checked` selects its
-        // target buffer (`tmp` under `can_arm()`, vs `seg.mirror` under the
-        // old `active()` check). Under the old `active()` guard, `victory_copy_try`
-        // would write page 0 (`0x22`) directly into `mirror` before faulting on
-        // page 1; under `can_arm()`, `mirror` and `dst` stay completely untouched.
+        // destination buffer.
+        let _force_inactive = crate::lazy_back::force_active_for_test(Some(false));
         assert!(
             !crate::lazy_back::active(),
-            "copy must begin with zero armed lazy blocks to exercise the can_arm() vs active() race"
+            "isolated active() must be false before destination selection"
         );
         let armed_mid_copy = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let armed_cb = armed_mid_copy.clone();
         let shadow_cb = shadow.clone();
         crate::host::set_before_copy_mapped_raw_hook(Some(Box::new(move || {
+            crate::lazy_back::clear_force_active_for_test();
             let ok = crate::lazy_back::try_defer_page_for_test(&shadow_cb, PAGE, PAGE, 0);
             armed_cb.store(ok, Ordering::SeqCst);
         })));
@@ -8739,6 +8816,7 @@ mod tests {
             stage_card: false,
         };
         let copy_ok = execute_copy_seg_checked(seg);
+        drop(_force_inactive);
         crate::host::set_before_copy_mapped_raw_hook(None);
         assert!(
             armed_mid_copy.load(Ordering::SeqCst),
@@ -8860,6 +8938,389 @@ mod tests {
         unsafe {
             UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: view.Value });
             CloseHandle(section);
+        }
+    }
+
+    #[test]
+    fn apply_rebar_relay_subrange_short_write_fails_and_preserves_unwritten_mirror() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READONLY, PAGE_READWRITE, VirtualAlloc,
+            VirtualFree, VirtualProtect,
+        };
+
+        let Some(_h) = host() else {
+            return;
+        };
+        const P4K: usize = 4 << 10;
+        let len = 2 * P4K;
+        // Private allocation (no `inplace` own view) so `apply_rebar_relay_subrange`
+        // uses the `write_mapped_raw_with` fallback path.
+        // SAFETY: fresh 2x4KiB private allocation.
+        let base = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                len,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE,
+            )
+            .cast::<u8>()
+        };
+        assert!(!base.is_null());
+        // SAFETY: seed both 4 KiB pages with `0x11`.
+        unsafe { std::ptr::write_bytes(base, 0x11, len) };
+
+        let shadow =
+            Shadow::new_rebar_for_test(base as u64, len as u64, 0x11).expect("rebar test shadow");
+
+        // Case 1: Page 0 is PAGE_READONLY and page 1 is PAGE_READWRITE -> short write
+        // writes ONLY page 1 (4 KiB of 8 KiB). Must return `None`, leave mirror[0..4K]
+        // at `0x11` (not advanced!), and update mirror[4K..8K] to `0xAA` to match title.
+        let mut old_prot = 0u32;
+        assert_ne!(
+            // SAFETY: making page 0 read-only while page 1 stays writable.
+            unsafe { VirtualProtect(base.cast(), P4K, PAGE_READONLY, &mut old_prot) },
+            0
+        );
+        let gpu = vec![0xAAu8; len];
+        let mut old = vec![0x11u8; len];
+        let mut title = Vec::new();
+        let mut wrote_fallback = false;
+        let res = shadow.apply_rebar_relay_subrange(
+            base as usize,
+            0,
+            &gpu,
+            &mut old,
+            &mut title,
+            false,
+            &mut wrote_fallback,
+        );
+        assert_eq!(
+            res, None,
+            "short write_mapped_raw must fail the ReBAR relay subrange"
+        );
+        assert!(wrote_fallback);
+        assert!(
+            old[..P4K].iter().all(|&b| b == 0x11),
+            "unwritten read-only page 0 must keep pre-merge mirror bytes"
+        );
+        assert!(
+            old[P4K..].iter().all(|&b| b == 0xAA),
+            "confirmed-written page 1 must reflect merged bytes in mirror"
+        );
+        // SAFETY: page 0 is readable (PAGE_READONLY) and page 1 is PAGE_READWRITE.
+        let (title0, title1) = unsafe {
+            (
+                std::slice::from_raw_parts(base, P4K),
+                std::slice::from_raw_parts(base.add(P4K), P4K),
+            )
+        };
+        assert!(title0.iter().all(|&b| b == 0x11));
+        assert!(title1.iter().all(|&b| b == 0xAA));
+
+        // Case 2: Both pages read-only -> written == 0, must return `None` and leave mirror untouched.
+        assert_ne!(
+            // SAFETY: making page 1 read-only too.
+            unsafe { VirtualProtect(base.add(P4K).cast(), P4K, PAGE_READONLY, &mut old_prot) },
+            0
+        );
+        let gpu2 = vec![0xBBu8; len];
+        let old_before = old.clone();
+        let res2 = shadow.apply_rebar_relay_subrange(
+            base as usize,
+            0,
+            &gpu2,
+            &mut old,
+            &mut title,
+            false,
+            &mut wrote_fallback,
+        );
+        assert_eq!(res2, None);
+        assert_eq!(
+            old, old_before,
+            "zero-byte write must leave mirror unchanged"
+        );
+
+        // Case 3: Restore RW -> full write succeeds and updates mirror.
+        assert_ne!(
+            // SAFETY: restoring RW on both pages.
+            unsafe { VirtualProtect(base.cast(), len, PAGE_READWRITE, &mut old_prot) },
+            0
+        );
+        let res3 = shadow.apply_rebar_relay_subrange(
+            base as usize,
+            0,
+            &gpu2,
+            &mut old,
+            &mut title,
+            false,
+            &mut wrote_fallback,
+        );
+        assert_eq!(res3, Some(len));
+        assert!(old.iter().all(|&b| b == 0xBB));
+
+        drop(shadow);
+        // SAFETY: cleanup.
+        unsafe { VirtualFree(base.cast(), 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn update_busy_reports_failure_when_page_backed_by_other_shadows_lazy_block() {
+        use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MEM_RELEASE, MEM_RESERVE,
+            MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile, PAGE_NOACCESS, PAGE_READWRITE,
+            UnmapViewOfFile, VirtualAlloc, VirtualFree,
+        };
+
+        let Some(_h) = host() else {
+            return;
+        };
+        let len = 2 * PAGE;
+        // SAFETY: 2-page anonymous section.
+        let section: HANDLE = unsafe {
+            CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                len as u32,
+                std::ptr::null(),
+            )
+        };
+        assert!(!section.is_null());
+        // SAFETY: map 2 contiguous pages.
+        let view = unsafe { MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, len) };
+        assert!(!view.Value.is_null());
+        let ptr = view.Value.cast::<u8>();
+        let va0 = ptr as usize;
+        let blk0 = va0 / PAGE;
+        crate::lazy_back::clear_hot_for_test_pub(blk0);
+        crate::inplace::title_memory_section(section as usize, len as u64, true);
+        assert!(crate::inplace::title_memory_view(
+            va0,
+            len,
+            section as usize,
+            0
+        ));
+        // SAFETY: seed page 0 = `0x11`, page 1 = `0x44`.
+        unsafe {
+            std::ptr::write_bytes(ptr, 0x11, PAGE);
+            std::ptr::write_bytes(ptr.add(PAGE), 0x44, PAGE);
+        }
+
+        // Shadow B owns page 0's deferred lazy block; Shadow A (both card and ReBAR)
+        // covers [va0, va0 + 2*PAGE) and must report `all_ok == false` when page 0's
+        // materialization fails, while preserving page 1's copied bytes & epoch.
+        let mut side_b = vec![0x11u8; PAGE];
+        let shadow_b =
+            Shadow::new_card_sized_for_test(side_b.as_mut_ptr(), va0 as u64, PAGE as u64)
+                .expect("owner shadow B");
+        assert!(crate::lazy_back::try_defer_page_for_test(
+            &shadow_b, 0, PAGE, 0
+        ));
+
+        // 1. Card-backed Shadow A (non-ReBAR branch in `update_busy`).
+        let mut side_a = vec![0x11u8; len];
+        let card_a = Shadow::new_card_sized_for_test(side_a.as_mut_ptr(), va0 as u64, len as u64)
+            .expect("card shadow A");
+        crate::lazy_back::set_fail_next_fetches_for_test(4);
+        let (copied_card, ok_card) = card_a.update_busy(va0, va0 + len);
+        crate::lazy_back::set_fail_next_fetches_for_test(0);
+        assert!(
+            !ok_card,
+            "card update_busy must report failure when a busy page is backed by another shadow's failed lazy block"
+        );
+        assert_eq!(copied_card, PAGE, "good page 1 bytes must still be copied");
+        assert!(side_a[PAGE..].iter().all(|&b| b == 0x44));
+        {
+            let copied_epochs = card_a.copied.lock().unwrap();
+            assert_eq!(copied_epochs[0], 0, "failed page 0 epoch must stay pending");
+            assert_ne!(copied_epochs[1], 0, "good page 1 epoch must advance");
+        }
+        drop(card_a);
+
+        // 2. ReBAR-backed Shadow A (ReBAR branch in `update_busy`).
+        let rebar_a =
+            Shadow::new_rebar_for_test(va0 as u64, len as u64, 0x11).expect("rebar shadow A");
+        crate::lazy_back::set_fail_next_fetches_for_test(4);
+        let (copied_rebar, ok_rebar) = rebar_a.update_busy(va0, va0 + len);
+        crate::lazy_back::set_fail_next_fetches_for_test(0);
+        assert!(
+            !ok_rebar,
+            "ReBAR update_busy must report failure when a busy page is backed by another shadow's failed lazy block"
+        );
+        assert_eq!(copied_rebar, PAGE, "good page 1 bytes must still be copied");
+        {
+            let copied_epochs = rebar_a.copied.lock().unwrap();
+            assert_eq!(copied_epochs[0], 0, "failed page 0 epoch must stay pending");
+            assert_ne!(copied_epochs[1], 0, "good page 1 epoch must advance");
+        }
+        drop(rebar_a);
+
+        // Clean up lazy block on page 0.
+        assert!(crate::lazy_back::materialize_range(va0, PAGE));
+        drop(shadow_b);
+
+        // 3. Ordinary unmapped hole with NO lazy block must remain skippable (`all_ok == true`).
+        // SAFETY: reserved (uncommitted) 1-page hole.
+        let hole = unsafe { VirtualAlloc(std::ptr::null(), PAGE, MEM_RESERVE, PAGE_NOACCESS) };
+        assert!(!hole.is_null());
+        let mut side_h = vec![0u8; PAGE];
+        let hole_shadow =
+            Shadow::new_card_sized_for_test(side_h.as_mut_ptr(), hole as u64, PAGE as u64)
+                .expect("hole shadow");
+        let (_, ok_hole) = hole_shadow.update_busy(hole as usize, hole as usize + PAGE);
+        assert!(
+            ok_hole,
+            "ordinary unmapped hole without a lazy block must remain skippable"
+        );
+        drop(hole_shadow);
+        // SAFETY: cleanup.
+        unsafe {
+            VirtualFree(hole, 0, MEM_RELEASE);
+            crate::lazy_back::clear_hot_for_test_pub(blk0);
+            crate::watch::title_memory_remapped(va0, len);
+            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: view.Value });
+            CloseHandle(section);
+        }
+    }
+
+    #[test]
+    fn card_staging_publication_and_dirty_marking_are_atomic_with_relay_merge() {
+        use std::sync::{Barrier, Condvar};
+        use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
+            PAGE_READWRITE, UnmapViewOfFile,
+        };
+
+        let Some(_h) = host() else {
+            return;
+        };
+        // Exercise BOTH single-shadow (`copy_runs_with_epochs`) and batch (`refresh_batch`) paths.
+        for use_batch in [false, true] {
+            // SAFETY: 1-page anonymous section.
+            let section: HANDLE = unsafe {
+                CreateFileMappingW(
+                    INVALID_HANDLE_VALUE,
+                    std::ptr::null(),
+                    PAGE_READWRITE,
+                    0,
+                    PAGE as u32,
+                    std::ptr::null(),
+                )
+            };
+            assert!(!section.is_null());
+            // SAFETY: map 1 page.
+            let view = unsafe { MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, PAGE) };
+            assert!(!view.Value.is_null());
+            let ptr = view.Value.cast::<u8>();
+            let va = ptr as usize;
+            crate::inplace::title_memory_section(section as usize, PAGE as u64, true);
+            assert!(crate::inplace::title_memory_view(
+                va,
+                PAGE,
+                section as usize,
+                0
+            ));
+            // Title now holds newer CPU refresh value `0x77`; card.staging and stale GPU hold `0x11`.
+            // SAFETY: writing title view.
+            unsafe { std::ptr::write_bytes(ptr, 0x77, PAGE) };
+
+            let mut side = vec![0x11u8; PAGE];
+            let shadow = Shadow::new_card_sized_for_test(side.as_mut_ptr(), va as u64, PAGE as u64)
+                .expect("card shadow");
+            shadow.clear_card_dirty_for_test();
+
+            let entered_gap = Arc::new((Mutex::new(false), Condvar::new()));
+            let merge_ready = Arc::new(Barrier::new(2));
+            let lock_was_exclusive = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+            let entered_cb = entered_gap.clone();
+            let ready_cb = merge_ready.clone();
+            let exclusive_cb = lock_was_exclusive.clone();
+            let shadow_cb = shadow.clone();
+            BETWEEN_PUBLISH_AND_DIRTY_HOOK.with(|h| {
+                *h.borrow_mut() = Some(Box::new(move || {
+                    // Right after `publish_staged_card_segs` and before `finish_copy_segs`:
+                    // `shadow.before` MUST be write-locked so `card_merge_relay_inner` cannot
+                    // observe the new `0x77` staging bytes without their `card.dirty` range.
+                    exclusive_cb.store(shadow_cb.before.try_read().is_err(), Ordering::SeqCst);
+                    {
+                        let mut g = entered_cb.0.lock().unwrap();
+                        *g = true;
+                        entered_cb.1.notify_all();
+                    }
+                    ready_cb.wait();
+                }));
+            });
+
+            let shadow_t2 = shadow.clone();
+            let entered_t2 = entered_gap.clone();
+            let ready_t2 = merge_ready.clone();
+            let merge_thread = std::thread::spawn(move || {
+                {
+                    let mut g = entered_t2.0.lock().unwrap();
+                    while !*g {
+                        g = entered_t2.1.wait(g).unwrap();
+                    }
+                }
+                ready_t2.wait();
+                // Stale GPU bytes (`0x11`, matching old staging) arrive right as staging
+                // was published to `0x77`: must block on `self.before.read()` until
+                // `card.dirty` is recorded, then skip the dirty range instead of
+                // overwriting title RAM `0x77` back to `0x11`.
+                let stale_gpu = vec![0x11u8; PAGE];
+                let mut scratch = Vec::new();
+                shadow_t2
+                    .card_merge_relay_via_own_at(0, va, &stale_gpu, 0, &mut scratch)
+                    .expect("relay merge")
+            });
+
+            if use_batch {
+                // Include a second empty-span shadow so `refresh_batch` takes
+                // the multi-shadow batch path (`items.len() >= 2`) rather than
+                // the single-item `update_checked` shortcut.
+                let mut dummy_side = vec![0u8; PAGE];
+                let dummy = Shadow::new_card_sized_for_test(
+                    dummy_side.as_mut_ptr(),
+                    va as u64,
+                    PAGE as u64,
+                )
+                .expect("dummy card shadow");
+                let items = vec![(shadow.clone(), va, va + PAGE), (dummy, va, va)];
+                let (bytes, ok) = refresh_batch(items, false);
+                assert!(ok);
+                assert_eq!(bytes, PAGE);
+            } else {
+                let (bytes, ok) = shadow.copy_runs_with_epochs(&[(va, va + PAGE)], &[]);
+                assert!(ok);
+                assert_eq!(bytes, PAGE);
+            }
+
+            let merged = merge_thread.join().unwrap();
+            assert!(
+                lock_was_exclusive.load(Ordering::SeqCst),
+                "self.before.write() must be held across staging publication and dirty marking (batch={use_batch})"
+            );
+            assert_eq!(
+                merged, 0,
+                "concurrent relay merge must see card.dirty alongside new staging and write 0 bytes (batch={use_batch})"
+            );
+            // SAFETY: title page is still mapped and readable.
+            let got = unsafe { std::slice::from_raw_parts(ptr, 32) };
+            assert_eq!(
+                got, &[0x77; 32],
+                "newer CPU refresh bytes must not be overwritten by stale GPU readback (batch={use_batch})"
+            );
+
+            drop(shadow);
+            crate::watch::title_memory_remapped(va, PAGE);
+            // SAFETY: cleanup.
+            unsafe {
+                UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: view.Value });
+                CloseHandle(section);
+            }
         }
     }
 }

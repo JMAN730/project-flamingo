@@ -577,21 +577,109 @@ pub(super) fn relay_copy_queue() -> bool {
 static RELAY_MOVED: Condvar = Condvar::new();
 static LINE_LANDED: Condvar = Condvar::new();
 
-/// With [`relay`], the monotonic count of sends of changed ranges whose sync
-/// command lists have ACTUALLY been submitted to `Host::queue`
-/// (`Host::card_before`). Held while queueing a card sync list and while
-/// queueing a direct-queue fallback fetch.
+/// Coordinated queue-order and fence-watermark timeline for relay card uploads.
 ///
-/// Lock order: `FETCHER` (`direct_submit_guard()`) -> `QUEUE_ORDER` -> `last_signalled`.
-pub(super) static QUEUE_ORDER: Mutex<u64> = Mutex::new(0);
+/// Tracks `queue_order` (locked when submitting card sync lists or direct-queue
+/// fallback fetches), its lock-free mirror `submitted_order` (updated strictly
+/// under `queue_order` right after `ExecuteCommandLists`), and the latest
+/// `(fence_value, submitted_order)` pair (`last_signalled`).
+///
+/// Lock order: `FETCHER` (`direct_submit_guard()`) -> `queue_order` -> `last_signalled`.
+/// [`Self::note_signalled`] reads `submitted_order` lock-free so it never
+/// acquires `queue_order` and unsubmitted candidate plans are never included in
+/// a fence watermark before submission.
+pub(crate) struct QueueOrderTimeline {
+    queue_order: Mutex<u64>,
+    submitted_order: AtomicU64,
+    last_signalled: Mutex<(u64, u64)>,
+}
 
-/// Lock-free mirror of the highest `QUEUE_ORDER` value whose card sync upload
-/// command list has been submitted to `Host::queue`. Updated strictly inside
-/// `QUEUE_ORDER` right after `ExecuteCommandLists` so `note_signalled` can
-/// record the submitted watermark without ever locking `QUEUE_ORDER` (preventing
-/// ABBA deadlock with `direct_submit_guard()` and ensuring unsubmitted plans are
-/// never included in a fence watermark).
-pub(super) static SUBMITTED_QUEUE_ORDER: AtomicU64 = AtomicU64::new(0);
+impl QueueOrderTimeline {
+    pub(crate) const fn new() -> Self {
+        Self {
+            queue_order: Mutex::new(0),
+            submitted_order: AtomicU64::new(0),
+            last_signalled: Mutex::new((0, 0)),
+        }
+    }
+
+    pub(crate) fn lock_queue_order(&self) -> std::sync::MutexGuard<'_, u64> {
+        self.queue_order.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[inline]
+    pub(crate) fn submitted_order(&self) -> u64 {
+        self.submitted_order.load(Ordering::Acquire)
+    }
+
+    /// Computes `(prev_order, candidate_sent_as)` for a pending card plan.
+    #[inline]
+    pub(crate) fn next_candidate(&self) -> (u64, u64) {
+        let prev = self.submitted_order();
+        (prev, prev + 1)
+    }
+
+    /// Advances `queue_order` and `submitted_order` after `ExecuteCommandLists`
+    /// while holding `order_guard`, returning the committed submitted order.
+    #[inline]
+    pub(crate) fn commit_submitted_locked(
+        &self,
+        order_guard: &mut u64,
+        sent_as: u64,
+        has_uploads: bool,
+    ) -> u64 {
+        if has_uploads {
+            *order_guard = (*order_guard).max(sent_as);
+            self.submitted_order.store(*order_guard, Ordering::Release);
+        }
+        *order_guard
+    }
+
+    /// Records `(fence_val, current submitted_order)` without locking `queue_order`.
+    pub(crate) fn note_signalled(&self, fence_val: u64) {
+        let order = self.submitted_order();
+        self.note_signalled_with_order(fence_val, order);
+    }
+
+    pub(crate) fn note_signalled_with_order(&self, fence_val: u64, order: u64) {
+        let mut pair = self
+            .last_signalled
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if fence_val > pair.0 {
+            *pair = (fence_val, order);
+        }
+    }
+
+    pub(crate) fn last_signalled(&self) -> (u64, u64) {
+        *self
+            .last_signalled
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Computes `(fence_to_wait, visible_watermark)` for an auxiliary `COPY` queue.
+    pub(crate) fn sync_copy_plan(
+        &self,
+        completed_fence: u64,
+        wait_direct: bool,
+        relay_fetched: u64,
+    ) -> (Option<u64>, u64) {
+        let (v, order) = self.last_signalled();
+        if v > 0 {
+            if completed_fence >= v {
+                return (None, order.max(relay_fetched));
+            }
+            if wait_direct {
+                return (Some(v), order.max(relay_fetched));
+            }
+        }
+        (None, relay_fetched)
+    }
+}
+
+/// Process-wide queue-order and fence-watermark timeline for `Host::queue`.
+pub(super) static QUEUE_TIMELINE: QueueOrderTimeline = QueueOrderTimeline::new();
 
 static RELAY_STATS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 static INFLIGHT_STATS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
@@ -1913,42 +2001,22 @@ pub(super) fn log_stats(frames: f64) {
 }
 
 impl Host {
-    /// Records `(fence_val, current SUBMITTED_QUEUE_ORDER)` after `self.queue.Signal`.
-    /// Reads the lock-free `SUBMITTED_QUEUE_ORDER` so only card uploads whose
+    /// Records `(fence_val, current submitted_order)` after `self.queue.Signal`.
+    /// Reads the lock-free `submitted_order` so only card uploads whose
     /// command lists were already submitted to `self.queue` are included and
-    /// `QUEUE_ORDER` is never acquired inside `direct_submit_guard()`.
+    /// `queue_order` is never acquired inside `direct_submit_guard()`.
     pub(crate) fn note_signalled(&self, fence_val: u64) {
-        let order = SUBMITTED_QUEUE_ORDER.load(Ordering::Acquire);
-        self.note_signalled_with_order(fence_val, order);
+        QUEUE_TIMELINE.note_signalled(fence_val);
     }
 
     #[cfg(test)]
     pub(crate) fn lock_queue_order_for_test(&self) -> std::sync::MutexGuard<'static, u64> {
-        QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
-    #[cfg(test)]
-    pub(crate) fn submitted_queue_order_for_test(&self) -> u64 {
-        SUBMITTED_QUEUE_ORDER.load(Ordering::Acquire)
+        QUEUE_TIMELINE.lock_queue_order()
     }
 
     #[cfg(test)]
     pub(crate) fn last_signalled_for_test(&self) -> (u64, u64) {
-        *self
-            .last_signalled
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-    }
-
-    #[cfg(test)]
-    pub(crate) fn signal_direct_for_test(&self) -> u64 {
-        let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
-        let _lazy_order = crate::lazy_back::direct_submit_guard();
-        *submitted += 1;
-        // SAFETY: `self.queue` and `self.fence` are live.
-        unsafe { self.queue.Signal(&self.fence, *submitted) }.expect("signal direct fence");
-        self.note_signalled(*submitted);
-        *submitted
+        QUEUE_TIMELINE.last_signalled()
     }
 
     #[cfg(test)]
@@ -1975,13 +2043,7 @@ impl Host {
     }
 
     pub(super) fn note_signalled_with_order(&self, fence_val: u64, order: u64) {
-        let mut pair = self
-            .last_signalled
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        if fence_val > pair.0 {
-            *pair = (fence_val, order);
-        }
+        QUEUE_TIMELINE.note_signalled_with_order(fence_val, order);
     }
 
     /// Synchronizes an auxiliary `COPY` queue behind the latest `self.queue`
@@ -2001,22 +2063,18 @@ impl Host {
         copy_queue: &ID3D12CommandQueue,
         wait_direct: bool,
     ) -> windows::core::Result<u64> {
-        let (v, order) = *self
-            .last_signalled
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        if v > 0 {
-            // SAFETY: `self.fence` is live.
-            if unsafe { self.fence.GetCompletedValue() } >= v {
-                return Ok(order.max(crate::shadow::relay_fetched_value()));
-            }
-            if wait_direct {
-                // SAFETY: `self.fence` is live and `v` was already signalled on `self.queue`.
-                unsafe { copy_queue.Wait(&self.fence, v)? };
-                return Ok(order.max(crate::shadow::relay_fetched_value()));
-            }
+        // SAFETY: `self.fence` is live.
+        let completed = unsafe { self.fence.GetCompletedValue() };
+        let (wait_v, watermark) = QUEUE_TIMELINE.sync_copy_plan(
+            completed,
+            wait_direct,
+            crate::shadow::relay_fetched_value(),
+        );
+        if let Some(v) = wait_v {
+            // SAFETY: `self.fence` is live and `v` was already signalled on `self.queue`.
+            unsafe { copy_queue.Wait(&self.fence, v)? };
         }
-        Ok(crate::shadow::relay_fetched_value())
+        Ok(watermark)
     }
 
     /// Whether the host has what copies in the card's memory need (lists and
@@ -2141,12 +2199,11 @@ impl Host {
         if !crate::shadow::cards() {
             return None;
         }
-        let prev_order = if relay() {
-            SUBMITTED_QUEUE_ORDER.load(Ordering::Acquire)
+        let (prev_order, candidate_sent_as) = if relay() {
+            QUEUE_TIMELINE.next_candidate()
         } else {
-            0
+            (0, 0)
         };
-        let candidate_sent_as = if relay() { prev_order + 1 } else { 0 };
         let mut dirty = crate::shadow::card_dirty(candidate_sent_as);
         let has_uploads = !dirty.is_empty();
         let sent_as = if has_uploads {
@@ -2276,17 +2333,12 @@ impl Host {
                     }
                     list.Close()?;
                     {
-                        // Lock order: `FETCHER` (`direct_submit_guard()`) -> `QUEUE_ORDER` -> `last_signalled`.
+                        // Lock order: `FETCHER` (`direct_submit_guard()`) -> `queue_order` -> `last_signalled`.
                         let _lazy_order = crate::lazy_back::direct_submit_guard();
-                        let mut order =
-                            relay().then(|| QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner()));
+                        let mut order = relay().then(|| QUEUE_TIMELINE.lock_queue_order());
                         self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
                         let submitted_order = if let Some(order) = order.as_mut() {
-                            if has_uploads {
-                                **order = (**order).max(sent_as);
-                                SUBMITTED_QUEUE_ORDER.store(**order, Ordering::Release);
-                            }
-                            **order
+                            QUEUE_TIMELINE.commit_submitted_locked(order, sent_as, has_uploads)
                         } else {
                             0
                         };
@@ -2307,7 +2359,7 @@ impl Host {
             used.push((false, sync));
         }
         let order_after = if relay() {
-            SUBMITTED_QUEUE_ORDER.load(Ordering::Acquire)
+            QUEUE_TIMELINE.submitted_order()
         } else {
             0
         };
@@ -2677,7 +2729,7 @@ impl Host {
         if !card_done_inflight && !has_card {
             let max_sent_as = plans.iter().map(|p| p.sent_as).max();
             let queue_order = if !inflight_fetch() && self.copy_queue.is_none() {
-                *QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner())
+                *QUEUE_TIMELINE.lock_queue_order()
             } else {
                 0
             };
@@ -2758,7 +2810,7 @@ impl Host {
                     WaitForSingleObject(event, INFINITE);
                     return Ok(after.max(landed));
                 }
-                let order = QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner());
+                let order = QUEUE_TIMELINE.lock_queue_order();
                 self.queue.ExecuteCommandLists(&lists);
                 let after = *order;
                 drop(order);

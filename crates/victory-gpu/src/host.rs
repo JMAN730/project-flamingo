@@ -164,9 +164,6 @@ pub(crate) struct Host {
     fence: ID3D12Fence,
     /// The last value signalled on `fence`, behind the submission lock.
     submitted: Mutex<u64>,
-    /// Latest `(fence_value, QUEUE_ORDER)` signalled on `queue`, used to
-    /// synchronize auxiliary `COPY` queues behind direct-queue work.
-    last_signalled: Mutex<(u64, u64)>,
     event: HANDLE,
     rtvs: ID3D12DescriptorHeap,
     rtv_size: u32,
@@ -633,7 +630,6 @@ fn create() -> windows::core::Result<Host> {
             copy_queue,
             fence,
             submitted: Mutex::new(0),
-            last_signalled: Mutex::new((0, 0)),
             event,
             rtvs,
             rtv_size,
@@ -2106,9 +2102,7 @@ impl Host {
         }
         self.log_messages();
         if relay::relay() {
-            crate::shadow::relay_fetched(
-                *relay::QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner()),
-            );
+            crate::shadow::relay_fetched(*relay::QUEUE_TIMELINE.lock_queue_order());
         }
         drop(submitted);
         drop(exec_epoch);
@@ -5191,6 +5185,17 @@ type NtWrite = unsafe extern "system" fn(
     written: *mut usize,
 ) -> i32;
 
+#[cfg(test)]
+std::thread_local! {
+    static BEFORE_WRITE_MAPPED_RAW_HOOK: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_before_write_mapped_raw_hook(hook: Option<Box<dyn FnMut()>>) {
+    BEFORE_WRITE_MAPPED_RAW_HOOK.with(|h| *h.borrow_mut() = hook);
+}
+
 /// Copies host memory into title memory after a submission (what shaders
 /// wrote), leaving pages that are not mapped alone.
 ///
@@ -5198,32 +5203,62 @@ type NtWrite = unsafe extern "system" fn(
 /// the NT write directly, avoiding the region query and temporary changes
 /// to read-only page protections that WriteProcessMemory can perform.
 ///
-/// Returns `None` if lazy copy-back materialization failed for any page in
-/// `[dst, dst + len)` (without calling `write_mapped_raw`), or `Some(written)`
-/// with the exact count of bytes written into mapped destination pages.
+/// # Lazy copy-back contract
+/// - Materializes any deferred `lazy_back` blocks overlapping `[dst, dst + len)`
+///   before writing. If materialization fails, returns `None` without calling
+///   `write_mapped_raw`.
+/// - If `write_mapped_raw` returns a short count (`written < len`) while a
+///   concurrent lazy arm landed in `[dst, dst + len)` (observed via
+///   `lazy_back::has_block_in_range` or a `lazy_back::remove_generation()`
+///   change across the write), retries materialization and the raw write up to
+///   `MAX_LAZY_RETRIES` times.
+/// - If lazy-backed bytes still prevent a complete write after retries are
+///   exhausted, returns `None` so callers such as [`read_backs`] fail closed
+///   instead of reporting a short count as complete.
+/// - Short writes caused solely by ordinary unmapped or read-only pages (no
+///   overlapping lazy block or removal generation change) still return
+///   `Some(written)` with the exact count of bytes written.
 #[must_use]
 pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) -> Option<usize> {
+    const MAX_LAZY_RETRIES: usize = 8;
     if len == 0 {
         return Some(0);
     }
-    if !crate::lazy_back::materialize_range(dst as usize, len) {
-        return None;
-    }
-    let written = write_mapped_raw(dst, src, len);
-    if written < len && crate::lazy_back::has_block_in_range(dst as usize, len) {
-        // A concurrent lazy arm landed between materialization and the raw write.
-        if !crate::lazy_back::materialize_range(dst as usize, len) {
+    let addr = dst as usize;
+    for _ in 0..=MAX_LAZY_RETRIES {
+        if !crate::lazy_back::materialize_range(addr, len) {
             return None;
         }
-        return Some(write_mapped_raw(dst, src, len));
+        let gen_before = crate::lazy_back::remove_generation();
+        #[cfg(test)]
+        BEFORE_WRITE_MAPPED_RAW_HOOK.with(|h| {
+            if let Some(cb) = h.borrow_mut().as_mut() {
+                cb();
+            }
+        });
+        let written = write_mapped_raw(dst, src, len);
+        if written == len {
+            return Some(written);
+        }
+        let lazy_interfered = crate::lazy_back::has_block_in_range(addr, len)
+            || crate::lazy_back::remove_generation() != gen_before;
+        if !lazy_interfered {
+            return Some(written);
+        }
     }
-    Some(written)
+    None
 }
 
-/// [`write_mapped`] without calling [`crate::lazy_back::materialize_range`].
-/// Safe to call while holding `Shadow` locks after materializing outside.
-/// Returns the exact count of bytes successfully written into mapped pages.
-pub(crate) fn write_mapped_raw(dst: *mut u8, src: *const u8, len: usize) -> usize {
+/// [`write_mapped`] without calling [`crate::lazy_back::materialize_range`],
+/// invoking `on_piece(offset_from_dst, piece_len)` for every confirmed-written
+/// sub-piece. Safe to call while holding `Shadow` locks after materializing
+/// outside.
+pub(crate) fn write_mapped_raw_with(
+    dst: *mut u8,
+    src: *const u8,
+    len: usize,
+    mut on_piece: impl FnMut(usize, usize),
+) -> usize {
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     if len == 0 {
         return 0;
@@ -5231,8 +5266,9 @@ pub(crate) fn write_mapped_raw(dst: *mut u8, src: *const u8, len: usize) -> usiz
     let Some(method) = copy_back_method() else {
         return 0;
     };
+    let base = dst as usize;
     let write = |at: usize, n: usize| {
-        let from = src.wrapping_add(at - dst as usize);
+        let from = src.wrapping_add(at - base);
         let CopyBack::NativeWrite(call) = method else {
             return read(from, at as *mut u8, n);
         };
@@ -5250,22 +5286,32 @@ pub(crate) fn write_mapped_raw(dst: *mut u8, src: *const u8, len: usize) -> usiz
             ) == 0
         }
     };
-    if write(dst as usize, len) {
+    if write(base, len) {
+        on_piece(0, len);
         return len;
     }
     let mut written = 0usize;
-    for_pieces(dst as usize, len, 64 << 10, |at, n| {
+    for_pieces(base, len, 64 << 10, |at, n| {
         if write(at, n) {
+            on_piece(at - base, n);
             written += n;
         } else {
             for_pieces(at, n, 4 << 10, |at, n| {
                 if write(at, n) {
+                    on_piece(at - base, n);
                     written += n;
                 }
             });
         }
     });
     written
+}
+
+/// [`write_mapped`] without calling [`crate::lazy_back::materialize_range`].
+/// Safe to call while holding `Shadow` locks after materializing outside.
+/// Returns the exact count of bytes successfully written into mapped pages.
+pub(crate) fn write_mapped_raw(dst: *mut u8, src: *const u8, len: usize) -> usize {
+    write_mapped_raw_with(dst, src, len, |_, _| {})
 }
 
 /// Calls `f` with the pieces of `[start, start + len)` cut at multiples of
