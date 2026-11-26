@@ -3293,8 +3293,8 @@ pub(crate) fn clean(page: usize) -> bool {
     DIR.is_guard_clean(page)
 }
 
-pub(crate) fn ensure_handler() {
-    install();
+pub(crate) fn ensure_handler() -> bool {
+    install()
 }
 
 /// Returns `true` if `block` is known view memory in `PageDir` without locking `GUARDS`.
@@ -4485,15 +4485,20 @@ pub fn title_memory_written(at: usize, len: usize, pages: bool) {
 /// of `section` (`crate::inplace::title_memory_view`).
 pub(crate) fn views_mapped(section: usize, offset: u64, len: usize) {
     use windows_sys::Win32::System::Memory::PAGE_READWRITE;
-    if !view_guard() {
+    let lazy = crate::lazy_back::active_or_arming();
+    let guard = view_guard();
+    if !guard && !lazy {
         return;
     }
     let ranges = crate::inplace::views_of_section(section, offset, len);
     if ranges.is_empty() {
         return;
     }
-    if crate::lazy_back::active() {
-        crate::lazy_back::materialize_ranges(&ranges);
+    if lazy {
+        let _ = crate::lazy_back::materialize_ranges_unconditional(&ranges);
+    }
+    if !guard {
+        return;
     }
     let mut mask = ShardMask::EMPTY;
     for &(at, n) in &ranges {
@@ -4665,10 +4670,14 @@ pub(crate) fn remap_seq() -> u64 {
 pub struct Remapping {
     _held: Held<std::sync::RwLockWriteGuard<'static, ()>>,
     since: std::time::Instant,
+    lazy_remap_id: u64,
 }
 
 impl Drop for Remapping {
     fn drop(&mut self) {
+        if self.lazy_remap_id != 0 {
+            crate::lazy_back::end_remap(self.lazy_remap_id);
+        }
         REMAP_SEQ.fetch_add(1, Ordering::SeqCst);
         REMAPS[2].fetch_add(
             self.since.elapsed().as_micros() as u64,
@@ -4684,7 +4693,11 @@ impl Drop for Remapping {
 /// and the mapping again, over all the bytes whose mapping it changes.
 pub fn title_memory_remapping(at: usize, len: usize) -> Remapping {
     use std::sync::atomic::Ordering::Relaxed;
-    crate::lazy_back::materialize_range(at, len);
+    // Register the remap range in `lazy_back` BEFORE draining so no concurrent
+    // relay thread can arm a lazy block inside `[at, at + len)` between the
+    // pre-remap drain and `title_memory_remapped`'s `discard_range`.
+    let lazy_remap_id = crate::lazy_back::begin_remap(at, len);
+    let _ = crate::lazy_back::materialize_range(at, len);
     let started = std::time::Instant::now();
     let held = if by_range() {
         let end = at.saturating_add(len);
@@ -4710,6 +4723,7 @@ pub fn title_memory_remapping(at: usize, len: usize) -> Remapping {
     Remapping {
         _held: held,
         since: std::time::Instant::now(),
+        lazy_remap_id,
     }
 }
 
@@ -5170,8 +5184,13 @@ fn install() -> bool {
             None => {}
         }
         // Read-only, in a view we were told of, and not noted guarded: only we
-        // make title views read-only, so it is ours to give back.
-        if view_guard() && crate::inplace::has_view_at(at) {
+        // make title views read-only, so it is ours to give back. Never reopen
+        // a block still tracked as `lazy_back` (e.g. after a failed DMA).
+        if view_guard()
+            && !DIR.is_lazy_armed(at / BLOCK)
+            && !crate::lazy_back::has_block(at / BLOCK)
+            && crate::inplace::has_view_at(at)
+        {
             let mut old = 0;
             let block = at - at % BLOCK;
             // SAFETY: only the protection of title view memory changes.

@@ -378,7 +378,7 @@ static GENERATION: AtomicU64 = AtomicU64::new(1);
 /// The views' generation ([`GENERATION`]).
 #[allow(dead_code)]
 pub(crate) fn generation() -> u64 {
-    GENERATION.load(Ordering::Acquire)
+    GENERATION.load(Ordering::SeqCst)
 }
 
 /// The other places the pages of `[at, at + len)` show at: address ranges
@@ -501,7 +501,7 @@ pub fn title_memory_view(at: usize, len: usize, section: usize, offset: u64) {
                 .push(at + k * K64);
         }
     }
-    GENERATION.fetch_add(1, Ordering::AcqRel);
+    GENERATION.fetch_add(1, Ordering::SeqCst);
     // This view is writable from now on: a guard over the same bytes at
     // another view must look at them again, and the pages are noted written
     // there (`crate::watch`).
@@ -551,7 +551,7 @@ pub(crate) fn views_gone(at: usize, len: usize) {
             }
         }
     }
-    GENERATION.fetch_add(1, Ordering::AcqRel);
+    GENERATION.fetch_add(1, Ordering::SeqCst);
 }
 
 /// How many bytes of `[at, at + len)` views of physical pages show; `None`
@@ -793,6 +793,7 @@ static OWN: std::sync::Mutex<
 fn own_view_ptr(
     at: usize,
     len: usize,
+    blocking: bool,
 ) -> Option<(
     usize,
     Vec<usize>,
@@ -804,7 +805,11 @@ fn own_view_ptr(
     }
     // No mapping changes until the caller finishes: the view found below
     // shows these pages for as long as this guard is held.
-    let still = crate::watch::title_memory_reading_now(at, len)?;
+    let still = if blocking {
+        crate::watch::title_memory_reading(at, len)
+    } else {
+        crate::watch::title_memory_reading_now(at, len)?
+    };
     let (section, offset, shown, section_bytes) = {
         let v = views_read();
         let (&base, &(view_len, section, offset)) = v.views.range(..=at).next_back()?;
@@ -884,15 +889,32 @@ fn own_view_ptr(
     Some((ptr, shown, view_arc, still))
 }
 
+/// Whether `[at, at + len)` has a live, committed host-only `PAGE_READWRITE`
+/// own view of its backing section (non-blocking).
+pub(crate) fn has_own_view_for(at: usize, len: usize) -> bool {
+    own_view_ptr(at, len, false).is_some()
+}
+
 /// Reads title physical bytes at `[at, at + dst.len())` through our own
 /// `PAGE_READWRITE` section view (without touching title view protections),
 /// returning `false` if `[at, at + dst.len())` is not inside one 64 KiB page
 /// of a mapped section view or a mapping change is in progress.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn read_own(at: usize, dst: &mut [u8]) -> bool {
+    read_own_inner(at, dst, false)
+}
+
+/// Blocking variant of [`read_own`] for `lazy_back` materialization, waiting
+/// for any unrelated mapping change instead of failing transiently.
+pub(crate) fn read_own_blocking(at: usize, dst: &mut [u8]) -> bool {
+    read_own_inner(at, dst, true)
+}
+
+fn read_own_inner(at: usize, dst: &mut [u8], blocking: bool) -> bool {
     if dst.is_empty() {
         return true;
     }
-    let Some((src, _shown, _own, _still)) = own_view_ptr(at, dst.len()) else {
+    let Some((src, _shown, _own, _still)) = own_view_ptr(at, dst.len(), blocking) else {
         return false;
     };
     // SAFETY: committed bytes inside our own `PAGE_READWRITE` section view
@@ -909,7 +931,16 @@ pub(crate) fn read_own(at: usize, dst: &mut [u8]) -> bool {
 /// nothing written: not view memory, a page of very many views, the
 /// runtime changing mappings at this moment, or the host refusing.
 pub(crate) fn write_own(at: usize, bytes: &[u8]) -> Option<Vec<usize>> {
-    let (dst, shown, _own, _still) = own_view_ptr(at, bytes.len())?;
+    write_own_inner(at, bytes, false)
+}
+
+/// Blocking variant of [`write_own`] for `lazy_back` materialization.
+pub(crate) fn write_own_blocking(at: usize, bytes: &[u8]) -> Option<Vec<usize>> {
+    write_own_inner(at, bytes, true)
+}
+
+fn write_own_inner(at: usize, bytes: &[u8], blocking: bool) -> Option<Vec<usize>> {
+    let (dst, shown, _own, _still) = own_view_ptr(at, bytes.len(), blocking)?;
     // SAFETY: committed bytes inside our own view (`_own` keeps it mapped until
     // after the copy even if evicted, and `_still` keeps the title view live);
     // the source is the caller's slice.
@@ -2368,8 +2399,8 @@ mod tests {
         assert!(write_own(title_view + 64, &payload).is_some());
 
         // Simulate an active caller holding `Arc<Own>` across eviction.
-        let (ptr, _shown, active_own, still) =
-            own_view_ptr(title_view + 64, payload.len()).expect("own_view_ptr should succeed");
+        let (ptr, _shown, active_own, still) = own_view_ptr(title_view + 64, payload.len(), false)
+            .expect("own_view_ptr should succeed");
         let own_base = active_own.base;
         drop(still);
 

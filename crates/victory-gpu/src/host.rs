@@ -1758,13 +1758,21 @@ impl Host {
                 last_notes(runs)
             ));
         }
+        if batch.fill_failed {
+            fail(format_args!(
+                "title-to-upload fill failed after retrying lazy materialization before a submission of {} lists{}{}",
+                runs.len(),
+                self.removal_data(runs),
+                last_notes(runs)
+            ));
+        }
         let flown = late && relay::relay();
         if flown && self.card_results_low() {
             let settling = std::time::Instant::now();
             deferred_woken.add(self.settle(&mut submitted, relay::WHY_MOST));
             settled += settling.elapsed();
         }
-        let card = self.card_before(card_declared.unwrap_or_default(), flown);
+        let card = self.card_before(card_declared.unwrap_or_default(), flown, &mut submitted);
         let mut rebar_hash_plan = if rebar_entries.is_empty() {
             RebarHashPlan::default()
         } else {
@@ -1788,14 +1796,19 @@ impl Host {
                 lists.push(Some(check));
             }
             *submitted += 1;
-            // SAFETY: closed lists; the fence is ours under `submitted`.
-            let signalled = unsafe {
-                self.queue.ExecuteCommandLists(&lists);
-                self.queue.Signal(&self.fence, *submitted)
+            let signalled = {
+                let _lazy_order = crate::lazy_back::direct_submit_guard();
+                // SAFETY: closed lists; the fence is ours under `submitted`.
+                let signalled = unsafe {
+                    self.queue.ExecuteCommandLists(&lists);
+                    self.queue.Signal(&self.fence, *submitted)
+                };
+                if signalled.is_ok() {
+                    self.note_signalled(*submitted);
+                }
+                signalled
             };
-            if signalled.is_ok() {
-                self.note_signalled(*submitted);
-            } else if let Err(e) = signalled {
+            if let Err(e) = signalled {
                 fail(format_args!(
                     "host GPU fence signal failed after an async submission of {} lists ({e}){}{}",
                     runs.len(),
@@ -1899,30 +1912,35 @@ impl Host {
                 // batches have been waited for, so any reused prelude
                 // allocator is idle before the Reset inside prelude().
                 unsafe {
-                    self.queue.ExecuteCommandLists(group);
-                    match self.queue.Signal(&self.fence, *submitted) {
-                        Ok(()) => {
+                    let signalled = {
+                        let _lazy_order = crate::lazy_back::direct_submit_guard();
+                        self.queue.ExecuteCommandLists(group);
+                        let res = self.queue.Signal(&self.fence, *submitted);
+                        if res.is_ok() {
                             self.note_signalled(*submitted);
-                            match self.fence.SetEventOnCompletion(*submitted, self.event) {
-                                Ok(()) => {
-                                    let waited = WaitForSingleObject(self.event, INFINITE);
-                                    if waited != WAIT_OBJECT_0 {
-                                        tracing::warn!(
-                                            wait = waited.0,
-                                            "host fence event wait failed; polling fence"
-                                        );
-                                        self.poll_fence(*submitted);
-                                    }
-                                }
-                                Err(e) => {
+                        }
+                        res
+                    };
+                    match signalled {
+                        Ok(()) => match self.fence.SetEventOnCompletion(*submitted, self.event) {
+                            Ok(()) => {
+                                let waited = WaitForSingleObject(self.event, INFINITE);
+                                if waited != WAIT_OBJECT_0 {
                                     tracing::warn!(
-                                        error = %e,
-                                        "host fence event registration failed; polling fence"
+                                        wait = waited.0,
+                                        "host fence event wait failed; polling fence"
                                     );
                                     self.poll_fence(*submitted);
                                 }
                             }
-                        }
+                            Err(e) => {
+                                tracing::warn!(
+                                    error = %e,
+                                    "host fence event registration failed; polling fence"
+                                );
+                                self.poll_fence(*submitted);
+                            }
+                        },
                         Err(e) => fail(format_args!(
                             "host GPU fence signal failed after a submission of {} lists ({e}){}{}",
                             runs.len(),
@@ -4208,7 +4226,13 @@ impl HostList {
                         batch.fills.push((dst, src, len));
                         continue;
                     }
-                    crate::shadow::copy_mapped_wide(dst as *mut u8, src as *const u8, len);
+                    if !crate::shadow::copy_mapped_wide_checked(
+                        dst as *mut u8,
+                        src as *const u8,
+                        len,
+                    ) {
+                        batch.fill_failed = true;
+                    }
                     len
                 }
                 Step::Refresh(shadow, address, len) => {
@@ -4289,6 +4313,8 @@ struct Batch {
     ahead: std::collections::HashMap<usize, (usize, usize)>,
     /// Set if a ReBAR shadow's initial RAM mirror readback failed.
     rebar_init_failed: bool,
+    /// Set if a `Step::Fill` copy from title memory failed after retrying lazy materialization.
+    fill_failed: bool,
 }
 
 impl Batch {
@@ -4396,29 +4422,56 @@ impl Batch {
 /// `ReadProcessMemory`. Title destinations always run through the kernel copy
 /// so unmapped destination pages fail cleanly instead of faulting.
 pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: bool) {
+    if !copy_mapped_checked(dst, src, len, title_dst) {
+        fail(format_args!(
+            "copy_mapped failed after retrying lazy materialization (src={:#x}, dst={:#x}, len={len}, title_dst={title_dst})",
+            src as usize, dst as usize
+        ));
+    }
+}
+
+/// [`copy_mapped`] that retries lazy materialization if a concurrent relay
+/// re-defers the source (or destination for `title_dst`), returning `false`
+/// instead of silently proceeding with unwritten destination bytes.
+pub(crate) fn copy_mapped_checked(
+    dst: *mut u8,
+    src: *const u8,
+    len: usize,
+    title_dst: bool,
+) -> bool {
     if len == 0 {
-        return;
+        return true;
     }
-    if crate::lazy_back::active() {
-        let addr = if title_dst {
-            dst as usize
-        } else {
-            src as usize
-        };
-        crate::lazy_back::materialize_range(addr, len);
+    const MAX_ATTEMPTS: usize = 8;
+    for attempt in 0..MAX_ATTEMPTS {
+        if crate::lazy_back::active() {
+            let ok = if title_dst {
+                // Title-to-title copies (`Step::Copy`) may read a deferred source
+                // into a committed or deferred destination: materialize both ranges.
+                crate::lazy_back::materialize_ranges(&[(src as usize, len), (dst as usize, len)])
+            } else {
+                // Host fills materialize only their title source.
+                crate::lazy_back::materialize_range(src as usize, len)
+            };
+            if !ok {
+                return false;
+            }
+        }
+        if copy_mapped_raw_checked(dst, src, len, title_dst) {
+            return true;
+        }
+        if attempt + 1 < MAX_ATTEMPTS {
+            std::thread::yield_now();
+        }
     }
-    copy_mapped_raw(dst, src, len, title_dst);
+    false
 }
 
-/// [`copy_mapped`] without triggering [`crate::lazy_back::materialize_range`].
-/// Callers holding a `Shadow` lock MUST materialize `[src, src + len)` (or
-/// `[dst, dst + len)`) before taking the lock and call this raw variant inside.
-pub(crate) fn copy_mapped_raw(dst: *mut u8, src: *const u8, len: usize, title_dst: bool) {
-    let _ = copy_mapped_raw_checked(dst, src, len, title_dst);
-}
-
-/// [`copy_mapped_raw`] that returns `false` instead of zero-filling if a
-/// `PAGE_NOACCESS` source page belongs to an active [`crate::lazy_back`] block.
+/// [`copy_mapped`] without triggering [`crate::lazy_back::materialize_range`],
+/// returning `false` instead of zero-filling if a `PAGE_NOACCESS` source page
+/// belongs to an active [`crate::lazy_back`] block. Callers holding a `Shadow`
+/// lock MUST materialize `[src, src + len)` (or `[dst, dst + len)`) before
+/// taking the lock and call this raw variant inside.
 pub(crate) fn copy_mapped_raw_checked(
     dst: *mut u8,
     src: *const u8,
@@ -4491,8 +4544,7 @@ pub(crate) fn copy_mapped_raw_checked(
     } else if !title_dst {
         read_pieces_checked(src, dst, len)
     } else {
-        read_pieces_title_dst(src, dst, len);
-        true
+        read_pieces_title_dst_checked(src, dst, len)
     }
 }
 
@@ -4784,10 +4836,16 @@ fn read_sparse_checked(src: *const u8, dst: *mut u8, len: usize) -> bool {
     };
     let fast = fast_fill();
     let mut offset = 0;
+    let mut stale_retries = 0usize;
     while offset < len {
         let at = src.wrapping_add(offset);
         let to = dst.wrapping_add(offset);
         let remaining = len - offset;
+        // Sample `remove_generation()` strictly BEFORE `VirtualQuery` so if a
+        // lazy block finishes materializing between `VirtualQuery` (seeing
+        // `PAGE_NOACCESS`) and `range_has_lazy_block` (seeing it removed), the
+        // generation mismatch prevents zero-filling and forces a re-query.
+        let remove_gen = crate::lazy_back::remove_generation();
         // SAFETY: zero is valid for the fields of this Windows output structure.
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
         // SAFETY: the query inspects an address and fills the local structure.
@@ -4803,8 +4861,17 @@ fn read_sparse_checked(src: *const u8, dst: *mut u8, len: usize) -> bool {
             break;
         }
         if info.State != MEM_COMMIT || (info.Protect & PAGE_NOACCESS) != 0 {
-            if (info.Protect & PAGE_NOACCESS) != 0 && range_has_lazy_block(at as usize, n) {
-                return false;
+            if (info.Protect & PAGE_NOACCESS) != 0 {
+                if range_has_lazy_block(at as usize, n) {
+                    return false;
+                }
+                if crate::lazy_back::remove_generation() != remove_gen {
+                    stale_retries += 1;
+                    if stale_retries > 8 {
+                        return false;
+                    }
+                    continue;
+                }
             }
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
@@ -4823,6 +4890,7 @@ fn read_sparse_checked(src: *const u8, dst: *mut u8, len: usize) -> bool {
                 return false;
             }
         }
+        stale_retries = 0;
         offset += n;
     }
     true
@@ -4831,25 +4899,43 @@ fn read_sparse_checked(src: *const u8, dst: *mut u8, len: usize) -> bool {
 fn read_pieces_checked(src: *const u8, dst: *mut u8, len: usize) -> bool {
     // Something is unmapped: page by page (64 KiB, then 4 KiB in a piece
     // that fails), zeros for what cannot be read (unless a `lazy_back` block
-    // was concurrently armed on the source).
+    // was concurrently armed or just materialized on the source).
     let mut ok = true;
     for_pieces(src as usize, len, 64 << 10, |at, n| {
         if !ok {
             return;
         }
         let to = dst.wrapping_add(at - src as usize);
+        let gen64 = crate::lazy_back::remove_generation();
         if !read(at as *const u8, to, n) {
             if range_has_lazy_block(at, n) {
                 ok = false;
                 return;
+            }
+            if crate::lazy_back::remove_generation() != gen64 {
+                if read(at as *const u8, to, n) {
+                    return;
+                }
+                if range_has_lazy_block(at, n) {
+                    ok = false;
+                    return;
+                }
             }
             for_pieces(at, n, 4 << 10, |at, n| {
                 if !ok {
                     return;
                 }
                 let to = dst.wrapping_add(at - src as usize);
+                let gen4 = crate::lazy_back::remove_generation();
                 if !read(at as *const u8, to, n) {
                     if range_has_lazy_block(at, n) {
+                        ok = false;
+                        return;
+                    }
+                    if crate::lazy_back::remove_generation() != gen4 {
+                        if read(at as *const u8, to, n) {
+                            return;
+                        }
                         ok = false;
                         return;
                     }
@@ -4864,29 +4950,19 @@ fn read_pieces_checked(src: *const u8, dst: *mut u8, len: usize) -> bool {
     ok
 }
 
-fn read_pieces_title_dst(src: *const u8, dst: *mut u8, len: usize) {
+fn read_pieces_title_dst_checked(src: *const u8, dst: *mut u8, len: usize) -> bool {
     // Title destination fallback when a page is unmapped: copy 64 KiB / 4 KiB
-    // pieces, zeroing unmapped source pieces.
-    for_pieces(src as usize, len, 64 << 10, |at, n| {
-        let to = dst.wrapping_add(at - src as usize);
-        if !read(at as *const u8, to, n) {
-            for_pieces(at, n, 4 << 10, |at, n| {
-                let to = dst.wrapping_add(at - src as usize);
-                if !read(at as *const u8, to, n) {
-                    #[cfg(feature = "diagnostics")]
-                    crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
-                    // SAFETY: inside the destination, which is mapped.
-                    unsafe { to.write_bytes(0, n) };
-                }
-            });
-        }
-    });
+    // pieces, zeroing unmapped source pieces unless the source piece belongs to
+    // a deferred or concurrently materialized `lazy_back` block.
+    read_pieces_checked(src, dst, len)
 }
 
 /// Reads title memory at `src` into `dst`; false if a page of it is not
 /// readable.
 pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
-    crate::lazy_back::materialize_range(src as usize, dst.len());
+    if !crate::lazy_back::materialize_range(src as usize, dst.len()) {
+        return false;
+    }
     read_into_raw(src, dst)
 }
 
@@ -4912,7 +4988,9 @@ pub(crate) fn read_into_probe(src: *const u8, dst: &mut [u8]) -> bool {
     if dst.is_empty() {
         return true;
     }
-    crate::lazy_back::materialize_range(src as usize, dst.len());
+    if !crate::lazy_back::materialize_range(src as usize, dst.len()) {
+        return false;
+    }
     read(src, dst.as_mut_ptr(), dst.len())
 }
 
@@ -4923,7 +5001,9 @@ pub(crate) fn read_into_fast(src: *const u8, dst: &mut [u8]) -> bool {
     if dst.is_empty() {
         return true;
     }
-    crate::lazy_back::materialize_range(src as usize, dst.len());
+    if !crate::lazy_back::materialize_range(src as usize, dst.len()) {
+        return false;
+    }
     if fast_fill() {
         // SAFETY: `dst` is mapped writable memory of `dst.len()` bytes; a
         // fault on `src` is caught by `fast_fill`'s vectored handler and
@@ -4931,7 +5011,9 @@ pub(crate) fn read_into_fast(src: *const u8, dst: &mut [u8]) -> bool {
         if unsafe { victory_copy_try(dst.as_mut_ptr(), src, dst.len()) } != 0 {
             return true;
         }
-        crate::lazy_back::materialize_range(src as usize, dst.len());
+        if !crate::lazy_back::materialize_range(src as usize, dst.len()) {
+            return false;
+        }
     }
     read(src, dst.as_mut_ptr(), dst.len())
 }
@@ -5733,20 +5815,25 @@ impl Host {
         // SAFETY: `cmd` is closed; `fence` and `event` are owned by `self` and
         // serialized under `submitted`.
         unsafe {
-            self.queue.ExecuteCommandLists(&[Some(cmd)]);
-            match self.queue.Signal(&self.fence, *submitted) {
-                Ok(()) => {
+            let signalled = {
+                let _lazy_order = crate::lazy_back::direct_submit_guard();
+                self.queue.ExecuteCommandLists(&[Some(cmd)]);
+                let res = self.queue.Signal(&self.fence, *submitted);
+                if res.is_ok() {
                     self.note_signalled(*submitted);
-                    match self.fence.SetEventOnCompletion(*submitted, self.event) {
-                        Ok(()) => {
-                            let waited = WaitForSingleObject(self.event, INFINITE);
-                            if waited != WAIT_OBJECT_0 {
-                                self.poll_fence(*submitted);
-                            }
-                        }
-                        Err(_) => self.poll_fence(*submitted),
-                    }
                 }
+                res
+            };
+            match signalled {
+                Ok(()) => match self.fence.SetEventOnCompletion(*submitted, self.event) {
+                    Ok(()) => {
+                        let waited = WaitForSingleObject(self.event, INFINITE);
+                        if waited != WAIT_OBJECT_0 {
+                            self.poll_fence(*submitted);
+                        }
+                    }
+                    Err(_) => self.poll_fence(*submitted),
+                },
                 Err(e) => {
                     tracing::warn!(error = %e, "{label} fence signal failed");
                     return false;

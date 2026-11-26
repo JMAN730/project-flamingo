@@ -14,7 +14,7 @@ use std::sync::{Arc, OnceLock};
 
 use super::{
     Batch, HostList, PREP_FILL_BYTES, PREP_FILL_COUNT, PREP_FILL_US, PREP_WATCH_US, PREPARING,
-    PREPARING_COPIES, Step, copy_mapped, copy_mapped_raw_checked, wide_refresh,
+    PREPARING_COPIES, Step, copy_mapped_checked, copy_mapped_raw_checked, wide_refresh,
 };
 
 /// Whether a submission's fills of upload memory are batched and run across
@@ -102,18 +102,27 @@ impl Batch {
                 .filter(|&&(_, _, len)| len > 0)
                 .map(|&(_, src, len)| (src, len))
                 .collect();
-            if !ranges.is_empty() {
-                crate::lazy_back::materialize_ranges(&ranges);
+            if !ranges.is_empty() && !crate::lazy_back::materialize_ranges(&ranges) {
+                self.fill_failed = true;
+                return;
             }
         }
         if fills.len() < FEW {
             for &(dst, src, len) in &fills {
                 if lazy {
-                    if !copy_mapped_raw_checked(dst as *mut u8, src as *const u8, len, false) {
-                        copy_mapped(dst as *mut u8, src as *const u8, len, false);
+                    if !copy_mapped_raw_checked(dst as *mut u8, src as *const u8, len, false)
+                        && !copy_mapped_checked(dst as *mut u8, src as *const u8, len, false)
+                    {
+                        self.fill_failed = true;
+                        return;
                     }
-                } else {
-                    crate::shadow::copy_mapped_wide(dst as *mut u8, src as *const u8, len);
+                } else if !crate::shadow::copy_mapped_wide_checked(
+                    dst as *mut u8,
+                    src as *const u8,
+                    len,
+                ) {
+                    self.fill_failed = true;
+                    return;
                 }
             }
         } else {
@@ -137,12 +146,16 @@ impl Batch {
                     .filter(|&&(_, _, len)| len > 0)
                     .map(|&(_, src, len)| (src, len))
                     .collect();
-                if !ranges.is_empty() {
-                    crate::lazy_back::materialize_ranges(&ranges);
+                if !ranges.is_empty() && !crate::lazy_back::materialize_ranges(&ranges) {
+                    self.fill_failed = true;
+                    return;
                 }
                 for &(dst, src, len) in fills.iter() {
-                    if !copy_mapped_raw_checked(dst as *mut u8, src as *const u8, len, false) {
-                        copy_mapped(dst as *mut u8, src as *const u8, len, false);
+                    if !copy_mapped_raw_checked(dst as *mut u8, src as *const u8, len, false)
+                        && !copy_mapped_checked(dst as *mut u8, src as *const u8, len, false)
+                    {
+                        self.fill_failed = true;
+                        return;
                     }
                 }
             }

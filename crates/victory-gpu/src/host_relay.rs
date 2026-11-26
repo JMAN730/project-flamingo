@@ -1886,6 +1886,10 @@ impl Host {
     /// Records `(fence_val, current QUEUE_ORDER)` after `self.queue.Signal`.
     pub(super) fn note_signalled(&self, fence_val: u64) {
         let order = *QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner());
+        self.note_signalled_with_order(fence_val, order);
+    }
+
+    pub(super) fn note_signalled_with_order(&self, fence_val: u64, order: u64) {
         let mut pair = self
             .last_signalled
             .lock()
@@ -2042,7 +2046,12 @@ impl Host {
     /// Uploads dirty CPU ranges to card-backed shadows before the submission's
     /// command lists and records the post-submission [`CARD_COMPARE`] (and
     /// optional [`CARD_FETCH`]) command list.
-    pub(super) fn card_before(&self, declared: Vec<Declared>, flown: bool) -> Option<CardPlan> {
+    pub(super) fn card_before(
+        &self,
+        declared: Vec<Declared>,
+        flown: bool,
+        submitted: &mut u64,
+    ) -> Option<CardPlan> {
         use std::sync::Arc;
         if !crate::shadow::cards() {
             return None;
@@ -2177,7 +2186,18 @@ impl Host {
                         }
                     }
                     list.Close()?;
-                    self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
+                    {
+                        let _lazy_order = crate::lazy_back::direct_submit_guard();
+                        self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
+                        if crate::lazy_back::ever_active() {
+                            *submitted += 1;
+                            self.queue.Signal(&self.fence, *submitted)?;
+                            self.note_signalled_with_order(
+                                *submitted,
+                                order.as_deref().copied().unwrap_or(0),
+                            );
+                        }
+                    }
                     Ok(())
                 })()
             };
