@@ -60,7 +60,7 @@ pub fn run(
     let original = std::fs::read(exe)
         .inspect_err(|error| IoOperation::ReadImage.failed(error, started))
         .with_context(|| format!("reading {}", exe.display()))?;
-    let prepared = victory_loader::prepare(&original)?;
+    let prepared = victory_loader::prepare_owned(original)?;
     let hash = prepared.original_hash.to_hex();
     let title_dir = exe.parent().unwrap_or(Path::new("."));
     match victory_game::identify(&hash) {
