@@ -48,7 +48,7 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
     GroupMemoryBarrierWithGroupSync();
 
     [unroll]
-    for (uint stride = 32u; stride > 0u; stride >>= 1u) {
+    for (uint stride = 32u; stride > 1u; stride >>= 1u) {
         if (tid < stride) {
             s_hash[tid] = mix_pair(s_hash[tid], s_hash[tid + stride]);
         }
@@ -56,7 +56,7 @@ void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
     }
 
     if (tid == 0u) {
-        uint4 final_h = s_hash[0];
+        uint4 final_h = mix_pair(s_hash[0], s_hash[1]);
         if (mode != 0u) {
             uint4 prev = hashes.Load4(piece * 16u);
             uint changed = any(final_h != prev) ? 1u : 0u;
