@@ -2018,6 +2018,42 @@ fn sums_of_absolute_differences() {
     }
 }
 
+/// `v_msad_u8` skips bytes whose reference/mask byte (`src1`) is 0 and wraps
+/// the 32-bit sum with `src2`.
+#[test]
+fn v_msad_u8_masks_zero_bytes_and_accumulates_sad() {
+    let msad = |a: u32, b: u32, c: u32| -> u32 {
+        (0..4).fold(c, |acc, i| {
+            let x = (a >> (8 * i)) & 0xFF;
+            let y = (b >> (8 * i)) & 0xFF;
+            if y == 0 {
+                acc
+            } else {
+                acc.wrapping_add(x.abs_diff(y))
+            }
+        })
+    };
+    let inputs: Vec<[u32; 4]> = vec![
+        [0, 0, 0, 0],
+        // Every mask byte is 0 -> result is just src2.
+        [0xFFAA_5511, 0x0000_0000, 0x1234, 0],
+        // Mixed zero and non-zero mask bytes: bytes 1 and 3 masked out.
+        [0xFF10_2030, 0x0015_0025, 7, 0],
+        // All non-zero mask bytes match v_sad_u8.
+        [0x0403_0201, 0x0102_0304, 10, 0],
+        // Wrapping 32-bit accumulator.
+        [0xFF00_FF00, 0x0101_0101, 0xFFFF_FFF0, 0],
+    ];
+    let shader = build_valu_cs(&vop3(0x171, 0, vgpr(1), vgpr(2), vgpr(3)));
+    run_cases(&shader, &inputs, |backend, i, x, got| {
+        let want = msad(x[0], x[1], x[2]);
+        assert_eq!(
+            got, want,
+            "{backend}: v_msad_u8 case {i}: {got:#010x}, want {want:#010x}"
+        );
+    });
+}
+
 /// The CPU model of the integer dot products: `c` plus the products of
 /// `a` and `b`'s fields of `width` bits, sign- or zero-extended, wrapping.
 fn dot(a: u32, b: u32, c: u32, width: u32, signed: bool) -> u32 {

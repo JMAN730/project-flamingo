@@ -890,7 +890,7 @@ pub(super) fn blocked_ranges(
                         first_stat.get_or_insert(16);
                     }
                 }
-                Step::Texture(staging) => {
+                Step::Texture(staging, _) => {
                     let (start, end) = staging.memory_range();
                     if touches(written, start, end) {
                         ranges.push((start, end));

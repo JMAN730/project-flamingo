@@ -633,6 +633,163 @@ fn host_list_reset_trims_excess_scratch_chunks() {
 }
 
 #[test]
+fn upload_scratch_aligns_placements_and_falls_back_when_oversized() {
+    let _retire = isolated_retire_scope();
+    let Some(host) = host() else {
+        return;
+    };
+    let list = host.new_list().expect("host list");
+    let errors_before = host.d3d12_errors();
+
+    // First 256-byte scratch leaves `used = 256`, which is not 512-byte aligned.
+    let (gpu0, _) = list.scratch(256).expect("initial scratch");
+    assert_eq!(gpu0 % 256, 0);
+
+    let (buf1, at1, ptr1) = list
+        .upload_scratch(128)
+        .expect("aligned sub-allocated upload");
+    assert_eq!(
+        at1, 512,
+        "texture placement offset must round up to 512 bytes"
+    );
+    assert_eq!(at1 % 512, 0);
+    assert!(!ptr1.is_null());
+    assert_eq!(
+        list.deferred().uploads.len(),
+        0,
+        "sub-allocated staging must not allocate a dedicated upload buffer"
+    );
+    // SAFETY: `buf1` is a live resource and `ptr1` points to 256+ writable bytes.
+    unsafe {
+        assert_eq!(buf1.GetGPUVirtualAddress() + at1, gpu0 + at1);
+        ptr1.write_bytes(0x5a, 128);
+    }
+
+    // Oversized copy falls back to a dedicated upload buffer at offset 0.
+    let (buf_big, at_big, ptr_big) = list
+        .upload_scratch(SCRATCH_CHUNK + 512)
+        .expect("oversized fallback upload");
+    assert_eq!(at_big, 0);
+    assert!(!ptr_big.is_null());
+    assert_ne!(buf_big.as_raw(), buf1.as_raw());
+    assert_eq!(list.deferred().uploads.len(), 1);
+    // SAFETY: `ptr_big` is mapped for at least `SCRATCH_CHUNK + 512` bytes.
+    unsafe { ptr_big.write_bytes(0x3c, 16) };
+
+    list.close();
+    host.execute(&[&list]);
+    assert_eq!(host.d3d12_errors(), errors_before);
+}
+
+#[test]
+fn fill_scratch_deduplicates_until_copy_or_defer_run() {
+    let _retire = isolated_retire_scope();
+    let Some(host) = host() else {
+        return;
+    };
+    let list = host.new_list().expect("host list");
+    let errors_before = host.d3d12_errors();
+    let mut src = [0x11u8; 64];
+    let mut dst = [0u8; 64];
+
+    let gpu1 = list.fill_scratch(src.as_ptr(), 64).expect("first fill");
+    let gpu2 = list.fill_scratch(src.as_ptr(), 64).expect("dedup fill");
+    assert_eq!(gpu1, gpu2);
+    assert_eq!(
+        list.deferred()
+            .copies
+            .iter()
+            .filter(|s| matches!(s, Step::Fill(..)))
+            .count(),
+        1
+    );
+
+    // Intervening title copy invalidates `filled` cache.
+    list.defer_copy(dst.as_mut_ptr(), src.as_ptr(), 4);
+    let gpu3 = list.fill_scratch(src.as_ptr(), 64).expect("post-copy fill");
+    assert_ne!(gpu3, gpu1);
+
+    // Intervening deferred run also invalidates `filled` cache.
+    list.defer(|| {});
+    src[0] = 0x22;
+    let gpu4 = list.fill_scratch(src.as_ptr(), 64).expect("post-run fill");
+    assert_ne!(gpu4, gpu3);
+
+    list.close();
+    host.execute(&[&list]);
+    assert_eq!(host.d3d12_errors(), errors_before);
+}
+
+#[test]
+fn defer_gpu_write_deduplicates_and_clears_on_copy() {
+    let _retire = isolated_retire_scope();
+    let Some(host) = host() else {
+        return;
+    };
+    let list = host.new_list().expect("host list");
+    let errors_before = host.d3d12_errors();
+    let mut backing = vec![0u8; 4096];
+    let start = backing.as_mut_ptr() as u64;
+    let addr = start as usize;
+    crate::shadow::register(addr, start, backing.len() as u64);
+    let shadow = crate::shadow::find(start, backing.len() as u64).expect("registered shadow");
+
+    list.defer_gpu_write(&shadow, addr, 256);
+    list.defer_gpu_write(&shadow, addr, 256);
+    list.defer_gpu_write(&shadow, addr + 256, 256);
+
+    let gpu_write_count = list
+        .deferred()
+        .copies
+        .iter()
+        .filter(|s| matches!(s, Step::GpuWrite(..)))
+        .count();
+    assert_eq!(gpu_write_count, 2);
+
+    let (back, rebar, non_rebar) = collect_declared_writes(
+        vec![
+            (shadow.clone(), addr, 256),
+            (shadow.clone(), addr, 256),
+            (shadow.clone(), addr + 256, 256),
+        ],
+        false,
+    );
+    assert_eq!(back.len(), 1);
+    assert_eq!(back[0].1.len(), 2);
+    if shadow.is_rebar() {
+        assert_eq!(rebar.len(), 1);
+        assert_eq!(rebar[0].declared_spans.len(), 2);
+        assert!(non_rebar.is_empty());
+    } else if shadow.carded() {
+        assert!(rebar.is_empty());
+        assert!(non_rebar.is_empty());
+    } else {
+        assert!(rebar.is_empty());
+        assert_eq!(non_rebar.len(), 3);
+    }
+
+    let mut dst = [0u8; 16];
+    list.defer_copy(dst.as_mut_ptr(), backing.as_ptr(), 16);
+    list.defer_gpu_write(&shadow, addr, 256);
+    let gpu_write_count_after = list
+        .deferred()
+        .copies
+        .iter()
+        .filter(|s| matches!(s, Step::GpuWrite(..)))
+        .count();
+    assert_eq!(gpu_write_count_after, 3);
+
+    list.close();
+    list.reset();
+    drop(back);
+    drop(rebar);
+    drop(non_rebar);
+    drop(shadow);
+    crate::shadow::unregister(addr, start);
+    assert_eq!(host.d3d12_errors(), errors_before);
+}
+
+#[test]
 fn recycle_list_releases_scratch_uploads_and_tracked_resources_immediately() {
     let _retire = isolated_retire_scope();
     let Some(host) = host() else {
@@ -850,28 +1007,31 @@ mod batch {
         let mut batch = Batch::default();
         let (a, b) = (Arc::new([0u8; 16]), Arc::new([0u8; 16]));
         // The first list sampling each texture checks it ...
-        assert!(batch.texture_due(&a));
-        assert!(batch.texture_due(&b));
-        // ... later lists of the same submission do not.
-        assert!(!batch.texture_due(&a));
-        assert!(!batch.texture_due(&a.clone()));
-        assert!(!batch.texture_due(&b));
+        assert!(batch.texture_due(&a, 64));
+        assert!(batch.texture_due(&b, 64));
+        // ... later lists of the same submission with equal or smaller baseline do not ...
+        assert!(!batch.texture_due(&a, 64));
+        assert!(!batch.texture_due(&a.clone(), 32));
+        assert!(!batch.texture_due(&b, 64));
+        // ... but a later list requiring a higher mapped-byte baseline does.
+        assert!(batch.texture_due(&a, 128));
+        assert!(!batch.texture_due(&a, 128));
     }
 
     #[test]
     fn title_writes_make_textures_due_again() {
         let mut batch = Batch::default();
         let a = Arc::new(1u32);
-        assert!(batch.texture_due(&a));
-        assert!(!batch.texture_due(&a));
+        assert!(batch.texture_due(&a, 0));
+        assert!(!batch.texture_due(&a, 0));
         // A copy into title memory or work that may write it may have
         // changed the texture's memory.
         batch.title_written();
-        assert!(batch.texture_due(&a));
-        assert!(!batch.texture_due(&a));
+        assert!(batch.texture_due(&a, 0));
+        assert!(!batch.texture_due(&a, 0));
         // A fresh submission starts over.
         let mut next = Batch::default();
-        assert!(next.texture_due(&a));
+        assert!(next.texture_due(&a, 0));
     }
 
     /// The hashing a submission does for textures in physical-page memory,
@@ -893,7 +1053,7 @@ mod batch {
             let started = std::time::Instant::now();
             for _ in 0..LISTS {
                 for t in &textures {
-                    if !dedupe || batch.texture_due(t) {
+                    if !dedupe || batch.texture_due(t, 0) {
                         std::hint::black_box(blake3::hash(t));
                         hashed += 1;
                     }
