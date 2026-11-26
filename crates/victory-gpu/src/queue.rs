@@ -203,6 +203,27 @@ pub(crate) fn async_schedule(timeline: &Arc<Timeline>) {
     QUEUE.1.notify_one();
 }
 
+/// Restores this thread's `watch` submission stamp to its prior value (`0` at
+/// top level) on scope exit, even on unwind.
+#[cfg(windows)]
+struct CurrentStampGuard(u64);
+
+#[cfg(windows)]
+impl Drop for CurrentStampGuard {
+    fn drop(&mut self) {
+        crate::watch::swap_current_stamp(self.0);
+    }
+}
+
+/// Runs `f` with this thread's `watch` submission stamp set to `stamp` and
+/// restores the prior stamp (`0` at top level) when `f` returns or unwinds.
+#[cfg(windows)]
+fn with_current_stamp<R>(stamp: u64, f: impl FnOnce() -> R) -> R {
+    let prev = crate::watch::swap_current_stamp(stamp);
+    let _guard = CurrentStampGuard(prev);
+    f()
+}
+
 /// Runs the lists' host lists and waits for them (decision 0007), once
 /// the queue's waits before them are reached. Contiguous host list segments
 /// run in a single host submission, ordered around mid-list memory waits.
@@ -214,10 +235,17 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
     if crate::host::host().is_some() {
         // SAFETY: the title passes `count` lists.
         let lists = unsafe { std::slice::from_raw_parts(lists, count as usize) };
+        if lists.is_empty() {
+            return;
+        }
         let segments: Vec<_> = lists
             .iter()
             .flat_map(|&l| crate::list::segments(l))
             .collect();
+        if segments.is_empty() {
+            return;
+        }
+        let stamp = crate::watch::TITLE_SUBMITS.fetch_add(1, Ordering::AcqRel) + 1;
         let timeline = &queue(this).timeline;
         let async_mode = async_submit();
         let submit_op = |op: Op| {
@@ -238,21 +266,23 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
             // completes (or lands, when `host::late()` is active).
             let in_flight = std::mem::take(batch);
             submit_op(Op::Run(Box::new(move || {
-                if let Some(host) = crate::host::host() {
-                    crate::descriptor::sync_all_heaps();
-                    if crate::host::late() {
-                        host.execute_late(in_flight);
-                    } else {
-                        let runs: Vec<_> = in_flight.iter().map(InFlight::list).collect();
-                        host.execute(&runs);
-                        for entry in in_flight {
-                            let list = entry.take();
-                            if let Ok(orphan) = Arc::try_unwrap(list) {
-                                host.recycle_list(orphan);
+                with_current_stamp(stamp, || {
+                    if let Some(host) = crate::host::host() {
+                        crate::descriptor::sync_all_heaps();
+                        if crate::host::late() {
+                            host.execute_late(in_flight);
+                        } else {
+                            let runs: Vec<_> = in_flight.iter().map(InFlight::list).collect();
+                            host.execute(&runs);
+                            for entry in in_flight {
+                                let list = entry.take();
+                                if let Ok(orphan) = Arc::try_unwrap(list) {
+                                    host.recycle_list(orphan);
+                                }
                             }
                         }
                     }
-                }
+                });
             })));
         };
         for seg in segments {
@@ -866,6 +896,10 @@ mod tests {
 
     #[test]
     fn queue_signals_complete_at_once() {
+        #[cfg(windows)]
+        if crate::host::late() {
+            crate::host::settle_for_fence();
+        }
         let null = std::ptr::null();
         let desc = QueueDesc {
             kind: 0,
@@ -896,6 +930,10 @@ mod tests {
     /// The first queue's signal after its wait must not complete before.
     #[test]
     fn work_after_a_wait_runs_once_the_other_queue_signals() {
+        #[cfg(windows)]
+        if crate::host::late() {
+            crate::host::settle_for_fence();
+        }
         type Call = extern "system" fn(This, This, u64) -> HRESULT;
         let null = std::ptr::null();
         let desc = QueueDesc {
@@ -995,6 +1033,10 @@ mod tests {
     /// must keep its resource alive until it runs.
     #[test]
     fn present_runs_after_a_queues_wait() {
+        #[cfg(windows)]
+        if crate::host::late() {
+            crate::host::settle_for_fence();
+        }
         type Sync = extern "system" fn(This, This, u64) -> HRESULT;
         type Present = extern "system" fn(This, u32, *const Plane, *const u8) -> HRESULT;
         let null = std::ptr::null();
@@ -1362,8 +1404,23 @@ mod tests {
         );
 
         let lists = [list1, list2];
+        // Ensure any in-flight `Late::Write` targeting stack `out` lands before
+        // `out` leaves scope, even if an assertion unwinds under `VICTORY_RELAY`.
+        struct SettleOnDrop;
+        impl Drop for SettleOnDrop {
+            fn drop(&mut self) {
+                if crate::host::late() {
+                    crate::host::settle_for_fence();
+                }
+            }
+        }
+        let _settle = SettleOnDrop;
         execute(queue, 2, lists.as_ptr());
 
+        let limit = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while out[0].load(Ordering::Acquire) == 0 && std::time::Instant::now() < limit {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
         assert_eq!(out[0].load(Ordering::Acquire), 1);
         assert_eq!(out[1].load(Ordering::Acquire), 0);
         assert_eq!(out[2].load(Ordering::Acquire), 0);
@@ -1475,6 +1532,13 @@ mod tests {
         );
 
         assert_eq!(crate::fence::signal(ready, 1), S_OK);
+        if crate::host::late() {
+            crate::host::settle_for_fence();
+            let limit = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while drops.load(Ordering::SeqCst) == 0 && std::time::Instant::now() < limit {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
         assert_eq!(completed(done), 1);
         assert_eq!(
             drops.load(Ordering::SeqCst),
@@ -1530,6 +1594,9 @@ mod tests {
         assert_eq!(drops.load(Ordering::SeqCst), 0);
 
         assert_eq!(crate::fence::signal(f1, 1), S_OK);
+        if crate::host::late() {
+            crate::host::settle_for_fence();
+        }
         assert_eq!(completed(d1), 1);
         assert_eq!(
             drops.load(Ordering::SeqCst),
@@ -1538,6 +1605,13 @@ mod tests {
         );
 
         assert_eq!(crate::fence::signal(f2, 1), S_OK);
+        if crate::host::late() {
+            crate::host::settle_for_fence();
+            let limit = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while drops.load(Ordering::SeqCst) == 0 && std::time::Instant::now() < limit {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
         assert_eq!(completed(d2), 1);
         assert_eq!(drops.load(Ordering::SeqCst), 1);
 
@@ -1645,6 +1719,227 @@ mod tests {
         assert_eq!(drops.load(Ordering::SeqCst), 1);
 
         for object in [list, allocator, src, dst, ready] {
+            assert_eq!(release(object), 0);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn with_current_stamp_restores_zero_on_return_and_unwind() {
+        struct ResetStamp;
+        impl Drop for ResetStamp {
+            fn drop(&mut self) {
+                crate::watch::swap_current_stamp(0);
+            }
+        }
+        let _reset = ResetStamp;
+        crate::watch::swap_current_stamp(0);
+
+        let out = with_current_stamp(42, || {
+            assert_eq!(crate::watch::current_stamp(), 42);
+            let inner = with_current_stamp(77, || {
+                assert_eq!(crate::watch::current_stamp(), 77);
+                9u32
+            });
+            assert_eq!(inner, 9);
+            assert_eq!(
+                crate::watch::current_stamp(),
+                42,
+                "nested CurrentStampGuard must restore outer stamp"
+            );
+            7u32
+        });
+        assert_eq!(out, 7);
+        assert_eq!(crate::watch::current_stamp(), 0);
+
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            with_current_stamp(99, || {
+                assert_eq!(crate::watch::current_stamp(), 99);
+                panic!("simulated host execution panic");
+            });
+        }));
+        assert!(panicked.is_err());
+        assert_eq!(
+            crate::watch::current_stamp(),
+            0,
+            "CurrentStampGuard must reset current_stamp on unwind"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn with_current_stamp_is_thread_local_across_interleaved_guards() {
+        use std::sync::Barrier;
+
+        let b_entered = Arc::new(Barrier::new(2));
+        let b_a_dropped = Arc::new(Barrier::new(2));
+        let b_entered_t = b_entered.clone();
+        let b_a_dropped_t = b_a_dropped.clone();
+
+        // Interleave lifetimes: Thread A enters (stamp 101), Thread B enters
+        // (stamp 202), Thread A drops first, then Thread B drops second.
+        // With thread-local storage neither thread observes the other's stamp
+        // and neither leaks a non-zero stamp after drop.
+        let handle = std::thread::spawn(move || {
+            assert_eq!(crate::watch::current_stamp(), 0);
+            with_current_stamp(202, || {
+                assert_eq!(crate::watch::current_stamp(), 202);
+                b_entered_t.wait();
+                // Wait until Thread A has exited its guard.
+                b_a_dropped_t.wait();
+                assert_eq!(
+                    crate::watch::current_stamp(),
+                    202,
+                    "Thread A's guard drop must not disturb Thread B's stamp"
+                );
+            });
+            assert_eq!(crate::watch::current_stamp(), 0);
+        });
+
+        assert_eq!(crate::watch::current_stamp(), 0);
+        with_current_stamp(101, || {
+            assert_eq!(crate::watch::current_stamp(), 101);
+            b_entered.wait();
+            assert_eq!(
+                crate::watch::current_stamp(),
+                101,
+                "Thread B's guard entry must not overwrite Thread A's stamp"
+            );
+        });
+        assert_eq!(crate::watch::current_stamp(), 0);
+        b_a_dropped.wait();
+
+        handle.join().expect("thread B panicked");
+        assert_eq!(crate::watch::current_stamp(), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn execute_assigns_single_stamp_to_prefix_and_held_segments() {
+        if crate::host::host().is_none() || async_submit() {
+            return;
+        }
+        type Execute = extern "system" fn(This, u32, *const This);
+        type Write32 = extern "system" fn(This, u64, u32, u32, u32);
+        type Wait32 = extern "system" fn(This, u64, u32, u32, u32);
+
+        let null = std::ptr::null();
+        let (q, _) = test_queue();
+        let exec = slot::<Execute>(q, 0x50);
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+
+        let mut allocator = null;
+        assert_eq!(
+            crate::list::create_allocator(
+                null,
+                0,
+                &crate::resource::PAGEABLE_IIDS[0],
+                &mut allocator
+            ),
+            S_OK
+        );
+        let make_list = || {
+            let mut l = null;
+            let iid = guid(
+                0x5b160d0f,
+                0xac1b,
+                0x4185,
+                [0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x55],
+            );
+            assert_eq!(
+                crate::list::create_list(null, 0, 0, allocator, null, &iid, &mut l),
+                S_OK
+            );
+            l
+        };
+
+        let list1 = make_list();
+        let list2 = make_list();
+        let list_slot = crate::list::test_slot;
+
+        let gate1 = AtomicU32::new(0);
+        let gate2 = AtomicU32::new(0);
+        let out = [AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0)];
+
+        // list1 has a prefix segment (runs immediately), an unmet wait, and a held segment.
+        slot::<Write32>(list1, list_slot(list1, 69))(list1, (&raw const out[0]) as u64, 1, 0, 0);
+        slot::<Wait32>(list1, list_slot(list1, 71))(
+            list1,
+            (&raw const gate1) as u64,
+            3,
+            1,
+            u32::MAX,
+        );
+        slot::<Write32>(list1, list_slot(list1, 69))(list1, (&raw const out[1]) as u64, 2, 0, 0);
+        assert_eq!(
+            slot::<extern "system" fn(This) -> HRESULT>(list1, 0x48)(list1),
+            S_OK
+        );
+
+        // list2 has a second unmet wait and held segment.
+        slot::<Wait32>(list2, list_slot(list2, 71))(
+            list2,
+            (&raw const gate2) as u64,
+            3,
+            1,
+            u32::MAX,
+        );
+        slot::<Write32>(list2, list_slot(list2, 69))(list2, (&raw const out[2]) as u64, 3, 0, 0);
+        assert_eq!(
+            slot::<extern "system" fn(This) -> HRESULT>(list2, 0x48)(list2),
+            S_OK
+        );
+
+        struct SettleOnDrop;
+        impl Drop for SettleOnDrop {
+            fn drop(&mut self) {
+                if crate::host::late() {
+                    crate::host::settle_for_fence();
+                }
+            }
+        }
+        let _settle = SettleOnDrop;
+
+        // Empty submission must not mint a stamp.
+        let before = crate::watch::TITLE_SUBMITS.load(Ordering::Acquire);
+        exec(q, 0, &list1);
+        assert_eq!(crate::watch::TITLE_SUBMITS.load(Ordering::Acquire), before);
+        assert_eq!(crate::watch::current_stamp(), 0);
+
+        let lists = [list1, list2];
+        exec(q, 2, lists.as_ptr());
+        let after = crate::watch::TITLE_SUBMITS.load(Ordering::Acquire);
+        assert_eq!(
+            after,
+            before + 1,
+            "execute must mint one stamp across prefix and all held segments"
+        );
+        assert_eq!(crate::watch::current_stamp(), 0);
+        let limit = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while out[0].load(Ordering::Acquire) == 0 && std::time::Instant::now() < limit {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(out[0].load(Ordering::Acquire), 1);
+        assert_eq!(out[1].load(Ordering::Acquire), 0);
+        assert_eq!(out[2].load(Ordering::Acquire), 0);
+
+        // Release both gates and verify held segments complete without minting new stamps.
+        gate1.store(1, Ordering::Release);
+        gate2.store(1, Ordering::Release);
+        let limit = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while out[2].load(Ordering::Acquire) == 0 && std::time::Instant::now() < limit {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(out[1].load(Ordering::Acquire), 2);
+        assert_eq!(out[2].load(Ordering::Acquire), 3);
+        assert_eq!(
+            crate::watch::TITLE_SUBMITS.load(Ordering::Acquire),
+            after,
+            "draining held segments must reuse the original stamp without minting new ones"
+        );
+        assert_eq!(crate::watch::current_stamp(), 0);
+
+        for object in [list1, list2, allocator, q] {
             assert_eq!(release(object), 0);
         }
     }
