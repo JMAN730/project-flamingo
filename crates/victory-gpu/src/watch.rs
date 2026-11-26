@@ -2624,9 +2624,6 @@ pub fn title_memory_alias_rebound(at: usize, len: usize) {
         return;
     }
     let (first, end) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
-    if first >= end {
-        return;
-    }
     let _locked = GuardLockSet::lock_range(first, end);
     DIR.set_bits_range(first, end, BitField::GuardClean, false, Ordering::SeqCst);
 }
