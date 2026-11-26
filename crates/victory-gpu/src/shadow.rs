@@ -35,6 +35,10 @@ use crate::watch::PAGE;
 /// shadow buffers across live [`Shadow`] instances.
 static REBAR_SHADOW_BYTES: AtomicU64 = AtomicU64::new(0);
 
+/// Monotonic identifier for each live [`Shadow`] host copy (used by indirect
+/// window and per-buffer gather gating to avoid pointer-reuse ABA).
+static NEXT_SHADOW_ID: AtomicU64 = AtomicU64::new(1);
+
 /// Atomically reserves `size` bytes from `budget`, returning `false` if doing
 /// so would exceed `budget`.
 fn try_reserve_rebar(used: &AtomicU64, size: u64, budget: u64) -> bool {
@@ -226,6 +230,7 @@ impl RebarShadow {
 
 /// A title buffer's host copy.
 pub(crate) struct Shadow {
+    id: u64,
     pub(crate) buffer: ID3D12Resource,
     data: *mut u8,
     gpu: u64,
@@ -342,6 +347,11 @@ unsafe impl Send for Shadow {}
 unsafe impl Sync for Shadow {}
 
 impl Shadow {
+    /// Unique identifier for this host copy, stable for its lifetime.
+    pub(crate) fn id(&self) -> u64 {
+        self.id
+    }
+
     /// The host GPU address of a title address inside the buffer.
     pub(crate) fn gpu(&self, address: u64) -> u64 {
         self.gpu + (address - self.start)
@@ -378,6 +388,25 @@ impl Shadow {
         let len = usize::try_from(len).ok()?;
         // SAFETY: inside the mapping, which is as long as the buffer.
         Some(unsafe { std::slice::from_raw_parts(self.data.add(at), len) })
+    }
+
+    /// Brings `len` bytes at `address` up to date when `list` is submitted,
+    /// and keeps the copy alive until the list is reset, without recording a
+    /// resource-state transition on `list` itself (used when `list`'s prelude
+    /// reads the buffer and restores it to `COMMON`).
+    pub(crate) fn refresh_for_prelude(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
+        list.keep(&self.buffer);
+        let from = address.max(self.start);
+        let len = range_inside(
+            from,
+            len.saturating_sub(from.saturating_sub(address)),
+            self.start,
+            self.len,
+        );
+        if len == 0 {
+            return;
+        }
+        list.defer_refresh(self, from as usize, len as usize);
     }
 
     /// Brings `len` bytes at `address` up to date when `list` is submitted,
@@ -419,6 +448,7 @@ impl Shadow {
     ) -> Shadow {
         let pages = (start + len).div_ceil(PAGE as u64) - start / PAGE as u64;
         Shadow {
+            id: NEXT_SHADOW_ID.fetch_add(1, Ordering::Relaxed),
             buffer,
             data,
             gpu,

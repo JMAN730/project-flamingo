@@ -6,9 +6,9 @@
 //! not fit in what remains. The counter never exceeds [`BUDGET`], so rejected
 //! records cannot wrap the 32-bit word and reopen the budget.
 
-/// Vertex instances or threads one list may run (2^27); matches `BUDGET` in
+/// Vertex instances or threads one list may run (2^31); matches `BUDGET` in
 /// the shader.
-pub(crate) const BUDGET: u32 = 1 << 27;
+pub(crate) const BUDGET: u32 = 1 << 31;
 
 /// The budget word the shader updates.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -55,7 +55,7 @@ mod tests {
     #[test]
     fn rejected_records_cannot_wrap_the_counter() {
         let cost = 1u32 << 26;
-        let (work, b) = accepted_work(std::iter::repeat_n(cost, 66));
+        let (work, b) = accepted_work(std::iter::repeat_n(cost, 96));
         assert_eq!(work, u64::from(BUDGET));
         assert_eq!(b.used, BUDGET);
 
@@ -63,7 +63,7 @@ mod tests {
         // admits the budget a second time.
         let mut used = 0u32;
         let mut old_work = 0u64;
-        for _ in 0..66 {
+        for _ in 0..96 {
             if wrapping_admit(&mut used, cost) {
                 old_work += u64::from(cost);
             }
@@ -139,7 +139,7 @@ mod tests {
     #[test]
     fn shader_matches_the_model() {
         let source = include_str!("../shaders/argument_clamp.hlsl");
-        assert!(source.contains("BUDGET = 1u << 27"));
+        assert!(source.contains("BUDGET = 1u << 31"));
         assert!(source.contains("InterlockedCompareExchange"));
         assert!(
             !source.contains("InterlockedAdd(0, cost"),

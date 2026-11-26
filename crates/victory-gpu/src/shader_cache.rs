@@ -71,7 +71,8 @@ fn build(wave32: bool) -> &'static [u8; 32] {
                 bytes.push(
                     u8::from(wave32)
                         | (u8::from(wave32 && victory_shader::emit::wave64_double()) << 1)
-                        | (u8::from(wave32 && victory_shader::emit::wave64_console_flow()) << 2),
+                        | (u8::from(wave32 && victory_shader::emit::wave64_console_flow()) << 2)
+                        | (u8::from(victory_shader::emit::indirect_amplify_enabled()) << 3),
                 );
                 *blake3::hash(&bytes).as_bytes()
             }

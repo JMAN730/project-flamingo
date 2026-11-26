@@ -238,6 +238,43 @@ fn parse_loop_limit(value: Option<&str>) -> u32 {
     }
 }
 
+/// Parses `VICTORY_INDIRECT_AMPLIFY`: enabled by default; explicit `"0"`,
+/// `"false"`, `"no"`, or `"off"` (ASCII case-insensitive) disables the
+/// amplification stage for one-record indirect mesh draws.
+pub fn parse_indirect_amplify(value: Option<&std::ffi::OsStr>) -> bool {
+    let Some(value) = value else {
+        return true;
+    };
+    let Some(text) = value.to_str() else {
+        return true;
+    };
+    let trimmed = text.trim();
+    !(trimmed == "0"
+        || trimmed.eq_ignore_ascii_case("false")
+        || trimmed.eq_ignore_ascii_case("no")
+        || trimmed.eq_ignore_ascii_case("off"))
+}
+
+/// Whether one-record indirect mesh draws use our amplification stage
+/// (`VICTORY_INDIRECT_AMPLIFY`, on by default; `=0` disables).
+///
+/// Part of the translation: `victory-gpu`'s shader cache keys on it.
+pub fn indirect_amplify_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        parse_indirect_amplify(std::env::var_os("VICTORY_INDIRECT_AMPLIFY").as_deref())
+    })
+}
+
+/// The payload bytes mesh shaders declare: 4 when
+/// [`indirect_amplify_enabled`] (`VICTORY_INDIRECT_AMPLIFY=0` disables;
+/// `victory-gpu` puts an amplification stage of its own before them, whose
+/// payload is one word they do not read; the host wants the two sizes to
+/// agree), else 0.
+pub(crate) fn mesh_payload() -> u32 {
+    if indirect_amplify_enabled() { 4 } else { 0 }
+}
+
 /// A translated shader and what the host binds for it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostShader {
@@ -825,7 +862,21 @@ mod tests {
     #[cfg(windows)]
     use super::bitcode::Attr;
     use super::lower::LOOP_LIMIT;
-    use super::{parse_loop_limit, parse_shader_opt};
+    use super::{parse_indirect_amplify, parse_loop_limit, parse_shader_opt};
+
+    #[test]
+    fn the_indirect_amplify_switch_defaults_on_and_disables_with_zero() {
+        use std::ffi::OsStr;
+        assert!(parse_indirect_amplify(None));
+        assert!(parse_indirect_amplify(Some(OsStr::new("1"))));
+        assert!(parse_indirect_amplify(Some(OsStr::new("on"))));
+        assert!(parse_indirect_amplify(Some(OsStr::new(""))));
+        assert!(!parse_indirect_amplify(Some(OsStr::new("0"))));
+        assert!(!parse_indirect_amplify(Some(OsStr::new(" 0 "))));
+        assert!(!parse_indirect_amplify(Some(OsStr::new("false"))));
+        assert!(!parse_indirect_amplify(Some(OsStr::new("no"))));
+        assert!(!parse_indirect_amplify(Some(OsStr::new("off"))));
+    }
 
     #[test]
     fn fspx_modules_are_unsupported_not_missing_dxil() {

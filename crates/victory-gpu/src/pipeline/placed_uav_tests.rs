@@ -75,6 +75,8 @@ fn store_shader() -> Arc<Shader> {
     let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
     let io = io::raise(&p, &native).unwrap();
     let host = emit::emit(&c, &native, &p, &st, &io, &res).unwrap();
+    let does_store = super::stores(&native);
+    let addr_store = super::stores_by_address(&native);
     Arc::new(Shader {
         stage: "compute",
         hash: blake3::hash(&native.code).to_hex()[..16].to_owned(),
@@ -82,6 +84,8 @@ fn store_shader() -> Arc<Shader> {
         translated: OnceLock::from(Some(Translated {
             host,
             used: native.used,
+            stores: does_store,
+            address_stores: addr_store,
         })),
         wave64: OnceLock::new(),
     })
