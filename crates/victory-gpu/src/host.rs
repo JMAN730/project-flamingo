@@ -5409,6 +5409,15 @@ impl Host {
             };
             p.copy.reset();
             let list = &p.copy.list;
+            #[cfg(feature = "diagnostics")]
+            let plane_probes = composition
+                .filter(|_| crate::capture::plane_stats_wanted(frame))
+                .map(|((overlay, overlay_state, _), _)| {
+                    [
+                        crate::capture::probe_plane(&self.device, list, texture, state),
+                        crate::capture::probe_plane(&self.device, list, overlay, overlay_state),
+                    ]
+                });
             let capture_source =
                 if let Some(((overlay, overlay_state, extent), compositor)) = composition {
                     compositor.record(
@@ -5510,7 +5519,20 @@ impl Host {
             }
             p.meter.frame(p.hwnd);
             #[cfg(feature = "diagnostics")]
-            return probe.and_then(|b| crate::capture::black(&b));
+            {
+                let composite = probe.as_ref().and_then(crate::capture::grid_samples);
+                if let Some([primary, overlay]) = plane_probes {
+                    for (name, buffer) in [("primary", primary), ("overlay", overlay)] {
+                        crate::capture::report_grid(
+                            frame,
+                            name,
+                            buffer.as_ref().and_then(crate::capture::grid_samples),
+                        );
+                    }
+                    crate::capture::report_grid(frame, "composite", composite);
+                }
+                composite.map(crate::capture::note_presented)
+            }
             #[cfg(not(feature = "diagnostics"))]
             Some(false)
         }
