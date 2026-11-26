@@ -2624,11 +2624,8 @@ pub fn title_memory_alias_rebound(at: usize, len: usize) {
         return;
     }
     let (first, end) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
-    let mut g = guards();
-    let clean: Vec<usize> = g.clean.range(first..end).copied().collect();
-    for block in clean {
-        g.clean.remove(&block);
-    }
+    let _locked = GuardLockSet::lock_range(first, end);
+    DIR.set_bits_range(first, end, BitField::GuardClean, false, Ordering::SeqCst);
 }
 
 /// Coordinates in-place CPU reads of title memory with mapping changes.
