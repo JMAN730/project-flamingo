@@ -32,12 +32,26 @@ use crate::host::{HostList, host};
 use crate::watch::PAGE;
 
 /// Total VRAM bytes currently allocated to ReBAR (`D3D12_HEAP_TYPE_GPU_UPLOAD`)
-/// shadow buffers across live [`Shadow`] instances.
+/// registered shadow buffers across live [`Shadow`] instances.
 static REBAR_SHADOW_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Total VRAM bytes currently allocated to ReBAR (`D3D12_HEAP_TYPE_GPU_UPLOAD`)
+/// `LOOSE` window buffers across live [`Shadow`] instances.
+static REBAR_LOOSE_BYTES: AtomicU64 = AtomicU64::new(0);
 
 /// Monotonic identifier for each live [`Shadow`] host copy (used by indirect
 /// window and per-buffer gather gating to avoid pointer-reuse ABA).
 static NEXT_SHADOW_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Current ReBAR VRAM bytes reserved by live registered [`Shadow`]s.
+pub(crate) fn rebar_shadow_bytes() -> u64 {
+    REBAR_SHADOW_BYTES.load(Ordering::Relaxed)
+}
+
+/// Current ReBAR VRAM bytes reserved by live `LOOSE` window [`Shadow`]s.
+pub(crate) fn rebar_loose_bytes() -> u64 {
+    REBAR_LOOSE_BYTES.load(Ordering::Relaxed)
+}
 
 /// Atomically reserves `size` bytes from `budget`, returning `false` if doing
 /// so would exceed `budget`.
@@ -189,6 +203,7 @@ struct RebarHashes {
 /// copy-back only DMAs 64 KiB pieces whose GPU hash actually changed.
 struct RebarShadow {
     bytes: u64,
+    is_loose: bool,
     mirror: Mutex<Option<Vec<u8>>>,
     /// Leaf lock: never acquired while holding `mirror`, `pending`, or `copied`,
     /// and never held across D3D12 or kernel calls.
@@ -259,7 +274,11 @@ pub(crate) struct Shadow {
 impl Drop for Shadow {
     fn drop(&mut self) {
         if let Some(rebar) = &self.rebar {
-            REBAR_SHADOW_BYTES.fetch_sub(rebar.bytes, Ordering::Relaxed);
+            if rebar.is_loose {
+                REBAR_LOOSE_BYTES.fetch_sub(rebar.bytes, Ordering::Relaxed);
+            } else {
+                REBAR_SHADOW_BYTES.fetch_sub(rebar.bytes, Ordering::Relaxed);
+            }
         }
     }
 }
@@ -461,11 +480,27 @@ impl Shadow {
             before: Mutex::default(),
             rebar: rebar_bytes.map(|bytes| RebarShadow {
                 bytes,
+                is_loose: false,
                 mirror: Mutex::new(None),
                 hashes: Mutex::new(None),
             }),
             last_used: AtomicU64::new(0),
         }
+    }
+
+    fn new_loose(
+        buffer: ID3D12Resource,
+        data: *mut u8,
+        gpu: u64,
+        start: u64,
+        len: u64,
+        rebar_bytes: Option<u64>,
+    ) -> Shadow {
+        let mut shadow = Self::new(buffer, data, gpu, start, len, rebar_bytes);
+        if let Some(rebar) = &mut shadow.rebar {
+            rebar.is_loose = true;
+        }
+        shadow
     }
 
     /// Whether this copy lives in ReBAR (`D3D12_HEAP_TYPE_GPU_UPLOAD`) VRAM.
@@ -594,6 +629,28 @@ impl Shadow {
         unsafe { std::slice::from_raw_parts(self.data.add(start), end - start) }.to_vec()
     }
 
+    #[cfg(all(test, windows))]
+    pub(crate) fn new_rebar_for_test(
+        buffer: ID3D12Resource,
+        data: *mut u8,
+        gpu: u64,
+        start: u64,
+        len: u64,
+    ) -> Arc<Self> {
+        // Balance `Shadow::drop`'s `REBAR_SHADOW_BYTES` decrement even on unwind.
+        REBAR_SHADOW_BYTES.fetch_add(len, Ordering::Relaxed);
+        Arc::new(Self::new(buffer, data, gpu, start, len, Some(len)))
+    }
+
+    #[cfg(all(test, windows))]
+    pub(crate) fn has_pending(&self) -> bool {
+        !self
+            .pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty()
+    }
+
     /// `[address, address + len)` cut to the buffer, as offsets in the copy.
     pub(crate) fn inside(&self, address: usize, len: usize) -> (usize, usize) {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
@@ -630,12 +687,16 @@ impl Shadow {
     /// submission declares (the world declares overlapping views of its
     /// 174 MB heap dozens of times), in reused memory (fresh snapshots cost
     /// ~2.3 million page faults per world frame).
+    ///
+    /// Returns `false` if a ReBAR shadow's initial RAM mirror could not be read
+    /// back; in that case `pending` stays recorded so refreshes cannot overwrite
+    /// the range.
     pub(crate) fn writing(
         &self,
         address: usize,
         len: usize,
         rebar_init: impl FnOnce(&ID3D12Resource, u64) -> Option<Vec<u8>>,
-    ) {
+    ) -> bool {
         self.pending
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -645,7 +706,7 @@ impl Shadow {
             if mirror.is_none() {
                 *mirror = rebar_init(&self.buffer, self.len);
             }
-            return;
+            return mirror.is_some();
         }
         let (from, to) = self.inside(address, len);
         // SAFETY: inside the mapping (write-back system memory; ReBAR buffers
@@ -661,7 +722,7 @@ impl Shadow {
         if let Some((at, bytes)) = &*before
             && (*at, at + bytes.len()) == (start, end)
         {
-            return;
+            return true;
         }
         // Parts newly covered from the copy, the rest as it was taken.
         let mut grown = pooled(end - start);
@@ -675,9 +736,11 @@ impl Shadow {
             None => grown.extend_from_slice(host(start, end)),
         }
         *before = Some((start, grown));
+        true
     }
 
-    /// Clears pending UAV-write ranges for a ReBAR shadow if readback failed.
+    /// Clears pending UAV-write ranges for a ReBAR shadow once GPU hash-compare
+    /// proves no copy-back is needed (or declared spans are empty).
     pub(crate) fn clear_pending_rebar(&self) {
         self.pending
             .lock()
@@ -689,83 +752,96 @@ impl Shadow {
     /// bytes (`gpu_slices`, already DMAed into cached `READBACK` RAM) for
     /// sorted disjoint buffer-offset `spans` against the cached RAM mirror,
     /// without ever reading write-combining VRAM on the CPU.
-    pub(crate) fn copy_back_rebar(&self, spans: &[(usize, usize)], gpu_slices: &[&[u8]]) -> usize {
-        let Some(rebar) = &self.rebar else {
-            return 0;
-        };
+    ///
+    /// Returns `None` (without clearing `pending`) if the shadow is not
+    /// ReBAR-backed, its pre-submission mirror is missing, or `spans` and
+    /// `gpu_slices` do not match.
+    pub(crate) fn copy_back_rebar(
+        &self,
+        spans: &[(usize, usize)],
+        gpu_slices: &[&[u8]],
+    ) -> Option<usize> {
+        let rebar = self.rebar.as_ref()?;
+        if spans.len() != gpu_slices.len() {
+            return None;
+        }
         let mut mirror_guard = rebar.mirror.lock().unwrap_or_else(|e| e.into_inner());
+        let mirror = mirror_guard.as_mut()?;
+        for (&(from, to), &gpu_span) in spans.iter().zip(gpu_slices) {
+            if from > to || to > mirror.len() || gpu_span.len() != to - from {
+                return None;
+            }
+        }
         let mut written = 0;
         let mut vram_dirty: Vec<(usize, usize)> = Vec::new();
         let start = self.start as usize;
-        if let Some(mirror) = mirror_guard.as_mut() {
-            let mut title = None;
-            for (&(from, to), &gpu_span) in spans.iter().zip(gpu_slices) {
-                if from >= to || to > mirror.len() || gpu_span.len() != to - from {
-                    continue;
-                }
-                let mut synced = Vec::new();
-                let mut at = from;
-                while at < to {
-                    let n = (PAGE - (start + at) % PAGE).min(to - at);
-                    let gpu = &gpu_span[at - from..at - from + n];
-                    let old = &mut mirror[at..at + n];
-                    if gpu != old {
-                        let title_buf = &mut title.get_or_insert_with(|| vec![0u8; PAGE])[..n];
-                        if crate::host::read_into((start + at) as *const u8, title_buf) {
-                            let mut changed = false;
-                            let mut host_differs = false;
-                            for ((t, &g), o) in title_buf.iter_mut().zip(gpu).zip(old.iter_mut()) {
-                                if g != *o && *t != g {
-                                    *t = g;
-                                    changed = true;
-                                }
-                                if *t != g {
-                                    host_differs = true;
-                                }
-                                *o = *t;
+        let mut title = None;
+        for (&(from, to), &gpu_span) in spans.iter().zip(gpu_slices) {
+            if from == to {
+                continue;
+            }
+            let mut synced = Vec::new();
+            let mut at = from;
+            while at < to {
+                let n = (PAGE - (start + at) % PAGE).min(to - at);
+                let gpu = &gpu_span[at - from..at - from + n];
+                let old = &mut mirror[at..at + n];
+                if gpu != old {
+                    let title_buf = &mut title.get_or_insert_with(|| vec![0u8; PAGE])[..n];
+                    if crate::host::read_into((start + at) as *const u8, title_buf) {
+                        let mut changed = false;
+                        let mut host_differs = false;
+                        for ((t, &g), o) in title_buf.iter_mut().zip(gpu).zip(old.iter_mut()) {
+                            if g != *o && *t != g {
+                                *t = g;
+                                changed = true;
                             }
-                            if changed {
-                                crate::watch::writing(start + at, n);
-                                crate::host::write_mapped(
-                                    (start + at) as *mut u8,
+                            if *t != g {
+                                host_differs = true;
+                            }
+                            *o = *t;
+                        }
+                        if changed {
+                            crate::watch::writing(start + at, n);
+                            crate::host::write_mapped(
+                                (start + at) as *mut u8,
+                                title_buf.as_ptr(),
+                                n,
+                            );
+                            written += n;
+                        }
+                        if host_differs {
+                            // Only push back to WC VRAM when a concurrent CPU
+                            // write altered bytes in the same page; record the
+                            // range so its GPU piece hash is refreshed next.
+                            // SAFETY: `at + n <= self.len`, write-only WC store.
+                            unsafe {
+                                std::ptr::copy_nonoverlapping(
                                     title_buf.as_ptr(),
+                                    self.data.add(at),
                                     n,
                                 );
-                                written += n;
                             }
-                            if host_differs {
-                                // Only push back to WC VRAM when a concurrent CPU
-                                // write altered bytes in the same page; record the
-                                // range so its GPU piece hash is refreshed next.
-                                // SAFETY: `at + n <= self.len`, write-only WC store.
-                                unsafe {
-                                    std::ptr::copy_nonoverlapping(
-                                        title_buf.as_ptr(),
-                                        self.data.add(at),
-                                        n,
-                                    );
-                                }
-                                vram_dirty.push((at, n));
-                            }
-                            synced.push((start + at) / PAGE);
-                        } else {
-                            // Unmapped in title memory: VRAM holds `gpu`, keep mirror in sync.
-                            old.copy_from_slice(gpu);
+                            vram_dirty.push((at, n));
                         }
+                        synced.push((start + at) / PAGE);
+                    } else {
+                        // Unmapped in title memory: VRAM holds `gpu`, keep mirror in sync.
+                        old.copy_from_slice(gpu);
                     }
-                    at += n;
                 }
-                let (first, last) = ((start + from).div_ceil(PAGE), (start + to) / PAGE);
-                if first < last
-                    && !synced.is_empty()
-                    && self.watched.load(Ordering::Relaxed) != NOT_WATCHED
-                    && let Some((now, _)) = crate::watch::writes(first * PAGE, last * PAGE, true)
-                {
-                    let base = start / PAGE;
-                    let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-                    for page in synced.into_iter().filter(|p| (first..last).contains(p)) {
-                        copied[page - base] = now;
-                    }
+                at += n;
+            }
+            let (first, last) = ((start + from).div_ceil(PAGE), (start + to) / PAGE);
+            if first < last
+                && !synced.is_empty()
+                && self.watched.load(Ordering::Relaxed) != NOT_WATCHED
+                && let Some((now, _)) = crate::watch::writes(first * PAGE, last * PAGE, true)
+            {
+                let base = start / PAGE;
+                let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+                for page in synced.into_iter().filter(|p| (first..last).contains(p)) {
+                    copied[page - base] = now;
                 }
             }
         }
@@ -777,7 +853,7 @@ impl Shadow {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
-        written
+        Some(written)
     }
 
     /// After the submission ran: copies the bytes its shaders wrote back
@@ -1573,20 +1649,43 @@ pub(crate) fn unregister(resource: usize, start: u64) {
     }
 }
 
+/// Reserves `size` bytes against `used` up to `budget` and allocates a ReBAR
+/// buffer, rolling back the reservation if D3D12 allocation fails.
+fn try_alloc_rebar_in(
+    used: &AtomicU64,
+    size: u64,
+    budget: u64,
+) -> Option<(ID3D12Resource, *mut u8, u64)> {
+    let h = host()?;
+    if try_reserve_rebar(used, size, budget) {
+        if let Some((buffer, data)) = h.try_rebar_shadow_buffer(size) {
+            return Some((buffer, data, size));
+        }
+        used.fetch_sub(size, Ordering::Relaxed);
+    }
+    None
+}
+
 /// Allocates a shadow backing buffer: prefers ReBAR (`D3D12_HEAP_TYPE_GPU_UPLOAD`)
 /// VRAM within the adapter's budget, falling back cleanly to system-RAM
 /// [`Host::shared_buffer`] when ReBAR is unavailable, disabled, or full.
 fn alloc_shadow_buffer(size: u64) -> Option<(ID3D12Resource, *mut u8, Option<u64>)> {
     let h = host()?;
-    let budget = h.rebar_shadow_budget();
-    if try_reserve_rebar(&REBAR_SHADOW_BYTES, size, budget) {
-        if let Some((buffer, data)) = h.try_rebar_shadow_buffer(size) {
-            return Some((buffer, data, Some(size)));
-        }
-        REBAR_SHADOW_BYTES.fetch_sub(size, Ordering::Relaxed);
+    if let Some((buffer, data, bytes)) =
+        try_alloc_rebar_in(&REBAR_SHADOW_BYTES, size, h.rebar_shadow_budget())
+    {
+        return Some((buffer, data, Some(bytes)));
     }
     let (buffer, data) = h.shared_buffer(size)?;
     Some((buffer, data, None))
+}
+
+/// Allocates a ReBAR (`D3D12_HEAP_TYPE_GPU_UPLOAD`) backing buffer for a
+/// `LOOSE` window from the dedicated [`REBAR_LOOSE_BYTES`] budget so `LOOSE`
+/// windows never starve registered `BUFFERS` out of [`REBAR_SHADOW_BYTES`].
+fn alloc_loose_rebar(size: u64) -> Option<(ID3D12Resource, *mut u8, u64)> {
+    let h = host()?;
+    try_alloc_rebar_in(&REBAR_LOOSE_BYTES, size, h.rebar_loose_budget())
 }
 
 /// The copy of the innermost title buffer holding `[address, address +
@@ -1934,18 +2033,38 @@ fn loose_in(
             shadow.touch();
             return Some(shadow.clone());
         }
-        // Keep unbounded loose 4 MiB windows in system memory so they cannot
-        // starve registered title buffers out of the bounded ReBAR budget.
-        let (buffer, data) = host()?.shared_buffer(len)?;
-        crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
+        // Prefer ReBAR VRAM from the dedicated `LOOSE` budget (read-only
+        // windows keep zero duplicate RAM mirror/hashes) and fall back to
+        // system memory when ReBAR is unavailable, disabled, or full.
+        let (buffer, data, rebar_bytes) = match alloc_loose_rebar(len) {
+            Some((buffer, data, rebar_bytes)) => {
+                crate::host::name(&buffer, || {
+                    format!("title memory {start:#x}+{len:#x} (ReBAR loose)")
+                });
+                (buffer, data, Some(rebar_bytes))
+            }
+            None => {
+                let (buffer, data) = host()?.shared_buffer(len)?;
+                crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
+                (buffer, data, None)
+            }
+        };
         // SAFETY: a live buffer.
         let gpu = unsafe { buffer.GetGPUVirtualAddress() };
         tracing::debug!(
             start = format_args!("{start:#x}"),
             len,
+            rebar = rebar_bytes.is_some(),
             "loose memory copied to the host"
         );
-        let shadow = Arc::new(Shadow::new(buffer, data, gpu, start, len, None));
+        let shadow = Arc::new(Shadow::new_loose(
+            buffer,
+            data,
+            gpu,
+            start,
+            len,
+            rebar_bytes,
+        ));
         shadow.touch();
         guard.entries.insert(key, shadow.clone());
         guard.total_bytes = guard.total_bytes.saturating_add(len);
@@ -1999,6 +2118,16 @@ pub(crate) fn near(va: u64) -> String {
         ));
     }
     text
+}
+
+/// Serializes ReBAR GPU tests that share the process-wide `Host` hash stats
+/// and `REBAR_SHADOW_BYTES` / `REBAR_LOOSE_BYTES` counters.
+#[cfg(all(test, windows))]
+static REBAR_GPU_TEST: Mutex<()> = Mutex::new(());
+
+#[cfg(all(test, windows))]
+pub(crate) fn lock_rebar_gpu_test() -> std::sync::MutexGuard<'static, ()> {
+    REBAR_GPU_TEST.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 #[cfg(test)]
@@ -2235,6 +2364,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn unregister_drops_shadow_immediately_when_idle() {
+        let _rebar = lock_rebar_gpu_test();
         let _retire = crate::host::isolated_retire_scope();
         if host().is_none() {
             return;
@@ -2255,6 +2385,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn bytes_reads_the_copy_inside_the_buffer_only() {
+        let _rebar = lock_rebar_gpu_test();
         let _retire = crate::host::isolated_retire_scope();
         if host().is_none() {
             return;
@@ -2284,6 +2415,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn unregister_retires_shadow_until_active_epoch_finishes() {
+        let _rebar = lock_rebar_gpu_test();
         let _retire = crate::host::isolated_retire_scope();
         let Some(host) = host() else {
             return;
@@ -2316,6 +2448,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn unregister_drops_new_shadow_despite_older_pinned_list() {
+        let _rebar = lock_rebar_gpu_test();
         let _retire = crate::host::isolated_retire_scope();
         let Some(host) = host() else {
             return;
@@ -2356,16 +2489,208 @@ mod tests {
         assert_eq!(used.load(Ordering::Relaxed), 1024);
     }
 
-    /// Serializes ReBAR GPU tests that share the process-wide `Host` hash stats.
     #[cfg(windows)]
-    static REBAR_GPU_TEST: Mutex<()> = Mutex::new(());
+    #[test]
+    fn rebar_loose_budget_is_isolated_and_releases_on_drop() {
+        let _rebar = REBAR_GPU_TEST.lock().unwrap_or_else(|e| e.into_inner());
+        let _retire = crate::host::isolated_retire_scope();
+        let Some(h) = host() else {
+            return;
+        };
+        let before_shadow = rebar_shadow_bytes();
+        let before_loose = rebar_loose_bytes();
+
+        // Verify drop accounting isolates `REBAR_LOOSE_BYTES` from `REBAR_SHADOW_BYTES`.
+        let (buf_a, ptr_a) = h.shared_buffer(4096).expect("shared_buffer a");
+        let (buf_b, ptr_b) = h.shared_buffer(4096).expect("shared_buffer b");
+        // SAFETY: live D3D12 buffers.
+        let gpu_a = unsafe { buf_a.GetGPUVirtualAddress() };
+        // SAFETY: live D3D12 buffers.
+        let gpu_b = unsafe { buf_b.GetGPUVirtualAddress() };
+
+        assert!(try_reserve_rebar(
+            &REBAR_LOOSE_BYTES,
+            4096,
+            before_loose + 4096
+        ));
+        assert_eq!(rebar_loose_bytes(), before_loose + 4096);
+        assert_eq!(rebar_shadow_bytes(), before_shadow);
+
+        let loose_shadow = Shadow::new_loose(buf_a, ptr_a, gpu_a, 0x2000_0000, 4096, Some(4096));
+        assert!(loose_shadow.is_rebar());
+        assert!(loose_shadow.rebar.as_ref().is_some_and(|r| r.is_loose));
+
+        assert!(try_reserve_rebar(
+            &REBAR_SHADOW_BYTES,
+            8192,
+            before_shadow + 8192
+        ));
+        let reg_shadow = Shadow::new(buf_b, ptr_b, gpu_b, 0x3000_0000, 8192, Some(8192));
+        assert!(reg_shadow.is_rebar());
+        assert!(reg_shadow.rebar.as_ref().is_some_and(|r| !r.is_loose));
+        assert_eq!(rebar_loose_bytes(), before_loose + 4096);
+        assert_eq!(rebar_shadow_bytes(), before_shadow + 8192);
+
+        drop(loose_shadow);
+        assert_eq!(rebar_loose_bytes(), before_loose);
+        assert_eq!(rebar_shadow_bytes(), before_shadow + 8192);
+
+        drop(reg_shadow);
+        assert_eq!(rebar_loose_bytes(), before_loose);
+        assert_eq!(rebar_shadow_bytes(), before_shadow);
+
+        // Exercise live `loose_in` allocation and eviction under the host's ReBAR loose budget.
+        // Because `try_rebar_shadow_buffer` can still fall back to shared memory under VRAM
+        // pressure or D3D12 allocation failure, derive per-window counter expectations from
+        // the backend each `loose_in` call actually returned.
+        let check_window = |shadow: &Shadow| -> bool {
+            let is_rebar = shadow.is_rebar();
+            if is_rebar {
+                let r = shadow.rebar.as_ref().expect("rebar state");
+                assert!(r.is_loose);
+                assert!(r.mirror.lock().unwrap().is_none());
+                assert!(r.hashes.lock().unwrap().is_none());
+                assert_eq!(rebar_loose_bytes(), before_loose + WINDOW);
+            } else {
+                assert!(shadow.rebar.is_none());
+                assert_eq!(rebar_loose_bytes(), before_loose);
+            }
+            assert_eq!(rebar_shadow_bytes(), before_shadow);
+            is_rebar
+        };
+
+        let cache = RwLock::new(LooseCache::new());
+        let base = 0x2000_0000_0000_u64;
+        let avail_loose = h.rebar_loose_budget().saturating_sub(before_loose);
+        if avail_loose >= WINDOW {
+            let s0 = loose_in(&cache, base, base + 64, WINDOW).expect("loose win 0");
+            let s0_rebar = check_window(&s0);
+            drop(s0);
+
+            // Inserting a second window evicts the first idle window and releases its ReBAR bytes.
+            // Because `loose_in` reserves ReBAR before eviction runs, `s1` cannot acquire ReBAR
+            // when `s0` already consumed the only available window in the loose budget (e.g.
+            // `VICTORY_REBAR_LOOSE_MB=4`); evicting `s0` returns `rebar_loose_bytes()` to
+            // `before_loose`.
+            let s1 =
+                loose_in(&cache, base + WINDOW, base + WINDOW + 64, WINDOW).expect("loose win 1");
+            if s0_rebar && avail_loose < 2 * WINDOW {
+                assert!(
+                    !s1.is_rebar(),
+                    "single-window loose budget must reject concurrent second ReBAR reservation"
+                );
+            }
+            let s1_rebar = check_window(&s1);
+            drop(s1);
+            if !s1_rebar {
+                // Evicting `s0` freed any single-window ReBAR reservation, so a third window can
+                // reserve ReBAR again when VRAM headroom permits.
+                let s2 = loose_in(&cache, base + 2 * WINDOW, base + 2 * WINDOW + 64, WINDOW)
+                    .expect("loose win 2");
+                let _ = check_window(&s2);
+                drop(s2);
+            }
+            drop(cache);
+            assert_eq!(rebar_loose_bytes(), before_loose);
+            assert_eq!(rebar_shadow_bytes(), before_shadow);
+        } else {
+            // Opt-out (`VICTORY_REBAR_LOOSE_MB=0`) or insufficient remaining loose budget:
+            // `loose_in` cleanly falls back to system RAM with zero ReBAR loose accounting.
+            let s0 = loose_in(&cache, base, base + 64, WINDOW).expect("loose win fallback");
+            assert!(!s0.is_rebar());
+            let _ = check_window(&s0);
+            drop(s0);
+            drop(cache);
+            assert_eq!(rebar_loose_bytes(), before_loose);
+            assert_eq!(rebar_shadow_bytes(), before_shadow);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn rebar_mark_dirty_spans_restores_failed_readback_pieces() {
+        let _rebar = lock_rebar_gpu_test();
+        let _retire = crate::host::isolated_retire_scope();
+        let Some(h) = host() else {
+            return;
+        };
+        let len = (3 * PAGE) as u64;
+        let (buf, ptr) = h.shared_buffer(len).expect("shared buffer");
+        // SAFETY: live D3D12 buffer.
+        let gpu = unsafe { buf.GetGPUVirtualAddress() };
+        let shadow = Shadow::new_rebar_for_test(buf, ptr, gpu, 0x4000_0000, len);
+        // Seed mirror so `prepare_rebar_hashes` initializes the hash UAV & dirty bitset.
+        assert!(shadow.writing(0x4000_0000, PAGE, |_, n| Some(vec![0u8; n as usize])));
+        let initial = shadow
+            .prepare_rebar_hashes(|n| h.default_buffer(n))
+            .expect("initial rebar hashes");
+        assert_eq!(initial.pre_runs, vec![(0, 3)]);
+        let clean = shadow
+            .prepare_rebar_hashes(|n| h.default_buffer(n))
+            .expect("clean rebar hashes");
+        assert!(clean.pre_runs.is_empty());
+
+        // Simulate readback failure restoring dirty spans across piece 0 and piece 2.
+        shadow.mark_rebar_dirty_spans(&[(16, 64), (2 * PAGE + 8, 2 * PAGE + 32)]);
+        let restored = shadow
+            .prepare_rebar_hashes(|n| h.default_buffer(n))
+            .expect("restored rebar hashes");
+        assert_eq!(restored.pre_runs, vec![(0, 1), (2, 1)]);
+        shadow.clear_pending_rebar();
+        drop(shadow);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn rebar_failed_copy_back_keeps_pending_and_preserves_gpu_bytes_on_refresh() {
+        let _rebar = lock_rebar_gpu_test();
+        let _retire = crate::host::isolated_retire_scope();
+        let Some(h) = host() else {
+            return;
+        };
+        let title = vec![0x11u8; 4096];
+        let start = title.as_ptr() as u64;
+        let len = title.len() as u64;
+        let (buf, ptr) = h.shared_buffer(len).expect("shared buffer");
+        // SAFETY: live D3D12 buffer.
+        let gpu = unsafe { buf.GetGPUVirtualAddress() };
+        let shadow = Shadow::new_rebar_for_test(buf, ptr, gpu, start, len);
+        // Simulate an unwatched buffer whose GPU bytes were written to `[64..128)`.
+        shadow.watched.store(NOT_WATCHED, Ordering::Relaxed);
+        // SAFETY: `ptr` is mapped for `len` bytes of shared RAM in this test.
+        unsafe {
+            std::ptr::write_bytes(ptr, 0x22, len as usize);
+            std::ptr::write_bytes(ptr.add(64), 0xAA, 64);
+        }
+
+        // If initial mirror readback fails, `writing` returns `false`, `copy_back_rebar`
+        // returns `None`, and `pending` stays intact so a later unwatched refresh does
+        // not overwrite `[64..128)` with stale title bytes (`0x11`).
+        assert!(!shadow.writing(start as usize + 64, 64, |_, _| None));
+        assert!(shadow.has_pending());
+        assert!(
+            shadow
+                .copy_back_rebar(&[(64, 128)], &[&[0xAA; 64]])
+                .is_none()
+        );
+        assert!(shadow.has_pending());
+
+        shadow.update(start as usize, len as usize);
+        let bytes = shadow.read_test_bytes(start, len as usize);
+        assert!(bytes[..64].iter().all(|&b| b == 0x11));
+        assert!(
+            bytes[64..128].iter().all(|&b| b == 0xAA),
+            "pending GPU result must survive unwatched refresh when copy-back failed"
+        );
+        assert!(bytes[128..].iter().all(|&b| b == 0x11));
+    }
 
     #[cfg(windows)]
     #[test]
     fn rebar_shadow_gpu_write_round_trips_and_preserves_concurrent_cpu_writes() {
         use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATE_COPY_DEST;
 
-        let _rebar = REBAR_GPU_TEST.lock().unwrap_or_else(|e| e.into_inner());
+        let _rebar = lock_rebar_gpu_test();
         let _retire = crate::host::isolated_retire_scope();
         let Some(h) = host() else {
             return;
@@ -2646,6 +2971,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn concurrent_find_reads_share_the_same_shadow_under_rwlock() {
+        let _rebar = lock_rebar_gpu_test();
         let _retire = crate::host::isolated_retire_scope();
         if host().is_none() {
             return;
@@ -2706,6 +3032,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn loose_evicts_lru_idle_windows_over_budget_and_skips_in_use_or_pending() {
+        let _rebar = lock_rebar_gpu_test();
         let _retire = crate::host::isolated_retire_scope();
         let Some(host) = host() else {
             return;
