@@ -359,6 +359,20 @@ impl Shadow {
         Some(unsafe { std::slice::from_raw_parts(self.data.add(at), len) })
     }
 
+    /// Clamps `[address, address + len)` to this copy's title-address span,
+    /// returning `None` if the intersection is empty.
+    #[inline]
+    pub(crate) fn clamp_range(&self, address: u64, len: u64) -> Option<(u64, u64)> {
+        let from = address.max(self.start);
+        let clamped = range_inside(
+            from,
+            len.saturating_sub(from.saturating_sub(address)),
+            self.start,
+            self.len,
+        );
+        (clamped > 0).then_some((from, clamped))
+    }
+
     /// Brings `len` bytes at `address` up to date when `list` is submitted,
     /// and keeps the copy alive until the list is reset. Cut to the copy.
     pub(crate) fn refresh(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
@@ -375,16 +389,9 @@ impl Shadow {
         access: D3D12_RESOURCE_STATES,
     ) {
         list.use_shadow(&self.buffer, access);
-        let from = address.max(self.start);
-        let len = range_inside(
-            from,
-            len.saturating_sub(from.saturating_sub(address)),
-            self.start,
-            self.len,
-        );
-        if len == 0 {
+        let Some((from, len)) = self.clamp_range(address, len) else {
             return;
-        }
+        };
         list.defer_refresh(self, from as usize, len as usize);
     }
 

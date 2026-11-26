@@ -336,12 +336,20 @@ pub(crate) fn ready(
     const WRITE: usize = usize::MAX - 0x6e;
     let first_read = list.first_use(READ);
     let first_write = writes && list.first_use(WRITE);
-    for (n, shadow) in m.copies.iter().enumerate() {
-        let (start, len) = shadow.span();
-        if first_read || n >= numbered {
-            shadow.refresh_as(list, start, len, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-        }
-        if writes && (first_write || n >= numbered) {
+    let refresh_from = if first_read { 0 } else { numbered };
+    if refresh_from < m.copies.len() {
+        list.defer_refresh_batch(
+            m.copies.len() - refresh_from,
+            m.copies[refresh_from..].iter().map(|shadow| {
+                let (start, len) = shadow.span();
+                (shadow, start, len, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)
+            }),
+        );
+    }
+    if writes {
+        let write_from = if first_write { 0 } else { numbered };
+        for shadow in &m.copies[write_from..] {
+            let (start, len) = shadow.span();
             shadow.gpu_writes(list, start, len);
         }
     }
@@ -397,5 +405,47 @@ mod tests {
         assert_eq!(DIRECTORY_SLOT_OFFSET, COPIES + 1);
         assert_eq!(FAULTS_SLOT_OFFSET, COPIES + 2);
         assert_eq!(HEAP_SLOTS, FAULTS_SLOT_OFFSET + 1);
+    }
+
+    #[test]
+    fn defer_refresh_batch_refreshes_and_deduplicates_multiple_shadows() {
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let mut buf_a = vec![0x11u8; 4096];
+        let mut buf_b = vec![0x22u8; 4096];
+        let addr_a = buf_a.as_ptr() as u64;
+        let addr_b = buf_b.as_ptr() as u64;
+        crate::shadow::register(addr_a as usize, addr_a, buf_a.len() as u64);
+        crate::shadow::register(addr_b as usize, addr_b, buf_b.len() as u64);
+
+        let shadow_a = crate::shadow::find(addr_a, 256).expect("shadow A");
+        let shadow_b = crate::shadow::find(addr_b, 256).expect("shadow B");
+
+        buf_a[..64].fill(0xA5);
+        buf_b[..64].fill(0x5A);
+
+        let list = host.new_list().expect("host list");
+        // Include duplicate range and mixed SRV/UAV state transition on shadow A.
+        list.defer_refresh_batch(
+            3,
+            [
+                (&shadow_a, addr_a, 64, D3D12_RESOURCE_STATE_GENERIC_READ),
+                (&shadow_a, addr_a, 64, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+                (&shadow_b, addr_b, 64, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+            ],
+        );
+        list.close();
+        host.execute(&[&list]);
+
+        assert_eq!(shadow_a.bytes(addr_a, 64).expect("mapped A"), &[0xA5; 64]);
+        assert_eq!(shadow_b.bytes(addr_b, 64).expect("mapped B"), &[0x5A; 64]);
+        // SAFETY: plain device health query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+
+        drop(shadow_a);
+        drop(shadow_b);
+        crate::shadow::unregister(addr_a as usize, addr_a);
+        crate::shadow::unregister(addr_b as usize, addr_b);
     }
 }
