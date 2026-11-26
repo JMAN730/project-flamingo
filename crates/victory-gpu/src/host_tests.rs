@@ -2172,4 +2172,333 @@ mod relay_tests {
         }
         crate::shadow::unregister(resource, start);
     }
+
+    #[test]
+    fn rehash_runs_defaults_on_and_honors_zero_override() {
+        assert!(relay::rehash_runs_enabled(None));
+        assert!(relay::rehash_runs_enabled(Some("1")));
+        assert!(!relay::rehash_runs_enabled(Some("0")));
+    }
+
+    #[test]
+    fn wide_merge_is_default_on_multicore_and_respects_disable() {
+        assert!(relay::wide_merge_enabled(None, Some(4)));
+        assert!(relay::wide_merge_enabled(None, Some(16)));
+        assert!(!relay::wide_merge_enabled(None, Some(2)));
+        assert!(!relay::wide_merge_enabled(None, None));
+        assert!(relay::wide_merge_enabled(Some("1"), Some(1)));
+        assert!(!relay::wide_merge_enabled(Some("0"), Some(16)));
+        assert!(relay::wide_merge_enabled(Some("auto"), Some(4)));
+    }
+
+    #[test]
+    fn wide_relay_card_merge_matches_sequential_across_pieces_and_shadows() {
+        use crate::shadow::Shadow;
+        const PIECE: usize = 64 << 10;
+
+        type MergeCaseOut = (usize, Vec<Vec<u8>>, Vec<Vec<u8>>);
+        type ShadowSpec = (usize, Vec<(usize, usize)>, Vec<(usize, usize, u64)>);
+
+        let run_case = |parallel: bool| -> Option<MergeCaseOut> {
+            // 3 card shadows:
+            // - Shadow 0: 24 pieces (1.5 MiB) -> tests partitioning one large shadow across workers (>= 16 pieces).
+            // - Shadow 1: 4 pieces (256 KiB) with dirty & sent ranges + overlapping plan-ordered pieces.
+            // - Shadow 2: 2 pieces (128 KiB) with unchanged and sparsely modified pieces.
+            let specs: &[ShadowSpec] = &[
+                (
+                    24 * PIECE,
+                    vec![],
+                    vec![(3 * PIECE + 128, 3 * PIECE + 256, 11)],
+                ),
+                (
+                    4 * PIECE,
+                    vec![(PIECE + 64, PIECE + 192)],
+                    vec![(16, 48, 8), (2 * PIECE + 32, 2 * PIECE + 96, 6)],
+                ),
+                (2 * PIECE, vec![], vec![]),
+            ];
+
+            let mut titles: Vec<Vec<u8>> = Vec::new();
+            let mut sides: Vec<Vec<u8>> = Vec::new();
+            let mut shadows: Vec<std::sync::Arc<Shadow>> = Vec::new();
+            for (s_idx, (len, dirty, sent)) in specs.iter().enumerate() {
+                let base: Vec<u8> = (0..*len)
+                    .map(|i| (((s_idx + 1) * 31 + i * 13 + (i >> 8)) & 0xff) as u8)
+                    .collect();
+                let mut title = base.clone();
+                let mut side = base;
+                // Simulate newer title CPU writes already staged into `side` for dirty/later-sent ranges.
+                for &(a, b) in dirty {
+                    for byte in &mut title[a..b] {
+                        *byte ^= 0x55;
+                    }
+                    side[a..b].copy_from_slice(&title[a..b]);
+                }
+                for &(a, b, send_no) in sent {
+                    if send_no > 6 {
+                        for byte in &mut title[a..b] {
+                            *byte ^= 0x33;
+                        }
+                        side[a..b].copy_from_slice(&title[a..b]);
+                    }
+                }
+                let shadow = Shadow::new_card_for_test(
+                    side.as_mut_ptr(),
+                    title.as_ptr() as u64,
+                    *len as u64,
+                    dirty.clone(),
+                    sent.clone(),
+                )?;
+                titles.push(title);
+                sides.push(side);
+                shadows.push(shadow);
+            }
+
+            // Build fetched GPU buffers (owned here until `relay_merge_card_pieces` returns).
+            let mut gpu_bufs: Vec<Vec<u8>> = Vec::new();
+            let mut meta: Vec<(usize, usize, usize, u64)> = Vec::new();
+
+            // Shadow 0: 24 disjoint pieces (even pieces modified by GPU, odd pieces unchanged except piece 3).
+            for p in 0..24usize {
+                let lo = p * PIECE;
+                let hi = lo + PIECE;
+                let mut buf = sides[0][lo..hi].to_vec();
+                if p % 2 == 0 {
+                    let start = 17 + (p * 19) % 512;
+                    let len = 1024 + p * 37;
+                    for b in &mut buf[start..start + len] {
+                        *b ^= 0xA7;
+                    }
+                }
+                if p == 3 {
+                    // Card holds pre-send-11 bytes in [128..256), plus a real GPU write at [400..500).
+                    for byte in &mut buf[128..256] {
+                        *byte ^= 0x33;
+                    }
+                    for b in &mut buf[400..500] {
+                        *b ^= 0xC9;
+                    }
+                }
+                gpu_bufs.push(buf);
+                meta.push((0, lo, hi, 10));
+            }
+
+            // Shadow 1:
+            // - Piece 0: two overlapping plans in order (plan 1 after=7, plan 2 after=9) to verify order preservation.
+            // - Piece 1: overlaps `dirty` [64..192) + GPU write at [300..420).
+            // - Piece 2: sent at 6 <= after (10), GPU writes at [10..120).
+            {
+                let mut p0_plan1 = sides[1][0..PIECE].to_vec();
+                // Pre-send-8 bytes at [16..48), GPU write from plan 1 at [100..200).
+                for byte in &mut p0_plan1[16..48] {
+                    *byte ^= 0x33;
+                }
+                for b in &mut p0_plan1[100..200] {
+                    *b = 0x11;
+                }
+                gpu_bufs.push(p0_plan1);
+                meta.push((1, 0, PIECE, 7));
+
+                let mut p0_plan2 = sides[1][0..PIECE].to_vec();
+                // Plan 2 ran after send 8 (`after=9`), and overwrote [120..240) with 0x22.
+                for b in &mut p0_plan2[120..240] {
+                    *b = 0x22;
+                }
+                gpu_bufs.push(p0_plan2);
+                meta.push((1, 0, PIECE, 9));
+
+                let mut p1 = sides[1][PIECE..2 * PIECE].to_vec();
+                for byte in &mut p1[64..192] {
+                    *byte ^= 0x55; // stale card bytes before dirty send
+                }
+                for b in &mut p1[300..420] {
+                    *b ^= 0x6D;
+                }
+                gpu_bufs.push(p1);
+                meta.push((1, PIECE, 2 * PIECE, 10));
+
+                let mut p2 = sides[1][2 * PIECE..3 * PIECE].to_vec();
+                for b in &mut p2[10..120] {
+                    *b ^= 0x8E;
+                }
+                gpu_bufs.push(p2);
+                meta.push((1, 2 * PIECE, 3 * PIECE, 10));
+            }
+
+            // Shadow 2: 1 unchanged piece + 1 sparse-diff piece.
+            {
+                gpu_bufs.push(sides[2][0..PIECE].to_vec());
+                meta.push((2, 0, PIECE, 10));
+                let mut p1 = sides[2][PIECE..2 * PIECE].to_vec();
+                p1[511] ^= 0xF0;
+                p1[PIECE - 7] ^= 0x0F;
+                gpu_bufs.push(p1);
+                meta.push((2, PIECE, 2 * PIECE, 10));
+            }
+
+            let pieces: Vec<relay::RelayCardPiece> = meta
+                .into_iter()
+                .zip(gpu_bufs.iter())
+                .map(|((s_idx, lo, hi, after), buf)| relay::RelayCardPiece {
+                    shadow: shadows[s_idx].clone(),
+                    lo,
+                    hi,
+                    gpu_ptr: buf.as_ptr() as usize,
+                    after,
+                })
+                .collect();
+
+            let written = relay::relay_merge_card_pieces(pieces, parallel);
+            drop(shadows);
+            Some((written, titles, sides))
+        };
+
+        let Some((seq_written, seq_titles, seq_sides)) =
+            run_case(relay::wide_merge_enabled(Some("0"), Some(16)))
+        else {
+            return;
+        };
+        let Some((par_written, par_titles, par_sides)) =
+            run_case(relay::wide_merge_enabled(None, Some(16)))
+        else {
+            return;
+        };
+
+        assert!(seq_written > 0, "expected non-zero merged bytes");
+        assert_eq!(
+            par_written, seq_written,
+            "parallel written byte count must match sequential"
+        );
+        assert_eq!(
+            par_titles, seq_titles,
+            "parallel merged title memory must match sequential"
+        );
+        assert_eq!(
+            par_sides, seq_sides,
+            "parallel merged CPU staging must match sequential"
+        );
+        // Verify plan 2's newer overlapping write won over plan 1's older write on Shadow 1 piece 0.
+        assert!(par_titles[1][120..240].iter().all(|&b| b == 0x22));
+    }
+
+    /// Multi-threaded lock-order stress test verifying that:
+    /// 1. `HostList::run_deferred` releases `list.deferred()` before running steps
+    ///    (so a step that waits on `LINE_LANDED` — such as `batch.flush()` ->
+    ///    `Shadow::update_busy()` -> `settle_card_busy()` — never deadlocks with
+    ///    `Host::relay_land`'s `read_backs(list)` acquiring `list.deferred()`),
+    ///    and restores `deferred.copies` after completion.
+    /// 2. Parallel `relay_merge_card_pieces(..., true)` across `victory-wide`
+    ///    workers runs concurrently with `copy_back_done` -> `LINE` -> `LINE_LANDED`
+    ///    without deadlocking or leaving stale pending ranges visible to waiters.
+    #[test]
+    fn relay_merge_wide_and_run_deferred_lock_order_stress() {
+        use std::sync::{Arc, Condvar};
+        const PIECE: usize = 64 << 10;
+        const PIECES: usize = 16;
+        const LEN: usize = PIECES * PIECE;
+
+        let _retire = isolated_retire_scope();
+        let Some(host) = host() else { return };
+
+        let title = vec![0x10u8; LEN];
+        let mut side = vec![0x10u8; LEN];
+        let title_addr = title.as_ptr() as usize;
+        let Some(shadow) = crate::shadow::Shadow::new_card_for_test(
+            side.as_mut_ptr(),
+            title_addr as u64,
+            LEN as u64,
+            Vec::new(),
+            Vec::new(),
+        ) else {
+            return;
+        };
+
+        let list = Arc::new(host.new_list().expect("host list"));
+        let line = Arc::new(Mutex::new(relay::Line::new_for_test()));
+        let landed = Arc::new(Condvar::new());
+        let step_entered = Arc::new((Mutex::new(false), Condvar::new()));
+
+        let line_step = line.clone();
+        let landed_step = landed.clone();
+        let entered_step = step_entered.clone();
+        list.defer(move || {
+            {
+                let mut e = entered_step.0.lock().unwrap();
+                *e = true;
+                entered_step.1.notify_all();
+            }
+            // Mirrors `settle_card_busy` waiting on `LINE_LANDED` from inside `run_deferred`.
+            let waited =
+                relay::wait_on_line(&line_step, &landed_step, relay::WHY_STALE, false, |l| {
+                    !l.settling
+                });
+            assert!(waited.is_some());
+        });
+
+        let gpu_bufs: Vec<Vec<u8>> = (0..PIECES)
+            .map(|p| {
+                let mut b = vec![0x10u8; PIECE];
+                b[p * 17] = (0x80 + p) as u8;
+                b
+            })
+            .collect();
+
+        for round in 0..8usize {
+            shadow.writing(title_addr, LEN, |_, _| None);
+            {
+                line.lock().unwrap().settling = true;
+                *step_entered.0.lock().unwrap() = false;
+            }
+            let pieces: Vec<relay::RelayCardPiece> = (0..PIECES)
+                .map(|p| relay::RelayCardPiece {
+                    shadow: shadow.clone(),
+                    lo: p * PIECE,
+                    hi: (p + 1) * PIECE,
+                    gpu_ptr: gpu_bufs[p].as_ptr() as usize,
+                    after: round as u64 + 1,
+                })
+                .collect();
+
+            let list_relay = list.clone();
+            let shadow_relay = shadow.clone();
+            let line_relay = line.clone();
+            let landed_relay = landed.clone();
+            let entered_relay = step_entered.clone();
+            let relay_thread = std::thread::spawn(move || {
+                // Wait until `run_deferred` is actively inside its step (blocked on `LINE_LANDED`).
+                let mut e = entered_relay.0.lock().unwrap();
+                while !*e {
+                    e = entered_relay.1.wait(e).unwrap();
+                }
+                drop(e);
+                // 1. Parallel `relay_merge_card_pieces` across `victory-wide`.
+                let _ = relay::relay_merge_card_pieces(pieces, true);
+                // 2. `read_backs` acquires `list.deferred()` while `run_deferred` is waiting.
+                read_backs(&list_relay);
+                // 3. `copy_back_done` strictly BEFORE clearing `settling` and notifying `LINE_LANDED`.
+                shadow_relay.copy_back_done(&[(title_addr, title_addr + LEN)]);
+                {
+                    line_relay.lock().unwrap().settling = false;
+                }
+                landed_relay.notify_all();
+            });
+
+            let mut batch = Batch::default();
+            let mut submitted = 0u64;
+            list.run_deferred(&mut batch, host, &mut submitted);
+            relay_thread.join().expect("relay thread panicked");
+
+            // `copy_back_done` ran strictly before `LINE_LANDED` woke `run_deferred`.
+            assert!(!shadow.writes_pending());
+            // `RestoreCopies` put `copies` back so the closed list stays resubmittable.
+            assert_eq!(list.deferred().copies.len(), 1);
+        }
+
+        // Verify all 16 GPU piece writes landed cleanly via parallel `relay_merge_card_pieces`.
+        for p in 0..PIECES {
+            assert_eq!(title[p * PIECE + p * 17], (0x80 + p) as u8);
+        }
+        drop(shadow);
+        let _ = side;
+    }
 }
