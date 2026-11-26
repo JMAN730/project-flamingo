@@ -1424,6 +1424,7 @@ fn promote_cold_pages(candidates: &[usize]) {
             || DIR.any_guard_flag(block)
             || DIR.cold_streak(block) < threshold_u8
             || locked.pinned(block)
+            || (crate::lazy_back::active() && crate::lazy_back::has_block(block))
             || in_view(block, block + 1)
         {
             continue;
@@ -3087,14 +3088,20 @@ impl GuardLockSet {
     }
 
     fn announce_range(&mut self, range: (usize, usize)) {
-        self.for_each_mut(|s, g| {
+        let mut mask = ShardMask::EMPTY;
+        mask.insert_range(range.0, range.1);
+        mask.for_each(|s| {
+            let g = self.shard_mut(s);
             *g.announced.entry(range).or_default() += 1;
             set_shard_announced_bit(s, true);
         });
     }
 
     fn unannounce_range(&mut self, range: (usize, usize)) {
-        self.for_each_mut(|s, g| {
+        let mut mask = ShardMask::EMPTY;
+        mask.insert_range(range.0, range.1);
+        mask.for_each(|s| {
+            let g = self.shard_mut(s);
             if let Some(n) = g.announced.get_mut(&range) {
                 *n -= 1;
                 if *n == 0 {
@@ -3291,24 +3298,21 @@ pub(crate) fn clean(page: usize) -> bool {
     DIR.is_guard_clean(page)
 }
 
-#[allow(dead_code)]
-pub(crate) fn ensure_handler() {
-    install();
+pub(crate) fn ensure_handler() -> bool {
+    install()
 }
 
 /// Returns `true` if `block` is known view memory in `PageDir` without locking `GUARDS`.
 #[inline]
-#[allow(dead_code)]
 pub(crate) fn is_known_view_block(block: usize) -> bool {
     DIR.is_known_view(block, view_known())
 }
 
 /// Records a fresh write epoch and sets `BitField::LazyArmed` for view pages
 /// armed with `PAGE_NOACCESS` (lock-free; safe under `LAZY_STATE`).
-#[allow(dead_code)]
-pub(crate) fn note_lazy_view_armed(armed_vas: &[usize]) {
+pub(crate) fn note_lazy_view_armed(armed_vas: impl IntoIterator<Item = usize>) {
     let now = next_epoch();
-    for &va in armed_vas {
+    for va in armed_vas {
         let b = va / PAGE;
         DIR.set_bit(b, BitField::GuardProtected, false, Ordering::SeqCst);
         DIR.set_bit(b, BitField::GuardClean, false, Ordering::SeqCst);
@@ -3319,35 +3323,76 @@ pub(crate) fn note_lazy_view_armed(armed_vas: &[usize]) {
 
 /// Advances the write epoch when an already-armed lazy view entry is reused for
 /// another GPU flight (lock-free; safe under `LAZY_STATE`).
-#[allow(dead_code)]
-pub(crate) fn note_lazy_view_reused(armed_vas: &[usize]) {
+pub(crate) fn note_lazy_view_reused(armed_vas: impl IntoIterator<Item = usize>) {
     let now = next_epoch();
-    for &va in armed_vas {
+    for va in armed_vas {
         DIR.record_written(va / PAGE, now);
     }
 }
 
 /// Clears `BitField::LazyArmed` for all pages in `armed_vas` (lock-free).
-#[allow(dead_code)]
-pub(crate) fn clear_lazy_view_armed(armed_vas: &[usize]) {
-    for &va in armed_vas {
+pub(crate) fn clear_lazy_view_armed(armed_vas: impl IntoIterator<Item = usize>) {
+    for va in armed_vas {
         DIR.set_bit(va / PAGE, BitField::LazyArmed, false, Ordering::SeqCst);
     }
 }
 
 /// Clears `BitField::LazyArmed` for a single 64 KiB `block` (lock-free).
 #[inline]
-#[allow(dead_code)]
 pub(crate) fn clear_lazy_view_armed_block(block: usize) {
     DIR.set_bit(block, BitField::LazyArmed, false, Ordering::SeqCst);
 }
 
-/// Atomically checks pin state, clears guard/cold metadata for `blocks`, and
-/// invokes `arm(cpu_clean_after)` under all affected guard shards
-/// (`GUARD_SHARDS_TABLE (ascending) -> LAZY_STATE` lock order) so no concurrent
-/// `guard()`, `promote_cold_pages()`, or `kernel_writing()` can re-arm or pin
-/// `blocks` between disarming and `LAZY_STATE` insertion.
-#[allow(dead_code)]
+/// Runs `f` while holding `block`'s guard shard lock (`GUARD_SHARDS_TABLE -> LAZY_STATE`
+/// lock order) so `lazy_back::attach_new_alias_on_failed_materialize` is strictly
+/// mutually exclusive with `guard_run_shard` / `protect_here` on `block`.
+pub(crate) fn under_guard_shard_for_lazy_attach<R>(block: usize, f: impl FnOnce() -> R) -> R {
+    let _g = guard_shard(shard_of(block));
+    f()
+}
+
+/// Clears any guard/cold metadata on `block` after `attach_new_alias_on_failed_materialize`
+/// applies `PAGE_NOACCESS` while holding `block`'s guard shard lock.
+pub(crate) fn clear_guard_bits_for_lazy_attach(block: usize) {
+    let frame32 = current_frame32();
+    if DIR.clear_bit_was_set(block, BitField::ColdRo, Ordering::SeqCst) {
+        DIR.reset_cold(block, frame32);
+    }
+    DIR.set_bit(block, BitField::GuardProtected, false, Ordering::SeqCst);
+    DIR.set_bit(block, BitField::GuardClean, false, Ordering::SeqCst);
+    DIR.set_bit(block, BitField::GuardAbsent, false, Ordering::SeqCst);
+    DIR.set_bit(block, BitField::GuardAliased, false, Ordering::SeqCst);
+}
+
+#[cfg(test)]
+pub(crate) fn lock_guard_block_for_test(block: usize) -> impl Drop {
+    guard_shard(shard_of(block))
+}
+
+#[cfg(test)]
+pub(crate) fn protect_here_block_for_test(block: usize) {
+    let g = guard_shard(shard_of(block));
+    let single = SingleShard {
+        shard: shard_of(block),
+        guard: &g,
+    };
+    protect_here(&single, block, block + 1);
+}
+
+#[cfg(test)]
+pub(crate) fn is_guard_protected_for_test(block: usize) -> bool {
+    DIR.is_guard_protected(block)
+}
+
+/// Atomically checks pin state, keeps views read-only across `arm(cpu_clean_after)`
+/// so the transition is directly `PAGE_READONLY -> PAGE_NOACCESS` with zero
+/// writable window, and clears guard/cold metadata under all affected guard shards
+/// (`GUARD_SHARDS_TABLE (ascending) -> LAZY_STATE` lock order). `cpu_clean_after`
+/// is only captured when every view in `blocks` is actively guarded read-only (and,
+/// when aliases exist, `view_guard()` is enabled); whenever any alias could be
+/// writable or unguarded (including `VICTORY_VIEW_GUARD=0`), `cpu_clean_after` is
+/// invalidated (`None`). On rejection (`arm` returns `false`), clears guard/cold
+/// metadata and restores `PAGE_READWRITE`.
 pub(crate) fn try_arm_lazy_under_guards(
     blocks: &[usize],
     arm: impl FnOnce(Option<u64>) -> bool,
@@ -3362,16 +3407,21 @@ pub(crate) fn try_arm_lazy_under_guards(
         return false;
     }
     let primary_block = blocks[0];
-    let was_clean_view = DIR.is_guard_protected(primary_block) && DIR.is_guard_clean(primary_block);
+    let has_aliases = blocks.iter().any(|&b| b != primary_block);
+    let all_views_guarded =
+        (!has_aliases || view_guard()) && blocks.iter().all(|&b| DIR.is_guard_protected(b));
+    let was_clean_view = all_views_guarded && DIR.is_guard_clean(primary_block);
     let cpu_clean_after = was_clean_view.then(|| DIR.written_epoch(primary_block));
     let mut sorted = blocks.to_vec();
     sorted.sort_unstable();
     sorted.dedup();
-    // Clear all guard/cold metadata across every block BEFORE restoring
-    // `PAGE_READWRITE` so no concurrent thread observes stale flags while
-    // another alias is already writable.
     let frame32 = current_frame32();
     let mut to_restore = Vec::new();
+    // Clear all guard/cold metadata while still holding `locked`, keeping views
+    // read-only (`PAGE_READONLY`) across `arm(...)` so no CPU write can land
+    // without faulting between capturing `cpu_clean_after` and applying
+    // `PAGE_NOACCESS`. Any write fault during this window sees `!writable(at)`
+    // and blocks on `locked`, then retries `lazy_back::handle_fault` once armed.
     for_each_contiguous_run(&sorted, |from, to| {
         to_restore.extend(DIR.collect_set_bits(from, to, BitField::GuardProtected));
         let cold = DIR.collect_set_bits(from, to, BitField::ColdRo);
@@ -3387,12 +3437,13 @@ pub(crate) fn try_arm_lazy_under_guards(
         DIR.set_bits_range(from, to, BitField::GuardAliased, false, Ordering::SeqCst);
         DIR.set_bits_range(from, to, BitField::ColdRo, false, Ordering::SeqCst);
     });
-    if !to_restore.is_empty() {
+    let armed = arm(cpu_clean_after);
+    if !armed && !to_restore.is_empty() {
         to_restore.sort_unstable();
         to_restore.dedup();
         protect_block_runs(&to_restore, PAGE_READWRITE);
     }
-    arm(cpu_clean_after)
+    armed
 }
 
 /// For view memory: the pages of `[start, end)`'s blocks written since
@@ -3506,7 +3557,6 @@ fn guard_run_shard(
     if first >= last {
         return (0, 0);
     }
-    let lazy = false;
     let mut cur = first;
     let mut uncommitted_until = first;
     let mut shard_written: Vec<usize> = Vec::new();
@@ -3539,7 +3589,10 @@ fn guard_run_shard(
                     }
                     if !open {
                         GuardBlockKind::Skip
-                    } else if g.pinned(block) || g.rests(block, rest) {
+                    } else if g.pinned(block)
+                        || (crate::lazy_back::active() && crate::lazy_back::has_block(block))
+                        || g.rests(block, rest)
+                    {
                         GuardBlockKind::LeaveOpen
                     } else if DIR.is_guard_protected(block) {
                         GuardBlockKind::Reclean
@@ -3557,8 +3610,7 @@ fn guard_run_shard(
                         published_idx = shard_written.len();
                         publishes += 1;
                     }
-                    if let Err(mask) = try_protect_single_shard(&g, shard, from, block, lazy, rest)
-                    {
+                    if let Err(mask) = try_protect_single_shard(&g, shard, from, block, rest) {
                         deferred = Some((from, block, mask));
                         next_cur = block;
                         break;
@@ -3574,7 +3626,7 @@ fn guard_run_shard(
                         publishes += 1;
                     }
                     if let Err(mask) =
-                        try_mark_protected_clean_single_shard(&g, shard, from, block, lazy, rest)
+                        try_mark_protected_clean_single_shard(&g, shard, from, block, rest)
                     {
                         deferred = Some((from, block, mask));
                         next_cur = block;
@@ -3602,7 +3654,7 @@ fn guard_run_shard(
             }
         }
         if let Some((from, to, alias_mask)) = deferred {
-            finish_guard_range_multi_shard(shard, alias_mask, from, to, lazy, rest);
+            finish_guard_range_multi_shard(shard, alias_mask, from, to, rest);
         }
         cur = next_cur;
     }
@@ -3622,7 +3674,6 @@ fn finish_guard_range_multi_shard(
     initial_alias_mask: ShardMask,
     from: usize,
     to: usize,
-    lazy: bool,
     rest: std::time::Duration,
 ) {
     let base_mask = initial_alias_mask.union(ShardMask::single(primary_shard));
@@ -3638,6 +3689,7 @@ fn finish_guard_range_multi_shard(
             || DIR.is_lazy_armed(block)
             || DIR.is_guard_absent(block)
             || locked.pinned(block)
+            || (crate::lazy_back::active() && crate::lazy_back::has_block(block))
             || locked.rests(block, rest)
         {
             continue;
@@ -3655,7 +3707,7 @@ fn finish_guard_range_multi_shard(
             .filter(|&&(b, _)| b >= r_from && b < r_to)
             .cloned()
             .collect();
-        protect_with_access(&locked, sub_entries, r_from, r_to, lazy, rest);
+        protect_with_access(&locked, sub_entries, r_from, r_to, rest);
     }
     for (r_from, r_to) in reclean_runs {
         let sub_entries: Vec<(usize, Vec<usize>)> = entries
@@ -3663,7 +3715,7 @@ fn finish_guard_range_multi_shard(
             .filter(|&&(b, _)| b >= r_from && b < r_to)
             .cloned()
             .collect();
-        mark_protected_clean_with_access(&locked, sub_entries, r_from, r_to, lazy, rest);
+        mark_protected_clean_with_access(&locked, sub_entries, r_from, r_to, rest);
     }
 }
 
@@ -3855,7 +3907,6 @@ fn protect_block_runs(blocks: &[usize], prot: u32) {
 fn guard_aliases_with(
     access: &impl ShardAccess,
     mut entries: Vec<(usize, Vec<usize>)>,
-    lazy: bool,
     rest: std::time::Duration,
 ) -> (Vec<(usize, Vec<usize>)>, std::collections::BTreeSet<usize>) {
     use std::collections::BTreeSet;
@@ -3873,9 +3924,9 @@ fn guard_aliases_with(
             }
             if access.pinned(alias)
                 || DIR.is_lazy_armed(alias)
+                || (crate::lazy_back::active() && crate::lazy_back::has_block(alias))
                 || (!DIR.is_guard_protected(alias) && access.rests(alias, rest))
             {
-                let _ = lazy;
                 blocked = true;
                 break;
             }
@@ -3921,7 +3972,6 @@ fn try_mark_protected_clean_single_shard(
     shard: usize,
     from: usize,
     to: usize,
-    lazy: bool,
     rest: std::time::Duration,
 ) -> Result<(), ShardMask> {
     let entries = collect_aliases(from, to);
@@ -3930,7 +3980,7 @@ fn try_mark_protected_clean_single_shard(
         return Err(alias_mask);
     }
     let access = SingleShard { shard, guard: g };
-    mark_protected_clean_with_access(&access, entries, from, to, lazy, rest);
+    mark_protected_clean_with_access(&access, entries, from, to, rest);
     Ok(())
 }
 
@@ -3942,7 +3992,6 @@ fn try_protect_single_shard(
     shard: usize,
     from: usize,
     to: usize,
-    lazy: bool,
     rest: std::time::Duration,
 ) -> Result<(), ShardMask> {
     let entries = collect_aliases(from, to);
@@ -3951,7 +4000,7 @@ fn try_protect_single_shard(
         return Err(alias_mask);
     }
     let access = SingleShard { shard, guard: g };
-    protect_with_access(&access, entries, from, to, lazy, rest);
+    protect_with_access(&access, entries, from, to, rest);
     Ok(())
 }
 
@@ -3963,11 +4012,10 @@ fn mark_protected_clean_with_access(
     entries: Vec<(usize, Vec<usize>)>,
     from: usize,
     to: usize,
-    lazy: bool,
     rest: std::time::Duration,
 ) {
     debug_assert_range_locked(access, from, to);
-    let (aliased, unguarded) = guard_aliases_with(access, entries, lazy, rest);
+    let (aliased, unguarded) = guard_aliases_with(access, entries, rest);
     for (block, aliases) in aliased {
         if !DIR.is_guard_protected(block) {
             continue;
@@ -4000,13 +4048,12 @@ fn protect_with_access(
     entries: Vec<(usize, Vec<usize>)>,
     from: usize,
     to: usize,
-    lazy: bool,
     rest: std::time::Duration,
 ) {
     debug_assert_range_locked(access, from, to);
     #[cfg(feature = "diagnostics")]
     crate::faultbook::note(crate::faultbook::What::Taken, from, to, 0);
-    let (aliased, unguarded) = guard_aliases_with(access, entries, lazy, rest);
+    let (aliased, unguarded) = guard_aliases_with(access, entries, rest);
     if unguarded.is_empty() {
         protect_here(access, from, to);
     } else {
@@ -4036,9 +4083,39 @@ fn protect_with_access(
 /// Views of one page past which its views are not guarded together.
 pub(crate) const MANY_VIEWS: usize = 64;
 
+#[cfg(test)]
+thread_local! {
+    static FORCE_VIEW_GUARD_OFF_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) struct DisableViewGuardGuard(bool);
+
+#[cfg(test)]
+impl Drop for DisableViewGuardGuard {
+    fn drop(&mut self) {
+        FORCE_VIEW_GUARD_OFF_FOR_TEST.with(|c| c.set(self.0));
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn disable_view_guard_for_test() -> DisableViewGuardGuard {
+    let prev = FORCE_VIEW_GUARD_OFF_FOR_TEST.with(|c| c.replace(true));
+    DisableViewGuardGuard(prev)
+}
+
+#[cfg(test)]
+pub(crate) fn view_guard_enabled_for_test() -> bool {
+    view_guard()
+}
+
 /// Whether all the views of a guarded page are guarded together
 /// (`VICTORY_VIEW_GUARD`).
 fn view_guard() -> bool {
+    #[cfg(test)]
+    if FORCE_VIEW_GUARD_OFF_FOR_TEST.with(|c| c.get()) {
+        return false;
+    }
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_VIEW_GUARD").is_none_or(|v| v != "0"))
 }
@@ -4302,21 +4379,46 @@ pub(crate) fn writing(at: usize, len: usize) {
     }
 }
 
-/// Before a write into title memory `[at, at + len)` through the kernel (which
-/// does not fault into our handler): opens its guarded/cold blocks and leaves them
-/// writable for [`PIN`] across every view of their pages.
+/// RAII guard holding a non-expiring kernel-write announcement from
+/// [`kernel_writing`] across lazy materialization, `AHEAD.write()`, and caller
+/// dispatch until the write completes (or the guard is dropped).
 #[allow(dead_code)]
-pub fn kernel_writing(at: usize, len: usize) {
+#[must_use]
+pub struct KernelWriteGuard {
+    range: Option<(usize, usize)>,
+}
+
+impl Drop for KernelWriteGuard {
+    fn drop(&mut self) {
+        if let Some(range) = self.range.take() {
+            let mut locked = GuardLockSet::lock_range(range.0, range.1);
+            locked.unannounce_range(range);
+        }
+    }
+}
+
+/// Before a write into title memory `[at, at + len)` through the kernel (which
+/// does not fault into our handler): opens its guarded/cold blocks, holds a
+/// non-expiring announcement across the entire blocking lazy drain, across
+/// `AHEAD.write()`, and until the returned [`KernelWriteGuard`] is dropped
+/// after dispatch completes. Returns `None` (and releases the announcement
+/// immediately) if lazy materialization failed.
+#[allow(dead_code)]
+#[must_use]
+pub fn kernel_writing(at: usize, len: usize) -> Option<KernelWriteGuard> {
     use windows_sys::Win32::System::Memory::PAGE_READWRITE;
     if len == 0 {
-        return;
+        return Some(KernelWriteGuard { range: None });
     }
     let end = at.saturating_add(len);
     let (first, last) = (at / BLOCK, end.div_ceil(BLOCK));
-    // Pin + clear guard/cold metadata across the range and all aliases under
-    // their guard shards (ascending order) strictly BEFORE any
-    // `VirtualProtect(..., PAGE_READWRITE)` so lock-free `PageDir` readers
-    // never race with newly writable pages.
+    let range = (first, last);
+    // Announce (non-expiring) + pin + clear guard/cold metadata across the range
+    // and all aliases under their guard shards (ascending order) strictly BEFORE
+    // any `VirtualProtect(..., PAGE_READWRITE)` and BEFORE
+    // `lazy_back::materialize_range`, so neither a concurrent
+    // `try_arm_lazy_under_guards` nor a slow drain/dispatch delay > `PIN` can
+    // re-arm the destination before dispatch completes.
     {
         let (mut locked, alias_blocks) = lock_range_and_all_aliases(first, last);
         locked.prune_pins();
@@ -4325,6 +4427,8 @@ pub fn kernel_writing(at: usize, len: usize) {
         for_each_contiguous_run(&alias_blocks, |r_from, r_to| {
             locked.pin_range(r_from, r_to, until);
         });
+        locked.announce_range(range);
+        ANNOUNCED_SEQ.fetch_add(1, Ordering::SeqCst);
 
         let frame32 = current_frame32();
         let mut to_restore = DIR.collect_set_bits(first, last, BitField::GuardProtected);
@@ -4364,30 +4468,77 @@ pub fn kernel_writing(at: usize, len: usize) {
             protect_block_runs(&to_restore, PAGE_READWRITE);
         }
     }
-    let range = (first, last);
-    let mut ahead = AHEAD.write().unwrap_or_else(|e| e.into_inner());
-    ahead.forget_ahead(range);
+    let guard = KernelWriteGuard { range: Some(range) };
+    let ok = crate::lazy_back::materialize_range(at, len);
+    // Renew the timed `PIN` across the range and all current aliases while the
+    // non-expiring announcement remains held in `guard` across `AHEAD.write()`
+    // and through caller dispatch.
+    {
+        let (mut locked, alias_blocks) = lock_range_and_all_aliases(first, last);
+        locked.prune_pins();
+        let until = std::time::Instant::now() + PIN;
+        locked.pin_range(first, last, until);
+        for_each_contiguous_run(&alias_blocks, |r_from, r_to| {
+            locked.pin_range(r_from, r_to, until);
+        });
+    }
+    {
+        let mut ahead = AHEAD.write().unwrap_or_else(|e| e.into_inner());
+        ahead.forget_ahead(range);
+    }
+    if ok {
+        Some(guard)
+    } else {
+        drop(guard);
+        None
+    }
 }
 
-/// Before the title's kernel read into its memory `[at, at + len)`: opens the
-/// guarded and cold-promoted blocks there and keeps them open until
-/// [`kernel_wrote`]. Stored as a ref-counted range per touched shard so
-/// saturated lengths (`usize::MAX`) cost O(touched shards <= 128) and
-/// overlapping reads stay open until every reader lands.
-pub fn kernel_will_write(at: usize, len: usize) {
+/// Test helper: clears timed `PIN` entries covering `[at, at + len)` and its
+/// section aliases without touching unrelated shards/blocks or active
+/// non-expiring `announced` ranges (simulating a drain > `PIN`).
+#[cfg(test)]
+pub(crate) fn expire_pins_in_range_for_test(at: usize, len: usize) {
     if len == 0 {
         return;
     }
     let end = at.saturating_add(len);
+    let (first, last) = (at / BLOCK, end.div_ceil(BLOCK));
+    let (mut locked, alias_blocks) = lock_range_and_all_aliases(first, last);
+    locked.unpin_range(first, last);
+    for_each_contiguous_run(&alias_blocks, |r_from, r_to| {
+        locked.unpin_range(r_from, r_to);
+    });
+}
+
+/// Before the title's kernel read into its memory `[at, at + len)`: opens the
+/// guarded and cold-promoted blocks there, keeps them open until
+/// [`kernel_wrote`], and materializes any overlapping deferred lazy blocks.
+/// Stored as a ref-counted range per touched shard so saturated lengths
+/// (`usize::MAX`) cost O(touched shards <= 128) and overlapping reads stay open
+/// until every reader lands.
+///
+/// Returns `false` if lazy materialization failed (the caller MUST still call
+/// [`kernel_wrote`] to release the announcement and abort before writing to the
+/// destination).
+#[must_use]
+pub fn kernel_will_write(at: usize, len: usize) -> bool {
+    if len == 0 {
+        return true;
+    }
+    let end = at.saturating_add(len);
     let range = (at / BLOCK, end.div_ceil(BLOCK));
     // Lock order: `GUARD_SHARDS_TABLE` (ascending) -> `AHEAD`.
-    let mut locked = lock_range_for_open(range.0, range.1);
-    open_under_locked(&locked, at, end, |_| {});
-    demote_cold_range(&locked, range.0, range.1);
-    locked.announce_range(range);
-    ANNOUNCED_SEQ.fetch_add(1, Ordering::SeqCst);
-    let mut ahead = AHEAD.write().unwrap_or_else(|e| e.into_inner());
-    ahead.forget_ahead(range);
+    {
+        let mut locked = lock_range_for_open(range.0, range.1);
+        open_under_locked(&locked, at, end, |_| {});
+        demote_cold_range(&locked, range.0, range.1);
+        locked.announce_range(range);
+        ANNOUNCED_SEQ.fetch_add(1, Ordering::SeqCst);
+        let mut ahead = AHEAD.write().unwrap_or_else(|e| e.into_inner());
+        ahead.forget_ahead(range);
+    }
+    crate::lazy_back::materialize_range(at, len)
 }
 
 /// The kernel write [`kernel_will_write`] announced for `[at, at + len)` has
@@ -4477,38 +4628,69 @@ pub fn title_memory_written(at: usize, len: usize, pages: bool) {
     }
 }
 
-/// The runtime mapped a view of the physical bytes `[offset, offset + len)`
-/// of `section` (`crate::inplace::title_memory_view`).
-pub(crate) fn views_mapped(section: usize, offset: u64, len: usize) {
+/// The runtime mapped a view `[at, at + len)` of the physical bytes
+/// `[offset, offset + len)` of `section` (`crate::inplace::title_memory_view`).
+/// Returns `false` if lazy materialization of existing armed aliases failed
+/// (in which case `[at, at + len)` has been protected with `PAGE_NOACCESS` and
+/// attached to the armed entry so stale RAM is never exposed).
+pub(crate) fn views_mapped(at: usize, len: usize, section: usize, offset: u64) -> bool {
     use windows_sys::Win32::System::Memory::PAGE_READWRITE;
-    if !view_guard() {
-        return;
+    let lazy = crate::lazy_back::active_or_arming();
+    let guard = view_guard();
+    if !guard && !lazy {
+        return true;
+    }
+    let mut materialized_ok = true;
+    if lazy {
+        // Use the uncapped lookup so mapping a `(MANY_VIEWS + 1)`-th view of a
+        // deferred page still materializes all armed views.
+        let lazy_ranges = crate::inplace::views_of_section_all(section, offset, len);
+        if !lazy_ranges.is_empty()
+            && !crate::lazy_back::materialize_ranges_unconditional(&lazy_ranges)
+        {
+            // Drain failed while an existing alias stays armed at PAGE_NOACCESS:
+            // protect and attach the newly mapped alias before returning so it
+            // cannot silently read stale RAM without faulting. If protecting
+            // the newly mapped alias ALSO fails, roll back its view metadata
+            // and fail closed so stale RAM is never exposed.
+            if !crate::lazy_back::attach_new_alias_on_failed_materialize(at, len, section, offset) {
+                crate::inplace::views_gone(at, len);
+                crate::host::fail(format_args!(
+                    "failed to materialize deferred GPU bytes and failed to protect newly mapped alias {at:#x}..{:#x}",
+                    at.saturating_add(len)
+                ));
+            }
+            materialized_ok = false;
+        }
+    }
+    if !guard {
+        return materialized_ok;
     }
     let ranges = crate::inplace::views_of_section(section, offset, len);
     if ranges.is_empty() {
-        return;
+        return materialized_ok;
     }
     let mut mask = ShardMask::EMPTY;
-    for &(at, n) in &ranges {
+    for &(r_at, n) in &ranges {
         if n == 0 {
             continue;
         }
-        let end = at.saturating_add(n);
-        mask.insert_range(at / BLOCK, end.div_ceil(BLOCK));
+        let end = r_at.saturating_add(n);
+        mask.insert_range(r_at / BLOCK, end.div_ceil(BLOCK));
     }
     if mask.is_empty() {
-        return;
+        return materialized_ok;
     }
     let _locked = GuardLockSet::lock_mask(mask);
     let mut to_open = Vec::new();
     #[cfg(feature = "diagnostics")]
     let mut opened_ranges = 0u64;
-    for &(at, n) in &ranges {
+    for &(r_at, n) in &ranges {
         if n == 0 {
             continue;
         }
-        let end = at.saturating_add(n);
-        let (first, last) = (at / BLOCK, end.div_ceil(BLOCK));
+        let end = r_at.saturating_add(n);
+        let (first, last) = (r_at / BLOCK, end.div_ceil(BLOCK));
         let blocks = DIR.collect_set_bits(first, last, BitField::GuardProtected);
         if !blocks.is_empty() {
             #[cfg(feature = "diagnostics")]
@@ -4518,8 +4700,11 @@ pub(crate) fn views_mapped(section: usize, offset: u64, len: usize) {
             to_open.extend(blocks);
         }
     }
+    if !materialized_ok {
+        to_open.retain(|&b| !crate::lazy_back::has_block(b));
+    }
     if to_open.is_empty() {
-        return;
+        return materialized_ok;
     }
     to_open.sort_unstable();
     to_open.dedup();
@@ -4531,6 +4716,7 @@ pub(crate) fn views_mapped(section: usize, offset: u64, len: usize) {
     #[cfg(feature = "diagnostics")]
     ALIASES[2].fetch_add(opened_ranges, Ordering::Relaxed);
     protect_block_runs(&to_open, PAGE_READWRITE);
+    materialized_ok
 }
 
 /// Coordinates in-place CPU reads of title memory with mapping changes.
@@ -4658,10 +4844,14 @@ pub(crate) fn remap_seq() -> u64 {
 pub struct Remapping {
     _held: Held<std::sync::RwLockWriteGuard<'static, ()>>,
     since: std::time::Instant,
+    lazy_remap_id: u64,
 }
 
 impl Drop for Remapping {
     fn drop(&mut self) {
+        if self.lazy_remap_id != 0 {
+            crate::lazy_back::end_remap(self.lazy_remap_id);
+        }
         REMAP_SEQ.fetch_add(1, Ordering::SeqCst);
         REMAPS[2].fetch_add(
             self.since.elapsed().as_micros() as u64,
@@ -4677,6 +4867,11 @@ impl Drop for Remapping {
 /// and the mapping again, over all the bytes whose mapping it changes.
 pub fn title_memory_remapping(at: usize, len: usize) -> Remapping {
     use std::sync::atomic::Ordering::Relaxed;
+    // Register the remap range in `lazy_back` BEFORE draining so no concurrent
+    // relay thread can arm a lazy block inside `[at, at + len)` between the
+    // pre-remap drain and `title_memory_remapped`'s `discard_range`.
+    let lazy_remap_id = crate::lazy_back::begin_remap(at, len);
+    let _ = crate::lazy_back::materialize_range(at, len);
     let started = std::time::Instant::now();
     let held = if by_range() {
         let end = at.saturating_add(len);
@@ -4702,6 +4897,7 @@ pub fn title_memory_remapping(at: usize, len: usize) -> Remapping {
     Remapping {
         _held: held,
         since: std::time::Instant::now(),
+        lazy_remap_id,
     }
 }
 
@@ -4789,6 +4985,7 @@ pub(crate) fn change_over(at: usize, len: usize) {
 pub fn title_memory_remapped(at: usize, len: usize) {
     use windows_sys::Win32::System::Memory::PAGE_READWRITE;
     REMAP_SEQ.fetch_add(1, Ordering::SeqCst);
+    crate::lazy_back::discard_range(at, len);
     crate::texback::remapped(at, len);
     // The views the runtime told us of there are no longer what it shows.
     crate::inplace::views_gone(at, len);
@@ -4905,8 +5102,10 @@ pub fn title_memory_alias_rebound(at: usize, len: usize) {
     if len == 0 {
         return;
     }
+    crate::lazy_back::materialize_range(at, len);
     REMAP_SEQ.fetch_add(1, Ordering::SeqCst);
     wrote(at, len);
+    let lazy = crate::lazy_back::active();
     let rest = rest();
     let end = at.saturating_add(len);
     let range = at / BLOCK..end.div_ceil(BLOCK);
@@ -4951,6 +5150,7 @@ pub fn title_memory_alias_rebound(at: usize, len: usize) {
                     if !locked.pinned(alias)
                         && !locked.rests(alias, rest)
                         && !DIR.is_lazy_armed(alias)
+                        && !(lazy && crate::lazy_back::has_block(alias))
                     {
                         alias_targets.push(alias);
                         protected_pairs.push((*block, alias));
@@ -4974,6 +5174,7 @@ pub fn title_memory_alias_rebound(at: usize, len: usize) {
                 && !locked.rests(*block, rest)
                 && !DIR.is_cold_ro(*block)
                 && !DIR.is_lazy_armed(*block)
+                && !(lazy && crate::lazy_back::has_block(*block))
             {
                 alias_targets.push(*block);
                 for &alias in aliases {
@@ -5072,7 +5273,11 @@ fn install() -> bool {
         }
         let access = r.ExceptionInformation[0];
         let at = r.ExceptionInformation[1];
-        let _ = READ;
+        if (access == READ || access == WRITE)
+            && crate::lazy_back::handle_fault(at, access == WRITE)
+        {
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
         if access != WRITE {
             return EXCEPTION_CONTINUE_SEARCH;
         }
@@ -5150,28 +5355,37 @@ fn install() -> bool {
                 return EXCEPTION_CONTINUE_EXECUTION;
             }
             Some(false) => return EXCEPTION_CONTINUE_EXECUTION,
-            None => {}
+            None => {
+                // If `try_arm_lazy_under_guards` transitioned this block directly
+                // from `PAGE_READONLY` to `PAGE_NOACCESS` while we waited on its
+                // guard shard, materialize the newly armed lazy block now.
+                if crate::lazy_back::handle_fault(at, true) {
+                    return EXCEPTION_CONTINUE_EXECUTION;
+                }
+            }
         }
         // Read-only, in a view we were told of, and not noted guarded: only we
-        // make title views read-only, so it is ours to give back.
+        // make title views read-only, so it is ours to give back. Hold the
+        // block's guard shard across rechecking lazy ownership, verifying the
+        // page is still read-only, and calling `VirtualProtect(..., PAGE_READWRITE)`
+        // so a concurrent armer cannot transition the block to `PAGE_NOACCESS`
+        // between our check and `VirtualProtect`.
         if view_guard() && crate::inplace::has_view_at(at) {
-            let mut old = 0;
-            let block = at - at % BLOCK;
-            // SAFETY: only the protection of title view memory changes.
-            let opened = unsafe {
-                windows_sys::Win32::System::Memory::VirtualProtect(
-                    block as *const _,
-                    BLOCK,
-                    windows_sys::Win32::System::Memory::PAGE_READWRITE,
-                    &mut old,
-                )
-            } != 0;
-            if opened {
-                tracing::warn!(
-                    at = format_args!("{at:#x}"),
-                    "a read-only view block that no guard knew was opened"
-                );
-                return EXCEPTION_CONTINUE_EXECUTION;
+            match fallback_reopen_unguarded_view(at, block, shard) {
+                FallbackReopen::Opened => {
+                    tracing::warn!(
+                        at = format_args!("{at:#x}"),
+                        "a read-only view block that no guard knew was opened"
+                    );
+                    return EXCEPTION_CONTINUE_EXECUTION;
+                }
+                FallbackReopen::AlreadyWritable => return EXCEPTION_CONTINUE_EXECUTION,
+                FallbackReopen::LazyOwned => {
+                    if crate::lazy_back::handle_fault(at, true) {
+                        return EXCEPTION_CONTINUE_EXECUTION;
+                    }
+                }
+                FallbackReopen::Unhandled => {}
             }
         }
         EXCEPTION_CONTINUE_SEARCH
@@ -5181,6 +5395,54 @@ fn install() -> bool {
         // SAFETY: the handler only touches our guard state and protections.
         unsafe { !AddVectoredExceptionHandler(1, Some(on_write)).is_null() }
     })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FallbackReopen {
+    Opened,
+    AlreadyWritable,
+    LazyOwned,
+    Unhandled,
+}
+
+/// Fallback reopen path for a registered read-only view block with no guard
+/// metadata. Acquires `guard_shard(shard)` across the lazy-ownership recheck,
+/// protection check, and `VirtualProtect(..., PAGE_READWRITE)` so concurrent
+/// `try_arm_lazy_under_guards` / `attach_new_alias_on_failed_materialize`
+/// calls on `block` are mutually excluded.
+fn fallback_reopen_unguarded_view(at: usize, block: usize, shard: usize) -> FallbackReopen {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_READONLY, PAGE_READWRITE, VirtualProtect,
+        VirtualQuery,
+    };
+    let _g = guard_shard(shard);
+    if DIR.is_lazy_armed(block) || crate::lazy_back::has_block(block) {
+        return FallbackReopen::LazyOwned;
+    }
+    // SAFETY: plain data filled in by `VirtualQuery`.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: valid out pointer of the right size.
+    let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+    if n == 0 || info.State != MEM_COMMIT {
+        return FallbackReopen::Unhandled;
+    }
+    if info.Protect == PAGE_READWRITE {
+        return FallbackReopen::AlreadyWritable;
+    }
+    if info.Protect != PAGE_READONLY {
+        return FallbackReopen::Unhandled;
+    }
+    let mut old = 0u32;
+    let block_va = block * BLOCK;
+    // SAFETY: `_g` excludes lazy arming on `block` and only this view's
+    // `PAGE_READONLY` protection is restored to `PAGE_READWRITE`.
+    let opened =
+        unsafe { VirtualProtect(block_va as *const _, BLOCK, PAGE_READWRITE, &mut old) } != 0;
+    if opened {
+        FallbackReopen::Opened
+    } else {
+        FallbackReopen::Unhandled
+    }
 }
 
 /// Whether `at` is committed read-write memory now.
@@ -5625,8 +5887,18 @@ mod tests {
             let two = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, bytes).Value as usize;
             assert_ne!(one, 0);
             assert_ne!(two, 0);
-            crate::inplace::title_memory_view(one, bytes, section as usize, 0);
-            crate::inplace::title_memory_view(two, bytes, section as usize, 0);
+            assert!(crate::inplace::title_memory_view(
+                one,
+                bytes,
+                section as usize,
+                0
+            ));
+            assert!(crate::inplace::title_memory_view(
+                two,
+                bytes,
+                section as usize,
+                0
+            ));
             (section as usize, one, two)
         }
     }
@@ -5693,7 +5965,7 @@ mod tests {
             "nothing written yet"
         );
         title_memory_remapped(other, SIZE);
-        crate::inplace::title_memory_view(other, SIZE, section, 0);
+        assert!(crate::inplace::title_memory_view(other, SIZE, section, 0));
         assert_eq!(
             guard(guarded, guarded + SIZE),
             Some(vec![pages(0), pages(1)])
@@ -5727,21 +5999,23 @@ mod tests {
         assert_eq!(guard(guarded, guarded + SIZE), Some(vec![pages(1)]));
         assert_eq!(guard(guarded, guarded + SIZE), Some(Vec::new()));
         // Async kernel write: pinned writable for 2 s across all views.
-        kernel_writing(other + BLOCK, BLOCK);
+        let kw1 = kernel_writing(other + BLOCK, BLOCK).expect("kernel_writing");
         assert_eq!(guard(guarded, guarded + SIZE), Some(vec![pages(1)]));
         assert!(writable(guarded + BLOCK));
         assert!(writable(other + BLOCK));
         assert_eq!(guard(guarded, guarded + SIZE), Some(vec![pages(1)]));
-        // Once the pin expires, the block re-guards cleanly.
+        // Once dispatch completes and the pin expires, the block re-guards cleanly.
+        drop(kw1);
         clear_all_pins();
         assert_eq!(guard(guarded, guarded + SIZE), Some(vec![pages(1)]));
         assert_eq!(guard(guarded, guarded + SIZE), Some(Vec::new()));
         // Half a page and the next: both blocks, not just the first's.
-        kernel_writing(other + BLOCK / 2, BLOCK);
+        let kw2 = kernel_writing(other + BLOCK / 2, BLOCK).expect("kernel_writing");
         assert_eq!(
             guard(guarded, guarded + SIZE),
             Some(vec![pages(0), pages(1)])
         );
+        drop(kw2);
         clear_all_pins();
         drop_views(section, &[guarded, other], SIZE);
     }
@@ -5826,7 +6100,12 @@ mod tests {
         let (section, one, two) = two_views(BLOCK);
         let filler = one + (1 << 45);
         for n in 0..MANY_VIEWS {
-            crate::inplace::title_memory_view(filler + n * BLOCK, BLOCK, section, 0);
+            assert!(crate::inplace::title_memory_view(
+                filler + n * BLOCK,
+                BLOCK,
+                section,
+                0
+            ));
         }
         assert_eq!(guard(one, one + BLOCK), Some(vec![one / PAGE]));
         assert!(writable(two), "another view of it is left alone");
@@ -5921,7 +6200,7 @@ mod tests {
 
         // Pin alias `b` via `kernel_writing`: `a` is opened and stays changed
         // on every `take` while `b` remains pinned.
-        kernel_writing(b, 16);
+        let kw_b = kernel_writing(b, 16).expect("kernel_writing b");
         assert!(writable(b));
         assert_eq!(t.take(a, a + PAGE), [(a, a + PAGE)]);
         assert_eq!(
@@ -5933,8 +6212,9 @@ mod tests {
         unsafe { (b as *mut u32).write_volatile(0x1234) };
         assert_eq!(t.take(a, a + PAGE), [(a, a + PAGE)]);
 
-        // Once `b`'s pin expires, `take` reports once more, guards both views,
-        // and becomes clean.
+        // Once `b`'s dispatch guard drops and pin expires, `take` reports once more,
+        // guards both views, and becomes clean.
+        drop(kw_b);
         clear_all_pins();
         assert_eq!(t.take(a, a + PAGE), [(a, a + PAGE)]);
         assert!(
@@ -5949,13 +6229,14 @@ mod tests {
         let (sec2, c, d) = two_views(BLOCK);
         // Make `c` alias `a`'s section in `inplace` while `c` is pinned.
         title_memory_remapped(c, BLOCK);
-        kernel_writing(c, 16);
-        crate::inplace::title_memory_view(c, BLOCK, section, 0);
+        let kw_c = kernel_writing(c, 16).expect("kernel_writing c");
+        assert!(crate::inplace::title_memory_view(c, BLOCK, section, 0));
         // `views_mapped` opened `a`; re-verify `take` stays changed while `c` is pinned.
         assert_eq!(t.take(a, a + PAGE), [(a, a + PAGE)]);
         assert_eq!(t.take(a, a + PAGE), [(a, a + PAGE)]);
-        // Clear `c`'s pin -> `a` becomes clean again, then pin `c` and exercise
+        // Clear `c`'s guard and pin -> `a` becomes clean again, then pin `c` and exercise
         // `title_memory_alias_rebound(c, BLOCK)` directly.
+        drop(kw_c);
         clear_all_pins();
         assert_eq!(t.take(a, a + PAGE), [(a, a + PAGE)]);
         assert!(t.take(a, a + PAGE).is_empty());
@@ -5984,7 +6265,7 @@ mod tests {
         // SAFETY: `b` is our committed view; simulate `LazyArmed` (`PAGE_NOACCESS`).
         let prot = unsafe { VirtualProtect(b as *const _, PAGE, PAGE_NOACCESS, &mut old) };
         assert_ne!(prot, 0);
-        note_lazy_view_armed(&[b]);
+        note_lazy_view_armed([b]);
         assert_eq!(t.take(a, a + PAGE), [(a, a + PAGE)]);
         assert_eq!(
             t.take(a, a + PAGE),
@@ -6001,7 +6282,7 @@ mod tests {
             info.Protect, PAGE_NOACCESS,
             "guarding view `a` must not clobber LazyArmed PAGE_NOACCESS on alias `b`"
         );
-        clear_lazy_view_armed(&[b]);
+        clear_lazy_view_armed([b]);
         // SAFETY: restoring RW on `b` before cleanup.
         let prot_rw = unsafe { VirtualProtect(b as *const _, PAGE, PAGE_READWRITE, &mut old) };
         assert_ne!(prot_rw, 0);
@@ -6281,9 +6562,10 @@ mod tests {
         assert!(writable(base + 2 * PAGE));
 
         assert!(DIR.is_cold_ro(base / PAGE + 3));
-        kernel_writing(base + 3 * PAGE, PAGE);
+        let kw_cold = kernel_writing(base + 3 * PAGE, PAGE).expect("kernel_writing cold");
         assert!(!DIR.is_cold_ro(base / PAGE + 3));
         assert!(writable(base + 3 * PAGE));
+        drop(kw_cold);
         clear_all_pins();
     }
 
@@ -6486,18 +6768,66 @@ mod tests {
         clear_all_pins();
         DIR.set_bit(b1, BitField::ColdRo, true, Ordering::SeqCst);
         let blocks = [b0, b1, b2];
-        let ok = try_arm_lazy_under_guards(&blocks, |cpu_clean_after| {
+        // Rejection path: guarded views stay read-only (`!writable`) inside the
+        // closure (no writable window before `PAGE_NOACCESS`), and rollback
+        // restores `PAGE_READWRITE` when `arm` returns `false`.
+        let rejected = try_arm_lazy_under_guards(&blocks, |cpu_clean_after| {
             assert!(cpu_clean_after.is_some());
             for &b in &blocks {
                 assert!(!DIR.is_guard_protected(b));
                 assert!(!DIR.is_guard_clean(b));
                 assert!(!DIR.get_bit(b, BitField::GuardAliased, Ordering::SeqCst));
                 assert!(!DIR.is_cold_ro(b));
-                assert!(writable(b * BLOCK));
             }
+            assert!(!writable(b0 * BLOCK));
+            assert!(!writable(b2 * BLOCK));
+            false
+        });
+        assert!(!rejected);
+        assert!(writable(b0 * BLOCK));
+        assert!(writable(b2 * BLOCK));
+
+        // If any alias/co-armed block is not guarded (`b1` is RW here), the
+        // clean proof MUST be invalidated (`None`).
+        assert!(guard(one, one + BLOCK).is_some());
+        assert!(!writable(b0 * BLOCK));
+        assert!(writable(b1 * BLOCK));
+        assert!(!writable(b2 * BLOCK));
+        let unguarded_alias_rejected = try_arm_lazy_under_guards(&blocks, |cpu_clean_after| {
+            assert!(
+                cpu_clean_after.is_none(),
+                "clean proof must be invalidated when any block in the arm set is unguarded"
+            );
+            false
+        });
+        assert!(!unguarded_alias_rejected);
+        assert!(writable(b0 * BLOCK));
+        assert!(writable(b2 * BLOCK));
+
+        // Acceptance path: re-guard `b0` and its alias `b2`, then return `true`
+        // without opening RW first.
+        assert!(guard(one, one + BLOCK).is_some());
+        assert!(!writable(b0 * BLOCK));
+        assert!(!writable(b2 * BLOCK));
+        let ok = try_arm_lazy_under_guards(&[b0, b2], |cpu_clean_after| {
+            assert_eq!(cpu_clean_after.is_some(), view_guard());
+            for &b in &[b0, b2] {
+                assert!(!DIR.is_guard_protected(b));
+                assert!(!DIR.is_guard_clean(b));
+                assert!(!DIR.get_bit(b, BitField::GuardAliased, Ordering::SeqCst));
+                assert!(!DIR.is_cold_ro(b));
+            }
+            assert!(!writable(b0 * BLOCK));
+            assert!(!writable(b2 * BLOCK));
             true
         });
         assert!(ok);
+        // Cleanly restore RW before dropping test views since our dummy closure
+        // did not apply `PAGE_NOACCESS` / `materialize`.
+        protect_block_runs(
+            &[b0, b2],
+            windows_sys::Win32::System::Memory::PAGE_READWRITE,
+        );
         drop_views(section, &[one, two], 2 * BLOCK);
     }
 
@@ -6540,7 +6870,7 @@ mod tests {
         // SAFETY: `va` is a committed section view mapped by `two_views`.
         let prot_na = unsafe { VirtualProtect(va as *const _, PAGE, PAGE_NOACCESS, &mut old) };
         assert_ne!(prot_na, 0);
-        note_lazy_view_armed(&[va]);
+        note_lazy_view_armed([va]);
         assert!(DIR.is_lazy_armed(block));
         let defer_epoch = DIR.written_epoch(block);
         assert!(defer_epoch > 0);
@@ -6557,7 +6887,7 @@ mod tests {
         assert_eq!(info.State, MEM_COMMIT);
         assert_eq!(info.Protect, PAGE_NOACCESS);
 
-        clear_lazy_view_armed(&[va]);
+        clear_lazy_view_armed([va]);
         assert!(!DIR.is_lazy_armed(block));
         // SAFETY: restoring RW protection before resuming normal `PAGE_READONLY` guarding.
         let prot_rw = unsafe { VirtualProtect(va as *const _, PAGE, PAGE_READWRITE, &mut old) };
@@ -6791,7 +7121,8 @@ mod tests {
         // Pin two blocks straddling the shard boundary via `kernel_writing`.
         let pin_lo = boundary - 1;
         let pin_hi = boundary + 1;
-        kernel_writing(one + pin_lo * BLOCK, (pin_hi - pin_lo) * BLOCK);
+        let kw_pin = kernel_writing(one + pin_lo * BLOCK, (pin_hi - pin_lo) * BLOCK)
+            .expect("kernel_writing cross-shard");
         for i in pin_lo..pin_hi {
             assert!(
                 writable(one + i * BLOCK),
@@ -6828,7 +7159,8 @@ mod tests {
         );
         assert!(DIR.is_guard_protected(b_one + unpinned_idx));
 
-        // Clearing pins allows immediate clean re-guarding across the boundary.
+        // Clearing guard + pins allows immediate clean re-guarding across the boundary.
+        drop(kw_pin);
         clear_all_pins();
         assert_eq!(
             guard(one, one + SIZE),
@@ -6899,7 +7231,7 @@ mod tests {
             handles.push(std::thread::spawn(move || {
                 let mut iter = 0usize;
                 while !stop.load(Ordering::Relaxed) {
-                    kernel_writing(one + (boundary - 1) * BLOCK, 3 * BLOCK);
+                    let _ = kernel_writing(one + (boundary - 1) * BLOCK, 3 * BLOCK);
                     writing(three + (boundary - 1) * BLOCK, 3 * BLOCK);
                     iter += 1;
                     if iter.is_multiple_of(8) {
@@ -7192,7 +7524,7 @@ mod tests {
         let at = 0xFFFF_8000_0000_0000;
         let range = (at / BLOCK, usize::MAX.div_ceil(BLOCK));
         let probe_block = at / BLOCK + 12345;
-        kernel_will_write(at, usize::MAX);
+        assert!(kernel_will_write(at, usize::MAX));
         assert!(guard_shard_read(shard_of(probe_block)).announced(probe_block));
         kernel_wrote(at, usize::MAX);
         assert!(
@@ -7211,7 +7543,7 @@ mod tests {
         let range = (at / BLOCK, (at + BLOCK).div_ceil(BLOCK));
         let s = shard_of(at / BLOCK);
         for _ in 0..1000 {
-            kernel_will_write(at, BLOCK);
+            assert!(kernel_will_write(at, BLOCK));
         }
         assert_eq!(guard_shard_read(s).announced.get(&range), Some(&1000));
         kernel_wrote(at, BLOCK);
@@ -7262,7 +7594,7 @@ mod tests {
             let into = unsafe { std::slice::from_raw_parts_mut((view + 100) as *mut u8, 13) };
             file.read(into).is_ok_and(|n| n == 13)
         };
-        kernel_will_write(view + 100, 13); // the title's thread, in `ReadFile`
+        assert!(kernel_will_write(view + 100, 13)); // the title's thread, in `ReadFile`
         let _ = guard(view, view + 2 * BLOCK); // a refresh on another thread
         assert!(
             read(&mut file),
@@ -7342,11 +7674,11 @@ mod tests {
             let _ask = AskOnceGuard;
             let (before, _) = writes(at, at + PAGE, false).unwrap();
             if already_announced {
-                kernel_will_write(at, 5);
+                assert!(kernel_will_write(at, 5));
             }
             ask_once(&[(at, at + PAGE)]);
             if !already_announced {
-                kernel_will_write(at, 5);
+                assert!(kernel_will_write(at, 5));
             }
             file.rewind().unwrap();
             // SAFETY: these five bytes belong to the committed allocation.
@@ -7810,6 +8142,144 @@ mod tests {
             windows_sys::Win32::Foundation::CloseHandle(section);
         }
         title_memory_remapped(view, 2 * BLOCK);
+    }
+
+    #[test]
+    fn fallback_reopen_unguarded_view_excludes_lazy_armer_on_guard_shard() {
+        use std::sync::{Arc, Condvar, Mutex};
+        use std::time::Duration;
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE,
+            VirtualProtect, VirtualQuery,
+        };
+
+        let alloc = WatchedAllocGuard::new(1);
+        let va = alloc.base;
+        let block = va / BLOCK;
+        let shard = shard_of(block);
+        let query_protect = |addr: usize| -> u32 {
+            // SAFETY: zero-initialized `MEMORY_BASIC_INFORMATION`.
+            let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            // SAFETY: querying page protection with valid out pointer.
+            let n = unsafe { VirtualQuery(addr as *const _, &mut info, size_of_val(&info)) };
+            assert_ne!(n, 0);
+            assert_eq!(info.State, MEM_COMMIT);
+            info.Protect
+        };
+
+        // 1. Unowned read-only block with no guard metadata is reopened to RW.
+        let mut old = 0u32;
+        assert_ne!(
+            // SAFETY: test-owned allocation.
+            unsafe { VirtualProtect(va as *const _, BLOCK, PAGE_READONLY, &mut old) },
+            0
+        );
+        assert_eq!(
+            fallback_reopen_unguarded_view(va, block, shard),
+            FallbackReopen::Opened
+        );
+        assert_eq!(query_protect(va), PAGE_READWRITE);
+
+        // 2. An armer holding `guard_shard(shard)` blocks `fallback_reopen_unguarded_view`
+        //    until it finishes setting `PAGE_NOACCESS` and marking `DIR.set_lazy_armed`;
+        //    once released, fallback sees `FallbackReopen::LazyOwned` and does NOT
+        //    clobber `PAGE_NOACCESS` back to `PAGE_READWRITE`.
+        assert_ne!(
+            // SAFETY: set page read-only before concurrent arming race.
+            unsafe { VirtualProtect(va as *const _, BLOCK, PAGE_READONLY, &mut old) },
+            0
+        );
+        let entered_arm = Arc::new((Mutex::new(false), Condvar::new()));
+        let release_arm = Arc::new((Mutex::new(false), Condvar::new()));
+        let entered_t = entered_arm.clone();
+        let release_t = release_arm.clone();
+
+        let armer = std::thread::spawn(move || {
+            let armed = try_arm_lazy_under_guards(&[block], |_| {
+                {
+                    let mut g = entered_t.0.lock().unwrap();
+                    *g = true;
+                    entered_t.1.notify_all();
+                }
+                let mut r = release_t.0.lock().unwrap();
+                while !*r {
+                    r = release_t.1.wait(r).unwrap();
+                }
+                let mut old_p = 0u32;
+                assert_ne!(
+                    // SAFETY: test-owned allocation armed to PAGE_NOACCESS under guard shard.
+                    unsafe { VirtualProtect(va as *const _, BLOCK, PAGE_NOACCESS, &mut old_p) },
+                    0
+                );
+                DIR.set_bits_range(
+                    block,
+                    block + 1,
+                    BitField::LazyArmed,
+                    true,
+                    Ordering::SeqCst,
+                );
+                true
+            });
+            assert!(armed);
+        });
+
+        {
+            let mut g = entered_arm.0.lock().unwrap();
+            while !*g {
+                g = entered_arm.1.wait(g).unwrap();
+            }
+        }
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let reopen_thread = std::thread::spawn(move || {
+            let outcome = fallback_reopen_unguarded_view(va, block, shard);
+            let _ = tx.send(outcome);
+        });
+
+        // While the armer holds `guard_shard(shard)`, fallback MUST remain blocked.
+        assert!(
+            rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "fallback_reopen_unguarded_view must block on guard_shard while lazy arm is in progress"
+        );
+        {
+            let mut r = release_arm.0.lock().unwrap();
+            *r = true;
+            release_arm.1.notify_all();
+        }
+        armer.join().unwrap();
+        let outcome = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("fallback_reopen_unguarded_view must complete after armer releases shard");
+        reopen_thread.join().unwrap();
+        assert_eq!(
+            outcome,
+            FallbackReopen::LazyOwned,
+            "fallback must see lazy ownership instead of clobbering PAGE_NOACCESS"
+        );
+        assert_eq!(
+            query_protect(va),
+            PAGE_NOACCESS,
+            "PAGE_NOACCESS applied by armer must not be overwritten to PAGE_READWRITE"
+        );
+
+        // 3. Clean up lazy bit; a plain PAGE_NOACCESS block is still left `Unhandled`.
+        DIR.set_bits_range(
+            block,
+            block + 1,
+            BitField::LazyArmed,
+            false,
+            Ordering::SeqCst,
+        );
+        assert_eq!(
+            fallback_reopen_unguarded_view(va, block, shard),
+            FallbackReopen::Unhandled
+        );
+        assert_eq!(query_protect(va), PAGE_NOACCESS);
+        assert_ne!(
+            // SAFETY: restore RW before `alloc` drop.
+            unsafe { VirtualProtect(va as *const _, BLOCK, PAGE_READWRITE, &mut old) },
+            0
+        );
     }
 }
 

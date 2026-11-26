@@ -1403,7 +1403,14 @@ fn into_destination(
         if request.options & (ZLIB | BCPACK) == 0 {
             // Raw reads are bounded by the OS file read and do not need a
             // second potentially large buffer.
-            victory_gpu::kernel_will_write(request.destination as usize, len);
+            if !victory_gpu::kernel_will_write(request.destination as usize, len) {
+                victory_gpu::kernel_wrote(request.destination as usize, len);
+                tracing::warn!(
+                    bytes = len,
+                    "dstorage: destination lazy materialization failed"
+                );
+                return Err(E_INVALIDARG);
+            }
             // SAFETY: the title's destination holds `destination_size` bytes,
             // at least `len`, and the worker owns this request until completion.
             let out =

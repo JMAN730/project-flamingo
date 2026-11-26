@@ -490,7 +490,7 @@ struct CardRange {
 }
 
 /// What a submission does for copies in the card's memory.
-pub(super) struct CardPlan {
+pub(crate) struct CardPlan {
     ranges: Vec<CardRange>,
     sent_as: u64,
     pub(super) check: Option<ID3D12CommandList>,
@@ -577,10 +577,109 @@ pub(super) fn relay_copy_queue() -> bool {
 static RELAY_MOVED: Condvar = Condvar::new();
 static LINE_LANDED: Condvar = Condvar::new();
 
-/// With [`relay`], the monotonic count of sends of changed ranges to copies
-/// in the card's memory (`Host::card_before`). Held while recording & queueing
-/// a sync list and while queueing a direct-queue fallback fetch.
-pub(super) static QUEUE_ORDER: Mutex<u64> = Mutex::new(0);
+/// Coordinated queue-order and fence-watermark timeline for relay card uploads.
+///
+/// Tracks `queue_order` (locked when submitting card sync lists or direct-queue
+/// fallback fetches), its lock-free mirror `submitted_order` (updated strictly
+/// under `queue_order` right after `ExecuteCommandLists`), and the latest
+/// `(fence_value, submitted_order)` pair (`last_signalled`).
+///
+/// Lock order: `FETCHER` (`direct_submit_guard()`) -> `queue_order` -> `last_signalled`.
+/// [`Self::note_signalled`] reads `submitted_order` lock-free so it never
+/// acquires `queue_order` and unsubmitted candidate plans are never included in
+/// a fence watermark before submission.
+pub(crate) struct QueueOrderTimeline {
+    queue_order: Mutex<u64>,
+    submitted_order: AtomicU64,
+    last_signalled: Mutex<(u64, u64)>,
+}
+
+impl QueueOrderTimeline {
+    pub(crate) const fn new() -> Self {
+        Self {
+            queue_order: Mutex::new(0),
+            submitted_order: AtomicU64::new(0),
+            last_signalled: Mutex::new((0, 0)),
+        }
+    }
+
+    pub(crate) fn lock_queue_order(&self) -> std::sync::MutexGuard<'_, u64> {
+        self.queue_order.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[inline]
+    pub(crate) fn submitted_order(&self) -> u64 {
+        self.submitted_order.load(Ordering::Acquire)
+    }
+
+    /// Computes `(prev_order, candidate_sent_as)` for a pending card plan.
+    #[inline]
+    pub(crate) fn next_candidate(&self) -> (u64, u64) {
+        let prev = self.submitted_order();
+        (prev, prev + 1)
+    }
+
+    /// Advances `queue_order` and `submitted_order` after `ExecuteCommandLists`
+    /// while holding `order_guard`, returning the committed submitted order.
+    #[inline]
+    pub(crate) fn commit_submitted_locked(
+        &self,
+        order_guard: &mut u64,
+        sent_as: u64,
+        has_uploads: bool,
+    ) -> u64 {
+        if has_uploads {
+            *order_guard = (*order_guard).max(sent_as);
+            self.submitted_order.store(*order_guard, Ordering::Release);
+        }
+        *order_guard
+    }
+
+    /// Records `(fence_val, current submitted_order)` without locking `queue_order`.
+    pub(crate) fn note_signalled(&self, fence_val: u64) {
+        let order = self.submitted_order();
+        self.note_signalled_with_order(fence_val, order);
+    }
+
+    pub(crate) fn note_signalled_with_order(&self, fence_val: u64, order: u64) {
+        let mut pair = self
+            .last_signalled
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if fence_val > pair.0 {
+            *pair = (fence_val, order);
+        }
+    }
+
+    pub(crate) fn last_signalled(&self) -> (u64, u64) {
+        *self
+            .last_signalled
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Computes `(fence_to_wait, visible_watermark)` for an auxiliary `COPY` queue.
+    pub(crate) fn sync_copy_plan(
+        &self,
+        completed_fence: u64,
+        wait_direct: bool,
+        relay_fetched: u64,
+    ) -> (Option<u64>, u64) {
+        let (v, order) = self.last_signalled();
+        if v > 0 {
+            if completed_fence >= v {
+                return (None, order.max(relay_fetched));
+            }
+            if wait_direct {
+                return (Some(v), order.max(relay_fetched));
+            }
+        }
+        (None, relay_fetched)
+    }
+}
+
+/// Process-wide queue-order and fence-watermark timeline for `Host::queue`.
+pub(super) static QUEUE_TIMELINE: QueueOrderTimeline = QueueOrderTimeline::new();
 
 static RELAY_STATS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 static INFLIGHT_STATS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
@@ -594,6 +693,27 @@ pub(crate) fn fallback_fetched_mark(inflight: bool, after: u64, landed: Option<u
         (false, _) => after,
         (true, Some(landed)) => landed.min(after),
         (true, None) => 0,
+    }
+}
+
+/// Computes the `relay_fetched` watermark when a relay landing has no eager
+/// card pieces left to DMA (including when every changed card page was
+/// deferred by `lazy_back`). Deferred pages never pin this watermark.
+///
+/// Without an eager readback fence on `Host::queue`, only flights in `plans`
+/// are proven complete on the GPU, so both the copy-queue and direct-queue
+/// non-inflight paths derive the watermark from `completed_order` rather than
+/// live `QUEUE_TIMELINE` submitted order (which could include a later DIRECT
+/// upload whose fence has not yet completed).
+pub(crate) fn relay_no_card_fetch_watermark(
+    inflight: bool,
+    max_sent_as: Option<u64>,
+    completed_order: u64,
+) -> Option<u64> {
+    if inflight {
+        max_sent_as
+    } else {
+        Some(completed_order)
     }
 }
 
@@ -1147,7 +1267,6 @@ mod fill_ahead {
 }
 
 #[cfg(test)]
-#[allow(unused_imports)]
 pub(crate) use fill_ahead::read as test_fill_ahead_read;
 pub(crate) use fill_ahead::wrote as shaders_write;
 
@@ -1884,21 +2003,48 @@ pub(super) fn log_stats(frames: f64) {
 }
 
 impl Host {
-    /// Records `(fence_val, current QUEUE_ORDER)` after `self.queue.Signal`.
-    pub(super) fn note_signalled(&self, fence_val: u64) {
-        let order = *QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner());
-        let mut pair = self
-            .last_signalled
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        if fence_val > pair.0 {
-            *pair = (fence_val, order);
+    /// Records `(fence_val, current submitted_order)` after `self.queue.Signal`.
+    /// Reads the lock-free `submitted_order` so only card uploads whose
+    /// command lists were already submitted to `self.queue` are included and
+    /// `queue_order` is never acquired inside `direct_submit_guard()`.
+    pub(crate) fn note_signalled(&self, fence_val: u64) {
+        QUEUE_TIMELINE.note_signalled(fence_val);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn last_signalled_for_test(&self) -> (u64, u64) {
+        QUEUE_TIMELINE.last_signalled()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn card_before_for_test(&self) -> Option<(CardPlan, u64)> {
+        let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        let plan = self.card_before(Vec::new(), false, &mut submitted)?;
+        Some((plan, *submitted))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn card_done_and_wait_for_test(&self, plan: CardPlan, fence_val: u64) {
+        // SAFETY: `self.fence` is live; local wait event avoids contending on `self.event`.
+        unsafe {
+            if self.fence.GetCompletedValue() < fence_val {
+                let ev = CreateEventW(None, false, false, None).expect("wait event");
+                self.fence
+                    .SetEventOnCompletion(fence_val, ev)
+                    .expect("set fence event");
+                WaitForSingleObject(ev, INFINITE);
+                let _ = windows::Win32::Foundation::CloseHandle(ev);
+            }
         }
+        self.card_done(plan);
+    }
+
+    pub(super) fn note_signalled_with_order(&self, fence_val: u64, order: u64) {
+        QUEUE_TIMELINE.note_signalled_with_order(fence_val, order);
     }
 
     /// Synchronizes an auxiliary `COPY` queue behind the latest `self.queue`
     /// signal and returns the `QUEUE_ORDER` watermark visible after the wait.
-    #[allow(dead_code)]
     pub(crate) fn sync_copy_queue(
         &self,
         copy_queue: &ID3D12CommandQueue,
@@ -1909,28 +2055,23 @@ impl Host {
     /// Synchronizes an auxiliary `COPY` queue behind `self.queue` only when
     /// `wait_direct` is true and `self.fence` has not already completed past
     /// `last_signalled`.
-    #[allow(dead_code)]
     pub(crate) fn sync_copy_queue_for(
         &self,
         copy_queue: &ID3D12CommandQueue,
         wait_direct: bool,
     ) -> windows::core::Result<u64> {
-        let (v, order) = *self
-            .last_signalled
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        if v > 0 {
-            // SAFETY: `self.fence` is live.
-            if unsafe { self.fence.GetCompletedValue() } >= v {
-                return Ok(order.max(crate::shadow::relay_fetched_value()));
-            }
-            if wait_direct {
-                // SAFETY: `self.fence` is live and `v` was already signalled on `self.queue`.
-                unsafe { copy_queue.Wait(&self.fence, v)? };
-                return Ok(order.max(crate::shadow::relay_fetched_value()));
-            }
+        // SAFETY: `self.fence` is live.
+        let completed = unsafe { self.fence.GetCompletedValue() };
+        let (wait_v, watermark) = QUEUE_TIMELINE.sync_copy_plan(
+            completed,
+            wait_direct,
+            crate::shadow::relay_fetched_value(),
+        );
+        if let Some(v) = wait_v {
+            // SAFETY: `self.fence` is live and `v` was already signalled on `self.queue`.
+            unsafe { copy_queue.Wait(&self.fence, v)? };
         }
-        Ok(crate::shadow::relay_fetched_value())
+        Ok(watermark)
     }
 
     /// Whether the host has what copies in the card's memory need (lists and
@@ -2045,20 +2186,28 @@ impl Host {
     /// Uploads dirty CPU ranges to card-backed shadows before the submission's
     /// command lists and records the post-submission [`CARD_COMPARE`] (and
     /// optional [`CARD_FETCH`]) command list.
-    pub(super) fn card_before(&self, declared: Vec<Declared>, flown: bool) -> Option<CardPlan> {
+    pub(super) fn card_before(
+        &self,
+        declared: Vec<Declared>,
+        flown: bool,
+        submitted: &mut u64,
+    ) -> Option<CardPlan> {
         use std::sync::Arc;
         if !crate::shadow::cards() {
             return None;
         }
-        let mut order = relay().then(|| QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner()));
-        let sent_as = match order.as_mut() {
-            Some(order) => {
-                **order += 1;
-                **order
-            }
-            None => 0,
+        let (prev_order, candidate_sent_as) = if relay() {
+            QUEUE_TIMELINE.next_candidate()
+        } else {
+            (0, 0)
         };
-        let mut dirty = crate::shadow::card_dirty(sent_as);
+        let mut dirty = crate::shadow::card_dirty(candidate_sent_as);
+        let has_uploads = !dirty.is_empty();
+        let sent_as = if has_uploads {
+            candidate_sent_as
+        } else {
+            prev_order
+        };
         if declared.is_empty() && dirty.is_empty() {
             return None;
         }
@@ -2180,7 +2329,22 @@ impl Host {
                         }
                     }
                     list.Close()?;
-                    self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
+                    {
+                        // Lock order: `FETCHER` (`direct_submit_guard()`) -> `queue_order` -> `last_signalled`.
+                        let _lazy_order = crate::lazy_back::direct_submit_guard();
+                        let mut order = relay().then(|| QUEUE_TIMELINE.lock_queue_order());
+                        self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
+                        let submitted_order = if let Some(order) = order.as_mut() {
+                            QUEUE_TIMELINE.commit_submitted_locked(order, sent_as, has_uploads)
+                        } else {
+                            0
+                        };
+                        if crate::lazy_back::can_arm() || crate::lazy_back::ever_active() {
+                            *submitted += 1;
+                            self.queue.Signal(&self.fence, *submitted)?;
+                            self.note_signalled_with_order(*submitted, submitted_order);
+                        }
+                    }
                     Ok(())
                 })()
             };
@@ -2191,8 +2355,11 @@ impl Host {
             }
             used.push((false, sync));
         }
-        let order_after = order.as_deref().copied().unwrap_or(0);
-        drop(order);
+        let order_after = if relay() {
+            QUEUE_TIMELINE.submitted_order()
+        } else {
+            0
+        };
         let mut plan = CardPlan {
             ranges: Vec::new(),
             sent_as,
@@ -2425,9 +2592,14 @@ impl Host {
             offsets: Vec<u64>,
         }
 
+        let lazy = crate::lazy_back::enabled();
         let mut card_done_inflight = false;
         if inflight_fetch() {
-            let landed = self.relay_card_inflight(plans);
+            let landed = if lazy {
+                false
+            } else {
+                self.relay_card_inflight(plans)
+            };
             inflight_tickets_landed(plans);
             if landed {
                 card_done_inflight = true;
@@ -2471,6 +2643,16 @@ impl Host {
                             }
                             let (lo, hi) = r.shadow.card_piece(&r.span, p);
                             if lo < hi && seen.insert((copy, lo, hi)) {
+                                if lazy
+                                    && crate::lazy_back::try_defer_page(
+                                        &r.shadow,
+                                        lo,
+                                        hi - lo,
+                                        plan.sent_as,
+                                    )
+                                {
+                                    continue;
+                                }
                                 pieces.push((r.shadow.clone(), lo, hi, card_total));
                                 card_total += (hi - lo) as u64;
                             }
@@ -2493,7 +2675,35 @@ impl Host {
                 .map(|&(from, to)| shadow.inside(from, to.saturating_sub(from)))
                 .filter(|&(from, to)| from < to)
                 .collect();
-            let spans = merge_ranges(ranges);
+            let merged = merge_ranges(ranges);
+            if merged.is_empty() {
+                continue;
+            }
+            let spans = if lazy {
+                let start = shadow.start() as usize;
+                let page = crate::watch::PAGE;
+                let mut kept: Vec<(usize, usize)> = Vec::new();
+                for (from, to) in merged {
+                    let mut at = from;
+                    while at < to {
+                        let va = start + at;
+                        let step = (page - va % page).min(to - at);
+                        let next = at + step;
+                        if crate::lazy_back::try_defer_page(shadow, at, step, 0) {
+                            shadow.mark_rebar_dirty_range(at, step);
+                        } else {
+                            match kept.last_mut() {
+                                Some(last) if last.1 == at => last.1 = next,
+                                _ => kept.push((at, next)),
+                            }
+                        }
+                        at = next;
+                    }
+                }
+                kept
+            } else {
+                merged
+            };
             if spans.is_empty() {
                 continue;
             }
@@ -2514,17 +2724,11 @@ impl Host {
 
         let completed_order = plans.iter().map(|p| p.order_after).max().unwrap_or(0);
         if !card_done_inflight && !has_card {
-            if inflight_fetch() {
-                if let Some(last) = plans.iter().map(|p| p.sent_as).max() {
-                    crate::shadow::relay_fetched(last);
-                }
-            } else {
-                let after = if self.copy_queue.is_some() {
-                    completed_order
-                } else {
-                    *QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner())
-                };
-                crate::shadow::relay_fetched(after);
+            let max_sent_as = plans.iter().map(|p| p.sent_as).max();
+            if let Some(mark) =
+                relay_no_card_fetch_watermark(inflight_fetch(), max_sent_as, completed_order)
+            {
+                crate::shadow::relay_fetched(mark);
             }
         }
         if !has_card && !has_rebar {
@@ -2594,7 +2798,7 @@ impl Host {
                     WaitForSingleObject(event, INFINITE);
                     return Ok(after.max(landed));
                 }
-                let order = QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner());
+                let order = QUEUE_TIMELINE.lock_queue_order();
                 self.queue.ExecuteCommandLists(&lists);
                 let after = *order;
                 drop(order);
@@ -2665,7 +2869,12 @@ impl Host {
                         }
                     })
                     .collect();
-                written += entry.shadow.relay_merge_rebar(&entry.spans, &slices);
+                let Some(merged) = entry.shadow.relay_merge_rebar(&entry.spans, &slices) else {
+                    fail(format_args!(
+                        "relay ReBAR readback merge failed: title read or lazy materialization failed (VICTORY_RELAY)"
+                    ));
+                };
+                written += merged;
                 entry.shadow.mark_rebar_dirty_spans(&entry.spans);
             }
             COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
@@ -2854,7 +3063,11 @@ impl Host {
                 Late::Run(flight) => {
                     last = flight.number;
                     for entry in &flight.lists {
-                        read_backs(entry.list());
+                        if !read_backs(entry.list()) {
+                            fail(format_args!(
+                                "relay readback failed: lazy copy-back materialization failed (VICTORY_RELAY)"
+                            ));
+                        }
                     }
                     if let Some(card) = flight.card {
                         self.card_done(card);
@@ -3297,7 +3510,11 @@ impl Host {
                     Late::Run(flight) => {
                         last = flight.number;
                         for entry in &flight.lists {
-                            read_backs(entry.list());
+                            if !read_backs(entry.list()) {
+                                fail(format_args!(
+                                    "settle readback failed: lazy copy-back materialization failed"
+                                ));
+                            }
                         }
                         if let Some(card) = flight.card {
                             self.card_done(card);

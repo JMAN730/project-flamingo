@@ -378,7 +378,7 @@ static GENERATION: AtomicU64 = AtomicU64::new(1);
 /// The views' generation ([`GENERATION`]).
 #[allow(dead_code)]
 pub(crate) fn generation() -> u64 {
-    GENERATION.load(Ordering::Acquire)
+    GENERATION.load(Ordering::SeqCst)
 }
 
 /// The other places the pages of `[at, at + len)` show at: address ranges
@@ -482,7 +482,14 @@ pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
 
 /// The runtime mapped `[at, at + len)` as a view of `section` from
 /// `offset` on. Call after [`crate::title_memory_remapped`] of the range.
-pub fn title_memory_view(at: usize, len: usize, section: usize, offset: u64) {
+/// Returns `false` if an overlapping deferred lazy copy-back could not be
+/// materialized (in which case `[at, at + len)` is armed at `PAGE_NOACCESS`
+/// so stale RAM is never exposed). If protecting the newly mapped alias with
+/// `PAGE_NOACCESS` also fails, `views_mapped` rolls back the view registration
+/// and fails closed via [`crate::host::fail`] rather than exposing an
+/// unprotected stale alias.
+#[must_use]
+pub fn title_memory_view(at: usize, len: usize, section: usize, offset: u64) -> bool {
     {
         let mut v = views();
         if let Some((_, s, o)) = v.views.insert(at, (len, section, offset)) {
@@ -501,11 +508,12 @@ pub fn title_memory_view(at: usize, len: usize, section: usize, offset: u64) {
                 .push(at + k * K64);
         }
     }
-    GENERATION.fetch_add(1, Ordering::AcqRel);
-    // This view is writable from now on: a guard over the same bytes at
-    // another view must look at them again, and the pages are noted written
-    // there (`crate::watch`).
-    crate::watch::views_mapped(section, offset, len);
+    GENERATION.fetch_add(1, Ordering::SeqCst);
+    // This view is writable from now on (unless lazy materialization failed
+    // and armed it at `PAGE_NOACCESS`): a guard over the same bytes at another
+    // view must look at them again, and the pages are noted written there
+    // (`crate::watch`).
+    crate::watch::views_mapped(at, len, section, offset)
 }
 
 /// What `[at, at + len)` showed is gone ([`crate::title_memory_remapped`]):
@@ -551,7 +559,7 @@ pub(crate) fn views_gone(at: usize, len: usize) {
             }
         }
     }
-    GENERATION.fetch_add(1, Ordering::AcqRel);
+    GENERATION.fetch_add(1, Ordering::SeqCst);
 }
 
 /// How many bytes of `[at, at + len)` views of physical pages show; `None`
@@ -672,10 +680,12 @@ pub(crate) fn pages_of(page: usize) -> Vec<usize> {
         .unwrap_or_default()
 }
 
-/// The title views that show any of the physical bytes `[offset, offset +
-/// len)` of `section`, as `(address, bytes)` ranges in address order; not
-/// those of a page shown in very many views (`MANY_VIEWS`).
-pub(crate) fn views_of_section(section: usize, offset: u64, len: usize) -> Vec<(usize, usize)> {
+fn views_of_section_inner(
+    section: usize,
+    offset: u64,
+    len: usize,
+    max_views: Option<usize>,
+) -> Vec<(usize, usize)> {
     if len == 0 {
         return Vec::new();
     }
@@ -685,7 +695,7 @@ pub(crate) fn views_of_section(section: usize, offset: u64, len: usize) -> Vec<(
     let mut at = offset - offset % K64 as u64;
     while at < end {
         if let Some(shown) = v.pages.get(&(section, at))
-            && shown.len() <= crate::watch::MANY_VIEWS
+            && max_views.is_none_or(|cap| shown.len() <= cap)
         {
             pages.extend(shown.iter().copied());
         }
@@ -704,6 +714,20 @@ pub(crate) fn views_of_section(section: usize, offset: u64, len: usize) -> Vec<(
         }
     }
     runs
+}
+
+/// The title views that show any of the physical bytes `[offset, offset +
+/// len)` of `section`, as `(address, bytes)` ranges in address order; not
+/// those of a page shown in very many views (`MANY_VIEWS`).
+pub(crate) fn views_of_section(section: usize, offset: u64, len: usize) -> Vec<(usize, usize)> {
+    views_of_section_inner(section, offset, len, Some(crate::watch::MANY_VIEWS))
+}
+
+/// Uncapped variant of [`views_of_section`] used by `lazy_back` in
+/// [`crate::watch::views_mapped`] so mapping a `(MANY_VIEWS + 1)`-th alias of a
+/// deferred section page still materializes every armed view.
+pub(crate) fn views_of_section_all(section: usize, offset: u64, len: usize) -> Vec<(usize, usize)> {
+    views_of_section_inner(section, offset, len, None)
 }
 
 /// Whether what shaders wrote goes back into title view memory through a
@@ -793,6 +817,8 @@ static OWN: std::sync::Mutex<
 fn own_view_ptr(
     at: usize,
     len: usize,
+    blocking: bool,
+    allow_many_views: bool,
 ) -> Option<(
     usize,
     Vec<usize>,
@@ -804,7 +830,11 @@ fn own_view_ptr(
     }
     // No mapping changes until the caller finishes: the view found below
     // shows these pages for as long as this guard is held.
-    let still = crate::watch::title_memory_reading_now(at, len)?;
+    let still = if blocking {
+        crate::watch::title_memory_reading(at, len)
+    } else {
+        crate::watch::title_memory_reading_now(at, len)?
+    };
     let (section, offset, shown, section_bytes) = {
         let v = views_read();
         let (&base, &(view_len, section, offset)) = v.views.range(..=at).next_back()?;
@@ -816,7 +846,7 @@ fn own_view_ptr(
             .pages
             .get(&(section, offset - offset % K64 as u64))?
             .clone();
-        if shown.len() > crate::watch::MANY_VIEWS {
+        if !allow_many_views && shown.len() > crate::watch::MANY_VIEWS {
             return None;
         }
         let section_bytes = v.sections.iter().find(|s| s.0 == section)?.1;
@@ -884,15 +914,34 @@ fn own_view_ptr(
     Some((ptr, shown, view_arc, still))
 }
 
+/// Whether `[at, at + len)` has a live, committed host-only `PAGE_READWRITE`
+/// own view of its backing section (non-blocking).
+pub(crate) fn has_own_view_for(at: usize, len: usize) -> bool {
+    own_view_ptr(at, len, false, false).is_some()
+}
+
 /// Reads title physical bytes at `[at, at + dst.len())` through our own
 /// `PAGE_READWRITE` section view (without touching title view protections),
 /// returning `false` if `[at, at + dst.len())` is not inside one 64 KiB page
 /// of a mapped section view or a mapping change is in progress.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn read_own(at: usize, dst: &mut [u8]) -> bool {
+    read_own_inner(at, dst, false, false)
+}
+
+/// Blocking variant of [`read_own`] for `lazy_back` materialization, waiting
+/// for any unrelated mapping change instead of failing transiently and
+/// permitting pages that just crossed `MANY_VIEWS` when a new alias was mapped.
+pub(crate) fn read_own_blocking(at: usize, dst: &mut [u8]) -> bool {
+    read_own_inner(at, dst, true, true)
+}
+
+fn read_own_inner(at: usize, dst: &mut [u8], blocking: bool, allow_many_views: bool) -> bool {
     if dst.is_empty() {
         return true;
     }
-    let Some((src, _shown, _own, _still)) = own_view_ptr(at, dst.len()) else {
+    let Some((src, _shown, _own, _still)) = own_view_ptr(at, dst.len(), blocking, allow_many_views)
+    else {
         return false;
     };
     // SAFETY: committed bytes inside our own `PAGE_READWRITE` section view
@@ -909,7 +958,22 @@ pub(crate) fn read_own(at: usize, dst: &mut [u8]) -> bool {
 /// nothing written: not view memory, a page of very many views, the
 /// runtime changing mappings at this moment, or the host refusing.
 pub(crate) fn write_own(at: usize, bytes: &[u8]) -> Option<Vec<usize>> {
-    let (dst, shown, _own, _still) = own_view_ptr(at, bytes.len())?;
+    write_own_inner(at, bytes, false, false)
+}
+
+/// Blocking variant of [`write_own`] for `lazy_back` materialization,
+/// permitting pages that just crossed `MANY_VIEWS` when a new alias was mapped.
+pub(crate) fn write_own_blocking(at: usize, bytes: &[u8]) -> Option<Vec<usize>> {
+    write_own_inner(at, bytes, true, true)
+}
+
+fn write_own_inner(
+    at: usize,
+    bytes: &[u8],
+    blocking: bool,
+    allow_many_views: bool,
+) -> Option<Vec<usize>> {
+    let (dst, shown, _own, _still) = own_view_ptr(at, bytes.len(), blocking, allow_many_views)?;
     // SAFETY: committed bytes inside our own view (`_own` keeps it mapped until
     // after the copy even if evicted, and `_still` keeps the title view live);
     // the source is the caller's slice.
@@ -1978,7 +2042,12 @@ mod tests {
         // Addresses nothing has: only the record is asked.
         let at = 0x7ff1_0000_0000_usize;
         for (block, blocks) in [(0, 1), (1, 1), (4, 2)] {
-            super::title_memory_view(at + block * K64, blocks * K64, 7, 0);
+            assert!(super::title_memory_view(
+                at + block * K64,
+                blocks * K64,
+                7,
+                0
+            ));
         }
         let shown = |from: usize, len: usize| super::shown_bytes(at + from, len);
         assert_eq!(shown(0, 8 * K64), Some(4 * K64 as u64));
@@ -2032,8 +2101,8 @@ mod tests {
     #[test]
     fn remapped_memory_forgets_its_views() {
         let at = 0x7_4000_0000usize;
-        title_memory_view(at, 4 * K64, 77, 0);
-        title_memory_view(at + 4 * K64, K64, 77, 4 * K64 as u64);
+        assert!(title_memory_view(at, 4 * K64, 77, 0));
+        assert!(title_memory_view(at + 4 * K64, K64, 77, 4 * K64 as u64));
         assert_eq!(cover(at, 5 * K64), Cover::Run(77, 0));
         // One page inside the first view goes: the whole view is forgotten
         // (the runtime maps and tells again what stays of it).
@@ -2051,12 +2120,27 @@ mod tests {
         let base = 0x7a00_0000_0000usize;
         let (section, other) = (0x51, 0x52);
         for k in 0..3 {
-            title_memory_view(base + k * K64, K64, section, (k * K64) as u64);
+            assert!(title_memory_view(
+                base + k * K64,
+                K64,
+                section,
+                (k * K64) as u64
+            ));
         }
         // Next in memory, not in the section.
-        title_memory_view(base + 3 * K64, K64, section, (9 * K64) as u64);
+        assert!(title_memory_view(
+            base + 3 * K64,
+            K64,
+            section,
+            (9 * K64) as u64
+        ));
         // Next in the section's offsets, of another section.
-        title_memory_view(base + 4 * K64, K64, other, (10 * K64) as u64);
+        assert!(title_memory_view(
+            base + 4 * K64,
+            K64,
+            other,
+            (10 * K64) as u64
+        ));
         let reach = 1 << 30;
         assert_eq!(
             stretch(base + K64 + 8, base + K64 + 16, reach),
@@ -2220,8 +2304,13 @@ mod tests {
                 mem::PAGE_READWRITE,
             ) as u64;
             let view = 0x7_8000_0000u64;
-            title_memory_view(view as usize, 2 * K64, 5, 0);
-            title_memory_view(view as usize + 2 * K64, K64, 5, 9 * K64 as u64);
+            assert!(title_memory_view(view as usize, 2 * K64, 5, 0));
+            assert!(title_memory_view(
+                view as usize + 2 * K64,
+                K64,
+                5,
+                9 * K64 as u64
+            ));
             let lines = census_of(&[
                 (base, 2 * K64 as u64, false),
                 (base + 4 * K64 as u64, K64 as u64, true),
@@ -2275,8 +2364,8 @@ mod tests {
             (section as usize, one, two)
         };
         title_memory_section(section, SIZE as u64, true);
-        title_memory_view(one, SIZE, section, 0);
-        title_memory_view(two, SIZE, section, 0);
+        assert!(title_memory_view(one, SIZE, section, 0));
+        assert!(title_memory_view(two, SIZE, section, 0));
 
         // Guard view `one` so its pages are read-only and clean.
         assert!(crate::watch::writes(one, one + SIZE, true).is_some());
@@ -2362,14 +2451,15 @@ mod tests {
             (section as usize, view)
         };
         title_memory_section(section, SIZE as u64, true);
-        title_memory_view(title_view, SIZE, section, 0);
+        assert!(title_memory_view(title_view, SIZE, section, 0));
 
         let payload = [0x11u8, 0x22, 0x33, 0x44];
         assert!(write_own(title_view + 64, &payload).is_some());
 
         // Simulate an active caller holding `Arc<Own>` across eviction.
         let (ptr, _shown, active_own, still) =
-            own_view_ptr(title_view + 64, payload.len()).expect("own_view_ptr should succeed");
+            own_view_ptr(title_view + 64, payload.len(), false, false)
+                .expect("own_view_ptr should succeed");
         let own_base = active_own.base;
         drop(still);
 

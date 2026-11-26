@@ -52,6 +52,8 @@ mod indirect;
 mod indirect_budget;
 #[cfg(windows)]
 mod inplace;
+#[cfg(windows)]
+pub(crate) mod lazy_back;
 pub mod list;
 #[cfg(windows)]
 mod memory;
