@@ -372,10 +372,86 @@ extern "system" fn list_type(this: This) -> u32 {
     // SAFETY: `this` is one of our lists.
     unsafe { (*this.cast::<List>()).kind }
 }
+/// Finishes any open hoisted-clamp list on `state` and appends it to
+/// `segments` ahead of the active host list.
+#[cfg(windows)]
+fn finish_hoist(segments: &mut Vec<Segment>, state: &mut crate::draw::State) {
+    if let Some(clamps) = state.end_hoist() {
+        segments.push(Segment::List(clamps));
+    }
+}
+
+/// Before an indirect draw (`crate::indirect::hoisting`, opt-in via
+/// `VICTORY_HOIST_CLAMPS`): unless the clamps of the list's draws already go
+/// to a list before it and nothing since may have written arguments, cut the
+/// recording here; a list for the clamps of the draws to come precedes the
+/// new draw list, which receives the title's reapplied fixed-function state.
+#[cfg(windows)]
+fn hoist(this: This) {
+    if !crate::indirect::hoisting() || this.is_null() {
+        return;
+    }
+    // SAFETY: the title passes one of our lists.
+    let list = unsafe { &*this.cast::<List>() };
+    // Lock order: host -> segments -> state.
+    let mut host = list.host.lock().unwrap_or_else(|e| e.into_inner());
+    let mut segments = list.segments.lock().unwrap_or_else(|e| e.into_inner());
+    let mut state = list.state.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(current) = host.as_ref() else {
+        return;
+    };
+    if state.hoists_into(current) {
+        return;
+    }
+    finish_hoist(&mut segments, &mut state);
+    crate::indirect::CUTS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let Some(next) = crate::host::host()
+        .and_then(|h| h.acquire_list().ok())
+        .map(std::sync::Arc::new)
+    else {
+        return;
+    };
+    let needs_separate = list.has_work.load(std::sync::atomic::Ordering::Acquire)
+        || !current.untouched()
+        || crate::indirect::hoist_mode() == 5;
+    let clamps = if needs_separate {
+        let Some(clamps) = crate::host::host()
+            .and_then(|h| h.acquire_list().ok())
+            .map(std::sync::Arc::new)
+        else {
+            return;
+        };
+        if let Some(old) = host.replace(next.clone()) {
+            old.close();
+            segments.push(Segment::List(old.clone()));
+            state.reapply_host(&next, &old);
+        }
+        clamps
+    } else {
+        let Some(old) = host.replace(next.clone()) else {
+            return;
+        };
+        state.reapply_host(&next, &old);
+        old
+    };
+    list.has_work
+        .store(false, std::sync::atomic::Ordering::Release);
+    state.hoist(clamps, &next);
+}
+
 extern "system" fn close(this: This) -> HRESULT {
     #[cfg(windows)]
-    if let Some(host) = host_list(this) {
-        host.close();
+    if !this.is_null() {
+        // SAFETY: the title passes one of our lists.
+        let list = unsafe { &*this.cast::<List>() };
+        // Lock order: host -> segments -> state.
+        let host = list.host.lock().unwrap_or_else(|e| e.into_inner());
+        let mut segments = list.segments.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = list.state.lock().unwrap_or_else(|e| e.into_inner());
+        finish_hoist(&mut segments, &mut state);
+        if let Some(host) = host.as_ref() {
+            host.close();
+        }
     }
     S_OK
 }
@@ -395,6 +471,7 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
         let mut host = list.host.lock().unwrap_or_else(|e| e.into_inner());
         let mut segments = list.segments.lock().unwrap_or_else(|e| e.into_inner());
         let mut state = list.state.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = state.end_hoist();
         if let Some(pending) = segments
             .iter()
             .filter_map(|s| match s {
@@ -643,6 +720,8 @@ extern "system" fn copy_buffer_region(
         && let Some(to) = buffer_range(dst, dst_offset, len)
         && let Some(from) = buffer_range(src, src_offset, len)
     {
+        list.count_write();
+        list.gather_close();
         list.defer_copy(to, from, len as usize);
         mark_work(this);
     }
@@ -682,6 +761,8 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             crate::resource::buffer_bytes(dst),
             crate::resource::buffer_bytes(src),
         ) {
+            list.count_write();
+            list.gather_close();
             list.defer_copy(to, from, a.min(b) as usize);
             mark_work(this);
         }
@@ -1295,6 +1376,8 @@ extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags:
         && src != 0
         && len != 0
     {
+        list.count_write();
+        list.gather_close();
         let disjoint = dst.checked_add(len).is_some_and(|end| end <= src)
             || src.checked_add(len).is_some_and(|end| end <= dst);
         if disjoint {
@@ -1679,6 +1762,7 @@ mod state {
         super::mark_work(this);
         if indirect != 0 {
             const MESH: u32 = 10;
+            super::hoist(this);
             let mut ran = false;
             let mut dropped = "";
             with_state(this, |list, s| {
@@ -1785,6 +1869,9 @@ extern "system" fn execute_indirect(
         } else {
             *kind
         };
+        if kind != DISPATCH {
+            hoist(this);
+        }
         with_state(this, |list, s| {
             ran = s.execute_indirect(list, (kind, stride, max), address, counter, &mut dropped);
         });
@@ -1907,6 +1994,7 @@ fn record_wait(this: This, address: u64, comparison: u32, reference: u64, mask: 
                 .swap(false, std::sync::atomic::Ordering::AcqRel)
                 && let Some(prev) = host.take()
             {
+                finish_hoist(&mut segments, &mut state);
                 prev.close();
                 segments.push(Segment::List(prev.clone()));
                 match crate::host::host().and_then(|h| h.acquire_list().ok()) {

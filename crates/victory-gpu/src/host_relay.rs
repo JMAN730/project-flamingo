@@ -3018,11 +3018,18 @@ impl Host {
         let ok = self.copy_rebar_readback(submitted, &copy_jobs, |slices| {
             for entry in &merged {
                 if entry.first < entry.end {
-                    let written = entry
+                    match entry
                         .shadow
-                        .copy_back_rebar(&entry.spans, &slices[entry.first..entry.end]);
-                    entry.shadow.mark_rebar_dirty_spans(&entry.spans);
-                    COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+                        .copy_back_rebar(&entry.spans, &slices[entry.first..entry.end])
+                    {
+                        Some(written) => {
+                            entry.shadow.mark_rebar_dirty_spans(&entry.spans);
+                            COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+                        }
+                        None => {
+                            entry.shadow.mark_rebar_dirty_spans(&entry.spans);
+                        }
+                    }
                 } else {
                     entry.shadow.clear_pending_rebar();
                 }
@@ -3032,8 +3039,9 @@ impl Host {
             for entry in &merged {
                 if !entry.spans.is_empty() {
                     entry.shadow.mark_rebar_dirty_spans(&entry.spans);
+                } else {
+                    entry.shadow.clear_pending_rebar();
                 }
-                entry.shadow.clear_pending_rebar();
             }
         }
     }

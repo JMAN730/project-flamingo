@@ -1018,9 +1018,10 @@ mod eager_gbv_tests {
 #[cfg(test)]
 mod wave_tests {
     use super::{
-        REBAR_HASH_SOURCE, flagged_piece_byte_runs, host, intersect_ranges, merge_ranges,
-        parse_rebar_mb_override, rebar_hash_pipeline, rebar_loose_policy, rebar_policy,
-        resolve_rebar_budgets, spans_to_piece_runs, transition, wave32_supported,
+        REBAR_HASH_SOURCE, RebarWriteEntry, flagged_piece_byte_runs, host, intersect_ranges,
+        isolated_retire_scope, merge_ranges, parse_rebar_mb_override, rebar_hash_pipeline,
+        rebar_loose_policy, rebar_policy, resolve_rebar_budgets, spans_to_piece_runs, transition,
+        wave32_supported,
     };
     use crate::watch::PAGE;
 
@@ -1343,6 +1344,99 @@ mod wave_tests {
             errors_before,
             "unexpected D3D12 debug layer error during rebar_hash test"
         );
+    }
+
+    #[test]
+    fn rebar_finish_copy_back_failure_keeps_pending_and_preserves_vram_on_refresh() {
+        let _rebar = crate::shadow::lock_rebar_gpu_test();
+        let _retire = isolated_retire_scope();
+        let Some(h) = host() else {
+            return;
+        };
+
+        let title = vec![0x11u8; 4096];
+        let start = title.as_ptr() as u64;
+        let len = title.len() as u64;
+        let (buf_a, ptr_a) = h.shared_buffer(len).expect("shared buffer a");
+        let (buf_b, ptr_b) = h.shared_buffer(len).expect("shared buffer b");
+        // SAFETY: live D3D12 buffers.
+        let (gpu_a, gpu_b) =
+            unsafe { (buf_a.GetGPUVirtualAddress(), buf_b.GetGPUVirtualAddress()) };
+        let shadow_owed =
+            crate::shadow::Shadow::new_rebar_from_parts_for_test(buf_a, ptr_a, gpu_a, start, len);
+        let shadow_empty =
+            crate::shadow::Shadow::new_rebar_from_parts_for_test(buf_b, ptr_b, gpu_b, start, len);
+
+        assert!(
+            shadow_owed.writing(start as usize + 64, 64, |_, n| Some(vec![
+                0x11u8;
+                n as usize
+            ]))
+        );
+        assert!(shadow_empty.writing(start as usize, 64, |_, n| Some(vec![0x11u8; n as usize])));
+        // Initialize hash state so we can verify dirty-span restoration on readback failure.
+        let _ = shadow_owed
+            .prepare_rebar_hashes(|n| h.default_buffer(n))
+            .expect("initial rebar hashes");
+        assert!(
+            shadow_owed
+                .prepare_rebar_hashes(|n| h.default_buffer(n))
+                .expect("clean rebar hashes")
+                .pre_runs
+                .is_empty()
+        );
+        // Simulate GPU-written bytes in `[64..128)`.
+        // SAFETY: `ptr_a` is mapped for `len` bytes of shared RAM in this test.
+        unsafe {
+            std::ptr::write_bytes(ptr_a, 0x22, len as usize);
+            std::ptr::write_bytes(ptr_a.add(64), 0xAA, 64);
+        }
+
+        let entries = vec![
+            RebarWriteEntry {
+                shadow: shadow_owed.clone(),
+                declared_spans: vec![(64, 128)],
+                piece_runs: vec![(0, 1)],
+                compare_out_base: None,
+                compare_pieces: 0,
+            },
+            RebarWriteEntry {
+                shadow: shadow_empty.clone(),
+                declared_spans: Vec::new(),
+                piece_runs: Vec::new(),
+                compare_out_base: None,
+                compare_pieces: 0,
+            },
+        ];
+
+        // Simulate `copy_rebar_readback` returning `false`.
+        let ok = h.finish_rebar_copy_back_with(entries, 0, |_, _| false);
+        assert!(!ok, "failed ReBAR readback must report failure");
+        assert!(
+            shadow_owed.has_pending(),
+            "undelivered GPU span must remain pending on readback failure"
+        );
+        assert!(
+            !shadow_empty.has_pending(),
+            "entry with no owed spans may clear pending cleanly"
+        );
+        assert_eq!(
+            shadow_owed
+                .prepare_rebar_hashes(|n| h.default_buffer(n))
+                .expect("restored dirty hashes")
+                .pre_runs,
+            vec![(0, 1)]
+        );
+
+        // A subsequent refresh must not overwrite the pending GPU bytes `[64..128)`.
+        shadow_owed.update(start as usize, len as usize);
+        let bytes = shadow_owed.read_test_bytes(start, len as usize);
+        assert!(bytes[..64].iter().all(|&b| b == 0x11));
+        assert!(
+            bytes[64..128].iter().all(|&b| b == 0xAA),
+            "refresh must keep undelivered GPU result intact while copy-back is pending"
+        );
+        assert!(bytes[128..].iter().all(|&b| b == 0x11));
     }
 }
 

@@ -381,6 +381,14 @@ fn clwb_loop(code: &[u8]) -> Option<ClwbLoop> {
     (limit != base).then_some(ClwbLoop { base, limit, len })
 }
 
+/// Whether the 15-byte `clzero` loop (`mov rax, a; add a, 0x40; clzero; cmp a, b; jb`)
+/// is emulated whole (`VICTORY_CLZERO_LOOP15=0` disables the loop fast path and
+/// emulates one 64-byte line per exception).
+fn clzero_loop15_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CLZERO_LOOP15").is_none_or(|v| v != "0"))
+}
+
 /// `clzero` at `context.Rip`. An exception costs about a microsecond and
 /// titles clear tens of kilobytes at a time, a line per pass, so the two
 /// loops compilers build around the instruction are done whole in one
@@ -427,7 +435,7 @@ unsafe fn clzero(context: &mut CONTEXT) -> bool {
             return true;
         }
     }
-    if (7..=0x1000 - 8).contains(&page) {
+    if clzero_loop15_enabled() && (7..=0x1000 - 8).contains(&page) {
         // SAFETY: inside the page the CPU fetched the instruction from.
         let (before, after) = unsafe {
             (

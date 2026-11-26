@@ -146,6 +146,14 @@ fn check_present(
 // Adapted from the upstream PresentX recovery and pre-flip readback tests.
 #[test]
 fn present_overlay_composites_pixels_and_recovers_from_initialization_failure() {
+    // The fixture can be run as an exact filter to check the selected plane records.
+    let _subscriber = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(std::io::stderr)
+            .finish(),
+    );
     let Some(host) = host() else {
         eprintln!("PRESENTX_GPU_SKIP: no host D3D12 device");
         return;
@@ -247,6 +255,62 @@ fn present_overlay_composites_pixels_and_recovers_from_initialization_failure() 
         (BASE_SIDE, RED),
         "duplicate source falls back to single-plane extent",
     );
+    assert_eq!(
+        host.present_overlay(&black, SOURCE_STATE, &transparent, SOURCE_STATE, 9),
+        Some(true),
+        "transparent black overlay preserves a black fade input"
+    );
     assert_eq!(host.present_compositor_retry.lock().unwrap().attempts, 0);
     eprintln!("PRESENTX_GPU_READBACK_OK: fallback, half-alpha, opaque and transparent");
+}
+
+#[test]
+fn black_primary_and_opaque_overlay_have_distinct_sample_counts() {
+    let Some(host) = host() else {
+        eprintln!("PRESENTX_GPU_SKIP: no host D3D12 device");
+        return;
+    };
+    log_adapter(host);
+    let compositor = PresentCompositor::new(&host.device, FORMAT).expect("compositor");
+    let list = host.new_list().expect("probe list");
+    let target = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    let primary = clear_plane(host, &list, BASE_SIDE, BLACK);
+    let overlay = clear_plane(host, &list, OVERLAY_SIDE, GREEN);
+    let back = clear_plane(host, &list, OVERLAY_SIDE, BLACK);
+    let read = |texture| {
+        crate::capture::probe_plane(&host.device, &list.list, texture, target).expect("plane probe")
+    };
+    let base_samples = read(&primary);
+    let overlay_samples = read(&overlay);
+    // SAFETY: the test retains the target and the open list, and just cleared it as an RTV.
+    unsafe {
+        list.list
+            .ResourceBarrier(&[transition(&back, target, D3D12_RESOURCE_STATE_PRESENT)])
+    };
+    compositor.record(
+        &host.device,
+        &list.list,
+        &back,
+        [(&primary, target), (&overlay, target)],
+        (OVERLAY_SIDE, OVERLAY_SIDE),
+    );
+    let composite_samples = read(&back);
+    list.close();
+    host.execute(&[&list]);
+    for (buffer, expected, peak) in [
+        (&base_samples, 0, 0),
+        (&overlay_samples, 16, 255),
+        (&composite_samples, 16, 255),
+    ] {
+        let samples = crate::capture::grid_samples(buffer).expect("completed, mapped grid");
+        assert_eq!(
+            (
+                samples.samples,
+                samples.nonzero,
+                samples.above_black,
+                samples.peak
+            ),
+            (16, expected, expected, peak)
+        );
+    }
 }
