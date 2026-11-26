@@ -1561,13 +1561,21 @@ impl State {
             }
             h.finish()
         };
-        if crate::descriptor::host::take_short_reads() {
-            // A texture filled short during a remap: re-run bindless upload pass.
-            self.bindless_cache = None;
-        }
+        // Only check pending short-read notices on SRV passes, and only for
+        // resources that actually have a live SRV in this heap. Notices are
+        // cleared per-resource inside `texture::upload_from` once an eligible
+        // pass schedules the upload, so UAV-only passes and unrelated heaps
+        // never consume another texture's retry notice.
+        let short_retry = if uses_heap_srv && crate::descriptor::host::has_short_reads() {
+            let pending = crate::descriptor::host::pending_short_resources();
+            host.matching_live_srvs(&pending)
+        } else {
+            Vec::new()
+        };
         let cur_tex_gen = host.tex_gen();
         let cur_state_gen = list.state_gen();
-        if let Some(cache) = &self.bindless_cache
+        if short_retry.is_empty()
+            && let Some(cache) = &self.bindless_cache
             && cache.heap == self.heaps[0]
             && cache.tex_gen == cur_tex_gen
             && cache.state_gen == cur_state_gen
@@ -1582,8 +1590,8 @@ impl State {
         // When the view heap and bindless SRV/UAV mode are unchanged, only
         // textures whose descriptor was newly written since `cache.tex_gen`,
         // textures transitioned on `list` since the last sync, targets skipped
-        // on the previous draw, or the active depth target can need transitions
-        // — O(|new_slots| + |dirty|) instead of walking every resident texture.
+        // on the previous draw, the active depth target, or pending short-read
+        // textures in this heap can need transitions/uploads — O(|new| + |dirty|).
         let incremental = self
             .bindless_cache
             .as_ref()
@@ -1595,6 +1603,7 @@ impl State {
             .and_then(|cache| {
                 let (_, mut candidates) = list.dirty_since(cache.dirty_cursor);
                 candidates.extend_from_slice(&cache.skipped_targets);
+                candidates.extend_from_slice(&short_retry);
                 if let Some(d) = active_depth {
                     candidates.push(d.resource);
                 }
@@ -5601,6 +5610,122 @@ mod bindless_tests {
         // SAFETY: plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
         assert_eq!(host.d3d12_errors(), errors_before);
+    }
+
+    #[test]
+    fn short_read_notice_is_not_consumed_by_uav_only_or_other_heap_passes() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU
+        };
+        let (_, gfx_srv_only, compute_srv) = make_test_pipelines(&host.device);
+        let used_uav = UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::ResourceHeap,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 8,
+            user_data: 0,
+            slot: 0,
+        };
+        let compute_uav_only = HostPipeline {
+            structured_strides: Vec::new(),
+            compute: true,
+            mesh: false,
+            rects: false,
+            amplify: None,
+            pso: compute_srv.pso.clone(),
+            root: compute_srv.root.clone(),
+            stages: vec![Stage {
+                shader: Shader::for_test("compute", HwStage::Cs, vec![used_uav]),
+                user_data: None,
+                root_cbvs: Vec::new(),
+                root_srvs: Vec::new(),
+                root_uavs: Vec::new(),
+            }],
+            slots: 0,
+            inputs: Vec::new(),
+            name: "compute_uav_only".into(),
+        };
+
+        let tex_a = make_texture(DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE);
+        let tex_b = make_texture(DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE);
+        let heap_a = make_view_heap(4);
+        let heap_b = make_view_heap(4);
+        let null = std::ptr::null();
+        crate::descriptor::create_srv(
+            null,
+            tex_a.0,
+            null.cast(),
+            crate::descriptor::heap(heap_a.0).start,
+        );
+        crate::descriptor::create_srv(
+            null,
+            tex_b.0,
+            null.cast(),
+            crate::descriptor::heap(heap_b.0).start,
+        );
+
+        let list = host.new_list().expect("host list");
+        let mut state_a = State::default();
+        state_a.set_heaps(&[heap_a.0]);
+        assert!(state_a.bind(&list, &gfx_srv_only, false));
+        let walks_a = state_a.bindless_full_walks;
+        assert!(list.covers_texture(tex_a.0 as usize, 0));
+
+        // Reset the list (keeping `state_a`'s bindless_cache warm, simulating a
+        // cached State seeing a short-read notice for `tex_a`).
+        let list2 = host.new_list().expect("host list 2");
+        let (mem_a, _) = crate::resource::texture_memory(tex_a.0).unwrap();
+        let start_a = mem_a as u64;
+        crate::descriptor::host::read_all(start_a);
+        crate::descriptor::host::read_short(start_a, tex_a.0 as usize);
+        assert!(crate::descriptor::host::is_short_read_pending(
+            tex_a.0 as usize
+        ));
+
+        // 1. A UAV-only bindless pass on heap A must NOT consume `tex_a`'s notice.
+        let mut state_uav = State::default();
+        state_uav.set_heaps(&[heap_a.0]);
+        assert!(state_uav.bind(&list2, &compute_uav_only, true));
+        assert!(
+            crate::descriptor::host::is_short_read_pending(tex_a.0 as usize),
+            "UAV-only pass must not consume an SRV short-read notice"
+        );
+
+        // 2. An SRV bindless pass on heap B (which does not contain `tex_a`)
+        // must NOT consume `tex_a`'s notice.
+        let mut state_b = State::default();
+        state_b.set_heaps(&[heap_b.0]);
+        assert!(state_b.bind(&list2, &gfx_srv_only, false));
+        assert!(
+            crate::descriptor::host::is_short_read_pending(tex_a.0 as usize),
+            "SRV pass on an unrelated heap must not consume tex_a's notice"
+        );
+
+        // 3. The owning State on heap A (even with a warm bindless_cache) must
+        // retry `tex_a` incrementally, schedule its upload on `list2`, and clear
+        // the notice.
+        assert!(!list2.covers_texture(tex_a.0 as usize, 0));
+        assert!(state_a.bind(&list2, &gfx_srv_only, false));
+        assert_eq!(
+            state_a.bindless_full_walks, walks_a,
+            "short-read retry on warm cache should use incremental subset sync"
+        );
+        assert!(
+            list2.covers_texture(tex_a.0 as usize, 0),
+            "owning heap SRV pass must upload the short-read texture"
+        );
+        assert!(
+            !crate::descriptor::host::is_short_read_pending(tex_a.0 as usize),
+            "short-read notice must clear once an eligible pass schedules the upload"
+        );
+
+        crate::descriptor::host::read_all(start_a);
+        list.close();
+        list.reset();
+        list2.close();
+        list2.reset();
     }
 
     #[test]

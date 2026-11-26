@@ -45,6 +45,35 @@ pub(crate) fn memory_wait_timeouts() -> u64 {
 }
 
 impl MemoryWait {
+    /// Target memory address and comparison width in bytes (4 or 8).
+    #[cfg(windows)]
+    pub(crate) fn place(&self) -> (usize, usize) {
+        (self.address as usize, if self.width == 4 { 4 } else { 8 })
+    }
+
+    /// Whether `val` satisfies this wait's masked comparison (used by
+    /// `crate::host::late_met` against queued bottom-of-pipe writes).
+    #[cfg(windows)]
+    pub(crate) fn holds_for(&self, val: u64) -> bool {
+        let (lhs, rhs) = if self.width == 4 {
+            (
+                u64::from((val as u32) & self.mask),
+                u64::from(self.reference as u32),
+            )
+        } else {
+            (val, self.reference)
+        };
+        match self.comparison {
+            2 => lhs < rhs,
+            3 => lhs == rhs,
+            4 => lhs <= rhs,
+            5 => lhs > rhs,
+            6 => lhs != rhs,
+            7 => lhs >= rhs,
+            _ => true,
+        }
+    }
+
     /// Whether the memory location currently satisfies the wait condition.
     ///
     /// On Windows, reads only the 4 or 8 target bytes through the kernel
@@ -183,6 +212,18 @@ impl Timeline {
         self.run(s);
     }
 
+    /// Adds work to the queue and returns immediately, scheduling it on the
+    /// asynchronous submission worker when `VICTORY_ASYNC_SUBMIT=1` is active.
+    #[cfg(windows)]
+    pub(crate) fn submit_async(self: &Arc<Self>, op: Op) {
+        {
+            let mut s = self.lock();
+            s.ops.push_back(op);
+            s.pushed += 1;
+        }
+        crate::queue::async_schedule(self);
+    }
+
     /// The fence this queue waits for moved: runs what it held back.
     pub(crate) fn wake(self: &Arc<Self>) {
         let s = self.lock();
@@ -207,7 +248,17 @@ impl Timeline {
                 }
                 Op::WaitMemory(wait, deadline) => {
                     let was_registered = deadline.is_some();
-                    if !wait.satisfied() {
+                    let mut met = wait.satisfied();
+                    #[cfg(windows)]
+                    if !met && crate::host::late() {
+                        // Drop `Timeline::state` before `late_met` -> `settle_now`
+                        // (`Host::submitted` + `LINE_LANDED`) so concurrent wakes
+                        // never deadlock or invert lock order.
+                        drop(s);
+                        met = crate::host::late_met(&wait);
+                        s = self.lock();
+                    }
+                    if !met {
                         let deadline = deadline.unwrap_or_else(|| {
                             Instant::now() + crate::fence::memory_wait_timeout()
                         });

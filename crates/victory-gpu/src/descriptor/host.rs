@@ -845,50 +845,118 @@ pub(crate) struct HostHeap {
 /// device-removed reports: a shader indexing a heap past its end faults.
 static GPU_RANGES: Mutex<Vec<(u64, u64, u64, bool)>> = Mutex::new(Vec::new());
 
-/// Placed textures (by the start of their memory) filled while the runtime
-/// was remapping with less than was mapped of them
-/// (`crate::texture::fill_unlocked`), whose bindless upload pass should look
-/// at them again; and how often in a row that was, which ends it: memory
-/// that is shown and cannot be read would be uploaded again every frame.
-static SHORT: Mutex<(
-    std::collections::BTreeSet<u64>,
-    std::collections::BTreeMap<u64, u32>,
-)> = Mutex::new((
-    std::collections::BTreeSet::new(),
-    std::collections::BTreeMap::new(),
-));
+/// Per-resource short-fill retry state: placed textures filled while the
+/// runtime was remapping with less than was mapped of them
+/// (`crate::texture::fill_unlocked`), keyed by title resource pointer so an
+/// unrelated heap or UAV-only pass never consumes another texture's notice,
+/// plus consecutive short-fill counts per title-memory start address.
+struct ShortReads {
+    pending: std::collections::BTreeMap<usize, u64>,
+    counts: std::collections::BTreeMap<u64, u32>,
+}
+
+impl ShortReads {
+    const fn new() -> Self {
+        Self {
+            pending: std::collections::BTreeMap::new(),
+            counts: std::collections::BTreeMap::new(),
+        }
+    }
+
+    fn record_short(&mut self, start: u64, resource: usize) -> bool {
+        let times = self.counts.entry(start).or_insert(0);
+        *times += 1;
+        if *times <= SHORT_IN_A_ROW {
+            self.pending.insert(resource, start);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn record_all(&mut self, start: u64) {
+        self.counts.remove(&start);
+        self.pending.retain(|_, &mut s| s != start);
+    }
+
+    fn clear_resource(&mut self, resource: usize) -> bool {
+        self.pending.remove(&resource).is_some()
+    }
+}
+
+static SHORT: Mutex<ShortReads> = Mutex::new(ShortReads::new());
+/// Fast-path atomic mirrors of `SHORT.pending` and `SHORT` non-emptiness so
+/// steady-state bindless draws and ordinary texture refreshes avoid locking.
+static HAS_SHORT_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static HAS_SHORT_STATE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Fillings in a row of one texture that got less than was mapped, after
 /// which its slots wait for the next notice of its memory.
 const SHORT_IN_A_ROW: u32 = 8;
 
-/// The placed texture at `start` was filled with less than was mapped.
-pub(crate) fn read_short(start: u64) {
+/// The placed texture `resource` at `start` was filled with less than was mapped.
+pub(crate) fn read_short(start: u64, resource: usize) {
     let mut short = SHORT.lock().unwrap_or_else(|e| e.into_inner());
-    let times = short.1.entry(start).or_insert(0);
-    *times += 1;
-    if *times <= SHORT_IN_A_ROW {
-        short.0.insert(start);
-    }
+    short.record_short(start, resource);
+    HAS_SHORT_PENDING.store(!short.pending.is_empty(), Ordering::Release);
+    HAS_SHORT_STATE.store(
+        !short.pending.is_empty() || !short.counts.is_empty(),
+        Ordering::Release,
+    );
 }
 
 /// The placed texture at `start` was filled with all that was mapped.
 pub(crate) fn read_all(start: u64) {
-    let mut short = SHORT.lock().unwrap_or_else(|e| e.into_inner());
-    if !short.1.is_empty() {
-        short.1.remove(&start);
+    if !HAS_SHORT_STATE.load(Ordering::Acquire) {
+        return;
     }
+    let mut short = SHORT.lock().unwrap_or_else(|e| e.into_inner());
+    short.record_all(start);
+    HAS_SHORT_PENDING.store(!short.pending.is_empty(), Ordering::Release);
+    HAS_SHORT_STATE.store(
+        !short.pending.is_empty() || !short.counts.is_empty(),
+        Ordering::Release,
+    );
 }
 
-/// Drains any pending short-fill notices recorded by [`read_short`] and
-/// returns whether at least one texture needs another upload pass.
-pub(crate) fn take_short_reads() -> bool {
-    let mut short = SHORT.lock().unwrap_or_else(|e| e.into_inner());
-    if short.0.is_empty() {
+/// Clears a pending short-fill retry notice for `resource` once an eligible
+/// pass has scheduled its upload (or the resource is forgotten), without
+/// resetting its consecutive short-fill counter.
+pub(crate) fn clear_short_read(resource: usize) -> bool {
+    if !HAS_SHORT_PENDING.load(Ordering::Acquire) {
         return false;
     }
-    short.0.clear();
-    true
+    let mut short = SHORT.lock().unwrap_or_else(|e| e.into_inner());
+    let cleared = short.clear_resource(resource);
+    HAS_SHORT_PENDING.store(!short.pending.is_empty(), Ordering::Release);
+    HAS_SHORT_STATE.store(
+        !short.pending.is_empty() || !short.counts.is_empty(),
+        Ordering::Release,
+    );
+    cleared
+}
+
+/// Whether any texture currently has a pending short-fill retry notice.
+pub(crate) fn has_short_reads() -> bool {
+    HAS_SHORT_PENDING.load(Ordering::Acquire)
+}
+
+/// Snapshot of title resource pointers with a pending short-fill retry notice.
+pub(crate) fn pending_short_resources() -> Vec<usize> {
+    if !HAS_SHORT_PENDING.load(Ordering::Acquire) {
+        return Vec::new();
+    }
+    let short = SHORT.lock().unwrap_or_else(|e| e.into_inner());
+    short.pending.keys().copied().collect()
+}
+
+#[cfg(test)]
+pub(crate) fn is_short_read_pending(resource: usize) -> bool {
+    SHORT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .pending
+        .contains_key(&resource)
 }
 
 /// For device-removed reports: where host GPU address `va` lies against
@@ -2710,6 +2778,20 @@ impl HostHeap {
     /// Current generation of tracked live textures in this heap.
     pub(crate) fn tex_gen(&self) -> u64 {
         self.tex_gen.load(Ordering::Acquire)
+    }
+
+    /// Returns the subset of `resources` that currently have a live SRV
+    /// descriptor in this heap.
+    pub(crate) fn matching_live_srvs(&self, resources: &[usize]) -> Vec<usize> {
+        if resources.is_empty() {
+            return Vec::new();
+        }
+        let tracker = self.tex_tracker.lock().unwrap_or_else(|e| e.into_inner());
+        resources
+            .iter()
+            .copied()
+            .filter(|r| tracker.live_srvs.contains_key(r))
+            .collect()
     }
 
     /// Snapshot of `(tex_gen, live_srvs, live_uavs)` in `O(active)` time,
@@ -4907,19 +4989,23 @@ mod tests {
     /// filling that got everything starts the count anew.
     #[test]
     fn a_short_filling_is_looked_at_again_a_few_times() {
-        // An address no other test names.
+        let mut short = super::ShortReads::new();
         let start = 0x7fee_1234_0000u64;
-        let pending = || super::SHORT.lock().unwrap().0.remove(&start);
+        let resource = 0x1234usize;
+        let other = 0x5678usize;
         for _ in 0..super::SHORT_IN_A_ROW {
-            super::read_short(start);
-            assert!(pending());
+            assert!(short.record_short(start, resource));
+            assert!(short.clear_resource(resource));
         }
-        super::read_short(start);
-        assert!(!pending());
-        super::read_all(start);
-        super::read_short(start);
-        assert!(pending());
-        super::read_all(start);
+        assert!(!short.record_short(start, resource));
+        assert!(!short.clear_resource(resource));
+        // Clearing an unrelated resource never disturbs another pending entry,
+        // and `record_all` resets the consecutive count so retries resume.
+        short.record_all(start);
+        assert!(short.record_short(start, resource));
+        assert!(!short.clear_resource(other));
+        assert!(short.clear_resource(resource));
+        short.record_all(start);
     }
 
     use super::*;

@@ -341,6 +341,18 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
         return S_OK;
     }
     // A null event: block until the value is reached, as D3D12 does.
+    // With asynchronous submissions (`crate::host::late`), the signal may be
+    // queued behind in-flight flights: drop `waiters` before settling so
+    // landing can signal this fence without deadlocking.
+    #[cfg(windows)]
+    if fence.value.load(Ordering::Acquire) < value && crate::host::late() {
+        drop(waiters);
+        crate::host::settle_for_fence();
+        waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
+        if fence.value.load(Ordering::Acquire) >= value {
+            return S_OK;
+        }
+    }
     let started = Instant::now();
     let mut warned = Duration::ZERO;
     while fence.value.load(Ordering::Acquire) < value {
@@ -430,6 +442,10 @@ fn run_held(queues: Vec<Arc<Timeline>>) {
 pub(crate) struct Woken(Vec<Arc<Timeline>>);
 
 impl Woken {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
     pub(crate) fn add(&mut self, other: Woken) {
         self.0.extend(other.0);
     }
@@ -453,6 +469,19 @@ impl Held {
 
     pub(crate) fn signal(&self, value: u64) {
         signal(self.0.get(), value);
+    }
+
+    /// Moves the fence to `value` and wakes its event waiters, returning any
+    /// woken [`Timeline`]s for the caller to resume after releasing outer locks
+    /// (such as `Host::submitted`).
+    #[cfg(windows)]
+    pub(crate) fn signal_deferred(&self, value: u64) -> Woken {
+        let fence = fence(self.0.get());
+        let waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
+        fence.value.store(value, Ordering::Release);
+        let mut queues = wake(fence, waiters);
+        queues.extend(scan_memory_waiters().0);
+        Woken(queues)
     }
 
     /// Whether the value is reached; if not, `queue` is woken once it is.
