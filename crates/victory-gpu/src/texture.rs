@@ -222,6 +222,32 @@ thread_local! {
     static SCRATCH: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
 }
 
+/// Calls `f` with `size` bytes of this thread's scratch buffer (their contents
+/// are whatever the last texture left). Moves the buffer out of the
+/// thread-local `RefCell` during `f` so same-thread VEH re-entrancy can never
+/// panic with `RefCell already borrowed`. Keeps the initialized length so
+/// alternating large and small textures do not re-zero the tail.
+fn with_scratch<R>(size: usize, f: impl FnOnce(&mut [u8]) -> R) -> R {
+    let mut read = SCRATCH.with(|slot| {
+        slot.try_borrow_mut()
+            .map(|mut b| std::mem::take(&mut *b))
+            .unwrap_or_default()
+    });
+    if size > read.len() {
+        read.reserve_exact(size - read.len());
+        read.resize(size, 0);
+    }
+    let out = f(&mut read[..size]);
+    SCRATCH.with(|slot| {
+        if let Ok(mut saved) = slot.try_borrow_mut()
+            && read.capacity() > saved.capacity()
+        {
+            *saved = read;
+        }
+    });
+    out
+}
+
 /// Textures the host GPU wrote by a copy or resolve: their contents are on
 /// the host, not in title memory, which stays as it was.
 static HOST_WRITTEN: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
@@ -693,8 +719,7 @@ impl Staging {
         // Read through the kernel, as above: the title may unmap the pages
         // (evicting a texture a big table lists) while we read them, and a
         // direct read would fault. The copy is reused, not kept per texture.
-        SCRATCH.with_borrow_mut(|tiled| {
-            tiled.resize(size, 0);
+        with_scratch(size, |tiled| {
             crate::host::copy_mapped(tiled.as_mut_ptr(), self.memory, size, false);
             self.changed(last, tiled, self.first)
         })
@@ -769,15 +794,9 @@ impl Staging {
     }
 }
 
-/// Reads a texture for the duration of its detile. Keep the initialized
-/// length so alternating large and small textures do not re-zero the tail.
+/// Reads a texture for the duration of its detile.
 fn with_tiled_copy(memory: *const u8, size: usize, detile: impl FnOnce(&[u8])) {
-    SCRATCH.with_borrow_mut(|read| {
-        if size > read.len() {
-            read.reserve_exact(size - read.len());
-            read.resize(size, 0);
-        }
-        let tiled = &mut read[..size];
+    with_scratch(size, |tiled| {
         crate::host::copy_mapped(tiled.as_mut_ptr(), memory, size, false);
         detile(tiled);
     });
@@ -1839,5 +1858,19 @@ mod resident_tests {
         assert_eq!(resident(resource), None);
         // Leave no cross-test residue in the process-wide sets.
         forget(resource as usize);
+    }
+
+    #[test]
+    fn with_scratch_is_reentrant_safe() {
+        let outer = super::with_scratch(64, |outer_buf| {
+            outer_buf.fill(0xaa);
+            let inner = super::with_scratch(256, |inner_buf| {
+                inner_buf.fill(0x55);
+                inner_buf.len()
+            });
+            assert!(outer_buf.iter().all(|&b| b == 0xaa));
+            (outer_buf.len(), inner)
+        });
+        assert_eq!(outer, (64, 256));
     }
 }
