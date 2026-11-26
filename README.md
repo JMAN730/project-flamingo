@@ -235,7 +235,8 @@ The on/off switches below (`...=1`) are off when unset or set to `0`.
 | `VICTORY_CRASH_BREAKPOINTS=1` | appends first-chance breakpoints to `crashes.log`, including ones a handler may recover from |
 | `VICTORY_CRASH_SAVE=<rva>:<len>,...` | saves title memory to the cache folder on a crash |
 | `VICTORY_CAPTURE=<dir>` | saves presented frames (powers of two, or `VICTORY_CAPTURE_FRAMES=<list>`) |
-| `VICTORY_DUMP_TARGETS=1` | with the two above, saves every render target of those frames |
+| `VICTORY_PLANE_STATS=1` | with `VICTORY_PRESENT_TWO_PLANES=1`, logs RGB statistics for successful two-plane presents listed in `VICTORY_CAPTURE_FRAMES` |
+| `VICTORY_DUMP_TARGETS=1` | with `VICTORY_CAPTURE` and `VICTORY_CAPTURE_FRAMES`, saves every render target of those frames |
 | `VICTORY_SHOW_TARGET=2560x1440-f28` | shows the last render target of that size and DXGI format each frame instead of the title's frame (copied 1:1 to the top left, only when its format matches the window's), e.g. the world's geometry while its lit image is black |
 | `VICTORY_D3D12_DEBUG=1` | host debug layer |
 | `VICTORY_D3D12_GBV=1` | with the above, GPU-based validation (bad descriptor use reported, not faulted; slow) |
@@ -264,6 +265,18 @@ The on/off switches below (`...=1`) are off when unset or set to `0`.
 | `VICTORY_COPY_MODE=plain` | copy title GPU memory without the timed/stats path used for the frame-rate line |
 | `VICTORY_WARP=1` | force the shader-test host device onto WARP (distinct from `VICTORY_D3D12_WARP`) |
 | `VICTORY_SAVE_STOP=<n>` | test helper: hang the process at save step `n` (used by crash-survival tests) |
+
+For Series S two-plane diagnostics, set `VICTORY_PRESENT_TWO_PLANES=1`,
+`VICTORY_PLANE_STATS=1` and an explicit comma-separated `VICTORY_CAPTURE_FRAMES`
+list. `VICTORY_CAPTURE` is optional. Each selected two-plane present that
+succeeds logs a `PresentX plane RGB samples` record for `primary`, `overlay`
+and `composite`. Each record counts 16 positions in a 4×4 grid across that
+texture's own extent. `nonzero` counts positions with any nonzero RGB,
+`above_black` counts those with any RGB channel at least 8, and `peak` gives
+the highest sampled RGB channel. The probes ignore alpha and can miss detail
+between sample positions. A failed readback logs `PresentX plane RGB sample
+unavailable`. Single-plane fallbacks and failed presents produce no plane
+records. The fade detector uses the presented image's samples.
 
 Every build appends unhandled exceptions, panics, and host GPU failures to
 `crashes.log` in the title's data folder.
