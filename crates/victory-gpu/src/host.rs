@@ -131,6 +131,7 @@ pub(crate) struct Host {
     adapter: Option<IDXGIAdapter3>,
     rebar_scratch: bool,
     rebar_shadow_budget: u64,
+    rebar_loose_budget: u64,
     rebar_readback: Mutex<RebarReadback>,
     queue: ID3D12CommandQueue,
     fence: ID3D12Fence,
@@ -453,10 +454,21 @@ fn create() -> windows::core::Result<Host> {
             .as_ref()
             .and_then(query_local_vram_budget)
             .or_else(|| chosen.map(|d| d.DedicatedVideoMemory as u64));
+        // `VICTORY_REBAR` (diagnostics builds): `0` disables all ReBAR (`GPU_UPLOAD`) allocations.
         let allow_rebar = !cfg!(feature = "diagnostics")
             || std::env::var_os("VICTORY_REBAR").is_none_or(|v| v != "0");
-        let (rebar_scratch, rebar_shadow_budget) =
-            rebar_policy(gpu_upload_supported, uma, local_vram_budget, allow_rebar);
+        // `VICTORY_REBAR_MB` (MiB): overrides the `BUFFERS` ReBAR budget (`0` disables buffer ReBAR).
+        let rebar_mb = std::env::var("VICTORY_REBAR_MB").ok();
+        // `VICTORY_REBAR_LOOSE_MB` (MiB): overrides the `LOOSE` windows ReBAR budget (`0` disables loose ReBAR).
+        let rebar_loose_mb = std::env::var("VICTORY_REBAR_LOOSE_MB").ok();
+        let (rebar_scratch, rebar_shadow_budget, rebar_loose_budget) = resolve_rebar_budgets(
+            gpu_upload_supported,
+            uma,
+            local_vram_budget,
+            allow_rebar,
+            rebar_mb.as_deref(),
+            rebar_loose_mb.as_deref(),
+        );
         #[cfg(feature = "diagnostics")]
         if debug
             && crate::switch::on("VICTORY_D3D12_GBV")
@@ -506,6 +518,7 @@ fn create() -> windows::core::Result<Host> {
                 uma,
                 rebar_scratch,
                 rebar_shadow_budget_mb = rebar_shadow_budget >> 20,
+                rebar_loose_budget_mb = rebar_loose_budget >> 20,
                 "host D3D12 device ready"
             );
         } else {
@@ -514,6 +527,7 @@ fn create() -> windows::core::Result<Host> {
                 uma,
                 rebar_scratch,
                 rebar_shadow_budget_mb = rebar_shadow_budget >> 20,
+                rebar_loose_budget_mb = rebar_loose_budget >> 20,
                 "host D3D12 device ready"
             );
         }
@@ -522,6 +536,7 @@ fn create() -> windows::core::Result<Host> {
             adapter: adapter3,
             rebar_scratch,
             rebar_shadow_budget,
+            rebar_loose_budget,
             rebar_readback: Mutex::default(),
             queue,
             fence,
@@ -1562,6 +1577,14 @@ impl Host {
         }
         batch.flush();
         drop(watch_guard);
+        if batch.rebar_init_failed {
+            fail(format_args!(
+                "ReBAR UAV mirror readback failed before a submission of {} lists{}{}",
+                runs.len(),
+                self.removal_data(runs),
+                last_notes(runs)
+            ));
+        }
         let mut non_rebar_writes = Vec::new();
         let mut rebar_entries: Vec<RebarWriteEntry> = Vec::new();
         for (shadow, address, len) in batch.gpu_writes {
@@ -1610,8 +1633,9 @@ impl Host {
         let timed = timing();
         #[cfg(not(feature = "diagnostics"))]
         let timed = false;
+        let mut pre_hash_ok = true;
         if timed && let Some(pre) = rebar_hash_plan.pre_list.take() {
-            let _ = self.submit_helper_list(&mut submitted, pre, "ReBAR pre-hash");
+            pre_hash_ok = self.submit_helper_list(&mut submitted, pre, "ReBAR pre-hash");
         }
         // Each HostList owns one reusable prelude allocator/list. A submission
         // may name the same list twice (queue segments, re-executes); calling
@@ -1721,9 +1745,10 @@ impl Host {
             }
             let _ = &firsts;
         }
-        let mut post_compare_ok = true;
+        let mut post_compare_ok = pre_hash_ok;
         if timed && let Some(post) = rebar_hash_plan.post_list {
-            post_compare_ok = self.submit_helper_list(&mut submitted, post, "ReBAR post-compare");
+            post_compare_ok =
+                pre_hash_ok && self.submit_helper_list(&mut submitted, post, "ReBAR post-compare");
         }
         let gpu = prepared.elapsed();
         SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
@@ -1764,8 +1789,8 @@ impl Host {
             let written = shadow.copy_back(address, len);
             COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
         }
-        if !rebar_entries.is_empty() {
-            self.finish_rebar_copy_back(
+        if !rebar_entries.is_empty()
+            && !self.finish_rebar_copy_back(
                 &mut submitted,
                 rebar_entries,
                 if post_compare_ok {
@@ -1773,7 +1798,14 @@ impl Host {
                 } else {
                     0
                 },
-            );
+            )
+        {
+            fail(format_args!(
+                "ReBAR UAV readback failed after a submission of {} lists{}{}",
+                runs.len(),
+                self.removal_data(runs),
+                last_notes(runs)
+            ));
         }
         for list in runs {
             let deferred = list.deferred();
@@ -3741,6 +3773,8 @@ struct Batch {
     declared_writes: std::collections::HashSet<(usize, usize, usize)>,
     /// Staging buffers (by address) refreshed since the last title write.
     textures: std::collections::HashSet<usize>,
+    /// Set if a ReBAR shadow's initial RAM mirror readback failed.
+    rebar_init_failed: bool,
 }
 
 impl Batch {
@@ -3762,9 +3796,11 @@ impl Batch {
             // Another declaration of this exact range is already pending until
             // the GPU submission finishes, so it needs no refresh boundary.
             self.flush();
-            shadow.writing(address, len, |buffer, size| {
+            if !shadow.writing(address, len, |buffer, size| {
                 host.readback_rebar_to_vec(submitted, buffer, size)
-            });
+            }) {
+                self.rebar_init_failed = true;
+            }
             self.gpu_writes.push((shadow.clone(), address, len));
         }
     }
@@ -4603,23 +4639,76 @@ fn rebar_policy(
     local_vram_budget: Option<u64>,
     allow_rebar: bool,
 ) -> (bool, u64) {
+    let (scratch, shadow_budget, _) =
+        rebar_tier_budgets(gpu_upload_supported, uma, local_vram_budget, allow_rebar);
+    (scratch, shadow_budget)
+}
+
+/// Decides the ReBAR (`D3D12_HEAP_TYPE_GPU_UPLOAD`) budget in bytes for `LOOSE`
+/// windows on the active adapter.
+fn rebar_loose_policy(
+    gpu_upload_supported: bool,
+    uma: bool,
+    local_vram_budget: Option<u64>,
+    allow_rebar: bool,
+) -> u64 {
+    rebar_tier_budgets(gpu_upload_supported, uma, local_vram_budget, allow_rebar).2
+}
+
+fn rebar_tier_budgets(
+    gpu_upload_supported: bool,
+    uma: bool,
+    local_vram_budget: Option<u64>,
+    allow_rebar: bool,
+) -> (bool, u64, u64) {
     const MIB: u64 = 1 << 20;
     const GIB: u64 = 1 << 30;
     if !allow_rebar || !gpu_upload_supported || uma {
-        return (false, 0);
+        return (false, 0, 0);
     }
     let Some(budget) = local_vram_budget else {
-        return (false, 0);
+        return (false, 0, 0);
     };
     if budget <= 8 * GIB {
-        (false, 0)
+        (false, 0, 0)
     } else if budget <= 14 * GIB {
-        (true, 512 * MIB)
+        (true, 512 * MIB, 0)
     } else if budget < 20 * GIB {
-        (true, GIB)
+        (true, GIB, 2 * GIB)
+    } else if budget < 28 * GIB {
+        (true, 2 * GIB, 4 * GIB)
     } else {
-        (true, (budget / 16).clamp(GIB, 2 * GIB))
+        (true, 3 * GIB, 6 * GIB)
     }
+}
+
+fn parse_rebar_mb_override(raw: Option<&str>) -> Option<u64> {
+    raw.and_then(|v| v.trim().parse::<u64>().ok())
+        .map(|mb| mb.saturating_mul(1 << 20))
+}
+
+fn resolve_rebar_budgets(
+    gpu_upload_supported: bool,
+    uma: bool,
+    local_vram_budget: Option<u64>,
+    allow_rebar: bool,
+    rebar_mb_override: Option<&str>,
+    rebar_loose_mb_override: Option<&str>,
+) -> (bool, u64, u64) {
+    if !allow_rebar || !gpu_upload_supported || uma {
+        return (false, 0, 0);
+    }
+    let (scratch, mut shadow_budget) =
+        rebar_policy(gpu_upload_supported, uma, local_vram_budget, allow_rebar);
+    let mut loose_budget =
+        rebar_loose_policy(gpu_upload_supported, uma, local_vram_budget, allow_rebar);
+    if let Some(bytes) = parse_rebar_mb_override(rebar_mb_override) {
+        shadow_budget = bytes;
+    }
+    if let Some(bytes) = parse_rebar_mb_override(rebar_loose_mb_override) {
+        loose_budget = bytes;
+    }
+    (scratch, shadow_budget, loose_budget)
 }
 
 /// Merges overlapping or adjacent half-open byte intervals `[from, to)` into
@@ -4784,6 +4873,12 @@ impl Host {
         self.rebar_shadow_budget
     }
 
+    /// Byte budget reserved for ReBAR (`D3D12_HEAP_TYPE_GPU_UPLOAD`) `LOOSE`
+    /// windows on this adapter (0 when ReBAR `LOOSE` windows are disabled).
+    pub(crate) fn rebar_loose_budget(&self) -> u64 {
+        self.rebar_loose_budget
+    }
+
     /// A buffer in `D3D12_HEAP_TYPE_GPU_UPLOAD` (CPU-writable local VRAM via
     /// Resizable BAR), starting in `COMMON` and mapped for sequential CPU
     /// writes. Callers MUST NOT read from the returned pointer on the CPU.
@@ -4825,7 +4920,8 @@ impl Host {
                 )
                 .and_then(|()| {
                     let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
-                    b.Map(0, None, Some(&mut data))
+                    let read_range = D3D12_RANGE { Begin: 0, End: 0 };
+                    b.Map(0, Some(&read_range), Some(&mut data))
                 })
         };
         match made {
@@ -4862,7 +4958,9 @@ impl Host {
     /// Returns `None` if ReBAR shadows are disabled, VRAM headroom is low, or
     /// allocation fails (callers fall back to [`Host::shared_buffer`]).
     pub(crate) fn try_rebar_shadow_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
-        if self.rebar_shadow_budget == 0 || !self.has_vram_headroom(size) {
+        if (self.rebar_shadow_budget == 0 && self.rebar_loose_budget == 0)
+            || !self.has_vram_headroom(size)
+        {
             return None;
         }
         self.gpu_upload_buffer(size, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)
@@ -5206,12 +5304,27 @@ impl Host {
     /// Reads GPU hash-compare flags (if run), coalesces contiguous flagged
     /// 64 KiB pieces intersected with declared UAV spans, and DMAs only those
     /// changed runs into `READBACK` for [`crate::shadow::Shadow::copy_back_rebar`].
+    ///
+    /// Returns `false` if readback or mirror merge fails; any entry with
+    /// undelivered spans keeps its `pending` ranges intact so refreshes and
+    /// loose-cache eviction cannot overwrite or drop GPU results.
     fn finish_rebar_copy_back(
         &self,
         submitted: &mut u64,
         entries: Vec<RebarWriteEntry>,
         total_flag_pieces: usize,
-    ) {
+    ) -> bool {
+        self.finish_rebar_copy_back_with(entries, total_flag_pieces, |jobs, f| {
+            self.copy_rebar_readback(submitted, jobs, f)
+        })
+    }
+
+    fn finish_rebar_copy_back_with(
+        &self,
+        entries: Vec<RebarWriteEntry>,
+        total_flag_pieces: usize,
+        readback: impl FnOnce(&[(&ID3D12Resource, u64, u64)], &mut dyn FnMut(&[&[u8]])) -> bool,
+    ) -> bool {
         struct PendingCopy {
             shadow: std::sync::Arc<crate::shadow::Shadow>,
             spans: Vec<(usize, usize)>,
@@ -5284,7 +5397,7 @@ impl Host {
             for entry in &pending {
                 entry.shadow.clear_pending_rebar();
             }
-            return;
+            return true;
         }
         let mut copy_jobs: Vec<(&ID3D12Resource, u64, u64)> = Vec::with_capacity(total_jobs);
         let mut copy_bytes = 0u64;
@@ -5303,23 +5416,41 @@ impl Host {
                 .fetch_add(copy_bytes, Ordering::Relaxed);
         }
         let _ = copy_bytes;
-        let ok = self.copy_rebar_readback(submitted, &copy_jobs, |slices| {
+        let mut all_delivered = true;
+        let mut deliver = |slices: &[&[u8]]| {
             for entry in &pending {
                 if entry.first < entry.end {
-                    let written = entry
+                    match entry
                         .shadow
-                        .copy_back_rebar(&entry.spans, &slices[entry.first..entry.end]);
-                    COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+                        .copy_back_rebar(&entry.spans, &slices[entry.first..entry.end])
+                    {
+                        Some(written) => {
+                            COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+                        }
+                        None => {
+                            entry.shadow.mark_rebar_dirty_spans(&entry.spans);
+                            all_delivered = false;
+                        }
+                    }
                 } else {
                     entry.shadow.clear_pending_rebar();
                 }
             }
-        });
+        };
+        let ok = readback(&copy_jobs, &mut deliver);
         if !ok {
             for entry in &pending {
-                entry.shadow.clear_pending_rebar();
+                if !entry.spans.is_empty() {
+                    // Keep `pending` ranges intact so refreshes and loose-cache
+                    // eviction cannot overwrite or drop undelivered GPU bytes.
+                    entry.shadow.mark_rebar_dirty_spans(&entry.spans);
+                } else {
+                    entry.shadow.clear_pending_rebar();
+                }
             }
+            return false;
         }
+        all_delivered
     }
 
     /// DMAs `copies` (`(src_buffer, src_offset, len)`) from ReBAR buffers into
@@ -5734,6 +5865,15 @@ impl Meter {
                     "depth twins: {twins} alive, {} depth textures left without one; \
                      copies per frame: {to_depth:.1} into depth textures, {to_twin:.1} into twins",
                     crate::resource::TWINS[1].load(Ordering::Relaxed)
+                );
+            }
+            let rebar_b = crate::shadow::rebar_shadow_bytes();
+            let rebar_loose_b = crate::shadow::rebar_loose_bytes();
+            if rebar_b > 0 || rebar_loose_b > 0 {
+                tracing::info!(
+                    "rebar residency: rebar={} MiB, rebar_loose={} MiB",
+                    rebar_b >> 20,
+                    rebar_loose_b >> 20,
                 );
             }
             let [changes, waiting, under_way] = [0, 1, 2].map(|i| {
@@ -7699,8 +7839,10 @@ fn wave32_supported(wave_ops: bool, min: u32, max: u32) -> bool {
 #[cfg(test)]
 mod wave_tests {
     use super::{
-        REBAR_HASH_SOURCE, flagged_piece_byte_runs, host, intersect_ranges, merge_ranges,
-        rebar_hash_pipeline, rebar_policy, spans_to_piece_runs, transition, wave32_supported,
+        REBAR_HASH_SOURCE, RebarWriteEntry, flagged_piece_byte_runs, host, intersect_ranges,
+        isolated_retire_scope, merge_ranges, parse_rebar_mb_override, rebar_hash_pipeline,
+        rebar_loose_policy, rebar_policy, resolve_rebar_budgets, spans_to_piece_runs, transition,
+        wave32_supported,
     };
     use crate::watch::PAGE;
 
@@ -7724,12 +7866,17 @@ mod wave_tests {
         assert_eq!(rebar_policy(true, true, Some(64 * GIB), true), (false, 0));
         assert_eq!(rebar_policy(true, false, Some(32 * GIB), false), (false, 0));
         assert_eq!(rebar_policy(true, false, None, true), (false, 0));
+        assert_eq!(rebar_loose_policy(false, false, Some(32 * GIB), true), 0);
+        assert_eq!(rebar_loose_policy(true, true, Some(64 * GIB), true), 0);
+        assert_eq!(rebar_loose_policy(true, false, Some(32 * GIB), false), 0);
+        assert_eq!(rebar_loose_policy(true, false, None, true), 0);
 
         // Low-VRAM discrete GPUs (<= 8 GiB) stay on system-RAM shadows.
         assert_eq!(rebar_policy(true, false, Some(4 * GIB), true), (false, 0));
         assert_eq!(rebar_policy(true, false, Some(8 * GIB), true), (false, 0));
+        assert_eq!(rebar_loose_policy(true, false, Some(8 * GIB), true), 0);
 
-        // 12 GiB tier: conservative 512 MiB shadow budget.
+        // 12–14 GiB tier: conservative 512 MiB buffer budget, 0 loose budget.
         assert_eq!(
             rebar_policy(true, false, Some(12 * GIB), true),
             (true, 512 * MIB)
@@ -7738,26 +7885,101 @@ mod wave_tests {
             rebar_policy(true, false, Some(14 * GIB), true),
             (true, 512 * MIB)
         );
+        assert_eq!(rebar_loose_policy(true, false, Some(12 * GIB), true), 0);
+        assert_eq!(rebar_loose_policy(true, false, Some(14 * GIB), true), 0);
 
-        // 16 GiB tier: 1 GiB shadow budget.
+        // 16 GiB tier (< 20 GiB): 1 GiB buffer budget, 2 GiB loose budget.
         assert_eq!(rebar_policy(true, false, Some(16 * GIB), true), (true, GIB));
+        assert_eq!(
+            rebar_loose_policy(true, false, Some(16 * GIB), true),
+            2 * GIB
+        );
 
-        // 20–32+ GiB tier: 1/16 of local VRAM budget clamped to 1–2 GiB to bound WDDM commit.
+        // 20–24 GiB tier (< 28 GiB): 2 GiB buffer budget, 4 GiB loose budget.
         assert_eq!(
             rebar_policy(true, false, Some(20 * GIB), true),
-            (true, 1280 * MIB)
+            (true, 2 * GIB)
         );
         assert_eq!(
             rebar_policy(true, false, Some(24 * GIB), true),
-            (true, 1536 * MIB)
+            (true, 2 * GIB)
+        );
+        assert_eq!(
+            rebar_loose_policy(true, false, Some(20 * GIB), true),
+            4 * GIB
+        );
+        assert_eq!(
+            rebar_loose_policy(true, false, Some(24 * GIB), true),
+            4 * GIB
+        );
+
+        // 28–32+ GiB tier (>= 28 GiB, e.g. RTX 5090): 3 GiB buffer, 6 GiB loose.
+        assert_eq!(
+            rebar_policy(true, false, Some(28 * GIB), true),
+            (true, 3 * GIB)
         );
         assert_eq!(
             rebar_policy(true, false, Some(32 * GIB), true),
-            (true, 2 * GIB)
+            (true, 3 * GIB)
         );
         assert_eq!(
             rebar_policy(true, false, Some(48 * GIB), true),
-            (true, 2 * GIB)
+            (true, 3 * GIB)
+        );
+        assert_eq!(
+            rebar_loose_policy(true, false, Some(28 * GIB), true),
+            6 * GIB
+        );
+        assert_eq!(
+            rebar_loose_policy(true, false, Some(32 * GIB), true),
+            6 * GIB
+        );
+        assert_eq!(
+            rebar_loose_policy(true, false, Some(48 * GIB), true),
+            6 * GIB
+        );
+
+        // Pure env override parsing & policy composition (`VICTORY_REBAR_MB` / `VICTORY_REBAR_LOOSE_MB`).
+        assert_eq!(parse_rebar_mb_override(None), None);
+        assert_eq!(parse_rebar_mb_override(Some("  ")), None);
+        assert_eq!(parse_rebar_mb_override(Some("abc")), None);
+        assert_eq!(parse_rebar_mb_override(Some("0")), Some(0));
+        assert_eq!(parse_rebar_mb_override(Some(" 1536 ")), Some(1536 * MIB));
+
+        assert_eq!(
+            resolve_rebar_budgets(true, false, Some(32 * GIB), true, Some("2048"), Some("0")),
+            (true, 2 * GIB, 0)
+        );
+        assert_eq!(
+            resolve_rebar_budgets(true, false, Some(16 * GIB), true, Some("0"), Some("1024")),
+            (true, 0, GIB)
+        );
+        // `VICTORY_REBAR=0`, UMA, or unsupported GPU upload disables all ReBAR despite overrides.
+        assert_eq!(
+            resolve_rebar_budgets(
+                true,
+                false,
+                Some(32 * GIB),
+                false,
+                Some("2048"),
+                Some("4096")
+            ),
+            (false, 0, 0)
+        );
+        assert_eq!(
+            resolve_rebar_budgets(true, true, Some(64 * GIB), true, Some("2048"), Some("4096")),
+            (false, 0, 0)
+        );
+        assert_eq!(
+            resolve_rebar_budgets(
+                false,
+                false,
+                Some(32 * GIB),
+                true,
+                Some("2048"),
+                Some("4096")
+            ),
+            (false, 0, 0)
         );
     }
 
@@ -7943,6 +8165,99 @@ mod wave_tests {
             errors_before,
             "unexpected D3D12 debug layer error during rebar_hash test"
         );
+    }
+
+    #[test]
+    fn rebar_finish_copy_back_failure_keeps_pending_and_preserves_vram_on_refresh() {
+        let _rebar = crate::shadow::lock_rebar_gpu_test();
+        let _retire = isolated_retire_scope();
+        let Some(h) = host() else {
+            return;
+        };
+
+        let title = vec![0x11u8; 4096];
+        let start = title.as_ptr() as u64;
+        let len = title.len() as u64;
+        let (buf_a, ptr_a) = h.shared_buffer(len).expect("shared buffer a");
+        let (buf_b, ptr_b) = h.shared_buffer(len).expect("shared buffer b");
+        // SAFETY: live D3D12 buffers.
+        let (gpu_a, gpu_b) =
+            unsafe { (buf_a.GetGPUVirtualAddress(), buf_b.GetGPUVirtualAddress()) };
+        let shadow_owed =
+            crate::shadow::Shadow::new_rebar_for_test(buf_a, ptr_a, gpu_a, start, len);
+        let shadow_empty =
+            crate::shadow::Shadow::new_rebar_for_test(buf_b, ptr_b, gpu_b, start, len);
+
+        assert!(
+            shadow_owed.writing(start as usize + 64, 64, |_, n| Some(vec![
+                0x11u8;
+                n as usize
+            ]))
+        );
+        assert!(shadow_empty.writing(start as usize, 64, |_, n| Some(vec![0x11u8; n as usize])));
+        // Initialize hash state so we can verify dirty-span restoration on readback failure.
+        let _ = shadow_owed
+            .prepare_rebar_hashes(|n| h.default_buffer(n))
+            .expect("initial rebar hashes");
+        assert!(
+            shadow_owed
+                .prepare_rebar_hashes(|n| h.default_buffer(n))
+                .expect("clean rebar hashes")
+                .pre_runs
+                .is_empty()
+        );
+        // Simulate GPU-written bytes in `[64..128)`.
+        // SAFETY: `ptr_a` is mapped for `len` bytes of shared RAM in this test.
+        unsafe {
+            std::ptr::write_bytes(ptr_a, 0x22, len as usize);
+            std::ptr::write_bytes(ptr_a.add(64), 0xAA, 64);
+        }
+
+        let entries = vec![
+            RebarWriteEntry {
+                shadow: shadow_owed.clone(),
+                declared_spans: vec![(64, 128)],
+                piece_runs: vec![(0, 1)],
+                compare_out_base: None,
+                compare_pieces: 0,
+            },
+            RebarWriteEntry {
+                shadow: shadow_empty.clone(),
+                declared_spans: Vec::new(),
+                piece_runs: Vec::new(),
+                compare_out_base: None,
+                compare_pieces: 0,
+            },
+        ];
+
+        // Simulate `copy_rebar_readback` returning `false`.
+        let ok = h.finish_rebar_copy_back_with(entries, 0, |_, _| false);
+        assert!(!ok, "failed ReBAR readback must report failure");
+        assert!(
+            shadow_owed.has_pending(),
+            "undelivered GPU span must remain pending on readback failure"
+        );
+        assert!(
+            !shadow_empty.has_pending(),
+            "entry with no owed spans may clear pending cleanly"
+        );
+        assert_eq!(
+            shadow_owed
+                .prepare_rebar_hashes(|n| h.default_buffer(n))
+                .expect("restored dirty hashes")
+                .pre_runs,
+            vec![(0, 1)]
+        );
+
+        // A subsequent refresh must not overwrite the pending GPU bytes `[64..128)`.
+        shadow_owed.update(start as usize, len as usize);
+        let bytes = shadow_owed.read_test_bytes(start, len as usize);
+        assert!(bytes[..64].iter().all(|&b| b == 0x11));
+        assert!(
+            bytes[64..128].iter().all(|&b| b == 0xAA),
+            "refresh must keep undelivered GPU result intact while copy-back is pending"
+        );
+        assert!(bytes[128..].iter().all(|&b| b == 0x11));
     }
 }
 
