@@ -636,10 +636,10 @@ fn create() -> windows::core::Result<Host> {
                 .ok()
                 .filter(|s| !s.trim().is_empty());
             match pick_hardware_adapter(filter.as_deref()) {
-                Ok((adapter, desc)) => {
-                    D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
-                    adapter3 = adapter.cast::<IDXGIAdapter3>().ok();
-                    chosen = Some(desc);
+                Ok(picked) => {
+                    device = Some(picked.device);
+                    adapter3 = picked.adapter.cast::<IDXGIAdapter3>().ok();
+                    chosen = Some(picked.desc);
                 }
                 Err(e) if filter.is_some() => return Err(e),
                 Err(e) => {
@@ -5928,21 +5928,28 @@ fn adapter_matches(name: &str, filter: &str) -> bool {
         .contains(&filter.trim().to_ascii_lowercase())
 }
 
+#[derive(Debug)]
+struct PickedAdapter {
+    adapter: IDXGIAdapter1,
+    desc: DXGI_ADAPTER_DESC1,
+    device: ID3D12Device,
+}
+
 /// Picks the adapter that runs the title: the first, in high-performance order (so a
 /// hybrid laptop's discrete GPU comes before its integrated one), with shader model 6.6,
 /// resource binding tier 3 and mesh shaders; when none has all three, the one that runs
 /// most of the title, with a warning naming what each adapter lacks (`crate::adapter`).
+/// Returns the live D3D12 device created during the capability probe so the host does
+/// not initialize a second device on the chosen adapter, releasing probe devices for
+/// candidates that are no longer in contention.
 /// When `filter` is given (`VICTORY_ADAPTER`), only adapters whose description contains
 /// it (case-insensitively) take part, software ones included.
-fn pick_hardware_adapter(
-    filter: Option<&str>,
-) -> windows::core::Result<(IDXGIAdapter1, DXGI_ADAPTER_DESC1)> {
+fn pick_hardware_adapter(filter: Option<&str>) -> windows::core::Result<PickedAdapter> {
     // SAFETY: plain DXGI enumeration and D3D12 capability probes.
     unsafe {
         let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
         let factory6 = factory.cast::<IDXGIFactory6>().ok();
-        let mut found: Vec<(IDXGIAdapter1, DXGI_ADAPTER_DESC1)> = Vec::new();
-        let mut candidates: Vec<crate::adapter::Candidate> = Vec::new();
+        let mut selector = crate::adapter::Selector::new();
         let mut i = 0u32;
         loop {
             let adapter: IDXGIAdapter1 = match &factory6 {
@@ -5979,13 +5986,19 @@ fn pick_hardware_adapter(
             let caps = adapter_caps(&device);
             #[cfg(feature = "diagnostics")]
             tracing::debug!(adapter = %name, ?caps, "adapter candidate");
-            candidates.push(crate::adapter::Candidate { name, caps });
-            found.push((adapter, desc));
+            let picked = PickedAdapter {
+                adapter,
+                desc,
+                device,
+            };
+            if selector.push(crate::adapter::Candidate { name, caps }, picked) {
+                break;
+            }
         }
-        let Some(choice) = crate::adapter::choose(&candidates) else {
+        let Some((picked, shortfall)) = selector.finish() else {
             return Err(windows::core::Error::from_hresult(DXGI_ERROR_NOT_FOUND));
         };
-        if let Some(s) = crate::adapter::shortfall(&candidates, &choice) {
+        if let Some(s) = shortfall {
             tracing::warn!(
                 adapter = %s.chosen,
                 lacks = %s.lacks,
@@ -5993,7 +6006,7 @@ fn pick_hardware_adapter(
                 "no adapter has everything the title needs; using the one that runs most"
             );
         }
-        Ok(found.swap_remove(choice.index))
+        Ok(picked)
     }
 }
 
@@ -6134,8 +6147,17 @@ mod tests {
 
     #[test]
     fn default_adapter_is_hardware_when_present() {
-        if let Ok((_, desc)) = pick_hardware_adapter(None) {
-            assert_eq!(desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32, 0);
+        if let Ok(picked) = pick_hardware_adapter(None) {
+            assert_eq!(picked.desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32, 0);
+            // SAFETY: `GetAdapterLuid` is a plain getter on a live D3D12 device.
+            let luid = unsafe { picked.device.GetAdapterLuid() };
+            assert_eq!(
+                (luid.LowPart, luid.HighPart),
+                (
+                    picked.desc.AdapterLuid.LowPart,
+                    picked.desc.AdapterLuid.HighPart,
+                ),
+            );
         }
     }
 
