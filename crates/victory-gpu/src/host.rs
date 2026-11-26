@@ -749,6 +749,9 @@ pub(crate) struct HostList {
     states: Mutex<States>,
     /// Actual D3D12 access state per host buffer for this recording.
     shadow_states: Mutex<std::collections::HashMap<usize, (ID3D12Resource, D3D12_RESOURCE_STATES)>>,
+    /// Incremented whenever `shadow_states` inserts or transitions a shadow
+    /// buffer's D3D12 access state; reset to 0 when the list is reset.
+    shadow_state_gen: std::sync::atomic::AtomicU64,
     /// Incremented whenever `states` inserts a new texture or transitions a
     /// texture to a different state; reset to 0 when the list is reset.
     state_gen: std::sync::atomic::AtomicU64,
@@ -774,6 +777,24 @@ pub(crate) struct HostList {
     /// The work its indirect executions may still do (`indirect`): a
     /// shader-writable word, zeroed when the list is submitted.
     budget: OnceLock<Option<(ID3D12Resource, usize)>>,
+    /// Device-local scratch buffer for clamped indirect arguments (`indirect`),
+    /// grown to the largest indirect execution recorded on the list.
+    indirect_args: Mutex<Option<(ID3D12Resource, u64)>>,
+    /// Dispatches and buffer copies recorded since the reset: what may have
+    /// written indirect arguments (`crate::indirect` clamps hoisted before).
+    writes: std::sync::atomic::AtomicU64,
+    /// Whether a shader that can store to buffers was bound since the last
+    /// clamp wait (starts true after reset so earlier lists' writes wait).
+    buffer_writes: std::sync::atomic::AtomicBool,
+    /// Buffers for clamped indirect arguments when this list holds the clamps
+    /// of the list after it (`clamp_room`).
+    clamp_chunks: Mutex<ClampChunks>,
+    /// Hoisted clamped argument buffers read by this list's indirect draws,
+    /// transitioned from `INDIRECT_ARGUMENT` back to `COMMON` at close.
+    hoisted_buffers: Mutex<Vec<ID3D12Resource>>,
+    /// The records its draws read from slots that its prelude fills
+    /// (`crate::indirect::gather`).
+    gather: Mutex<Gather>,
     /// GPU-writable scratch for indirect rectangle expansion (`rectangles`):
     /// expanded vertices, rewritten draw arguments and per-draw atomic
     /// counters, keeping at most one warm counter chunk across resets and
@@ -811,6 +832,35 @@ impl Drop for HostList {
         self.release_epoch();
     }
 }
+
+/// A list's buffers for hoisted clamped indirect arguments with their states,
+/// how many are in use since the reset, the bytes taken of the last of those,
+/// whether the list has the barrier that precedes the clamps, and whether the
+/// clamp compute pipeline is already bound on this list.
+#[derive(Default)]
+struct ClampChunks {
+    all: Vec<(ID3D12Resource, D3D12_RESOURCE_STATES)>,
+    used: usize,
+    at: u64,
+    barrier: bool,
+    bound: bool,
+}
+
+/// What a list gathers for its prelude to clamp (`crate::indirect::gather`).
+#[derive(Default)]
+struct Gather {
+    /// Which argument buffers may still be gathered (per-buffer or global close).
+    gate: crate::indirect::GatherGate,
+    /// One set per argument buffer, kind and stride.
+    sets: Vec<crate::indirect::GatherSet>,
+    /// The budget words the gathered records are charged to.
+    budget: Option<ID3D12Resource>,
+    /// Scratch buffers of earlier recordings, kept for the next sets.
+    spare: Vec<ID3D12Resource>,
+}
+
+/// The most argument buffers a list gathers from.
+const GATHER_SETS: usize = 8;
 
 // SAFETY: D3D12 lists and allocators may be used from any thread, one at
 // a time: the title records a list on one thread at a time, and a
@@ -1320,6 +1370,11 @@ struct Deferred {
     copies: Vec<Step>,
     /// Post-submission readbacks from GPU textures into title buffers.
     readbacks: Vec<Readback>,
+    /// Title textures of the kinds copied back ([`crate::texback`]) that
+    /// the list's shaders write, copied when the list closes.
+    back_wanted: Vec<crate::texback::Target>,
+    /// Those copies, whose texels go to title memory once the list has run.
+    texture_backs: Vec<crate::texback::Back>,
     uploads: Vec<ID3D12Resource>,
     /// Host objects the list's commands name (pipelines, root signatures,
     /// descriptor heaps): the title may release its objects before it
@@ -1519,6 +1574,7 @@ impl Host {
                 scratch: Mutex::default(),
                 states: Mutex::default(),
                 shadow_states: Mutex::default(),
+                shadow_state_gen: std::sync::atomic::AtomicU64::new(0),
                 state_gen: std::sync::atomic::AtomicU64::new(0),
                 dirty_resources: Mutex::default(),
                 twins: Mutex::default(),
@@ -1527,6 +1583,12 @@ impl Host {
                 kept_dynamic: Mutex::default(),
                 pipelines: Mutex::default(),
                 budget: OnceLock::new(),
+                indirect_args: Mutex::default(),
+                writes: std::sync::atomic::AtomicU64::new(0),
+                buffer_writes: std::sync::atomic::AtomicBool::new(true),
+                clamp_chunks: Mutex::default(),
+                hoisted_buffers: Mutex::default(),
+                gather: Mutex::default(),
                 rect_scratch: Mutex::default(),
                 epoch: std::sync::atomic::AtomicU64::new(0),
                 work_seq: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -1679,6 +1741,14 @@ impl Host {
         batch.fill();
         batch.flush();
         drop(watch_guard);
+        if batch.rebar_init_failed {
+            fail(format_args!(
+                "ReBAR UAV mirror readback failed before a submission of {} lists{}{}",
+                runs.len(),
+                self.removal_data(runs),
+                last_notes(runs)
+            ));
+        }
 
         let flown = late && relay::relay();
         if flown && self.card_results_low() {
@@ -1930,8 +2000,8 @@ impl Host {
             let written = shadow.copy_back(address, len);
             COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
         }
-        if !rebar_entries.is_empty() {
-            self.finish_rebar_copy_back(
+        if !rebar_entries.is_empty()
+            && !self.finish_rebar_copy_back(
                 &mut submitted,
                 rebar_entries,
                 if post_compare_ok {
@@ -1939,7 +2009,14 @@ impl Host {
                 } else {
                     0
                 },
-            );
+            )
+        {
+            fail(format_args!(
+                "ReBAR UAV readback failed after a submission of {} lists{}{}",
+                runs.len(),
+                self.removal_data(runs),
+                last_notes(runs)
+            ));
         }
         for list in runs {
             read_backs(list);
@@ -1966,9 +2043,10 @@ impl Host {
     }
 }
 
-/// Copies a finished list's texture-to-buffer readbacks into title memory.
+/// Copies a finished list's texture-to-buffer and texture readbacks into title memory.
 pub(super) fn read_backs(list: &HostList) {
-    for rb in &list.deferred().readbacks {
+    let deferred = list.deferred();
+    for rb in &deferred.readbacks {
         let written = if rb.dst_pitch == rb.src_pitch {
             crate::watch::writing(rb.dst, rb.total);
             write_mapped(rb.dst as *mut u8, rb.src as *const u8, rb.total);
@@ -1985,6 +2063,9 @@ pub(super) fn read_backs(list: &HostList) {
             n
         };
         COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+    }
+    for back in &deferred.texture_backs {
+        crate::texback::land(back);
     }
 }
 
@@ -2469,9 +2550,27 @@ impl HostList {
                     .ResourceBarrier(&[transition(buffer, before, after)])
             };
             *state = after;
+            self.shadow_state_gen.fetch_add(1, Ordering::Release);
         } else if before == D3D12_RESOURCE_STATE_COMMON {
             *state = wanted;
+            self.shadow_state_gen.fetch_add(1, Ordering::Release);
         }
+    }
+
+    /// Monotonic count of shadow-buffer state transitions recorded on this
+    /// list since reset (`VICTORY_LIST_VIEWS` buffer-SRV readiness key).
+    pub(crate) fn shadow_state_gen(&self) -> u64 {
+        self.shadow_state_gen.load(Ordering::Acquire)
+    }
+
+    /// Current tracked D3D12 access state for `buffer` on this list (tests).
+    #[cfg(test)]
+    pub(crate) fn shadow_state_of(&self, buffer: &ID3D12Resource) -> Option<D3D12_RESOURCE_STATES> {
+        self.shadow_states
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&(buffer.as_raw() as usize))
+            .map(|(_, state)| *state)
     }
 
     pub(crate) fn close(&self) {
@@ -2488,7 +2587,39 @@ impl HostList {
             unsafe { self.list.ResourceBarrier(&barriers) };
         }
         drop(states);
+        // The scratch buffers its prelude fills and leaves readable as
+        // arguments, plus any hoisted clamp buffers read by this list:
+        // returned to COMMON at list close.
+        {
+            let mut close_barriers = Vec::new();
+            let gather = self.gather.lock().unwrap_or_else(|e| e.into_inner());
+            for set in gather.sets.iter().filter(|s| s.records() > 0) {
+                close_barriers.push(transition(
+                    &set.scratch,
+                    D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                    D3D12_RESOURCE_STATE_COMMON,
+                ));
+            }
+            drop(gather);
+            let hoisted = self
+                .hoisted_buffers
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            for buf in hoisted.iter() {
+                close_barriers.push(transition(
+                    buf,
+                    D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                    D3D12_RESOURCE_STATE_COMMON,
+                ));
+            }
+            drop(hoisted);
+            if !close_barriers.is_empty() {
+                // SAFETY: an open list and live buffers left in INDIRECT_ARGUMENT.
+                unsafe { self.list.ResourceBarrier(&close_barriers) };
+            }
+        }
         self.twins_to_depth();
+        self.textures_back();
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
             let count =
@@ -2614,6 +2745,7 @@ impl HostList {
             .unwrap_or_else(|e| e.into_inner())
             .clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.shadow_state_gen.store(0, Ordering::Release);
         self.state_gen.store(0, Ordering::Relaxed);
         self.dirty_resources
             .lock()
@@ -2623,6 +2755,33 @@ impl HostList {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
+        self.writes.store(0, Ordering::Relaxed);
+        {
+            let mut chunks = self.clamp_chunks.lock().unwrap_or_else(|e| e.into_inner());
+            for (_, state) in &mut chunks.all {
+                *state = D3D12_RESOURCE_STATE_COMMON;
+            }
+            chunks.used = 0;
+            chunks.at = 0;
+            chunks.barrier = false;
+            chunks.bound = false;
+        }
+        self.hoisted_buffers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        {
+            let mut gather = self.gather.lock().unwrap_or_else(|e| e.into_inner());
+            let Gather {
+                gate, sets, spare, ..
+            } = &mut *gather;
+            gate.reset();
+            for set in sets.drain(..) {
+                if spare.len() < GATHER_SETS {
+                    spare.push(set.into_scratch());
+                }
+            }
+        }
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
     }
@@ -2632,6 +2791,17 @@ impl HostList {
     /// run in [`Self::reset`] when [`Host::acquire_list`] pops it for reuse.
     fn release_for_pool(&self) {
         self.clear_tracking();
+        {
+            *self.indirect_args.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
+        {
+            let mut chunks = self.clamp_chunks.lock().unwrap_or_else(|e| e.into_inner());
+            chunks.all.clear();
+        }
+        {
+            let mut gather = self.gather.lock().unwrap_or_else(|e| e.into_inner());
+            gather.spare.clear();
+        }
         {
             let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
             scratch.chunks.clear();
@@ -2650,6 +2820,7 @@ impl HostList {
     /// Only after the list's last submission finished (every one is waited
     /// for).
     pub(crate) fn reset(&self) {
+        self.buffer_writes.store(true, Ordering::Relaxed);
         self.clear_tracking();
         {
             let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
@@ -3068,12 +3239,15 @@ impl HostList {
             (real != *first)
                 .then(|| transition(&copy.texture, host_state(real), host_state(*first)))
         }));
-        if barriers.is_empty() && syncs.is_empty() {
+        // The records the list's draws read from slots (`crate::indirect::gather`).
+        let gather = self.gather.lock().unwrap_or_else(|e| e.into_inner());
+        let gathered = gather.sets.iter().any(|s| s.records() > 0);
+        if barriers.is_empty() && syncs.is_empty() && !gathered {
             return None;
         }
         let (allocator, list) = &self.prelude;
         // SAFETY: the prelude is not executing (every submission is waited
-        // for); the textures are live.
+        // for); the textures and gathered buffers are live.
         let recorded = unsafe {
             allocator.Reset().and_then(|()| {
                 list.Reset(allocator, None)?;
@@ -3085,6 +3259,20 @@ impl HostList {
                 }
                 if !barriers.is_empty() {
                     list.ResourceBarrier(&barriers);
+                }
+                if gathered {
+                    // The slots must hold clamped records before a draw
+                    // reads them: a prelude that cannot record the passes
+                    // is no prelude.
+                    let filled = match &gather.budget {
+                        Some(budget) => crate::indirect::record_gathers(list, &gather.sets, budget),
+                        None => false,
+                    };
+                    if !filled {
+                        fail(format_args!(
+                            "a list's gathered indirect records could not be clamped in its prelude"
+                        ));
+                    }
                 }
                 list.Close()
             })
@@ -3206,6 +3394,86 @@ impl HostList {
         }
     }
 
+    /// Batched [`crate::shadow::Shadow::refresh_as`] and [`HostList::defer_refresh`]:
+    /// acquires `shadow_states` and `deferred` at most once for all
+    /// `(shadow, address, len, access)` ranges and emits any resource state
+    /// transitions in a single `ResourceBarrier`.
+    pub(crate) fn defer_refresh_batch<'a>(
+        &self,
+        reserve: usize,
+        items: impl IntoIterator<
+            Item = (
+                &'a std::sync::Arc<crate::shadow::Shadow>,
+                u64,
+                u64,
+                D3D12_RESOURCE_STATES,
+            ),
+        >,
+    ) {
+        let mut staged: Vec<(&'a std::sync::Arc<crate::shadow::Shadow>, usize, usize)> =
+            Vec::with_capacity(reserve);
+        let mut any = false;
+        {
+            let mut states = self.shadow_states.lock().unwrap_or_else(|e| e.into_inner());
+            let mut barriers: Vec<D3D12_RESOURCE_BARRIER> = Vec::new();
+            let mut barrier_keys: Vec<usize> = Vec::new();
+            let mut transitioned = false;
+            for (shadow, address, len, wanted) in items {
+                if !any {
+                    self.mark_work();
+                    any = true;
+                }
+                let buffer = &shadow.buffer;
+                let raw_key = buffer.as_raw() as usize;
+                let (_, state) = states
+                    .entry(raw_key)
+                    .or_insert_with(|| (buffer.clone(), D3D12_RESOURCE_STATE_COMMON));
+                let before = *state;
+                if let Some(after) = shadow_transition(before, wanted) {
+                    if barrier_keys.contains(&raw_key) {
+                        // SAFETY: open list; flush before a second transition on the same resource.
+                        unsafe { self.list.ResourceBarrier(&barriers) };
+                        barriers.clear();
+                        barrier_keys.clear();
+                    }
+                    barriers.push(transition(buffer, before, after));
+                    barrier_keys.push(raw_key);
+                    *state = after;
+                    transitioned = true;
+                } else if before == D3D12_RESOURCE_STATE_COMMON {
+                    *state = wanted;
+                    transitioned = true;
+                }
+                if !shadow.is_placed()
+                    && let Some((from, clamped)) = shadow.clamp_range(address, len)
+                {
+                    staged.push((shadow, from as usize, clamped as usize));
+                }
+            }
+            if !barriers.is_empty() {
+                // SAFETY: this open list retains every transitioned resource in `states`.
+                unsafe { self.list.ResourceBarrier(&barriers) };
+            }
+            if transitioned {
+                self.shadow_state_gen.fetch_add(1, Ordering::Release);
+            }
+        }
+        if !any || staged.is_empty() {
+            return;
+        }
+        let mut deferred = self.deferred();
+        deferred.refreshed.reserve(staged.len());
+        deferred.copies.reserve(staged.len());
+        for (shadow, address, len) in staged {
+            let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
+            if deferred.refreshed.insert(key) {
+                deferred
+                    .copies
+                    .push(Step::Refresh(shadow.clone(), address, len));
+            }
+        }
+    }
+
     /// Shaders of the list write `[address, address + len)` of a buffer's
     /// host copy: copied back into title memory once the list has run.
     pub(crate) fn defer_gpu_write(
@@ -3224,6 +3492,57 @@ impl HostList {
     pub(crate) fn defer_write(&self, dst: *mut u8, what: crate::queue::Written, bytes: usize) {
         self.mark_work();
         self.deferred().writes.push((dst as usize, what, bytes));
+    }
+
+    /// A draw or dispatch being prepared writes title texture `resource`
+    /// through unordered access: if it is of a kind copied back
+    /// ([`crate::texback`]), the list copies the exposed subresources when it
+    /// closes (fxceless #1152).
+    pub(crate) fn texture_written(&self, resource: crate::object::This, view: Option<&[u32; 10]>) {
+        let Some(format) = crate::texback::wanted_format(resource) else {
+            return;
+        };
+        let mut deferred = self.deferred();
+        if let Some(target) = deferred
+            .back_wanted
+            .iter_mut()
+            .find(|t| t.owner() == resource as usize)
+        {
+            target.include(view);
+        } else if let Some(target) = crate::texback::Target::new(resource, format, view) {
+            deferred.back_wanted.push(target);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn push_texback_target(&self, target: crate::texback::Target) {
+        self.deferred().back_wanted.push(target);
+    }
+
+    /// Before the list closes: the textures its shaders wrote that are copied
+    /// back go into read-back buffers ([`crate::texback::record`]), restoring
+    /// each texture's final recorded state afterward (fxceless #1152 + #1170).
+    fn textures_back(&self) {
+        const COPY_SOURCE: u32 = 0x800;
+        let wanted = std::mem::take(&mut self.deferred().back_wanted)
+            .into_iter()
+            .filter(|target| target.can_tile() && target.is_valid());
+        for target in wanted {
+            let copy = target.copy.clone();
+            let last = self.tracked_texture_state(&copy);
+            let needs_barrier = last.is_none_or(|state| state & COPY_SOURCE == 0);
+            if needs_barrier {
+                self.settle(&copy, COPY_SOURCE);
+            }
+            let back = crate::texback::record(&self.list, target);
+            if needs_barrier && let Some(last) = last {
+                self.settle(&copy, last);
+            }
+            if let Some(back) = back {
+                self.mark_work();
+                self.deferred().texture_backs.push(back);
+            }
+        }
     }
 
     /// Copies a GPU texture readback from `src` into title memory at `dst`
@@ -3329,6 +3648,286 @@ impl HostList {
         }
         // SAFETY: a live buffer.
         Some(unsafe { buffer.GetGPUVirtualAddress() })
+    }
+
+    /// A shader that can store to buffers is bound.
+    pub(crate) fn buffers_written(&self) {
+        self.buffer_writes.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether a shader that can store to buffers was bound since the last
+    /// call (the caller emits a UAV barrier before clamping).
+    pub(crate) fn take_buffer_writes(&self) -> bool {
+        self.buffer_writes.swap(false, Ordering::Relaxed)
+    }
+
+    /// Counts a dispatch or a buffer copy: what may write indirect arguments.
+    pub(crate) fn count_write(&self) {
+        self.writes.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Dispatches and buffer copies recorded since the reset.
+    pub(crate) fn writes(&self) -> u64 {
+        self.writes.load(Ordering::Relaxed)
+    }
+
+    /// Whether this host list has no recorded work or tracked resource state yet.
+    pub(crate) fn untouched(&self) -> bool {
+        !self.has_epoch()
+            && self
+                .shadow_states
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty()
+            && self
+                .states
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty()
+            && self
+                .twins
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty()
+    }
+
+    /// A device-local unordered-access buffer of at least `size` bytes for
+    /// clamped indirect arguments, reused across executions and resets of the
+    /// list. Smaller buffers replaced mid-list stay alive until [`HostList::reset`].
+    pub(crate) fn indirect_scratch(&self, size: u64) -> Option<ID3D12Resource> {
+        let needed = size.max(64 << 10);
+        let mut slot = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((buffer, cap)) = &*slot
+            && *cap >= needed
+        {
+            let buf = buffer.clone();
+            drop(slot);
+            self.mark_work();
+            return Some(buf);
+        }
+        let prev = slot.as_ref().map_or(0, |(_, cap)| *cap);
+        let alloc = prev
+            .saturating_mul(2)
+            .max(needed)
+            .next_multiple_of(64 << 10);
+        let buffer = host()?.default_buffer(alloc)?;
+        name(&buffer, || format!("indirect arguments {alloc:#x}"));
+        let old = slot.replace((buffer.clone(), alloc));
+        drop(slot);
+        self.mark_work();
+        if let Some((old_buf, _)) = old {
+            self.keep(&old_buf);
+        }
+        Some(buffer)
+    }
+
+    /// Room for `bytes` of hoisted clamped indirect arguments in this list's
+    /// buffers, writable by shaders from here on in the list: the buffer and
+    /// the offset. `None` for more than a chunk holds.
+    pub(crate) fn clamp_room(&self, bytes: u64) -> Option<(ID3D12Resource, u64)> {
+        const CHUNK: u64 = 256 << 10;
+        let bytes = bytes.next_multiple_of(16);
+        if bytes > CHUNK {
+            return None;
+        }
+        let mut chunks = self.clamp_chunks.lock().unwrap_or_else(|e| e.into_inner());
+        if chunks.used > 0 && chunks.at + bytes <= CHUNK {
+            let at = chunks.at;
+            chunks.at += bytes;
+            let buf = chunks.all[chunks.used - 1].0.clone();
+            drop(chunks);
+            self.mark_work();
+            return Some((buf, at));
+        }
+        if chunks.used == chunks.all.len() {
+            let buffer = host()?.default_buffer(CHUNK)?;
+            name(&buffer, || "hoisted indirect arguments".to_owned());
+            chunks.all.push((buffer, D3D12_RESOURCE_STATE_COMMON));
+        }
+        let i = chunks.used;
+        chunks.used += 1;
+        chunks.at = bytes;
+        let mut barriers = Vec::new();
+        if !chunks.barrier {
+            chunks.barrier = true;
+            barriers.push(crate::indirect::uav_barrier());
+        }
+        let (buffer, state) = &mut chunks.all[i];
+        if *state != D3D12_RESOURCE_STATE_UNORDERED_ACCESS {
+            barriers.push(transition(
+                buffer,
+                *state,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            ));
+            *state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        }
+        let buffer = buffer.clone();
+        drop(chunks);
+        self.mark_work();
+        if !barriers.is_empty() {
+            // SAFETY: an open list and live buffers.
+            unsafe { self.list.ResourceBarrier(&barriers) };
+        }
+        Some((buffer, 0))
+    }
+
+    /// Whether the list's hoisted clamps still have to bind their root
+    /// signature, pipeline and budget: the first after the reset does.
+    pub(crate) fn clamp_unbound(&self) -> bool {
+        let mut chunks = self.clamp_chunks.lock().unwrap_or_else(|e| e.into_inner());
+        !std::mem::replace(&mut chunks.bound, true)
+    }
+
+    /// Transitions hoisted clamped argument buffers written so far to
+    /// `INDIRECT_ARGUMENT` for the draw list that follows.
+    pub(crate) fn clamp_end(&self) {
+        let mut chunks = self.clamp_chunks.lock().unwrap_or_else(|e| e.into_inner());
+        let used = chunks.used;
+        let barriers: Vec<_> = chunks.all[..used]
+            .iter_mut()
+            .filter(|(_, state)| *state == D3D12_RESOURCE_STATE_UNORDERED_ACCESS)
+            .map(|(buffer, state)| {
+                *state = D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
+                transition(
+                    buffer,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                )
+            })
+            .collect();
+        drop(chunks);
+        if !barriers.is_empty() {
+            // SAFETY: an open list and live buffers.
+            unsafe { self.list.ResourceBarrier(&barriers) };
+        }
+    }
+
+    /// Keeps a hoisted clamped argument buffer alive and schedules its return
+    /// from `INDIRECT_ARGUMENT` to `COMMON` when this list closes.
+    pub(crate) fn keep_hoisted(&self, buffer: &ID3D12Resource) {
+        self.keep(buffer);
+        let mut hoisted = self
+            .hoisted_buffers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if !hoisted.iter().any(|b| b.as_raw() == buffer.as_raw()) {
+            hoisted.push(buffer.clone());
+        }
+    }
+
+    /// From here on the list gathers no records (`crate::indirect::gather`):
+    /// what is about to be recorded may write arbitrary arguments.
+    pub(crate) fn gather_close(&self) {
+        self.gather
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .gate
+            .close_all();
+    }
+
+    /// From here on the list gathers no records from host copy `src_id`:
+    /// unmodified argument buffers may still gather.
+    pub(crate) fn gather_close_buffer(&self, src_id: u64) {
+        self.gather
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .gate
+            .close_buffer(src_id);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn gather_allows(&self, src_id: u64) -> bool {
+        self.gather
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .gate
+            .allows(src_id)
+    }
+
+    /// A slot for the record at `offset` of the host copy `src` in the
+    /// scratch buffer the list's prelude fills (`crate::indirect::gather`,
+    /// which checked the record): the buffer and the slot's byte offset.
+    pub(crate) fn gather_slot(
+        &self,
+        src: &ID3D12Resource,
+        src_id: u64,
+        offset: u32,
+        (kind, stride): (u32, u32),
+    ) -> Option<(ID3D12Resource, u64)> {
+        let none = |why: usize| {
+            crate::indirect::GATHER_NONE[why].fetch_add(1, Ordering::Relaxed);
+            None
+        };
+        let mut gather = self.gather.lock().unwrap_or_else(|e| e.into_inner());
+        if !gather.gate.allows(src_id) {
+            return none(1);
+        }
+        let found = gather.sets.iter().position(|s| {
+            s.src_id == src_id
+                && s.kind == kind
+                && s.stride == stride
+                && s.src.as_raw() == src.as_raw()
+        });
+        let at = match found {
+            Some(at) => at,
+            None => {
+                if gather.sets.len() >= GATHER_SETS {
+                    return none(2);
+                }
+                // The prelude zeroes the budget with WriteBufferImmediate.
+                if self.list.cast::<ID3D12GraphicsCommandList2>().is_err() {
+                    return none(4);
+                }
+                let Some(host) = host() else {
+                    return none(4);
+                };
+                if gather.budget.is_none() {
+                    let Some(budget) = host.default_buffer(256) else {
+                        return none(4);
+                    };
+                    name(&budget, || "indirect budget of gathered records".to_owned());
+                    gather.budget = Some(budget);
+                }
+                let scratch = match gather.spare.pop() {
+                    Some(scratch) => scratch,
+                    None => {
+                        let Some(scratch) = host.default_buffer(
+                            u64::from(crate::indirect::GATHER_MOST)
+                                * u64::from(crate::indirect::GATHER_STRIDE),
+                        ) else {
+                            return none(4);
+                        };
+                        name(&scratch, || "indirect arguments, gathered".to_owned());
+                        scratch
+                    }
+                };
+                let Some(table) = self.scratch(u64::from(crate::indirect::GATHER_MOST) * 4) else {
+                    gather.spare.push(scratch);
+                    return none(4);
+                };
+                gather.sets.push(crate::indirect::GatherSet::new(
+                    src.clone(),
+                    src_id,
+                    (kind, stride),
+                    scratch,
+                    table,
+                ));
+                gather.sets.len() - 1
+            }
+        };
+        let set = &mut gather.sets[at];
+        let Some(slot) = set.slot(offset) else {
+            return none(3);
+        };
+        let dst_stride = if kind & crate::indirect::ROWS != 0 {
+            crate::indirect::ROW_STRIDE
+        } else {
+            stride
+        };
+        let out = (set.scratch.clone(), u64::from(slot) * u64::from(dst_stride));
+        drop(gather);
+        self.mark_work();
+        Some(out)
     }
 
     /// The list's GPU-writable scratch buffer for expanded indirect
@@ -3610,6 +4209,8 @@ struct Batch {
     fills: Vec<(usize, usize, usize)>,
     /// Shadows already refreshed ahead of their first `Step::GpuWrite` (`host_prep`).
     ahead: std::collections::HashMap<usize, (usize, usize)>,
+    /// Set if a ReBAR shadow's initial RAM mirror readback failed.
+    rebar_init_failed: bool,
 }
 
 impl Batch {
@@ -3633,9 +4234,11 @@ impl Batch {
             // Another declaration of this exact range is already pending until
             // the GPU submission finishes, so it needs no refresh boundary.
             self.flush();
-            shadow.writing(address, len, |buffer, size| {
+            if !shadow.writing(address, len, |buffer, size| {
                 host.readback_rebar_to_vec(submitted, buffer, size)
-            });
+            }) {
+                self.rebar_init_failed = true;
+            }
         }
     }
 
@@ -5187,12 +5790,27 @@ impl Host {
     /// Reads GPU hash-compare flags (if run), coalesces contiguous flagged
     /// 64 KiB pieces intersected with declared UAV spans, and DMAs only those
     /// changed runs into `READBACK` for [`crate::shadow::Shadow::copy_back_rebar`].
+    ///
+    /// Returns `false` if readback or mirror merge fails; any entry with
+    /// undelivered spans keeps its `pending` ranges intact so refreshes and
+    /// loose-cache eviction cannot overwrite or drop GPU results.
     fn finish_rebar_copy_back(
         &self,
         submitted: &mut u64,
         entries: Vec<RebarWriteEntry>,
         total_flag_pieces: usize,
-    ) {
+    ) -> bool {
+        self.finish_rebar_copy_back_with(entries, total_flag_pieces, |jobs, f| {
+            self.copy_rebar_readback(submitted, jobs, f)
+        })
+    }
+
+    fn finish_rebar_copy_back_with(
+        &self,
+        entries: Vec<RebarWriteEntry>,
+        total_flag_pieces: usize,
+        readback: impl FnOnce(&[(&ID3D12Resource, u64, u64)], &mut dyn FnMut(&[&[u8]])) -> bool,
+    ) -> bool {
         struct PendingCopy {
             shadow: std::sync::Arc<crate::shadow::Shadow>,
             spans: Vec<(usize, usize)>,
@@ -5265,7 +5883,7 @@ impl Host {
             for entry in &pending {
                 entry.shadow.clear_pending_rebar();
             }
-            return;
+            return true;
         }
         let mut copy_jobs: Vec<(&ID3D12Resource, u64, u64)> = Vec::with_capacity(total_jobs);
         let mut copy_bytes = 0u64;
@@ -5284,26 +5902,41 @@ impl Host {
                 .fetch_add(copy_bytes, Ordering::Relaxed);
         }
         let _ = copy_bytes;
-        let ok = self.copy_rebar_readback(submitted, &copy_jobs, |slices| {
+        let mut all_delivered = true;
+        let mut deliver = |slices: &[&[u8]]| {
             for entry in &pending {
                 if entry.first < entry.end {
-                    let written = entry
+                    match entry
                         .shadow
-                        .copy_back_rebar(&entry.spans, &slices[entry.first..entry.end]);
-                    COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+                        .copy_back_rebar(&entry.spans, &slices[entry.first..entry.end])
+                    {
+                        Some(written) => {
+                            COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+                        }
+                        None => {
+                            entry.shadow.mark_rebar_dirty_spans(&entry.spans);
+                            all_delivered = false;
+                        }
+                    }
                 } else {
                     entry.shadow.clear_pending_rebar();
                 }
             }
-        });
+        };
+        let ok = readback(&copy_jobs, &mut deliver);
         if !ok {
             for entry in &pending {
                 if !entry.spans.is_empty() {
+                    // Keep `pending` ranges intact so refreshes and loose-cache
+                    // eviction cannot overwrite or drop undelivered GPU bytes.
                     entry.shadow.mark_rebar_dirty_spans(&entry.spans);
+                } else {
+                    entry.shadow.clear_pending_rebar();
                 }
-                entry.shadow.clear_pending_rebar();
             }
+            return false;
         }
+        all_delivered
     }
 
     /// DMAs `copies` (`(src_buffer, src_offset, len)`) from ReBAR buffers into
@@ -5978,6 +6611,15 @@ impl Host {
             };
             p.copy.reset();
             let list = &p.copy.list;
+            #[cfg(feature = "diagnostics")]
+            let plane_probes = composition
+                .filter(|_| crate::capture::plane_stats_wanted(frame))
+                .map(|((overlay, overlay_state, _), _)| {
+                    [
+                        crate::capture::probe_plane(&self.device, list, texture, state),
+                        crate::capture::probe_plane(&self.device, list, overlay, overlay_state),
+                    ]
+                });
             let capture_source =
                 if let Some(((overlay, overlay_state, extent), compositor)) = composition {
                     compositor.record(
@@ -6079,7 +6721,20 @@ impl Host {
             }
             p.meter.frame(p.hwnd);
             #[cfg(feature = "diagnostics")]
-            return probe.and_then(|b| crate::capture::black(&b));
+            {
+                let composite = probe.as_ref().and_then(crate::capture::grid_samples);
+                if let Some([primary, overlay]) = plane_probes {
+                    for (name, buffer) in [("primary", primary), ("overlay", overlay)] {
+                        crate::capture::report_grid(
+                            frame,
+                            name,
+                            buffer.as_ref().and_then(crate::capture::grid_samples),
+                        );
+                    }
+                    crate::capture::report_grid(frame, "composite", composite);
+                }
+                composite.map(crate::capture::note_presented)
+            }
             #[cfg(not(feature = "diagnostics"))]
             Some(false)
         }
