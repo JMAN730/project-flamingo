@@ -2509,7 +2509,7 @@ fn readable(
             }
             samples_depth
         }
-        (View::Unordered(resource, _, _), ResourceType::Uav) => {
+        (View::Unordered(resource, _, desc), ResourceType::Uav) => {
             // A shader writes it, so its contents are on the host and not in
             // title memory (as for a copy destination): the upload a later
             // read brings textures the title fills up to date with would copy
@@ -2519,6 +2519,8 @@ fn readable(
             }
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(*resource as This);
+            // Read by the title's CPU code: copied back into title memory.
+            list.texture_written(*resource as This, desc.as_ref());
             // Unordered access to a depth texture is its colour twin's: the
             // write does not land in the depth texture, so it is not the
             // draw's depth target and is not marked as sampled.

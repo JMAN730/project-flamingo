@@ -74,6 +74,8 @@ mod shadow;
 pub mod signature;
 mod switch;
 #[cfg(windows)]
+mod texback;
+#[cfg(windows)]
 mod texture;
 mod timeline;
 #[cfg(windows)]

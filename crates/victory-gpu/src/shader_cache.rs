@@ -73,6 +73,9 @@ fn build(wave32: bool) -> &'static [u8; 32] {
                         | (u8::from(wave32 && victory_shader::emit::wave64_double()) << 1)
                         | (u8::from(wave32 && victory_shader::emit::wave64_console_flow()) << 2),
                 );
+                if wave32 {
+                    bytes.extend_from_slice(&victory_shader::emit::wave_wide_cache_key());
+                }
                 *blake3::hash(&bytes).as_bytes()
             }
             Err(e) => {
@@ -92,7 +95,9 @@ fn build(wave32: bool) -> &'static [u8; 32] {
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
     let wave32 = allow_wave32();
     let translate = |c: &[u8]| {
-        victory_shader::emit::translate_with_wave32(c, wave32).map_err(|e| e.to_string())
+        let hash = blake3::hash(c).to_hex();
+        victory_shader::emit::translate_with_wave32_for_hash(c, wave32, &hash[..16])
+            .map_err(|e| e.to_string())
     };
     match CACHE.get() {
         Some(cache) => cached(cache, build(wave32), container, translate),

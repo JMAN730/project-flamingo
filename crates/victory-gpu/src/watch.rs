@@ -635,6 +635,7 @@ pub fn mapped_pages_written(addresses: impl Iterator<Item = usize>) {
 /// writes announced wholly inside it are moot (an overlapped read that
 /// never said it landed no longer keeps those blocks open).
 pub fn title_memory_remapped(at: usize, len: usize) {
+    crate::texback::remapped(at, len);
     let (first, end) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
     let mut g = guards();
     let blocks: Vec<usize> = g.protected.range(first..end).copied().collect();

@@ -1462,6 +1462,11 @@ struct Deferred {
     copies: Vec<Step>,
     /// Post-submission readbacks from GPU textures into title buffers.
     readbacks: Vec<Readback>,
+    /// Title textures of the kinds copied back ([`crate::texback`]) that
+    /// the list's shaders write, copied when the list closes.
+    back_wanted: Vec<crate::texback::Target>,
+    /// Those copies, whose texels go to title memory once the list has run.
+    texture_backs: Vec<crate::texback::Back>,
     uploads: Vec<ID3D12Resource>,
     /// Host objects the list's commands name (pipelines, root signatures,
     /// descriptor heaps): the title may release its objects before it
@@ -1947,7 +1952,8 @@ impl Host {
             );
         }
         for list in runs {
-            for rb in &list.deferred().readbacks {
+            let deferred = list.deferred();
+            for rb in &deferred.readbacks {
                 let written = if rb.dst_pitch == rb.src_pitch {
                     crate::watch::writing(rb.dst, rb.total);
                     write_mapped(rb.dst as *mut u8, rb.src as *const u8, rb.total);
@@ -1964,6 +1970,9 @@ impl Host {
                     n
                 };
                 COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+            }
+            for back in &deferred.texture_backs {
+                crate::texback::land(back);
             }
         }
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
@@ -2378,6 +2387,7 @@ impl HostList {
         }
         drop(states);
         self.twins_to_depth();
+        self.textures_back();
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
             let count =
@@ -3113,6 +3123,57 @@ impl HostList {
     pub(crate) fn defer_write(&self, dst: *mut u8, what: crate::queue::Written, bytes: usize) {
         self.mark_work();
         self.deferred().writes.push((dst as usize, what, bytes));
+    }
+
+    /// A draw or dispatch being prepared writes title texture `resource`
+    /// through unordered access: if it is of a kind copied back
+    /// ([`crate::texback`]), the list copies the exposed subresources when it
+    /// closes (fxceless #1152).
+    pub(crate) fn texture_written(&self, resource: crate::object::This, view: Option<&[u32; 10]>) {
+        let Some(format) = crate::texback::wanted_format(resource) else {
+            return;
+        };
+        let mut deferred = self.deferred();
+        if let Some(target) = deferred
+            .back_wanted
+            .iter_mut()
+            .find(|t| t.owner() == resource as usize)
+        {
+            target.include(view);
+        } else if let Some(target) = crate::texback::Target::new(resource, format, view) {
+            deferred.back_wanted.push(target);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn push_texback_target(&self, target: crate::texback::Target) {
+        self.deferred().back_wanted.push(target);
+    }
+
+    /// Before the list closes: the textures its shaders wrote that are copied
+    /// back go into read-back buffers ([`crate::texback::record`]), restoring
+    /// each texture's final recorded state afterward (fxceless #1152 + #1170).
+    fn textures_back(&self) {
+        const COPY_SOURCE: u32 = 0x800;
+        let wanted = std::mem::take(&mut self.deferred().back_wanted)
+            .into_iter()
+            .filter(|target| target.can_tile() && target.is_valid());
+        for target in wanted {
+            let copy = target.copy.clone();
+            let last = self.tracked_texture_state(&copy);
+            let needs_barrier = last.is_none_or(|state| state & COPY_SOURCE == 0);
+            if needs_barrier {
+                self.settle(&copy, COPY_SOURCE);
+            }
+            let back = crate::texback::record(&self.list, target);
+            if needs_barrier && let Some(last) = last {
+                self.settle(&copy, last);
+            }
+            if let Some(back) = back {
+                self.mark_work();
+                self.deferred().texture_backs.push(back);
+            }
+        }
     }
 
     /// Copies a GPU texture readback from `src` into title memory at `dst`
