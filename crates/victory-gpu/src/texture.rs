@@ -21,6 +21,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use windows::Win32::Graphics::Direct3D12::*;
+use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8_UNORM;
 
 use crate::host::{HostList, host};
 use crate::object::This;
@@ -96,6 +97,8 @@ pub(crate) struct Staging {
     /// Top levels of the title's texture the host copy lacks.
     skipped: u32,
     memory: *const u8,
+    /// Whether unchanged view guards can defer hashing this texture.
+    guard_view: bool,
     /// Title resource this staging buffer is of: host SRVs are narrowed to
     /// its resident mip window ([`note_resident`]).
     resource: This,
@@ -221,6 +224,32 @@ thread_local! {
     /// Texture memory read for hashing and detiling: one per submitting
     /// thread, as large as the largest texture it read.
     static SCRATCH: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Calls `f` with `size` bytes of this thread's scratch buffer (their contents
+/// are whatever the last texture left). Moves the buffer out of the
+/// thread-local `RefCell` during `f` so same-thread VEH re-entrancy can never
+/// panic with `RefCell already borrowed`. Keeps the initialized length so
+/// alternating large and small textures do not re-zero the tail.
+fn with_scratch<R>(size: usize, f: impl FnOnce(&mut [u8]) -> R) -> R {
+    let mut read = SCRATCH.with(|slot| {
+        slot.try_borrow_mut()
+            .map(|mut b| std::mem::take(&mut *b))
+            .unwrap_or_default()
+    });
+    if size > read.len() {
+        read.reserve_exact(size - read.len());
+        read.resize(size, 0);
+    }
+    let out = f(&mut read[..size]);
+    SCRATCH.with(|slot| {
+        if let Ok(mut saved) = slot.try_borrow_mut()
+            && read.capacity() > saved.capacity()
+        {
+            *saved = read;
+        }
+    });
+    out
 }
 
 /// Textures the host GPU wrote by a copy or resolve: their contents are on
@@ -659,7 +688,9 @@ impl Staging {
         let start = self.memory as usize;
         let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
         let last = &mut *last;
-        if let Some((now, written)) = crate::watch::writes(start, start + size, false) {
+        if self.guard_view
+            && let Some((now, written)) = crate::watch::writes(start, start + size, false)
+        {
             if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
                 return 0;
             }
@@ -699,8 +730,7 @@ impl Staging {
         // Read through the kernel, as above: the title may unmap the pages
         // (evicting a texture a big table lists) while we read them, and a
         // direct read would fault. The copy is reused, not kept per texture.
-        SCRATCH.with_borrow_mut(|tiled| {
-            tiled.resize(size, 0);
+        with_scratch(size, |tiled| {
             crate::host::copy_mapped(tiled.as_mut_ptr(), self.memory, size, false);
             self.changed(last, tiled, self.first)
         })
@@ -778,15 +808,9 @@ impl Staging {
     }
 }
 
-/// Reads a texture for the duration of its detile. Keep the initialized
-/// length so alternating large and small textures do not re-zero the tail.
+/// Reads a texture for the duration of its detile.
 fn with_tiled_copy(memory: *const u8, size: usize, detile: impl FnOnce(&[u8])) {
-    SCRATCH.with_borrow_mut(|read| {
-        if size > read.len() {
-            read.reserve_exact(size - read.len());
-            read.resize(size, 0);
-        }
-        let tiled = &mut read[..size];
+    with_scratch(size, |tiled| {
         crate::host::copy_mapped(tiled.as_mut_ptr(), memory, size, false);
         detile(tiled);
     });
@@ -795,11 +819,85 @@ fn with_tiled_copy(memory: *const u8, size: usize, detile: impl FnOnce(&[u8])) {
 /// Whether `[at, at + len)` is committed memory (streamed textures may be
 /// unmapped until their pages arrive).
 pub(crate) fn committed(at: *const u8, len: usize) -> bool {
+    if len == 0 {
+        return true;
+    }
+    // A range past the top of the address space is never all committed.
+    if (at as usize).checked_add(len).is_none() {
+        return false;
+    }
     committed_prefix(at, len) == len
 }
 
+/// Whether residency probes (`committed`, `committed_prefix`) fall back to
+/// `VirtualQuery` instead of batched `K32QueryWorkingSetEx`
+/// (`VICTORY_COMMITTED_QUERY=1` restores legacy `VirtualQuery`).
+fn by_query() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_COMMITTED_QUERY").is_some_and(|v| v == "1"))
+}
+
 fn committed_prefix(at: *const u8, len: usize) -> usize {
-    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    if len == 0 {
+        return 0;
+    }
+    if by_query() {
+        return committed_prefix_by_query(at, len);
+    }
+    readable_prefix(at as usize, len)
+}
+
+/// Contiguous readable prefix length of `[start, start.saturating_add(len))`
+/// using batched 256-page `K32QueryWorkingSetEx` syscalls (with
+/// [`crate::host::read_into_probe`] fallback for pages not yet in the working
+/// set), avoiding `VirtualQuery`'s full-region page-table walks.
+fn readable_prefix(start: usize, len: usize) -> usize {
+    use windows_sys::Win32::System::ProcessStatus::{
+        K32QueryWorkingSetEx, PSAPI_WORKING_SET_EX_INFORMATION,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    const KERNEL_PAGE: usize = 4096;
+    let end = start.saturating_add(len);
+    if start >= end {
+        return 0;
+    }
+    let first = start / KERNEL_PAGE;
+    let last = (end - 1) / KERNEL_PAGE;
+    // SAFETY: plain data filled by `K32QueryWorkingSetEx`.
+    let mut info: [PSAPI_WORKING_SET_EX_INFORMATION; 256] = unsafe { std::mem::zeroed() };
+    let mut page = first;
+    while page <= last {
+        let n = (last - page + 1).min(info.len());
+        for (i, entry) in info[..n].iter_mut().enumerate() {
+            entry.VirtualAddress = ((page + i) * KERNEL_PAGE) as *mut _;
+        }
+        // SAFETY: `n` entries of the given size; our own process.
+        let asked = unsafe {
+            K32QueryWorkingSetEx(
+                GetCurrentProcess(),
+                info.as_mut_ptr().cast(),
+                (n * size_of::<PSAPI_WORKING_SET_EX_INFORMATION>()) as u32,
+            )
+        } != 0;
+        for (i, entry) in info[..n].iter().enumerate() {
+            // Bit 0 of the answer: the page is in the working set.
+            // SAFETY: plain data filled by the query.
+            let valid = asked && unsafe { entry.VirtualAttributes.Flags } & 1 != 0;
+            let page_addr = (page + i) * KERNEL_PAGE;
+            let mut byte = [0u8];
+            if !(valid || crate::host::read_into_probe(page_addr as *const u8, &mut byte)) {
+                return page_addr.saturating_sub(start);
+            }
+        }
+        page += n;
+    }
+    end - start
+}
+
+fn committed_prefix_by_query(at: *const u8, len: usize) -> usize {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery,
+    };
     let mut p = at as usize;
     // A range past the top of the address space (a title address and size
     // taken as they come) is cut at the top, so it is never all committed.
@@ -809,7 +907,8 @@ fn committed_prefix(at: *const u8, len: usize) -> usize {
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
         // SAFETY: a valid out pointer of the right size.
         let n = unsafe { VirtualQuery(p as *const _, &mut info, size_of_val(&info)) };
-        if n == 0 || info.State != MEM_COMMIT {
+        if n == 0 || info.State != MEM_COMMIT || (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0
+        {
             break;
         }
         p = (info.BaseAddress as usize).saturating_add(info.RegionSize);
@@ -890,6 +989,15 @@ fn create_staging(
     let host = host()?;
     // SAFETY: a live resource.
     let d = unsafe { texture.GetDesc() };
+    // Software-decoded movie planes are linear R8 textures. The decoder can
+    // write through another view of the same pages, bypassing the guards on
+    // the sampled view. Check their content on every submission so cycling
+    // through the movie's textures does not replay old frames.
+    let guard_view = !(d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
+        && d.Format == DXGI_FORMAT_R8_UNORM
+        && d.MipLevels == 1
+        && d.DepthOrArraySize == 1
+        && layout.desc.swizzle == victory_formats::texture::Swizzle::LINEAR);
     let first = first_mip(&layout, u32::from(d.MipLevels), requested);
     let tiled_bytes = layout.bytes_from(first) as usize;
     let count = if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
@@ -932,6 +1040,7 @@ fn create_staging(
         mips: u32::from(d.MipLevels),
         skipped: crate::resource::dropped_mips(resource),
         memory,
+        guard_view,
         resource,
         last: Mutex::default(),
         born_seq: crate::host::birth_seq(),
@@ -976,6 +1085,76 @@ mod tests {
         assert!(committed(data.as_ptr(), data.len()));
         assert!(!committed(data.as_ptr(), usize::MAX));
         assert!(!committed(usize::MAX as *const u8, 2));
+    }
+
+    #[test]
+    fn batched_query_working_set_prefix_spans_multiple_batches_and_stops_at_holes() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc,
+            VirtualFree, VirtualProtect,
+        };
+        const MEM_TOP_DOWN: u32 = 0x10_0000;
+        const KERNEL_PAGE: usize = 4096;
+        // > 256 pages so `readable_prefix` crosses multiple 256-entry
+        // `K32QueryWorkingSetEx` batches (300 pages = 1.2 MiB).
+        const TOTAL_PAGES: usize = 300;
+        const COMMIT_PAGES: usize = 270;
+        const TOTAL_BYTES: usize = TOTAL_PAGES * KERNEL_PAGE;
+        const COMMIT_BYTES: usize = COMMIT_PAGES * KERNEL_PAGE;
+
+        // SAFETY: isolated reservation freed at the end of the test.
+        let base = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                TOTAL_BYTES,
+                MEM_RESERVE | MEM_TOP_DOWN,
+                PAGE_NOACCESS,
+            )
+            .cast::<u8>()
+        };
+        assert!(!base.is_null());
+        // SAFETY: commit the first 270 pages; leave pages 270..300 reserved.
+        let mapped = unsafe { VirtualAlloc(base.cast(), COMMIT_BYTES, MEM_COMMIT, PAGE_READWRITE) };
+        assert_eq!(mapped, base.cast());
+
+        // Touch only the first half so the second half exercises the
+        // `read_into_probe` fallback for committed pages not yet in working set.
+        // SAFETY: pages 0..135 are committed and writable.
+        unsafe { base.write_bytes(0x5A, 135 * KERNEL_PAGE) };
+
+        assert_eq!(readable_prefix(base as usize, TOTAL_BYTES), COMMIT_BYTES);
+        assert_eq!(
+            readable_prefix(base as usize + 123, TOTAL_BYTES - 123),
+            COMMIT_BYTES - 123
+        );
+        assert!(committed(base, COMMIT_BYTES));
+        assert!(!committed(base, TOTAL_BYTES));
+        // Unmapped start returns 0 immediately.
+        assert_eq!(
+            readable_prefix(base as usize + COMMIT_BYTES, 16 * KERNEL_PAGE),
+            0
+        );
+
+        // `PAGE_NOACCESS` mid-range stops `readable_prefix` before the protected page.
+        let mut old = 0u32;
+        // SAFETY: page 260 is committed within our reservation.
+        let protected = unsafe {
+            VirtualProtect(
+                base.add(260 * KERNEL_PAGE).cast(),
+                KERNEL_PAGE,
+                PAGE_NOACCESS,
+                &mut old,
+            )
+        };
+        assert_ne!(protected, 0);
+        assert_eq!(
+            readable_prefix(base as usize, TOTAL_BYTES),
+            260 * KERNEL_PAGE
+        );
+        assert!(!committed(base, COMMIT_BYTES));
+
+        // SAFETY: release our reservation.
+        assert_ne!(unsafe { VirtualFree(base.cast(), 0, MEM_RELEASE) }, 0);
     }
 
     #[test]
@@ -1858,5 +2037,19 @@ mod resident_tests {
         assert_eq!(resident(resource), None);
         // Leave no cross-test residue in the process-wide sets.
         forget(resource as usize);
+    }
+
+    #[test]
+    fn with_scratch_is_reentrant_safe() {
+        let outer = super::with_scratch(64, |outer_buf| {
+            outer_buf.fill(0xaa);
+            let inner = super::with_scratch(256, |inner_buf| {
+                inner_buf.fill(0x55);
+                inner_buf.len()
+            });
+            assert!(outer_buf.iter().all(|&b| b == 0xaa));
+            (outer_buf.len(), inner)
+        });
+        assert_eq!(outer, (64, 256));
     }
 }

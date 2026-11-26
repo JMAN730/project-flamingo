@@ -438,12 +438,7 @@ pub(crate) fn expand(
 
     // Refresh title buffers at submission time.
     let args_len = u64::from(stride) * u64::from(max.max(1));
-    args.refresh_as(
-        list,
-        arguments,
-        args_len,
-        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-    );
+    args.refresh(list, arguments, args_len);
     if let Some((c, at)) = counter {
         c.refresh_as(list, at, 4, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     }
@@ -456,13 +451,21 @@ pub(crate) fn expand(
         );
     }
 
-    let src_args_gpu = args.gpu(arguments);
-    if !crate::indirect::clamp_uav(list, src_args_gpu, (0, stride, max)) {
+    let Some(clamped_args) = crate::indirect::clamp_uav(
+        list,
+        (&args.buffer, args.offset(arguments)),
+        (0, stride, max),
+    ) else {
         return Err("rectangle clamp unavailable");
-    }
+    };
 
     // SAFETY: live D3D12 resources.
-    let dst_args_gpu = unsafe { dst_args_buf.GetGPUVirtualAddress() };
+    let (src_args_gpu, dst_args_gpu) = unsafe {
+        (
+            clamped_args.GetGPUVirtualAddress(),
+            dst_args_buf.GetGPUVirtualAddress(),
+        )
+    };
     let count_gpu = counter.map_or(src_args_gpu, |(c, at)| c.gpu(at));
     let rewrite_consts = [
         max,
@@ -531,6 +534,7 @@ pub(crate) fn expand(
             }
         }
     }
+    crate::indirect::done_uav(list, &clamped_args);
 
     Ok(Prepared {
         args_buf: dst_args_buf,

@@ -35,6 +35,10 @@ use crate::watch::PAGE;
 /// shadow buffers across live [`Shadow`] instances.
 static REBAR_SHADOW_BYTES: AtomicU64 = AtomicU64::new(0);
 
+/// Monotonic identifier for each live [`Shadow`] host copy (used by indirect
+/// window and per-buffer gather gating to avoid pointer-reuse ABA).
+static NEXT_SHADOW_ID: AtomicU64 = AtomicU64::new(1);
+
 /// Atomically reserves `size` bytes from `budget`, returning `false` if doing
 /// so would exceed `budget`.
 fn try_reserve_rebar(used: &AtomicU64, size: u64, budget: u64) -> bool {
@@ -192,6 +196,13 @@ struct RebarShadow {
 }
 
 impl RebarShadow {
+    fn has_mirror(&self) -> bool {
+        self.mirror
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
+    }
+
     fn mark_dirty_range(&self, off: usize, len: usize) {
         if len == 0 {
             return;
@@ -201,10 +212,25 @@ impl RebarShadow {
             h.dirty.mark_byte_range(off, len);
         }
     }
+
+    fn mark_dirty_segs(&self, start: usize, segs: &[CopySeg]) {
+        if segs.is_empty() {
+            return;
+        }
+        let mut guard = self.hashes.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(h) = guard.as_mut() {
+            for seg in segs {
+                if seg.len > 0 {
+                    h.dirty.mark_byte_range(seg.src - start, seg.len);
+                }
+            }
+        }
+    }
 }
 
 /// A title buffer's host copy.
 pub(crate) struct Shadow {
+    id: u64,
     pub(crate) buffer: ID3D12Resource,
     data: *mut u8,
     gpu: u64,
@@ -321,6 +347,11 @@ unsafe impl Send for Shadow {}
 unsafe impl Sync for Shadow {}
 
 impl Shadow {
+    /// Unique identifier for this host copy, stable for its lifetime.
+    pub(crate) fn id(&self) -> u64 {
+        self.id
+    }
+
     /// The host GPU address of a title address inside the buffer.
     pub(crate) fn gpu(&self, address: u64) -> u64 {
         self.gpu + (address - self.start)
@@ -374,6 +405,25 @@ impl Shadow {
     }
 
     /// Brings `len` bytes at `address` up to date when `list` is submitted,
+    /// and keeps the copy alive until the list is reset, without recording a
+    /// resource-state transition on `list` itself (used when `list`'s prelude
+    /// reads the buffer and restores it to `COMMON`).
+    pub(crate) fn refresh_for_prelude(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
+        list.keep(&self.buffer);
+        let from = address.max(self.start);
+        let len = range_inside(
+            from,
+            len.saturating_sub(from.saturating_sub(address)),
+            self.start,
+            self.len,
+        );
+        if len == 0 {
+            return;
+        }
+        list.defer_refresh(self, from as usize, len as usize);
+    }
+
+    /// Brings `len` bytes at `address` up to date when `list` is submitted,
     /// and keeps the copy alive until the list is reset. Cut to the copy.
     pub(crate) fn refresh(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
         self.refresh_as(list, address, len, D3D12_RESOURCE_STATE_GENERIC_READ);
@@ -405,6 +455,7 @@ impl Shadow {
     ) -> Shadow {
         let pages = (start + len).div_ceil(PAGE as u64) - start / PAGE as u64;
         Shadow {
+            id: NEXT_SHADOW_ID.fetch_add(1, Ordering::Relaxed),
             buffer,
             data,
             gpu,
@@ -828,10 +879,21 @@ impl Shadow {
     /// since it was last copied (all of it if the memory is not
     /// write-watched). Returns the bytes copied.
     pub(crate) fn update(&self, address: usize, len: usize) -> usize {
+        let plan = self.plan_update(address, len);
+        if plan.runs.is_empty() {
+            return 0;
+        }
+        self.copy_runs(&plan.runs)
+    }
+
+    /// Computes the disjoint dirty byte runs of `[address, address + len)`
+    /// outside pending shader writes and advances `self.copied` for whole
+    /// stale pages, releasing `self.copied`'s lock before any memory copy.
+    fn plan_update(&self, address: usize, len: usize) -> UpdatePlan {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (address.max(start), address.saturating_add(len).min(end));
         if from >= to {
-            return 0;
+            return UpdatePlan::default();
         }
         let mut busy: Vec<(usize, usize)> = self
             .pending
@@ -841,40 +903,45 @@ impl Shadow {
             .copied()
             .filter(|&(a, e)| a < to && e > from)
             .collect();
+        let mut plan = UpdatePlan::default();
         if !busy.is_empty() {
             // Around ranges shaders are writing: the gaps, each as below
             // (in the world most submissions have such ranges; copying the
             // gaps whole cost ~1 s per frame).
             busy.sort_unstable();
-            let (mut at, mut bytes) = (from, 0);
+            let mut at = from;
             for (a, e) in busy {
                 if a > at {
-                    bytes += self.update_free(at, a);
+                    self.plan_update_free(at, a, &mut plan);
                 }
                 at = at.max(e);
             }
             if at < to {
-                bytes += self.update_free(at, to);
+                self.plan_update_free(at, to, &mut plan);
             }
-            return bytes;
+            return plan;
         }
-        self.update_free(from, to)
+        self.plan_update_free(from, to, &mut plan);
+        plan
     }
 
-    /// [`Shadow::update`] of `[from, to)` (inside the buffer) where no
+    /// [`Shadow::plan_update`] of `[from, to)` (inside the buffer) where no
     /// shader writes.
-    fn update_free(&self, from: usize, to: usize) -> usize {
+    fn plan_update_free(&self, from: usize, to: usize, plan: &mut UpdatePlan) {
         if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
             if let Some((now, written)) = crate::watch::writes(from, to, true) {
                 self.watched.store(1, Ordering::Relaxed);
-                let copied = self.copy_stale(from, to, now, &written);
+                let before = plan.runs.len();
+                self.collect_stale(from, to, now, &written, &mut plan.runs);
                 #[cfg(feature = "diagnostics")]
                 {
                     use crate::copystat::{C, add};
+                    let copied: usize = plan.runs[before..].iter().map(|&(a, b)| b - a).sum();
                     add(C::Checked, (to - from) as u64);
                     add(C::Unchanged, (to - from).saturating_sub(copied) as u64);
                 }
-                return copied;
+                let _ = before;
+                return;
             }
             // Only mark the shadow permanently unwatched if it has never been
             // observed as watched. A sub-range that lands entirely in an
@@ -884,19 +951,25 @@ impl Shadow {
                 self.watched
                     .compare_exchange(0, NOT_WATCHED, Ordering::Relaxed, Ordering::Relaxed);
         }
-        self.copy(from, to);
-        to - from
+        plan.runs.push((from, to));
     }
 
-    /// Copies the pages of `[from, to)` written after their last copy
-    /// (`written`: last writes by page, in page order; `now`: this
-    /// asking), whole pages within the buffer.
-    fn copy_stale(&self, from: usize, to: usize, now: u64, written: &[(usize, u64)]) -> usize {
+    /// Collects contiguous stale byte ranges `(lo, hi)` of `[from, to)`
+    /// written after their last copy (`written`: last writes by page, in page
+    /// order; `now`: this asking), advances `self.copied` for whole pages,
+    /// and releases `self.copied`'s lock before any copy runs.
+    fn collect_stale(
+        &self,
+        from: usize,
+        to: usize,
+        now: u64,
+        written: &[(usize, u64)],
+        out: &mut Vec<(usize, usize)>,
+    ) {
         let base = self.start as usize / PAGE;
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
         let stale = stale_pages_in(base, &copied, from, to, written);
-        let mut bytes = 0;
         let mut run: Option<(usize, usize)> = None;
         for page in stale {
             // A page only partly in the range is copied in part: it
@@ -907,7 +980,11 @@ impl Shadow {
             match run {
                 Some((first, prev)) if page == prev + 1 => run = Some((first, page)),
                 Some((first, prev)) => {
-                    bytes += self.copy((first * PAGE).max(from), ((prev + 1) * PAGE).min(to));
+                    let lo = (first * PAGE).max(from);
+                    let hi = ((prev + 1) * PAGE).min(to);
+                    if lo < hi {
+                        out.push((lo, hi));
+                    }
                     run = Some((page, page));
                 }
                 None => run = Some((page, page)),
@@ -915,50 +992,499 @@ impl Shadow {
         }
         // Cut to the range: next to it shaders may be writing the copy.
         if let Some((first, prev)) = run {
-            bytes += self.copy((first * PAGE).max(from), ((prev + 1) * PAGE).min(to));
-        }
-        bytes
-    }
-
-    /// Copies title memory `[from, to)`, cut to the buffer, into the copy.
-    fn copy(&self, from: usize, to: usize) -> usize {
-        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
-        let (from, to) = (from.max(start), to.min(end));
-        if from >= to {
-            return 0;
-        }
-        let off = from - start;
-        let len = to - from;
-        if let Some(rebar) = &self.rebar {
-            let mut mirror = rebar.mirror.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(m) = mirror.as_mut()
-                && off + len <= m.len()
-            {
-                // Copy once from guarded title memory into cached RAM, then
-                // push straight to write-combining VRAM so both see identical bytes.
-                crate::host::copy_mapped(
-                    m.as_mut_ptr().wrapping_add(off),
-                    from as *const u8,
-                    len,
-                    false,
-                );
-                // SAFETY: `off + len <= self.len`, write-only WC store.
-                unsafe {
-                    std::ptr::copy_nonoverlapping(m.as_ptr().add(off), self.data.add(off), len);
-                }
-                drop(mirror);
-                rebar.mark_dirty_range(off, len);
-                return len;
+            let lo = (first * PAGE).max(from);
+            let hi = ((prev + 1) * PAGE).min(to);
+            if lo < hi {
+                out.push((lo, hi));
             }
         }
-        // SAFETY: inside the mapping (`from` and `to` are within the buffer).
-        let at = unsafe { self.data.add(off) };
-        crate::host::copy_mapped(at, from as *const u8, len, false);
-        if let Some(rebar) = &self.rebar {
-            rebar.mark_dirty_range(off, len);
-        }
-        len
     }
+
+    /// Converts disjoint title-address `runs` (clamped to the buffer) into
+    /// [`CopySeg`] entries targeting `self.data`, returning the total bytes.
+    fn push_copy_segs(&self, runs: &[(usize, usize)], out: &mut Vec<CopySeg>) -> usize {
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let mut total = 0usize;
+        for &(raw_from, raw_to) in runs {
+            let (from, to) = (raw_from.max(start), raw_to.min(end));
+            if from >= to {
+                continue;
+            }
+            let off = from - start;
+            let len = to - from;
+            out.push(CopySeg {
+                src: from,
+                dst: (self.data as usize) + off,
+                mirror: 0,
+                len,
+            });
+            total += len;
+        }
+        total
+    }
+
+    /// Copies disjoint title-memory `runs`, cut to the buffer, into the copy
+    /// (in parallel across worker threads when [`wide_copy`] is enabled and
+    /// total bytes reach [`WIDE_COPY_MIN`]).
+    fn copy_runs(&self, runs: &[(usize, usize)]) -> usize {
+        if runs.is_empty() {
+            return 0;
+        }
+        let start = self.start as usize;
+        let mut segs = Vec::with_capacity(runs.len());
+        let total = self.push_copy_segs(runs, &mut segs);
+        if total == 0 {
+            return 0;
+        }
+        if let Some(rebar) = &self.rebar {
+            let mut mirror = rebar.mirror.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(m) = mirror.as_mut() {
+                let m_ptr = m.as_mut_ptr() as usize;
+                let m_len = m.len();
+                if segs.iter().all(|s| (s.src - start) + s.len <= m_len) {
+                    // Copy once from guarded title memory into cached RAM, then
+                    // push straight to write-combining VRAM so both see identical bytes.
+                    for s in &mut segs {
+                        s.mirror = m_ptr + (s.src - start);
+                    }
+                    run_copy_segs(&segs);
+                    drop(mirror);
+                    rebar.mark_dirty_segs(start, &segs);
+                    return total;
+                }
+            }
+        }
+        run_copy_segs(&segs);
+        self.finish_copy_segs(start, &segs);
+        total
+    }
+
+    /// Post-copy metadata invalidation for non-mirrored `segs`, acquiring each
+    /// per-shadow lock at most once.
+    fn finish_copy_segs(&self, start: usize, segs: &[CopySeg]) {
+        if segs.is_empty() {
+            return;
+        }
+        if let Some(rebar) = &self.rebar {
+            rebar.mark_dirty_segs(start, segs);
+        }
+    }
+}
+
+type Job = Box<dyn FnOnce() + Send>;
+
+struct Workers {
+    jobs: Mutex<std::collections::VecDeque<Job>>,
+    more: std::sync::Condvar,
+}
+
+std::thread_local! {
+    /// Set while a thread is executing a job inside [`wide`] so nested callers
+    /// never re-enter the shared worker pool and deadlock.
+    static IN_WIDE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+struct InWideGuard(bool);
+
+impl InWideGuard {
+    fn enter() -> Self {
+        Self(IN_WIDE.with(|flag| flag.replace(true)))
+    }
+}
+
+impl Drop for InWideGuard {
+    fn drop(&mut self) {
+        IN_WIDE.with(|flag| flag.set(self.0));
+    }
+}
+
+fn in_wide() -> bool {
+    IN_WIDE.with(|flag| flag.get())
+}
+
+fn workers() -> &'static Workers {
+    static WORKERS: OnceLock<Workers> = OnceLock::new();
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    let workers = WORKERS.get_or_init(|| Workers {
+        jobs: Mutex::new(std::collections::VecDeque::new()),
+        more: std::sync::Condvar::new(),
+    });
+    STARTED.call_once(|| {
+        let n = std::thread::available_parallelism()
+            .map_or(4, |n| n.get() / 2)
+            .clamp(2, 6);
+        for i in 0..n {
+            let _ = std::thread::Builder::new()
+                .name(format!("victory-wide-{i}"))
+                .spawn(move || {
+                    let workers = WORKERS.get().expect("made above");
+                    loop {
+                        let job = {
+                            let mut jobs = workers.jobs.lock().unwrap_or_else(|e| e.into_inner());
+                            loop {
+                                if let Some(job) = jobs.pop_front() {
+                                    break job;
+                                }
+                                jobs = workers.more.wait(jobs).unwrap_or_else(|e| e.into_inner());
+                            }
+                        };
+                        let _guard = InWideGuard::enter();
+                        job();
+                    }
+                });
+        }
+    });
+    workers
+}
+
+fn wide(jobs: Vec<Job>) {
+    if jobs.len() < 2 {
+        for job in jobs {
+            let _guard = InWideGuard::enter();
+            job();
+        }
+        return;
+    }
+    let done = Arc::new((Mutex::new(jobs.len()), std::sync::Condvar::new()));
+    let workers = workers();
+    {
+        let mut queue = workers.jobs.lock().unwrap_or_else(|e| e.into_inner());
+        for job in jobs {
+            let done = done.clone();
+            queue.push_back(Box::new(move || {
+                struct Done(Arc<(Mutex<usize>, std::sync::Condvar)>);
+                impl Drop for Done {
+                    fn drop(&mut self) {
+                        let mut left = self.0.0.lock().unwrap_or_else(|e| e.into_inner());
+                        *left -= 1;
+                        if *left == 0 {
+                            self.0.1.notify_all();
+                        }
+                    }
+                }
+                let _done = Done(done);
+                job();
+            }));
+        }
+    }
+    workers.more.notify_all();
+    loop {
+        let job = workers
+            .jobs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pop_front();
+        match job {
+            Some(job) => {
+                let _guard = InWideGuard::enter();
+                job();
+            }
+            None => break,
+        }
+    }
+    let mut left = done.0.lock().unwrap_or_else(|e| e.into_inner());
+    while *left > 0 {
+        left = done.1.wait(left).unwrap_or_else(|e| e.into_inner());
+    }
+}
+
+/// Whether large shadow refreshes, parallel batch planning, and staging fills
+/// parallelize their dirty copy chunks across worker threads
+/// (`VICTORY_WIDE_COPY=0` disables it; `=1` forces it; on by default on 4+
+/// logical CPUs).
+pub(crate) fn wide_copy() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        wide_copy_enabled(
+            std::env::var("VICTORY_WIDE_COPY").ok().as_deref(),
+            std::thread::available_parallelism().ok().map(|n| n.get()),
+        )
+    })
+}
+
+fn wide_copy_enabled(setting: Option<&str>, logical_cpus: Option<usize>) -> bool {
+    match setting {
+        Some("1") => true,
+        Some("0") => false,
+        _ => logical_cpus.is_some_and(|n| n >= 4),
+    }
+}
+
+/// Minimum total dirty bytes to split across worker threads in [`run_copy_segs`].
+const WIDE_COPY_MIN: usize = 1 << 20;
+/// Maximum target byte size per parallel copy chunk.
+const WIDE_COPY_CHUNK: usize = 512 << 10;
+
+/// One contiguous byte range to copy from title memory into a shadow copy
+/// (and optionally through a cached ReBAR RAM mirror into WC VRAM).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CopySeg {
+    src: usize,
+    dst: usize,
+    /// Non-zero for mirrored ReBAR shadows: copy `src -> mirror`, then
+    /// `mirror -> dst` (WC VRAM).
+    mirror: usize,
+    len: usize,
+}
+
+/// Slices `segs` into buckets of at most `chunk_bytes` each, splitting long
+/// runs cleanly without losing or duplicating a single byte.
+fn chunk_copy_segs(segs: &[CopySeg], chunk_bytes: usize) -> Vec<Vec<CopySeg>> {
+    let chunk_bytes = chunk_bytes.max(1);
+    let mut buckets: Vec<Vec<CopySeg>> = Vec::new();
+    let mut cur: Vec<CopySeg> = Vec::new();
+    let mut bytes = 0usize;
+    for &seg in segs {
+        let mut at = 0usize;
+        while at < seg.len {
+            let n = (chunk_bytes - bytes).min(seg.len - at);
+            cur.push(CopySeg {
+                src: seg.src + at,
+                dst: seg.dst + at,
+                mirror: if seg.mirror != 0 { seg.mirror + at } else { 0 },
+                len: n,
+            });
+            at += n;
+            bytes += n;
+            if bytes >= chunk_bytes {
+                buckets.push(std::mem::take(&mut cur));
+                bytes = 0;
+            }
+        }
+    }
+    if !cur.is_empty() {
+        buckets.push(cur);
+    }
+    buckets
+}
+
+#[inline]
+fn execute_copy_seg(seg: CopySeg) {
+    if seg.len == 0 {
+        return;
+    }
+    if seg.mirror != 0 {
+        crate::host::copy_mapped(seg.mirror as *mut u8, seg.src as *const u8, seg.len, false);
+        // SAFETY: `seg` lies inside the shadow's mirror and WC VRAM mapping
+        // (`off + len <= self.len`), and chunks are strictly disjoint.
+        unsafe {
+            std::ptr::copy_nonoverlapping(seg.mirror as *const u8, seg.dst as *mut u8, seg.len);
+        }
+    } else {
+        crate::host::copy_mapped(seg.dst as *mut u8, seg.src as *const u8, seg.len, false);
+    }
+}
+
+/// Executes copy jobs on the warm `workers()` pool when called from outside
+/// [`wide`], or via a bounded `std::thread::scope` if called re-entrantly from
+/// inside a `wide` worker so the pool can never deadlock.
+fn run_copy_jobs(jobs: Vec<Job>) {
+    if jobs.len() < 2 {
+        for job in jobs {
+            job();
+        }
+        return;
+    }
+    if !in_wide() {
+        wide(jobs);
+        return;
+    }
+    // Re-entrant call from inside a `wide` worker: never push back into the
+    // pool queue; fan out with a small scoped group instead.
+    let threads = jobs.len().min(4);
+    let queue = Mutex::new(std::collections::VecDeque::from(jobs));
+    std::thread::scope(|s| {
+        for _ in 1..threads {
+            let queue = &queue;
+            s.spawn(move || {
+                while let Some(job) = queue.lock().unwrap_or_else(|e| e.into_inner()).pop_front() {
+                    job();
+                }
+            });
+        }
+        while let Some(job) = queue.lock().unwrap_or_else(|e| e.into_inner()).pop_front() {
+            job();
+        }
+    });
+}
+
+fn run_copy_segs(segs: &[CopySeg]) {
+    let total: usize = segs.iter().map(|s| s.len).sum();
+    if total == 0 {
+        return;
+    }
+    if !wide_copy() || total < WIDE_COPY_MIN {
+        for &seg in segs {
+            execute_copy_seg(seg);
+        }
+        return;
+    }
+    let chunk_bytes = (total / 4).clamp(256 << 10, WIDE_COPY_CHUNK);
+    let buckets = chunk_copy_segs(segs, chunk_bytes);
+    if buckets.len() < 2 {
+        for &seg in segs {
+            execute_copy_seg(seg);
+        }
+        return;
+    }
+    let jobs: Vec<Job> = buckets
+        .into_iter()
+        .map(|bucket| {
+            Box::new(move || {
+                for seg in bucket {
+                    execute_copy_seg(seg);
+                }
+            }) as Job
+        })
+        .collect();
+    run_copy_jobs(jobs);
+}
+
+/// Copies `len` bytes from title memory `src` into writable host memory `dst`,
+/// splitting large fills across worker threads when [`wide_copy`] is enabled.
+pub(crate) fn copy_mapped_wide(dst: *mut u8, src: *const u8, len: usize) {
+    if len == 0 {
+        return;
+    }
+    if !wide_copy() || len < WIDE_COPY_MIN {
+        crate::host::copy_mapped(dst, src, len, false);
+        return;
+    }
+    run_copy_segs(&[CopySeg {
+        src: src as usize,
+        dst: dst as usize,
+        mirror: 0,
+        len,
+    }]);
+}
+
+/// Dirty byte ranges discovered by [`Shadow::plan_update`] before copying.
+#[derive(Default)]
+struct UpdatePlan {
+    runs: Vec<(usize, usize)>,
+}
+
+/// Two-phase refresh for a [`crate::host::Batch`] flush:
+/// 1. Discover stale byte runs for each shadow (in parallel across shadows when
+///    `parallel_plan` is enabled and there are at least 4 shadows), releasing
+///    each shadow's `copied` lock immediately after planning.
+/// 2. Flatten all non-mirrored dirty runs across the entire batch into balanced
+///    copy chunks and execute them in one flat [`wide`] pass, then apply
+///    per-shadow metadata updates (ReBAR dirty bits) and copy any mirrored
+///    ReBAR shadows.
+///
+/// This eliminates both straggler single-thread bottlenecks (one huge 50–174 MB
+/// buffer stalling a multi-shadow flush) and nested `wide` re-entrancy.
+pub(crate) fn refresh_batch(items: Vec<(Arc<Shadow>, usize, usize)>, parallel_plan: bool) -> usize {
+    if items.is_empty() {
+        return 0;
+    }
+    if items.len() == 1 {
+        let (shadow, from, to) = items.into_iter().next().unwrap();
+        #[cfg(feature = "diagnostics")]
+        let started = std::time::Instant::now();
+        let copied = shadow.update(from, to - from);
+        #[cfg(feature = "diagnostics")]
+        {
+            if let Some(bytes) = skipped(to - from, copied) {
+                crate::copystat::add(crate::copystat::C::Skipped, 1);
+                crate::copystat::add(crate::copystat::C::SkippedBytes, bytes);
+            }
+            crate::copystat::range(from, to - from, started.elapsed().as_micros() as u64, 0);
+        }
+        return copied;
+    }
+
+    #[cfg(feature = "diagnostics")]
+    let batch_started = std::time::Instant::now();
+
+    type PlannedItem = (Arc<Shadow>, usize, usize, UpdatePlan);
+
+    let count = items.len();
+    let planned: Vec<PlannedItem> = if parallel_plan && count >= 4 && !in_wide() {
+        let slots: Arc<Vec<Mutex<Option<PlannedItem>>>> =
+            Arc::new((0..count).map(|_| Mutex::new(None)).collect());
+        let jobs: Vec<Job> = items
+            .into_iter()
+            .enumerate()
+            .map(|(i, (shadow, from, to))| {
+                let slots = slots.clone();
+                Box::new(move || {
+                    let plan = shadow.plan_update(from, to - from);
+                    *slots[i].lock().unwrap_or_else(|e| e.into_inner()) =
+                        Some((shadow, from, to, plan));
+                }) as Job
+            })
+            .collect();
+        wide(jobs);
+        slots
+            .iter()
+            .filter_map(|slot| slot.lock().unwrap_or_else(|e| e.into_inner()).take())
+            .collect()
+    } else {
+        items
+            .into_iter()
+            .map(|(shadow, from, to)| {
+                let plan = shadow.plan_update(from, to - from);
+                (shadow, from, to, plan)
+            })
+            .collect()
+    };
+
+    let mut all_segs: Vec<CopySeg> = Vec::new();
+    let mut non_mirrored: Vec<(usize, usize, usize)> = Vec::new();
+    let mut mirrored: Vec<usize> = Vec::new();
+    let mut item_copied = vec![0usize; planned.len()];
+    let mut total_copied = 0usize;
+
+    for (idx, (shadow, _, _, plan)) in planned.iter().enumerate() {
+        if plan.runs.is_empty() {
+            continue;
+        }
+        if shadow.rebar.as_ref().is_some_and(RebarShadow::has_mirror) {
+            mirrored.push(idx);
+            continue;
+        }
+        let seg_lo = all_segs.len();
+        let bytes = shadow.push_copy_segs(&plan.runs, &mut all_segs);
+        let seg_hi = all_segs.len();
+        if bytes > 0 {
+            non_mirrored.push((idx, seg_lo, seg_hi));
+            item_copied[idx] = bytes;
+            total_copied += bytes;
+        }
+    }
+
+    if !all_segs.is_empty() {
+        run_copy_segs(&all_segs);
+        for &(idx, seg_lo, seg_hi) in &non_mirrored {
+            let shadow = &planned[idx].0;
+            shadow.finish_copy_segs(shadow.start as usize, &all_segs[seg_lo..seg_hi]);
+        }
+    }
+
+    for idx in mirrored {
+        let (shadow, _, _, plan) = &planned[idx];
+        let bytes = shadow.copy_runs(&plan.runs);
+        item_copied[idx] = bytes;
+        total_copied += bytes;
+    }
+
+    #[cfg(feature = "diagnostics")]
+    {
+        let batch_us = batch_started.elapsed().as_micros() as u64;
+        for ((_, from, to, _), copied) in planned.iter().zip(item_copied) {
+            if let Some(bytes) = skipped(to.saturating_sub(*from), copied) {
+                crate::copystat::add(crate::copystat::C::Skipped, 1);
+                crate::copystat::add(crate::copystat::C::SkippedBytes, bytes);
+            }
+            crate::copystat::range(*from, to.saturating_sub(*from), batch_us, 0);
+        }
+    }
+    #[cfg(not(feature = "diagnostics"))]
+    let _ = item_copied;
+
+    total_copied
 }
 
 /// Pages of `[a, e)` that have never been copied (`copied == 0`) or were
@@ -2297,5 +2823,279 @@ mod tests {
             assert_eq!(guard.total_bytes, budget);
             assert!(guard.entries.contains_key(&(win(1), WINDOW)));
         }
+    }
+
+    #[test]
+    fn wide_copy_is_default_on_multicore_and_can_be_overridden() {
+        assert!(wide_copy_enabled(None, Some(4)));
+        assert!(wide_copy_enabled(None, Some(16)));
+        assert!(!wide_copy_enabled(None, Some(2)));
+        assert!(!wide_copy_enabled(None, None));
+        assert!(wide_copy_enabled(Some("1"), Some(1)));
+        assert!(!wide_copy_enabled(Some("0"), Some(16)));
+        assert!(wide_copy_enabled(Some("auto"), Some(4)));
+    }
+
+    #[test]
+    fn chunk_copy_segs_preserves_boundaries_and_mirror_offsets() {
+        let segs = [
+            CopySeg {
+                src: 0x1000,
+                dst: 0x2000,
+                mirror: 0x3000,
+                len: 700_000,
+            },
+            CopySeg {
+                src: 0x1000 + 800_000,
+                dst: 0x2000 + 800_000,
+                mirror: 0x3000 + 800_000,
+                len: 123,
+            },
+            CopySeg {
+                src: 0x1000 + 900_000,
+                dst: 0x2000 + 900_000,
+                mirror: 0,
+                len: 1_500_000,
+            },
+        ];
+        let buckets = chunk_copy_segs(&segs, 256 << 10);
+        assert!(buckets.len() >= 8);
+        let mut flat: Vec<CopySeg> = Vec::new();
+        for bucket in &buckets {
+            let sum: usize = bucket.iter().map(|s| s.len).sum();
+            assert!(sum > 0 && sum <= 256 << 10);
+            flat.extend_from_slice(bucket);
+        }
+        let mut merged: Vec<CopySeg> = Vec::new();
+        for seg in flat {
+            match merged.last_mut() {
+                Some(last)
+                    if last.src + last.len == seg.src
+                        && last.dst + last.len == seg.dst
+                        && ((last.mirror == 0 && seg.mirror == 0)
+                            || (last.mirror != 0 && last.mirror + last.len == seg.mirror)) =>
+                {
+                    last.len += seg.len;
+                }
+                _ => merged.push(seg),
+            }
+        }
+        assert_eq!(merged, segs);
+    }
+
+    #[test]
+    fn parallel_shadow_update_preserves_boundaries_unmapped_pages_and_pending_gaps() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc,
+            VirtualFree,
+        };
+        let Some(h) = host() else {
+            return;
+        };
+        const MEM_TOP_DOWN: u32 = 0x10_0000;
+        const LEN: usize = 4 << 20; // 4 MiB (> WIDE_COPY_MIN)
+        // SAFETY: reserve a 4 MiB address range and commit parts around a hole.
+        let base = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                LEN,
+                MEM_RESERVE | MEM_TOP_DOWN,
+                PAGE_NOACCESS,
+            )
+            .cast::<u8>()
+        };
+        assert!(!base.is_null());
+        let mut expected = vec![0u8; LEN];
+        // Leave [1 MiB, 1 MiB + 128 KiB) unmapped (hole) and keep [2 MiB, 2 MiB + 128 KiB)
+        // as a pending shader-write range that `update` must skip completely.
+        let hole = (1 << 20, (1 << 20) + 2 * PAGE);
+        let pending = (2 << 20, (2 << 20) + 2 * PAGE);
+        for &(from, to) in &[(0usize, hole.0), (hole.1, LEN)] {
+            // SAFETY: committing subranges inside our reserved allocation.
+            let p = unsafe {
+                VirtualAlloc(base.add(from).cast(), to - from, MEM_COMMIT, PAGE_READWRITE)
+            };
+            assert_eq!(p, base.wrapping_add(from).cast());
+            for (off, dst_byte) in expected.iter_mut().enumerate().take(to).skip(from) {
+                let v = ((off.wrapping_mul(31) ^ (off >> 12)) & 0xff) as u8;
+                // SAFETY: committed above.
+                unsafe { *base.add(off) = v };
+                *dst_byte = v;
+            }
+        }
+
+        let Some((buffer, data)) = h.shared_buffer(LEN as u64) else {
+            // SAFETY: freeing our test allocation.
+            unsafe { VirtualFree(base.cast(), 0, MEM_RELEASE) };
+            return;
+        };
+        // Pre-fill shadow staging with a sentinel so untouched regions are verifiable.
+        // SAFETY: `data` maps `LEN` bytes.
+        unsafe { std::ptr::write_bytes(data, 0xA5, LEN) };
+        // SAFETY: live D3D12 buffer.
+        let gpu_va = unsafe { buffer.GetGPUVirtualAddress() };
+        let shadow = Shadow::new(buffer, data, gpu_va, base as u64, LEN as u64, None);
+        shadow
+            .pending
+            .lock()
+            .unwrap()
+            .push((base as usize + pending.0, base as usize + pending.1));
+
+        // Refresh [37, LEN - 41): tests unaligned ends, hole zeroing, pending gap,
+        // and multi-chunk parallel copy.
+        let req_lo = 37usize;
+        let req_hi = LEN - 41;
+        let copied = shadow.update(base as usize + req_lo, req_hi - req_lo);
+        assert_eq!(copied, (pending.0 - req_lo) + (req_hi - pending.1));
+
+        // SAFETY: `data` maps `LEN` bytes and `update` has finished all workers.
+        let got = unsafe { std::slice::from_raw_parts(data, LEN) };
+        assert!(
+            got[..req_lo].iter().all(|&b| b == 0xA5),
+            "bytes before refreshed start must stay untouched"
+        );
+        assert!(
+            got[req_hi..].iter().all(|&b| b == 0xA5),
+            "bytes after refreshed end must stay untouched"
+        );
+        assert!(
+            got[pending.0..pending.1].iter().all(|&b| b == 0xA5),
+            "pending shader-write range must stay untouched"
+        );
+        assert_eq!(got[req_lo..hole.0], expected[req_lo..hole.0]);
+        assert!(
+            got[hole.0..hole.1].iter().all(|&b| b == 0),
+            "unmapped hole must be zeroed"
+        );
+        assert_eq!(got[hole.1..pending.0], expected[hole.1..pending.0]);
+        assert_eq!(got[pending.1..req_hi], expected[pending.1..req_hi]);
+
+        // SAFETY: freeing our test allocation.
+        unsafe { VirtualFree(base.cast(), 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn parallel_shadow_update_rebar_mirror_syncs_mirror_and_vram() {
+        let Some(h) = host() else {
+            return;
+        };
+        const LEN: usize = 3 << 20; // 3 MiB (> WIDE_COPY_MIN)
+        let title: Vec<u8> = (0..LEN)
+            .map(|i| ((i.wrapping_mul(17) ^ (i >> 8)) & 0xff) as u8)
+            .collect();
+        let start = title.as_ptr() as u64;
+        let Some((buffer, data)) = h.shared_buffer(LEN as u64) else {
+            return;
+        };
+        // SAFETY: `data` maps `LEN` bytes.
+        unsafe { std::ptr::write_bytes(data, 0x5A, LEN) };
+        // SAFETY: live D3D12 buffer.
+        let gpu_va = unsafe { buffer.GetGPUVirtualAddress() };
+        let shadow = Shadow::new(buffer, data, gpu_va, start, LEN as u64, Some(0));
+        {
+            let rebar = shadow.rebar.as_ref().expect("rebar state");
+            *rebar.mirror.lock().unwrap() = Some(vec![0x5Au8; LEN]);
+        }
+
+        // Disjoint runs totaling > 2 MiB that straddle chunk cuts.
+        let runs = [
+            (start as usize + 19, start as usize + (1 << 20) + 123),
+            (start as usize + (1 << 20) + PAGE, start as usize + LEN - 29),
+        ];
+        let copied = shadow.copy_runs(&runs);
+        let expected_copied: usize = runs.iter().map(|&(a, b)| b - a).sum();
+        assert_eq!(copied, expected_copied);
+
+        let mirror = shadow
+            .rebar
+            .as_ref()
+            .unwrap()
+            .mirror
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap();
+        // SAFETY: `data` maps `LEN` bytes.
+        let vram = unsafe { std::slice::from_raw_parts(data, LEN) };
+        let r0 = (runs[0].0 - start as usize, runs[0].1 - start as usize);
+        let r1 = (runs[1].0 - start as usize, runs[1].1 - start as usize);
+        assert_eq!(mirror[r0.0..r0.1], title[r0.0..r0.1]);
+        assert_eq!(vram[r0.0..r0.1], title[r0.0..r0.1]);
+        assert_eq!(mirror[r1.0..r1.1], title[r1.0..r1.1]);
+        assert_eq!(vram[r1.0..r1.1], title[r1.0..r1.1]);
+        assert!(mirror[..r0.0].iter().all(|&b| b == 0x5A));
+        assert!(vram[..r0.0].iter().all(|&b| b == 0x5A));
+        assert!(mirror[r0.1..r1.0].iter().all(|&b| b == 0x5A));
+        assert!(vram[r0.1..r1.0].iter().all(|&b| b == 0x5A));
+        assert!(mirror[r1.1..].iter().all(|&b| b == 0x5A));
+        assert!(vram[r1.1..].iter().all(|&b| b == 0x5A));
+    }
+
+    #[test]
+    fn wide_refresh_reentrancy_and_batch_do_not_deadlock() {
+        let Some(h) = host() else {
+            return;
+        };
+        const BIG: usize = 2 << 20;
+        const SMALL: usize = 64 << 10;
+        let mut backing: Vec<Vec<u8>> = Vec::new();
+        let mut shadows: Vec<Arc<Shadow>> = Vec::new();
+        for i in 0..8usize {
+            let len = if i < 4 { BIG } else { SMALL };
+            let buf: Vec<u8> = (0..len)
+                .map(|j| (((i + 1) * 29 + j * 7 + (j >> 9)) & 0xff) as u8)
+                .collect();
+            let start = buf.as_ptr() as u64;
+            let Some((res, data)) = h.shared_buffer(len as u64) else {
+                return;
+            };
+            // SAFETY: live D3D12 buffer.
+            let gpu_va = unsafe { res.GetGPUVirtualAddress() };
+            let shadow = Arc::new(Shadow::new(res, data, gpu_va, start, len as u64, None));
+            backing.push(buf);
+            shadows.push(shadow);
+        }
+
+        // 1. Direct re-entrancy stress: invoke multi-MB `Shadow::update` from
+        // inside `wide` workers concurrently. Must never deadlock `workers()`.
+        let jobs: Vec<Job> = shadows
+            .iter()
+            .map(|s| {
+                let s = s.clone();
+                Box::new(move || {
+                    let n = s.update(s.start as usize, s.len as usize);
+                    assert_eq!(n, s.len as usize);
+                }) as Job
+            })
+            .collect();
+        wide(jobs);
+        for (shadow, src) in shadows.iter().zip(&backing) {
+            // SAFETY: `shadow.data` maps `shadow.len` bytes.
+            let got = unsafe { std::slice::from_raw_parts(shadow.data, src.len()) };
+            assert_eq!(got, src.as_slice());
+        }
+
+        // 2. Two-phase `refresh_batch` mixing big + small shadows (parallel plan
+        // + single flat parallel copy pass).
+        for shadow in &shadows {
+            // SAFETY: clear staging before batch refresh.
+            unsafe { std::ptr::write_bytes(shadow.data, 0, shadow.len as usize) };
+        }
+        let batch_items: Vec<(Arc<Shadow>, usize, usize)> = shadows
+            .iter()
+            .map(|s| (s.clone(), s.start as usize, (s.start + s.len) as usize))
+            .collect();
+        let expected_total: usize = backing.iter().map(Vec::len).sum();
+        assert_eq!(refresh_batch(batch_items, true), expected_total);
+        for (shadow, src) in shadows.iter().zip(&backing) {
+            // SAFETY: `shadow.data` maps `shadow.len` bytes.
+            let got = unsafe { std::slice::from_raw_parts(shadow.data, src.len()) };
+            assert_eq!(got, src.as_slice());
+        }
+
+        // 3. `copy_mapped_wide` splits a multi-MB `Step::Fill` cleanly.
+        let mut wide_dst = vec![0u8; BIG];
+        copy_mapped_wide(wide_dst.as_mut_ptr(), backing[0].as_ptr(), BIG);
+        assert_eq!(wide_dst, backing[0]);
     }
 }
