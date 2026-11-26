@@ -748,16 +748,27 @@ pub(crate) extern "system" fn allocation_info(
     count: u32,
     descs: *const ResourceDesc,
 ) -> *mut AllocationInfo {
-    let descs = if descs.is_null() {
-        &[][..]
+    let total = if descs.is_null() && count != 0 {
+        UNKNOWN_ALLOCATION
     } else {
-        // SAFETY: the title passes `count` descriptions.
-        unsafe { std::slice::from_raw_parts(descs, count as usize) }
+        let descs = if count == 0 {
+            &[][..]
+        } else {
+            // SAFETY: the title passes `count` descriptions (non-null here).
+            unsafe { std::slice::from_raw_parts(descs, count as usize) }
+        };
+        place(descs.iter(), |_, _| ())
     };
     // SAFETY: the caller passes room for the value.
-    unsafe { out.write(place(descs.iter(), |_, _| ())) };
+    unsafe { out.write(total) };
     out
 }
+
+/// The documented answer for descriptions that have no size.
+const UNKNOWN_ALLOCATION: AllocationInfo = AllocationInfo {
+    size: u64::MAX,
+    alignment: 0,
+};
 
 /// The newer description: the plain one, then a sampler feedback mip
 /// region (width, height, depth).
@@ -786,18 +797,22 @@ pub(crate) extern "system" fn allocation_info2(
     descs: *const ResourceDesc1,
     each: *mut AllocationInfo1,
 ) -> *mut AllocationInfo {
-    let descs = if descs.is_null() {
-        &[][..]
+    let total = if descs.is_null() && count != 0 {
+        UNKNOWN_ALLOCATION
     } else {
-        // SAFETY: the title passes `count` descriptions.
-        unsafe { std::slice::from_raw_parts(descs, count as usize) }
+        let descs = if count == 0 {
+            &[][..]
+        } else {
+            // SAFETY: the title passes `count` descriptions (non-null here).
+            unsafe { std::slice::from_raw_parts(descs, count as usize) }
+        };
+        place(descs.iter().map(|d| &d.desc), |i, info| {
+            if !each.is_null() {
+                // SAFETY: the title passes room for `count` entries.
+                unsafe { each.add(i).write(info) };
+            }
+        })
     };
-    let total = place(descs.iter().map(|d| &d.desc), |i, info| {
-        if !each.is_null() {
-            // SAFETY: the title passes room for `count` entries.
-            unsafe { each.add(i).write(info) };
-        }
-    });
     // SAFETY: the caller passes room for the value.
     unsafe { out.write(total) };
     out
@@ -809,12 +824,19 @@ fn place<'a>(
     descs: impl Iterator<Item = &'a ResourceDesc>,
     mut each: impl FnMut(usize, AllocationInfo1),
 ) -> AllocationInfo {
+    // The largest alignment asked for, which keeps the console layout's own
+    // (4 KiB or 256 bytes for textures) instead of raising it to 64 KiB; no
+    // resources give 1, as on the host.
     let mut total = AllocationInfo {
         size: 0,
-        alignment: KIB_64,
+        alignment: 1,
     };
     for (i, desc) in descs.enumerate() {
-        let Some(one) = footprint(desc) else {
+        let placed = footprint(desc).and_then(|one| {
+            let offset = total.size.checked_next_multiple_of(one.alignment)?;
+            Some((one, offset, offset.checked_add(one.size)?))
+        });
+        let Some((one, offset, end)) = placed else {
             tracing::warn!(?desc, "no size for this resource");
             each(
                 i,
@@ -824,13 +846,9 @@ fn place<'a>(
                     size: u64::MAX,
                 },
             );
-            return AllocationInfo {
-                size: u64::MAX,
-                alignment: 0,
-            };
+            return UNKNOWN_ALLOCATION;
         };
         tracing::debug!(?desc, ?one, "allocation info");
-        let offset = total.size.next_multiple_of(one.alignment);
         each(
             i,
             AllocationInfo1 {
@@ -839,7 +857,7 @@ fn place<'a>(
                 size: one.size,
             },
         );
-        total.size = offset + one.size;
+        total.size = end;
         total.alignment = total.alignment.max(one.alignment);
     }
     total
@@ -2218,10 +2236,16 @@ extern "system" fn map(this: This, _sub: u32, _read: *const c_void, out: *mut *m
 }
 extern "system" fn unmap(_: This, _sub: u32, _written: *const c_void) {}
 /// Returns `out`, as the x64 COM ABI requires for struct returns in `RAX`.
+/// A texture made with `MipLevels` 0 reports the chain it was given, as
+/// native D3D12 does.
 extern "system" fn resource_desc(this: This, out: *mut ResourceDesc) -> *mut ResourceDesc {
     if !out.is_null() {
+        let mut desc = resource(this).desc;
+        if desc.dimension != BUFFER && desc.mip_levels == 0 {
+            desc.mip_levels = u16::try_from(mip_count(&desc)).unwrap_or(u16::MAX);
+        }
         // SAFETY: checked non-null; the title passes room for a description.
-        unsafe { out.write(resource(this).desc) };
+        unsafe { out.write(desc) };
     }
     out
 }
@@ -2707,6 +2731,104 @@ mod tests {
         );
         allocation_info(&mut info, std::ptr::null(), 0, 1, &texture(1, 1, 999, 1));
         assert_eq!(info.size, u64::MAX);
+    }
+
+    /// Placed resources keep the console layout's own alignment (#237), the
+    /// totals are checked for overflow, and null or empty inputs answer as
+    /// documented.
+    #[test]
+    fn allocation_info_keeps_console_alignments_and_checks_bounds() {
+        let mut info = AllocationInfo {
+            size: 0,
+            alignment: 0,
+        };
+        let bc7 = texture(512, 512, 98, 10);
+        allocation_info(&mut info, std::ptr::null(), 0, 1, &bc7);
+        assert_eq!(
+            info,
+            AllocationInfo {
+                size: 0x56000,
+                alignment: 0x1000
+            },
+            "4 KiB, not raised to 64 KiB"
+        );
+        // A buffer after the texture still takes its 64 KiB.
+        let mixed = [bc7, buffer(100)];
+        allocation_info(&mut info, std::ptr::null(), 0, 2, mixed.as_ptr());
+        assert_eq!(
+            info,
+            AllocationInfo {
+                size: 0x60000 + KIB_64,
+                alignment: KIB_64
+            }
+        );
+        // Newer descriptions report the same, for each and for the whole.
+        let newer = mixed.map(|desc| ResourceDesc1 {
+            desc,
+            mip_region: [0; 3],
+        });
+        let mut each = [const {
+            AllocationInfo1 {
+                offset: 0,
+                alignment: 0,
+                size: 0,
+            }
+        }; 2];
+        allocation_info2(
+            &mut info,
+            std::ptr::null(),
+            0,
+            1,
+            newer.as_ptr(),
+            each.as_mut_ptr(),
+        );
+        assert_eq!((each[0].alignment, info.alignment), (0x1000, 0x1000));
+
+        // No resources: size 0, alignment 1, as the host answers.
+        allocation_info(&mut info, std::ptr::null(), 0, 0, std::ptr::null());
+        assert_eq!(
+            info,
+            AllocationInfo {
+                size: 0,
+                alignment: 1
+            }
+        );
+        // Descriptions promised but missing.
+        allocation_info(&mut info, std::ptr::null(), 0, 3, std::ptr::null());
+        assert_eq!(info, UNKNOWN_ALLOCATION);
+        allocation_info2(
+            &mut info,
+            std::ptr::null(),
+            0,
+            3,
+            std::ptr::null(),
+            std::ptr::null_mut(),
+        );
+        assert_eq!(info, UNKNOWN_ALLOCATION);
+
+        // Totals past u64::MAX: from the sum and from the alignment padding.
+        let huge = [buffer(1 << 63), buffer(1 << 63)];
+        allocation_info(&mut info, std::ptr::null(), 0, 2, huge.as_ptr());
+        assert_eq!(info, UNKNOWN_ALLOCATION);
+        let aligned = ResourceDesc {
+            alignment: MIB_4,
+            ..buffer(1)
+        };
+        let padded = [buffer(u64::MAX - 2 * KIB_64 + 1), aligned];
+        let newer = padded.map(|desc| ResourceDesc1 {
+            desc,
+            mip_region: [0; 3],
+        });
+        allocation_info2(
+            &mut info,
+            std::ptr::null(),
+            0,
+            2,
+            newer.as_ptr(),
+            each.as_mut_ptr(),
+        );
+        assert_eq!(info, UNKNOWN_ALLOCATION);
+        assert_eq!(each[1].offset, u64::MAX);
     }
 
     #[cfg(windows)]
@@ -3732,6 +3854,23 @@ void main() {
         let read = unsafe { back.assume_init() };
         assert_eq!((read.dimension, read.width), (BUFFER, 256));
         assert!(get_desc(committed, std::ptr::null_mut()).is_null());
+        // A texture with an automatic chain reports how many levels it got.
+        let mut tex = null;
+        let hr = create_committed(
+            null,
+            &PROPERTIES,
+            0,
+            &texture(4, 4, 28, 0),
+            0,
+            null.cast(),
+            &RESOURCE_IIDS[0],
+            &mut tex,
+        );
+        assert_eq!(hr, S_OK);
+        get_desc(tex, back.as_mut_ptr());
+        // SAFETY: written above.
+        assert_eq!(unsafe { back.assume_init() }.mip_levels, 3);
+        assert_eq!(slot::<Release>(tex, 0x10)(tex), 0);
         let mut data = std::ptr::null_mut();
         assert_eq!(
             slot::<Map>(committed, 0x40)(committed, 0, null.cast(), &mut data),

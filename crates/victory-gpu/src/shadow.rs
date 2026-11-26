@@ -547,7 +547,10 @@ impl Shadow {
     pub(crate) fn inside(&self, address: usize, len: usize) -> (usize, usize) {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let from = address.clamp(start, end);
-        (from - start, (address + len).clamp(from, end) - start)
+        (
+            from - start,
+            address.saturating_add(len).clamp(from, end) - start,
+        )
     }
 
     /// Shaders of `list` may write `[address, address + len)` of the copy
@@ -585,7 +588,7 @@ impl Shadow {
         self.pending
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .push((address, address + len));
+            .push((address, address.saturating_add(len)));
         if let Some(rebar) = &self.rebar {
             let mut mirror = rebar.mirror.lock().unwrap_or_else(|e| e.into_inner());
             if mirror.is_none() {
@@ -804,7 +807,7 @@ impl Shadow {
         // Every submitted step that declared the range is done with it (one
         // submission runs at a time), and the snapshot with the last range.
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
-        pending.retain(|&r| r != (address, address + len));
+        pending.retain(|&r| r != (address, address.saturating_add(len)));
         if pending.is_empty()
             && let Some((_, bytes)) = snapshot.take()
         {
@@ -819,7 +822,7 @@ impl Shadow {
     /// write-watched). Returns the bytes copied.
     pub(crate) fn update(&self, address: usize, len: usize) -> usize {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
-        let (from, to) = (address.max(start), (address + len).min(end));
+        let (from, to) = (address.max(start), address.saturating_add(len).min(end));
         if from >= to {
             return 0;
         }
@@ -1017,7 +1020,9 @@ pub(crate) fn register(resource: usize, start: u64, len: u64) {
     BUFFERS.write().unwrap_or_else(|e| e.into_inner()).insert(
         (start, resource),
         Entry {
-            end: start + len,
+            // A size from the title's description: one past the address
+            // space ends at its top instead of wrapping below `start`.
+            end: start.saturating_add(len),
             shadow: None,
         },
     );
@@ -1097,7 +1102,7 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
         let len = entry.end - key.0;
         // Rounded up so that views ending in the buffer's last 256 bytes fit.
         // Shaders write some buffers (unordered access), so not upload memory.
-        let alloc_size = len.next_multiple_of(1 << 16);
+        let alloc_size = len.checked_next_multiple_of(1 << 16)?;
         let (buffer, data, rebar_bytes) = alloc_shadow_buffer(alloc_size)?;
         crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
         // SAFETY: a live buffer.
@@ -1468,6 +1473,29 @@ pub(crate) fn near(va: u64) -> String {
 mod tests {
     use super::*;
     use std::ops::Range;
+
+    #[test]
+    fn a_buffer_sized_past_the_address_space_ends_at_its_top() {
+        let start = u64::MAX - 0x0fff;
+        register(usize::MAX, start, u64::MAX);
+        let end = BUFFERS
+            .read()
+            .unwrap()
+            .get(&(start, usize::MAX))
+            .map(|e| e.end);
+        unregister(usize::MAX, start);
+        assert_eq!(end, Some(u64::MAX));
+    }
+
+    #[test]
+    fn a_buffer_too_big_to_round_to_a_shadow_size_gets_no_copy() {
+        // The end saturates at the top, so rounding its length up to 64 KiB
+        // would overflow: no copy, before any host allocation.
+        register(usize::MAX - 1, 0x1000, u64::MAX);
+        let found = find(0x1000, 1);
+        unregister(usize::MAX - 1, 0x1000);
+        assert!(found.is_none());
+    }
 
     #[test]
     fn concurrent_aligned_views_share_the_copy_refreshed_at_submission() {

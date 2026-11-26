@@ -60,6 +60,9 @@ pub(crate) struct Lowered {
     pub has_fcmp_uno: bool,
     #[cfg(test)]
     pub has_fcmp_oeq: bool,
+    /// Whether the program emits `fcmp false` or `fcmp true`.
+    #[cfg(test)]
+    pub has_fcmp_constant: bool,
     /// Whether the program reads the pixel coverage mask.
     #[cfg(test)]
     pub has_coverage_op: bool,
@@ -1615,6 +1618,8 @@ impl<'a> Lower<'a> {
         #[cfg(test)]
         let has_fcmp_oeq = self.s.m.has_cmp(pred::OEQ);
         #[cfg(test)]
+        let has_fcmp_constant = self.s.m.has_cmp(pred::FALSE) || self.s.m.has_cmp(pred::TRUE);
+        #[cfg(test)]
         let has_coverage_op = self.s.m.has_dx_op("dx.op.coverage.i32", 91);
         #[cfg(test)]
         let has_helper_lane_op = self.s.m.has_dx_op("dx.op.isHelperLane.i1", 221);
@@ -1660,6 +1665,8 @@ impl<'a> Lower<'a> {
             has_fcmp_uno,
             #[cfg(test)]
             has_fcmp_oeq,
+            #[cfg(test)]
+            has_fcmp_constant,
             #[cfg(test)]
             has_coverage_op,
             #[cfg(test)]
@@ -2427,10 +2434,19 @@ impl<'a> Lower<'a> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
         };
-        let op = *v.src.get(k).ok_or("a missing operand")?;
         if v.abs >> k & 1 != 0 || v.neg >> k & 1 != 0 {
             return Err("integer operand modifiers");
         }
+        self.raw_src(inst, k)
+    }
+
+    /// Source `k`'s bits (with its SDWA selection); its abs/neg modifiers
+    /// are left to the caller.
+    fn raw_src(&mut self, inst: &Inst, k: usize) -> Result<V, Why> {
+        let Fields::Valu(v) = &inst.fields else {
+            unreachable!()
+        };
+        let op = *v.src.get(k).ok_or("a missing operand")?;
         match self.src0 {
             Some(x) if k == 0 => Ok(x),
             _ => {
@@ -2441,6 +2457,26 @@ impl<'a> Lower<'a> {
                 })
             }
         }
+    }
+
+    /// Operand `k` of a typeless `_b32` instruction: `abs` clears bit 31 and
+    /// `neg` flips it, with no float operation, so denormals and NaN payloads
+    /// pass through as on the hardware.
+    fn bits_src(&mut self, inst: &Inst, k: usize) -> Result<V, Why> {
+        let Fields::Valu(v) = &inst.fields else {
+            unreachable!()
+        };
+        let (abs, neg) = (v.abs >> k & 1 != 0, v.neg >> k & 1 != 0);
+        let mut x = self.raw_src(inst, k)?;
+        if abs {
+            let m = self.s.m.i32(0x7FFF_FFFF);
+            x = self.s.m.bin(self.cur, Bin::And, x, m);
+        }
+        if neg {
+            let m = self.s.m.i32(0x8000_0000);
+            x = self.s.m.bin(self.cur, Bin::Xor, x, m);
+        }
+        Ok(x)
     }
 
     fn unary(&mut self, op: u32, f: V) -> V {
@@ -5516,7 +5552,7 @@ impl<'a> Lower<'a> {
 
     /// `channels` channels of the element at byte `off` of buffer `h`,
     /// converted from the GFX10 buffer format `format` as the hardware's
-    /// typed loads do (channels past the format's read 0, 0, 0, 1).
+    /// typed loads do (channels past the format's read 0, the fourth too).
     // shortcut: the descriptor's channel swizzle is taken as the identity
     // (it is for raw views and the descriptors code builds). A dynamic raw
     // address for elements of 4 bytes or more is taken as dword-aligned.
@@ -6731,11 +6767,11 @@ impl<'a> Lower<'a> {
                 int(self, r)
             }
             "v_mov_b32" => {
-                if v.abs != 0 || v.neg != 0 || v.clamp || v.omod != 0 {
+                if v.clamp || v.omod != 0 {
                     let a = f(self, 0)?;
                     return float(self, a);
                 }
-                let a = s(self, 0)?;
+                let a = self.bits_src(inst, 0)?;
                 int(self, a)
             }
             "v_add_f32" | "v_sub_f32" | "v_subrev_f32" | "v_mul_f32" | "v_mul_legacy_f32"
@@ -6980,12 +7016,7 @@ impl<'a> Lower<'a> {
             }
             "v_cndmask_b32" => {
                 let cond = self.select_condition(inst, v.src.get(2))?;
-                if v.abs != 0 || v.neg != 0 {
-                    let (a, bb) = (f(self, 0)?, f(self, 1)?);
-                    let r = self.s.m.select(c, cond, bb, a);
-                    return float(self, r);
-                }
-                let (a, bb) = (s(self, 0)?, s(self, 1)?);
+                let (a, bb) = (self.bits_src(inst, 0)?, self.bits_src(inst, 1)?);
                 let r = self.s.m.select(c, cond, bb, a);
                 int(self, r)
             }
@@ -7307,16 +7338,26 @@ impl<'a> Lower<'a> {
         };
         let mut high = v.opsel >> 3 & 1 != 0;
         // SDWA: the word written, the other one kept (preserve) or zero
-        // (pad; a sign extension above the high word adds nothing).
-        let mut keep = true;
+        // (pad), or the low word's sign bit extended above it (sext; above
+        // the high word that adds nothing).
+        let (mut keep, mut sext) = (true, false);
         if let Some(sd) = v.sdwa {
             match (sd.dst_sel, sd.dst_unused) {
                 (4, 2) => {}
                 (5, 2) => high = true,
-                (4 | 6, _) => keep = false,
-                (5, _) => (high, keep) = (true, false),
+                (4, 1) => (keep, sext) = (false, true),
+                (4, 0) | (6, _) => keep = false,
+                (5, 0 | 1) => (high, keep) = (true, false),
                 _ => return Err("an SDWA destination of a 16-bit operation"),
             }
+        }
+        if sext {
+            let c = self.cur;
+            let k16 = self.s.m.i32(16);
+            let x = self.s.m.bin(c, Bin::Shl, x, k16);
+            let r = self.s.m.bin(c, Bin::AShr, x, k16);
+            self.write_placed(inst, Reg::V(reg), r, guard);
+            return Ok(());
         }
         let c = self.cur;
         let old = match inst.read(Reg::V(reg)).map(|o| self.i32_of(o)) {
@@ -8392,8 +8433,22 @@ impl<'a> Lower<'a> {
                     }
                     h
                 } else {
-                    let x = self.fsrc(inst, 0)?;
-                    self.as_int(x)
+                    // abs/neg only touch the sign bit: float ops would flush
+                    // denormals and quiet signalling NaNs before the test.
+                    let Fields::Valu(v) = &inst.fields else {
+                        unreachable!()
+                    };
+                    let (abs, neg) = (v.abs & 1 != 0, v.neg & 1 != 0);
+                    let mut x = self.raw_src(inst, 0)?;
+                    if abs {
+                        let m = self.s.m.i32(0x7FFF_FFFF);
+                        x = self.s.m.bin(c, Bin::And, x, m);
+                    }
+                    if neg {
+                        let s = self.s.m.i32(0x8000_0000);
+                        x = self.s.m.bin(c, Bin::Xor, x, s);
+                    }
+                    x
                 };
                 let mask = self.src(inst, 1)?;
                 let k = |l: &mut Self, v: u32| l.s.m.i32(v);
@@ -8442,6 +8497,13 @@ impl<'a> Lower<'a> {
                 self.s.m.cmp(c, pred::NE, bit, zero)
             }
             "f32" | "f16" => {
+                // False and true whatever the operands, NaNs included. As
+                // constants, like the integer forms: `fcmp false`/`fcmp true`
+                // (which DXC never emits) remove the WARP device at dispatch.
+                if matches!(op, "f" | "tru") {
+                    self.lane(inst, Some(op == "tru"));
+                    return Ok(());
+                }
                 let (a, b) = if ty == "f16" {
                     (self.half_fsrc(inst, 0)?, self.half_fsrc(inst, 1)?)
                 } else {
@@ -8457,7 +8519,6 @@ impl<'a> Lower<'a> {
                     self.s.m.bin(c, Bin::Or, lt, gt)
                 } else {
                     let p = match op {
-                        "f" => pred::FALSE,
                         "lt" => pred::OLT,
                         "eq" => pred::OEQ,
                         "le" => pred::OLE,
@@ -8471,7 +8532,6 @@ impl<'a> Lower<'a> {
                         "nle" => pred::UGT,
                         "neq" => pred::UNE,
                         "nlt" => pred::UGE,
-                        "tru" => pred::TRUE,
                         _ => return Err(inst.name()),
                     };
                     self.s.m.cmp(c, p, a, b)
@@ -8871,6 +8931,7 @@ impl<'a> Lower<'a> {
         if *tfe || *lwe {
             return Err("an image access with tfe or lwe");
         }
+        let no_channels = *dmask == 0;
         // A load or sample with no channel enabled returns the first.
         let dmask = if *dmask == 0 { &1 } else { dmask };
         let site = (b, i);
@@ -9041,11 +9102,14 @@ impl<'a> Lower<'a> {
             if name != "image_store" {
                 return Err("an image store to a mip level");
             }
+            if no_channels {
+                return Err("an image store of no channels");
+            }
             // shortcut: stores are taken to write all four channels of a
             // float format (the console converts by the view's format).
-            if *dmask != 0xF {
-                return Err("an image store of some channels");
-            }
+            // The channels `dmask` selects come from consecutive data
+            // registers (halves with d16); the others are written as zero
+            // (RDNA2 ISA, MIMG stores).
             let iu = self.s.m.undef(self.s.t.i32);
             let mut cs = vec![iu; 3];
             for (k, slot) in cs.iter_mut().enumerate().take(coords) {
@@ -9055,7 +9119,12 @@ impl<'a> Lower<'a> {
                 return Err("image store data");
             };
             let mut vals = Vec::new();
-            for k in 0..4u8 {
+            let mut k = 0u8;
+            for ch in 0..4u8 {
+                if dmask >> ch & 1 == 0 {
+                    vals.push(self.s.m.f32(0));
+                    continue;
+                }
                 // d16: two f16 channels per VGPR, low half first.
                 let r = if *d16 { k / 2 } else { k };
                 let v = inst.read(Reg::V(reg + r)).ok_or("image store data")?;
@@ -9071,6 +9140,7 @@ impl<'a> Lower<'a> {
                 } else {
                     self.float_of(v)?
                 });
+                k += 1;
             }
             let h = self.handle(site, src, false, props)?;
             let at = self.begin_guarded(guard);

@@ -120,7 +120,11 @@ impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Tra
     }
     fn convert(&self, input: &[u8]) -> anyhow::Result<Vec<u8>> {
         self.ran.store(true, Ordering::Relaxed);
-        let outcome = (self.translate)(&input[32..]);
+        // The input is the 32-byte build fingerprint, then the container.
+        let container = input
+            .get(32..)
+            .ok_or_else(|| anyhow::anyhow!("shader cache input shorter than its build key"))?;
+        let outcome = (self.translate)(container);
         let bytes = encode(&outcome);
         *self.result.lock().unwrap_or_else(|e| e.into_inner()) = Some(outcome);
         Ok(bytes)
@@ -176,7 +180,7 @@ fn cached(
         .unwrap_or_else(|| (converter.translate)(container))
 }
 
-const MAGIC: &[u8; 4] = b"VSH2";
+const MAGIC: &[u8; 4] = b"VSH3";
 const REFUSAL_MAGIC: &[u8; 4] = b"VSE1";
 const STAGES: [HwStage; 8] = [
     HwStage::Ls,
@@ -189,28 +193,36 @@ const STAGES: [HwStage; 8] = [
     HwStage::Cs,
 ];
 
-fn root_code(r: RootType) -> u32 {
+/// The tag word of a root type, and for [`RootType::Other`] the raw value
+/// in a word of its own: the value is any `u32` the title's metadata holds,
+/// so folding it into the tag would overflow or alias a named type.
+fn root_code(r: RootType) -> (u32, Option<u32>) {
     match r {
-        RootType::Constants => 0,
-        RootType::Descriptor => 1,
-        RootType::Table => 2,
-        RootType::ImmediateSampler => 3,
-        RootType::ResourceHeap => 4,
-        RootType::SamplerHeap => 5,
-        RootType::Other(x) => 6 + x,
+        RootType::Constants => (0, None),
+        RootType::Descriptor => (1, None),
+        RootType::Table => (2, None),
+        RootType::ImmediateSampler => (3, None),
+        RootType::ResourceHeap => (4, None),
+        RootType::SamplerHeap => (5, None),
+        RootType::Other(x) => (OTHER_ROOT, Some(x)),
     }
 }
 
-fn root_type(code: u32) -> RootType {
-    match code {
+const OTHER_ROOT: u32 = 6;
+
+/// The root type of a tag word; `other` reads the raw value that follows
+/// [`OTHER_ROOT`]. An unknown tag is damage.
+fn root_type(code: u32, other: impl FnOnce() -> Option<u32>) -> Option<RootType> {
+    Some(match code {
         0 => RootType::Constants,
         1 => RootType::Descriptor,
         2 => RootType::Table,
         3 => RootType::ImmediateSampler,
         4 => RootType::ResourceHeap,
         5 => RootType::SamplerHeap,
-        x => RootType::Other(x - 6),
-    }
+        OTHER_ROOT => RootType::Other(other()?),
+        _ => return None,
+    })
 }
 
 /// Little-endian words and length-prefixed lists.
@@ -232,15 +244,15 @@ fn encode(outcome: &Result<HostShader, String>) -> Vec<u8> {
     out.extend(&s.dxil);
     word(&mut out, s.user_data.len() as u32);
     for u in &s.user_data {
-        for v in [
-            u.index,
-            u32::from(u.slot),
-            root_code(u.root),
-            u.dword,
-            u32::from(u.indexed_buffer),
-        ] {
-            word(&mut out, v);
+        let (root, other) = root_code(u.root);
+        word(&mut out, u.index);
+        word(&mut out, u32::from(u.slot));
+        word(&mut out, root);
+        if let Some(other) = other {
+            word(&mut out, other);
         }
+        word(&mut out, u.dword);
+        word(&mut out, u32::from(u.indexed_buffer));
     }
     word(&mut out, s.samplers.len() as u32);
     for sampler in &s.samplers {
@@ -305,10 +317,14 @@ fn decode(bytes: &[u8]) -> Option<Result<HostShader, String>> {
     let n = r.word()? as usize;
     let mut user_data = Vec::with_capacity(n.min(256));
     for _ in 0..n {
+        let index = r.word()?;
+        let slot = u8::try_from(r.word()?).ok()?;
+        let code = r.word()?;
+        let root = root_type(code, || r.word())?;
         user_data.push(UserData {
-            index: r.word()?,
-            slot: u8::try_from(r.word()?).ok()?,
-            root: root_type(r.word()?),
+            index,
+            slot,
+            root,
             dword: r.word()?,
             indexed_buffer: match r.word()? {
                 0 => false,
@@ -532,5 +548,43 @@ mod tests {
         bad_utf8.extend(2u32.to_le_bytes());
         bad_utf8.extend([0xff, 0xfe]);
         assert_eq!(decode(&bad_utf8), None);
+    }
+
+    #[test]
+    fn every_root_type_round_trips() {
+        let roots = [
+            RootType::Constants,
+            RootType::Descriptor,
+            RootType::Table,
+            RootType::ImmediateSampler,
+            RootType::ResourceHeap,
+            RootType::SamplerHeap,
+            RootType::Other(0),
+            RootType::Other(2),
+            RootType::Other(u32::MAX - 5),
+            RootType::Other(u32::MAX),
+        ];
+        for root in roots {
+            let mut s = shader();
+            s.user_data[0].root = root;
+            let ok = Ok(s);
+            assert_eq!(decode(&encode(&ok)), Some(ok), "{root:?}");
+        }
+        // A tag past the known ones is damage, not a guess.
+        let mut bytes = encode(&Ok(shader()));
+        let root_at = 4 + 4 + 4 + shader().dxil.len() + 4 + 4 + 4;
+        bytes[root_at..root_at + 4].copy_from_slice(&7u32.to_le_bytes());
+        assert_eq!(decode(&bytes), None);
+    }
+
+    #[test]
+    fn an_input_shorter_than_the_build_key_is_an_error() {
+        let converter = Translate {
+            translate: |_: &[u8]| Ok(shader()),
+            ran: AtomicBool::new(false),
+            result: Mutex::new(None),
+        };
+        assert!(converter.convert(&[0; 31]).is_err());
+        assert!(converter.convert(&[0; 32]).is_ok());
     }
 }

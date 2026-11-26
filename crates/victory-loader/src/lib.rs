@@ -23,6 +23,9 @@
 
 #[cfg(windows)]
 mod crash;
+// Only the Windows loader maps title DLLs; the tests run everywhere.
+#[cfg_attr(not(windows), allow(dead_code))]
+mod files;
 #[cfg(windows)]
 mod hooks;
 pub mod prepare;

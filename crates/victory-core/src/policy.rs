@@ -85,7 +85,7 @@ fn resolve(
     path: &Path,
     canonicalize: impl Fn(&Path) -> io::Result<PathBuf>,
 ) -> Result<PathBuf, PolicyError> {
-    let absolute = if path.is_absolute() {
+    let mut absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
         std::env::current_dir()
@@ -96,40 +96,54 @@ fn resolve(
             .join(path)
     };
 
-    let mut existing = absolute.as_path();
-    let mut rest = Vec::new();
-    loop {
-        match canonicalize(existing) {
-            Ok(canon) => {
-                let mut out = canon;
-                for component in rest.iter().rev() {
-                    out.push(component);
+    // A `..` folded lexically onto the canonical prefix can land on an existing
+    // path again (`<tmp>/missing/../link/cache`, `link` a symlink into a repo),
+    // so such a result is resolved once more. Its tail then has no `..` left.
+    let mut refold = true;
+    'resolve: loop {
+        let mut existing = absolute.as_path();
+        let mut rest: Vec<std::ffi::OsString> = Vec::new();
+        loop {
+            match canonicalize(existing) {
+                Ok(canon) => {
+                    let mut out = canon;
+                    for component in rest.iter().rev() {
+                        out.push(component);
+                    }
+                    let out = normalize(&out);
+                    if refold && rest.iter().any(|c| c == "..") {
+                        refold = false;
+                        absolute = out;
+                        continue 'resolve;
+                    }
+                    return Ok(out);
                 }
-                return Ok(normalize(&out));
-            }
-            Err(source) if cfg!(windows) && source.kind() == io::ErrorKind::PermissionDenied => {
-                return Err(PolicyError::Io {
-                    path: path.to_path_buf(),
-                    source,
-                });
-            }
-            Err(source) => match (existing.parent(), existing.file_name()) {
-                (Some(parent), Some(name)) => {
-                    rest.push(name.to_os_string());
-                    existing = parent;
-                }
-                // `file_name()` is None for a trailing `..`; keep it so `normalize` resolves it.
-                (Some(parent), None) if existing.ends_with("..") => {
-                    rest.push("..".into());
-                    existing = parent;
-                }
-                _ => {
+                Err(source)
+                    if cfg!(windows) && source.kind() == io::ErrorKind::PermissionDenied =>
+                {
                     return Err(PolicyError::Io {
                         path: path.to_path_buf(),
                         source,
                     });
                 }
-            },
+                Err(source) => match (existing.parent(), existing.file_name()) {
+                    (Some(parent), Some(name)) => {
+                        rest.push(name.to_os_string());
+                        existing = parent;
+                    }
+                    // `file_name()` is None for a trailing `..`; keep it so `normalize` resolves it.
+                    (Some(parent), None) if existing.ends_with("..") => {
+                        rest.push("..".into());
+                        existing = parent;
+                    }
+                    _ => {
+                        return Err(PolicyError::Io {
+                            path: path.to_path_buf(),
+                            source,
+                        });
+                    }
+                },
+            }
         }
     }
 }
@@ -244,6 +258,30 @@ mod tests {
             ),
             Err(PolicyError::InsideRepo { .. })
         ));
+    }
+
+    /// `<tmp>/missing/../link/cache` with `link` a symlink into a marked tree:
+    /// folding the `..` lands on `link`, which has to be resolved too.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_reached_through_a_folded_dot_dot_is_resolved() {
+        let marked = tempfile::tempdir().unwrap();
+        std::fs::write(marked.path().join(ROOT_MARKER), "").unwrap();
+        std::fs::create_dir(marked.path().join("crates")).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(marked.path().join("crates"), tmp.path().join("link")).unwrap();
+        let path = tmp
+            .path()
+            .join("missing")
+            .join("..")
+            .join("link")
+            .join("cache");
+        assert!(matches!(
+            ensure_outside_repo(&path),
+            Err(PolicyError::InsideRepo { .. })
+        ));
+        // The same path without the detour was already caught.
+        assert!(ensure_outside_repo(&tmp.path().join("link").join("cache")).is_err());
     }
 
     #[test]

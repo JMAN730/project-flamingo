@@ -397,6 +397,28 @@ fn med3_f32_emits_dxil_isnan_instead_of_fcmp_uno() {
     );
 }
 
+/// `v_cmp_{f,tru}_{f32,f16}` are false and true whatever the operands,
+/// NaNs included; they lower as constants like the integer forms, since
+/// `fcmp false`/`fcmp true` remove the WARP device at dispatch.
+#[test]
+fn float_compares_that_are_always_false_or_true_are_constants() {
+    for op in [0x000u32, 0x00F, 0x0C8, 0x0CF] {
+        // v_cmp_*_e64 s20, v1, v2; v_cndmask_b32_e64 v0, 0, 1, s20
+        let words = [
+            0x35 << 26 | op << 16 | 20,
+            (256 + 1) | (256 + 2) << 9,
+            0x35 << 26 | 0x101 << 16,
+            128 | 129 << 9 | 20 << 18,
+            S_ENDPGM,
+        ];
+        let lowered = lower_words(&words, 0).unwrap_or_else(|e| panic!("{op:#x}: {e}"));
+        assert!(
+            !lowered.has_fcmp_constant,
+            "{op:#x} must not emit fcmp false/true"
+        );
+    }
+}
+
 /// VOP3 `v_add_f32` with output modifier `omod` in bits 28:27 of word 1.
 fn v_add_f32_omod(omod: u8) -> [u32; 3] {
     let src0 = 256 + 1u32;
@@ -3073,6 +3095,99 @@ fn a_missing_value_on_a_path_no_lane_takes_is_dead() {
         S_ENDPGM,
     ];
     assert_eq!(refusal(&kept), None);
+}
+
+/// `v_mov_b32` and `v_cndmask_b32` are typeless: their `abs` and `neg`
+/// clear and flip bit 31 (`|-1 denormal|` stays a denormal), so they are
+/// integer operations, not `FAbs` (which flushes denormals and quiets sNaN).
+#[test]
+fn b32_moves_apply_abs_and_neg_to_the_sign_bit_only() {
+    const DS_WRITE: [u32; 2] = [0xD834_0000, 0x0000_0100]; // ds_write_b32 v0, v1
+    let cases: [&[u32]; 3] = [
+        // v_mov_b32_e64 v1, |v0|
+        &[0xD581_0101, 256],
+        // v_mov_b32_e64 v1, -v0
+        &[0xD581_0001, 256 | 1 << 29],
+        // s_mov_b32 s2, -1; v_cndmask_b32_e64 v1, |v0|, -v0, s2
+        &[0xBE82_03C1, 0xD501_0101, 256 | 256 << 9 | 2 << 18 | 2 << 29],
+    ];
+    for prefix in cases {
+        let words = [prefix, &DS_WRITE, &[S_ENDPGM]].concat();
+        let l = lower_words(&words, 1 << 15).expect("lowers"); // some LDS
+        assert!(
+            calls(&l, "unary.f32")
+                .iter()
+                .all(|args| args.first() != Some(&Some(6))),
+            "{prefix:08x?}: abs is not FAbs"
+        );
+    }
+}
+
+/// `v_cmp_class_f32`'s abs and neg flip the sign bit of the raw operand, as
+/// RDNA2 does: no FAbs (or fsub), which would flush a denormal to a zero and
+/// quiet a signalling NaN before it is classified.
+#[test]
+fn cmp_class_f32_modifiers_are_bitwise() {
+    // v_cmp_class_f32_e64 s6, |v1|, v2 with neg on src0 (VOP3 opcode 0x088).
+    let words = [
+        0x35 << 26 | 0x088 << 16 | 1 << 8 | 6,
+        (256 + 1) | (256 + 2) << 9 | 1 << 29,
+        S_ENDPGM,
+    ];
+    let l = lower_words(&words, 0).unwrap();
+    let fabs = l
+        .dx_ops
+        .iter()
+        .any(|(name, args)| name == "dx.op.unary.f32" && args.first() == Some(&Some(6)));
+    assert!(!fabs, "v_cmp_class_f32 abs must not lower to FAbs");
+}
+
+/// 16-bit SDWA destinations: WORD_0 with UNUSED_SEXT lowers (sign-extending
+/// the word); the reserved `dst_unused` 3 is refused.
+#[test]
+fn sdwa_16bit_destination_unused_modes() {
+    // v_cvt_i16_f16_sdwa v0, v1 dst_sel:WORD_0 src0_sel:WORD_0, with
+    // dst_unused UNUSED_PAD (0), UNUSED_SEXT (1), UNUSED_PRESERVE (2); then
+    // v_mov_b32 v2, 0; ds_write_b32 v2, v0, so the result is read.
+    let program = |ext: u32| {
+        [
+            0x7E00_A6F9,
+            ext,
+            0x7E04_0280,
+            0xD834_0000,
+            0x0000_0002,
+            S_ENDPGM,
+        ]
+    };
+    for unused in 0..3u32 {
+        lowers_lds(&program(0x0004_0401 | unused << 11))
+            .unwrap_or_else(|e| panic!("dst_unused {unused}: {e}"));
+    }
+    for dst_sel in [4u32, 5] {
+        let words = program(0x0004_0001 | dst_sel << 8 | 3 << 11);
+        assert!(
+            lowers_lds(&words).is_err(),
+            "dst_sel {dst_sel}, dst_unused 3"
+        );
+    }
+}
+
+/// `image_store` of some channels: the selected ones come from consecutive
+/// data registers, the others are stored as zero.
+#[test]
+fn image_stores_of_some_channels_zero_the_others() {
+    // image_store v[12:], v[2:3], s[12:19] dim:2D; v2-v15 set (the
+    // address, then distinct data in v12-v15).
+    let mut addr = vec![F_HALF, F_HALF];
+    addr.extend((4..12).map(|_| 0));
+    addr.extend([F_ONE, 0x4000_0000, 0x4040_0000, 0x4080_0000]);
+    for dmask in [0x1, 0x3, 0x5, 0x7, 0x9, 0xF] {
+        let words = image_words(0x08, dmask, 1, false, &addr);
+        let l = lower_image(&words).unwrap_or_else(|e| panic!("dmask {dmask:#x}: {e}"));
+        assert_eq!(calls(&l, "textureStore.f32").len(), 1, "dmask {dmask:#x}");
+    }
+    // No channel enabled: refused rather than writing the first register.
+    assert!(lower_image(&image_words(0x08, 0, 1, false, &addr)).is_err());
 }
 
 /// The VOP3P integer dot products lower in the form assemblers write
