@@ -391,6 +391,60 @@ impl PageDir {
         (out, max_epoch)
     }
 
+    fn publish_written(&self, pages: &[usize]) -> u64 {
+        let _w = DirWriteGuard::enter();
+        let now = next_epoch();
+        for &page in pages {
+            self.record_written(page, now);
+        }
+        now
+    }
+
+    fn publish_written_range(&self, first: usize, last: usize) -> u64 {
+        let _w = DirWriteGuard::enter();
+        let now = next_epoch();
+        for page in first..last {
+            self.record_written(page, now);
+        }
+        now
+    }
+
+    fn collect_written_consistent(
+        &self,
+        first: usize,
+        last: usize,
+        min_epoch: u64,
+    ) -> (u64, Vec<(usize, u64)>) {
+        if first >= last {
+            return (min_epoch, Vec::new());
+        }
+        let mut spins = 0u32;
+        loop {
+            let end_before = DIR_WRITE_END.load(Ordering::SeqCst);
+            let begin_before = DIR_WRITE_BEGIN.load(Ordering::SeqCst);
+            if begin_before != end_before {
+                spins = spins.saturating_add(1);
+                if spins < 64 {
+                    std::hint::spin_loop();
+                } else {
+                    std::thread::yield_now();
+                }
+                continue;
+            }
+            let (written, max_w) = self.collect_written(first, last);
+            let begin_after = DIR_WRITE_BEGIN.load(Ordering::SeqCst);
+            if begin_after == begin_before {
+                return (min_epoch.max(max_w), written);
+            }
+            spins = spins.saturating_add(1);
+            if spins < 64 {
+                std::hint::spin_loop();
+            } else {
+                std::thread::yield_now();
+            }
+        }
+    }
+
     #[inline]
     fn is_cold_ro(&self, block: usize) -> bool {
         self.get_bit(block, BitField::ColdRo, Ordering::SeqCst)
@@ -657,6 +711,36 @@ impl PageDir {
 /// Monotonic write-watch asking epoch; 0 means "never".
 static ASK_EPOCH: AtomicU64 = AtomicU64::new(0);
 
+/// Lock-free multi-writer publication counters for [`PageDir`] written-page
+/// records. Every writer that records written pages into [`DIR`] MUST:
+/// 1. Enter [`DirWriteGuard`] (incrementing `DIR_WRITE_BEGIN` with `SeqCst`),
+/// 2. Allocate its epoch via [`next_epoch`] while the guard is held,
+/// 3. Write all pages of its batch via [`PageDir::record_written`], and
+/// 4. Drop [`DirWriteGuard`] (incrementing `DIR_WRITE_END` with `SeqCst`).
+///
+/// Readers use [`PageDir::collect_written_consistent`] so a scan and its
+/// returned watermark always come from one consistent publication without
+/// skipping any page from a concurrent multi-word write batch.
+static DIR_WRITE_BEGIN: AtomicU64 = AtomicU64::new(0);
+static DIR_WRITE_END: AtomicU64 = AtomicU64::new(0);
+
+struct DirWriteGuard;
+
+impl DirWriteGuard {
+    #[inline]
+    fn enter() -> Self {
+        DIR_WRITE_BEGIN.fetch_add(1, Ordering::SeqCst);
+        Self
+    }
+}
+
+impl Drop for DirWriteGuard {
+    #[inline]
+    fn drop(&mut self) {
+        DIR_WRITE_END.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
 #[inline]
 fn next_epoch() -> u64 {
     ASK_EPOCH.fetch_add(1, Ordering::AcqRel) + 1
@@ -811,6 +895,35 @@ fn for_each_contiguous_run(blocks: &[usize], mut f: impl FnMut(usize, usize)) {
     }
 }
 
+/// Whether every 4 KiB page in the 64 KiB `block` is committed `PAGE_READWRITE`
+/// (exact protection match, excluding `PAGE_READONLY`, `PAGE_NOACCESS`,
+/// `PAGE_GUARD`, `PAGE_EXECUTE_*`, etc.) so promoting to `PAGE_READONLY` and
+/// restoring `PAGE_READWRITE` on fault never drops a caller-installed
+/// protection. Uses `cache = (region_start, region_end, is_rw)` to amortize
+/// `VirtualQuery` across contiguous blocks.
+fn block_is_all_readwrite(block: usize, cache: &mut (usize, usize, bool)) -> bool {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_READWRITE, VirtualQuery,
+    };
+    let start = block * PAGE;
+    let end = start.saturating_add(PAGE);
+    if start >= cache.0 && end <= cache.1 {
+        return cache.2;
+    }
+    let mut info = MEMORY_BASIC_INFORMATION::default();
+    // SAFETY: queries virtual memory metadata without dereferencing `start`.
+    let n = unsafe { VirtualQuery(start as *const _, &mut info, size_of_val(&info)) };
+    if n == 0 || info.RegionSize == 0 {
+        *cache = (0, 0, false);
+        return false;
+    }
+    let region_start = info.BaseAddress as usize;
+    let region_end = region_start.saturating_add(info.RegionSize);
+    let is_rw = info.State == MEM_COMMIT && info.Protect == PAGE_READWRITE;
+    *cache = (region_start, region_end, is_rw);
+    is_rw && start >= region_start && end <= region_end
+}
+
 /// Promotes contiguous runs of newly-cold write-watched 64 KiB blocks to
 /// `PAGE_READONLY` VEH guards, then re-verifies `GetWriteWatch(RESET)` while
 /// `PAGE_READONLY` is active so any write sneaking in right before
@@ -821,11 +934,13 @@ fn promote_cold_pages(candidates: &[usize]) {
     if threshold == 0 || candidates.is_empty() {
         return;
     }
+    if !install() {
+        return;
+    }
     let threshold_u8 = threshold.min(u8::MAX as u32) as u8;
     let mut sorted = candidates.to_vec();
     sorted.sort_unstable();
     sorted.dedup();
-    install();
     let frame32 = current_frame32();
 
     // Lock order: `WATCH_SERIAL` -> `GUARD_SHARDS_TABLE` (ascending). Holding
@@ -837,12 +952,17 @@ fn promote_cold_pages(candidates: &[usize]) {
     let locked = GuardLockSet::lock_blocks(&sorted);
 
     let mut eligible = Vec::with_capacity(sorted.len());
+    let mut rw_cache = (0usize, 0usize, false);
     for block in sorted {
         if DIR.is_cold_ro(block)
             || DIR.any_guard_flag(block)
             || DIR.cold_streak(block) < threshold_u8
             || locked.announced(block)
         {
+            continue;
+        }
+        if !block_is_all_readwrite(block, &mut rw_cache) {
+            DIR.reset_cold(block, frame32);
             continue;
         }
         eligible.push(block);
@@ -880,7 +1000,7 @@ fn promote_cold_pages(candidates: &[usize]) {
                 DIR.set_bits_range(from, to, BitField::ColdRo, true, Ordering::SeqCst);
                 return;
             }
-            let now = next_epoch();
+            let _now = DIR.publish_written(&dirty);
             let mut d_idx = dirty.partition_point(|&b| b < from);
             for block in from..to {
                 while d_idx < dirty.len() && dirty[d_idx] < block {
@@ -892,7 +1012,6 @@ fn promote_cold_pages(candidates: &[usize]) {
                     unsafe {
                         VirtualProtect((block * PAGE) as *const _, PAGE, PAGE_READWRITE, &mut old);
                     }
-                    DIR.record_written(block, now);
                 } else {
                     DIR.set_bit(block, BitField::ColdRo, true, Ordering::SeqCst);
                 }
@@ -955,35 +1074,157 @@ fn ahead_gap() -> usize {
 /// Maximum span of a single coalesced `GetWriteWatch` asking (1 GiB).
 const AHEAD_MAX: usize = (1 << 30) / PAGE;
 
-/// Processes one non-cold `[first, last)` interval with `GetWriteWatch(RESET)`,
-/// bisecting on failure and recording dirty/clean results in `DIR`.
-/// Pushes every succeeded `[a, b)` page interval into `covered`.
-fn ask_non_cold_bisect(
+/// Processes one non-cold `[first, last)` interval with `GetWriteWatch(RESET)`.
+/// When the whole-range query fails, walks allocation boundaries via
+/// `VirtualQuery` to skip free, mapped, image, and non-write-watched regions
+/// immediately while still querying any private `MEM_WRITE_WATCH` portions of a
+/// mixed range. Appends dirty pages to `batch_dirty` and pushes every succeeded
+/// `[a, b)` page interval into `covered`.
+fn ask_non_cold_range(
     first: usize,
     last: usize,
-    now: u64,
     frame32: u32,
     threshold: u8,
+    batch_dirty: &mut Vec<usize>,
     covered: &mut Vec<(usize, usize)>,
     to_promote: &mut Vec<usize>,
 ) {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_FREE, MEM_PRIVATE, MEMORY_BASIC_INFORMATION, VirtualQuery,
+    };
     if first >= last {
         return;
     }
     if let Some(dirty) = call_get_write_watch(first, last) {
-        for &p in &dirty {
-            DIR.record_written(p, now);
-        }
+        batch_dirty.extend_from_slice(&dirty);
         DIR.note_clean_for_cold(first, last, &dirty, frame32, threshold, to_promote);
         push_merged_interval(covered, first, last);
         return;
     }
-    if last - first <= 1 {
-        return;
+
+    let mut at = first * PAGE;
+    let end = last * PAGE;
+    while at < end {
+        let mut info = MEMORY_BASIC_INFORMATION::default();
+        // SAFETY: queries virtual memory metadata without dereferencing `at`.
+        if unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) } == 0
+            || info.RegionSize == 0
+        {
+            break;
+        }
+        let Some(mut to) = (info.BaseAddress as usize)
+            .checked_add(info.RegionSize)
+            .map(|e| e.min(end))
+        else {
+            break;
+        };
+        if to <= at {
+            break;
+        }
+        // Free regions, mapped views (`MEM_MAPPED`), and images (`MEM_IMAGE`)
+        // can never be `MEM_WRITE_WATCH`; skip their entire allocation without
+        // issuing failing `GetWriteWatch` syscalls while holding `WATCH_SERIAL`.
+        if info.State == MEM_FREE || info.Type != MEM_PRIVATE {
+            let base = info.AllocationBase as usize;
+            while info.State != MEM_FREE && to < end {
+                let mut next = MEMORY_BASIC_INFORMATION::default();
+                // SAFETY: metadata query only.
+                if unsafe { VirtualQuery(to as *const _, &mut next, size_of_val(&next)) } == 0
+                    || next.RegionSize == 0
+                    || next.State == MEM_FREE
+                    || next.AllocationBase as usize != base
+                {
+                    break;
+                }
+                let Some(next_to) = (next.BaseAddress as usize)
+                    .checked_add(next.RegionSize)
+                    .map(|e| e.min(end))
+                else {
+                    break;
+                };
+                if next_to <= to {
+                    break;
+                }
+                to = next_to;
+            }
+            at = to;
+            continue;
+        }
+
+        // Private allocation: gather all contiguous regions sharing `AllocationBase`.
+        let base = info.AllocationBase as usize;
+        let mut committed = info.State == MEM_COMMIT;
+        let mut committed_subranges: Vec<(usize, usize)> = Vec::new();
+        if info.State == MEM_COMMIT {
+            committed_subranges.push((at, to));
+        }
+        while to < end {
+            let mut next = MEMORY_BASIC_INFORMATION::default();
+            // SAFETY: metadata query only.
+            if unsafe { VirtualQuery(to as *const _, &mut next, size_of_val(&next)) } == 0
+                || next.RegionSize == 0
+                || next.State == MEM_FREE
+                || next.AllocationBase as usize != base
+            {
+                break;
+            }
+            let Some(next_to) = (next.BaseAddress as usize)
+                .checked_add(next.RegionSize)
+                .map(|e| e.min(end))
+            else {
+                break;
+            };
+            if next_to <= to {
+                break;
+            }
+            if next.State == MEM_COMMIT {
+                committed = true;
+                committed_subranges.push((to, next_to));
+            }
+            to = next_to;
+        }
+
+        if committed {
+            let p_first = at.div_ceil(PAGE);
+            let p_last = to / PAGE;
+            if p_first < p_last {
+                if (p_first != first || p_last != last)
+                    && let Some(dirty) = call_get_write_watch(p_first, p_last)
+                {
+                    batch_dirty.extend_from_slice(&dirty);
+                    DIR.note_clean_for_cold(
+                        p_first, p_last, &dirty, frame32, threshold, to_promote,
+                    );
+                    push_merged_interval(covered, p_first, p_last);
+                } else if committed_subranges.len() > 1
+                    || committed_subranges
+                        .first()
+                        .is_some_and(|&(s, e)| s != at || e != to)
+                {
+                    // Mixed committed+reserved private allocation where the full
+                    // span failed: probe committed page-aligned subranges and
+                    // bail on the first failure (non-MEM_WRITE_WATCH allocation).
+                    for (s, e) in committed_subranges {
+                        let sp0 = s.div_ceil(PAGE);
+                        let sp1 = e / PAGE;
+                        if sp0 >= sp1 {
+                            continue;
+                        }
+                        if let Some(dirty) = call_get_write_watch(sp0, sp1) {
+                            batch_dirty.extend_from_slice(&dirty);
+                            DIR.note_clean_for_cold(
+                                sp0, sp1, &dirty, frame32, threshold, to_promote,
+                            );
+                            push_merged_interval(covered, sp0, sp1);
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        at = to;
     }
-    let mid = first + (last - first) / 2;
-    ask_non_cold_bisect(first, mid, now, frame32, threshold, covered, to_promote);
-    ask_non_cold_bisect(mid, last, now, frame32, threshold, covered, to_promote);
 }
 
 /// Queries `GetWriteWatch` on a merged `[first, last)` interval while skipping
@@ -991,9 +1232,9 @@ fn ask_non_cold_bisect(
 fn ask_merged_interval(
     first: usize,
     last: usize,
-    now: u64,
     frame32: u32,
     threshold: u8,
+    batch_dirty: &mut Vec<usize>,
     covered: &mut Vec<(usize, usize)>,
     to_promote: &mut Vec<usize>,
 ) {
@@ -1009,12 +1250,12 @@ fn ask_merged_interval(
         let non_cold_pages: usize = non_cold.iter().map(|&(a, b)| b - a).sum();
         let mut sub_covered = Vec::with_capacity(non_cold.len());
         for (r0, r1) in non_cold {
-            ask_non_cold_bisect(
+            ask_non_cold_range(
                 r0,
                 r1,
-                now,
                 frame32,
                 threshold,
+                batch_dirty,
                 &mut sub_covered,
                 to_promote,
             );
@@ -1029,12 +1270,22 @@ fn ask_merged_interval(
         }
         return;
     }
-    ask_non_cold_bisect(first, last, now, frame32, threshold, covered, to_promote);
+    ask_non_cold_range(
+        first,
+        last,
+        frame32,
+        threshold,
+        batch_dirty,
+        covered,
+        to_promote,
+    );
 }
 
 /// Prepares sorted, merged, non-view intervals and queries `GetWriteWatch(RESET)`
 /// across them, coalescing small non-cold gaps without crossing cold or guard regions.
-fn collect_and_ask_batch(ranges: &[(usize, usize)], now: u64) -> Vec<(usize, usize)> {
+/// Reserves and publishes the batch epoch while holding `WATCH_SERIAL` so every
+/// reset carries an epoch strictly greater than any earlier watermark.
+fn collect_and_ask_batch(ranges: &[(usize, usize)]) -> (u64, Vec<(usize, usize)>) {
     let mut pieces: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
     for &(start, end) in ranges {
         if start >= end {
@@ -1047,7 +1298,7 @@ fn collect_and_ask_batch(ranges: &[(usize, usize)], now: u64) -> Vec<(usize, usi
         pieces.push((first, last));
     }
     if pieces.is_empty() {
-        return Vec::new();
+        return (0, Vec::new());
     }
     pieces.sort_unstable();
     let mut merged: Vec<(usize, usize)> = Vec::with_capacity(pieces.len());
@@ -1060,8 +1311,9 @@ fn collect_and_ask_batch(ranges: &[(usize, usize)], now: u64) -> Vec<(usize, usi
     let threshold = cold_after().min(u8::MAX as u32) as u8;
     let mut covered = Vec::with_capacity(merged.len());
     let mut to_promote = Vec::new();
+    let mut batch_dirty = Vec::new();
 
-    {
+    let now = {
         let _serial = WATCH_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let mut i = 0;
         while i < merged.len() {
@@ -1096,9 +1348,9 @@ fn collect_and_ask_batch(ranges: &[(usize, usize)], now: u64) -> Vec<(usize, usi
                 ask_merged_interval(
                     group_first,
                     group_last,
-                    now,
                     frame32,
                     threshold,
+                    &mut batch_dirty,
                     &mut covered,
                     &mut to_promote,
                 );
@@ -1110,17 +1362,15 @@ fn collect_and_ask_batch(ranges: &[(usize, usize)], now: u64) -> Vec<(usize, usi
                     ask_merged_interval(
                         a,
                         b,
-                        now,
                         frame32,
                         threshold,
+                        &mut batch_dirty,
                         &mut covered,
                         &mut to_promote,
                     );
                 }
             } else if let Some(dirty) = call_get_write_watch(group_first, group_last) {
-                for &p in &dirty {
-                    DIR.record_written(p, now);
-                }
+                batch_dirty.extend_from_slice(&dirty);
                 for &(a, b) in &merged[i..k] {
                     DIR.note_clean_for_cold(a, b, &dirty, frame32, threshold, &mut to_promote);
                     push_merged_interval(&mut covered, a, b);
@@ -1132,9 +1382,9 @@ fn collect_and_ask_batch(ranges: &[(usize, usize)], now: u64) -> Vec<(usize, usi
                     ask_merged_interval(
                         a,
                         b,
-                        now,
                         frame32,
                         threshold,
+                        &mut batch_dirty,
                         &mut covered,
                         &mut to_promote,
                     );
@@ -1142,12 +1392,19 @@ fn collect_and_ask_batch(ranges: &[(usize, usize)], now: u64) -> Vec<(usize, usi
             }
             i = k;
         }
-    }
+        batch_dirty.sort_unstable();
+        batch_dirty.dedup();
+        if batch_dirty.is_empty() {
+            next_epoch()
+        } else {
+            DIR.publish_written(&batch_dirty)
+        }
+    };
 
     if !to_promote.is_empty() && threshold > 0 {
         promote_cold_pages(&to_promote);
     }
-    covered
+    (now, covered)
 }
 
 /// Whether per-submission write-watch coalescing (`ask_once`) is enabled
@@ -1174,17 +1431,17 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
     let seq_before = ANNOUNCED_SEQ.load(Ordering::SeqCst);
     let pending_before = snapshot_announced();
 
-    let now = next_epoch();
-    let mut covered = collect_and_ask_batch(ranges, now);
+    let (now, mut covered) = collect_and_ask_batch(ranges);
     for &(p_first, p_last) in &pending_before {
         covered.retain(|&(a, b)| b <= p_first || p_last <= a);
     }
 
     let mut ahead = AHEAD.write().unwrap_or_else(|e| e.into_inner());
     if ANNOUNCED_SEQ.load(Ordering::SeqCst) != seq_before {
-        // A `kernel_will_write` landed concurrently while `collect_and_ask_batch`
-        // ran; drop the batch cache for this submission so no kernel write can
-        // be hidden behind a stale ahead interval.
+        // A `kernel_will_write` or `title_memory_remapped` landed concurrently
+        // while `collect_and_ask_batch` ran; drop the batch cache for this
+        // submission so no kernel write or remap can be hidden behind a stale
+        // ahead interval.
         covered.clear();
     }
     ahead.epoch = now;
@@ -1219,14 +1476,11 @@ pub(crate) fn wrote(at: usize, len: usize) {
     if !ahead.kept {
         return;
     }
-    let now = next_epoch();
-    ahead.epoch = now;
     let first = at / PAGE;
     let last = at.saturating_add(len).div_ceil(PAGE);
     let frame32 = current_frame32();
-    for page in first..last {
-        DIR.record_written(page, now);
-    }
+    let now = DIR.publish_written_range(first, last);
+    ahead.epoch = ahead.epoch.max(now);
     DIR.reset_cold_range(first, last, frame32);
 }
 
@@ -1235,17 +1489,21 @@ pub(crate) fn wrote(at: usize, len: usize) {
 /// own-view writes that bypass `GetWriteWatch` and page guards.
 #[allow(dead_code)]
 pub(crate) fn wrote_own(page: usize, others: &[usize]) -> (u64, u64) {
-    let now = next_epoch();
+    let (before, now) = {
+        let _w = DirWriteGuard::enter();
+        let now = next_epoch();
+        let before = DIR.record_written_prev(page, now);
+        for &other in others {
+            if other != page {
+                DIR.record_written(other, now);
+            }
+        }
+        (before, now)
+    };
     if AHEAD_ACTIVE.load(Ordering::Acquire) {
         let mut ahead = AHEAD.write().unwrap_or_else(|e| e.into_inner());
         if ahead.kept || !ahead.ranges.is_empty() {
-            ahead.epoch = now;
-        }
-    }
-    let before = DIR.record_written_prev(page, now);
-    for &other in others {
-        if other != page {
-            DIR.record_written(other, now);
+            ahead.epoch = ahead.epoch.max(now);
         }
     }
     (before, now)
@@ -1266,8 +1524,7 @@ pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)
         }
         ahead.epoch
     };
-    let (written, max_w) = DIR.collect_written(first, last);
-    Some((ahead_epoch.max(max_w), written))
+    Some(DIR.collect_written_consistent(first, last, ahead_epoch))
 }
 
 /// The pages of `[start, end)` (whole pages) as last written, for pages
@@ -1293,8 +1550,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
             }
         };
         if let Some(epoch) = ahead_epoch {
-            let (written, max_w) = DIR.collect_written(first, last);
-            return Some((epoch.max(max_w), written));
+            return Some(DIR.collect_written_consistent(first, last, epoch));
         }
     }
 
@@ -1303,19 +1559,19 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     if guarded && known_view(first * PAGE) {
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
-        let found = guard(first * PAGE, last * PAGE)?;
+        let (published, _) = guard_and_publish(first * PAGE, last * PAGE)?;
         #[cfg(feature = "diagnostics")]
         {
             use crate::copystat::{C, add};
             add(C::Watches, 1);
             add(C::WatchUs, started.elapsed().as_micros() as u64);
         }
-        let now = next_epoch();
-        for page in found {
-            DIR.record_written(page, now);
-        }
-        let (written, max_w) = DIR.collect_written(first, last);
-        return Some((now.max(max_w), written));
+        let now = if published != 0 {
+            published
+        } else {
+            next_epoch()
+        };
+        return Some(DIR.collect_written_consistent(first, last, now));
     }
 
     // Path 3: write-watched memory (skipping `ColdRo` sub-runs when v2 cold
@@ -1334,33 +1590,49 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
         if non_cold.is_empty() {
             Some(next_epoch())
         } else {
-            let mut all_ok = true;
-            let mut run_dirty: Vec<Vec<usize>> = Vec::with_capacity(non_cold.len());
-            for &(r0, r1) in &non_cold {
-                if let Some(d) = call_get_write_watch(r0, r1) {
-                    run_dirty.push(d);
+            let mut last_epoch = 0u64;
+            let mut failed_from: Option<usize> = None;
+            for (idx, &(r0, r1)) in non_cold.iter().enumerate() {
+                if let Some(dirty) = call_get_write_watch(r0, r1) {
+                    // Record each successful reset in `DIR` immediately under
+                    // `WATCH_SERIAL` before querying the next run so a later
+                    // failure can never drop an already-reset write bit.
+                    if !dirty.is_empty() {
+                        last_epoch = DIR.publish_written(&dirty);
+                    }
+                    DIR.note_clean_for_cold(r0, r1, &dirty, frame32, threshold, &mut to_promote);
                 } else {
-                    all_ok = false;
+                    failed_from = Some(idx);
                     break;
                 }
             }
-            if all_ok {
-                let now = next_epoch();
-                for (&(r0, r1), dirty) in non_cold.iter().zip(&run_dirty) {
-                    for &p in dirty {
-                        DIR.record_written(p, now);
+            if let Some(start_idx) = failed_from {
+                let mut all_ok = true;
+                for &(r0, r1) in &non_cold[start_idx..] {
+                    let (ok, pages) = by_allocation(r0 * PAGE, r1 * PAGE);
+                    if !pages.is_empty() {
+                        last_epoch = DIR.publish_written(&pages);
                     }
-                    DIR.note_clean_for_cold(r0, r1, dirty, frame32, threshold, &mut to_promote);
+                    if !ok {
+                        all_ok = false;
+                        break;
+                    }
                 }
-                Some(now)
-            } else if let Some(pages) = by_allocation(first * PAGE, last * PAGE) {
-                let now = next_epoch();
-                for page in pages {
-                    DIR.record_written(page, now);
+                if all_ok {
+                    Some(if last_epoch != 0 {
+                        last_epoch
+                    } else {
+                        next_epoch()
+                    })
+                } else {
+                    None
                 }
-                Some(now)
             } else {
-                None
+                Some(if last_epoch != 0 {
+                    last_epoch
+                } else {
+                    next_epoch()
+                })
             }
         }
     };
@@ -1370,8 +1642,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     }
 
     if let Some(now) = result {
-        let (written, max_w) = DIR.collect_written(first, last);
-        return Some((now.max(max_w), written));
+        return Some(DIR.collect_written_consistent(first, last, now));
     }
 
     if !guarded {
@@ -1380,29 +1651,30 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
 
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
-    let found = guard(first * PAGE, last * PAGE)?;
+    let (published, _) = guard_and_publish(first * PAGE, last * PAGE)?;
     #[cfg(feature = "diagnostics")]
     {
         use crate::copystat::{C, add};
         add(C::Watches, 1);
         add(C::WatchUs, started.elapsed().as_micros() as u64);
     }
-    let now = next_epoch();
-    for page in found {
-        DIR.record_written(page, now);
-    }
-    let (list, max_w) = DIR.collect_written(first, last);
-    Some((now.max(max_w), list))
+    let now = if published != 0 {
+        published
+    } else {
+        next_epoch()
+    };
+    Some(DIR.collect_written_consistent(first, last, now))
 }
 
 /// The pages of `[start, end)` written, asked allocation by allocation:
 /// the kernel refuses a range over several (a title buffer spans as many
 /// allocations as the runtime made for it). Parts never committed cannot
 /// have been written, so a range none of which is committed (a reserved
-/// allocation the title has not committed yet) has no writes. `None` if a
-/// committed part is not write-watched (or the range is one committed
-/// allocation, already refused).
-fn by_allocation(start: usize, end: usize) -> Option<Vec<usize>> {
+/// allocation the title has not committed yet) has no writes. Returns
+/// `(all_watched, reset_dirty_pages)` so even when a later allocation is not
+/// write-watched (`all_watched == false`), any dirty pages already reset by
+/// earlier allocations are returned and recorded rather than lost.
+fn by_allocation(start: usize, end: usize) -> (bool, Vec<usize>) {
     use windows_sys::Win32::System::Memory::{
         GetWriteWatch, MEM_COMMIT, MEM_FREE, MEM_MAPPED, MEMORY_BASIC_INFORMATION, VirtualQuery,
     };
@@ -1415,18 +1687,28 @@ fn by_allocation(start: usize, end: usize) -> Option<Vec<usize>> {
     };
     let (mut pages, mut at, mut allocations, mut any) = (Vec::new(), start, 0, false);
     while at < end {
-        let info = query(at)?;
+        let Some(info) = query(at) else {
+            pages.sort_unstable();
+            pages.dedup();
+            return (false, pages);
+        };
         // A committed section view cannot belong to a MEM_WRITE_WATCH
         // reservation. Its other protection regions need no further queries.
         if info.State == MEM_COMMIT && info.Type == MEM_MAPPED {
-            return None;
+            pages.sort_unstable();
+            pages.dedup();
+            return (false, pages);
         }
         let base = info.AllocationBase as usize;
         let mut committed = info.State == MEM_COMMIT;
         let mut to = (info.BaseAddress as usize + info.RegionSize).min(end);
         // The rest of the allocation's regions in the range.
         while info.State != MEM_FREE && to < end {
-            let next = query(to)?;
+            let Some(next) = query(to) else {
+                pages.sort_unstable();
+                pages.dedup();
+                return (false, pages);
+            };
             if next.State == MEM_FREE || next.AllocationBase as usize != base {
                 break;
             }
@@ -1458,12 +1740,16 @@ fn by_allocation(start: usize, end: usize) -> Option<Vec<usize>> {
                 true
             });
             if !ok {
-                return None;
+                pages.sort_unstable();
+                pages.dedup();
+                return (false, pages);
             }
         }
         at = to;
     }
-    (allocations > 1 || !any).then_some(pages)
+    pages.sort_unstable();
+    pages.dedup();
+    (allocations > 1 || !any, pages)
 }
 
 // ---------------------------------------------------------------------------
@@ -1592,9 +1878,9 @@ static GUARD_SHARDS_TABLE: [GuardShardSlot; GUARD_SHARDS] = [const {
 /// write lock.
 static ANNOUNCED_SHARD_MASK: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 
-/// Monotonic counter incremented on every [`kernel_will_write`] so [`ask_once`]
-/// can detect a concurrent announcement that started and finished while
-/// `GetWriteWatch` was running.
+/// Monotonic counter incremented on every [`kernel_will_write`] and
+/// [`title_memory_remapped`] so [`ask_once`] can detect a concurrent
+/// announcement or remap that landed while `GetWriteWatch` was running.
 static ANNOUNCED_SEQ: AtomicU64 = AtomicU64::new(0);
 
 #[inline]
@@ -1833,52 +2119,86 @@ fn known_view(start: usize) -> bool {
 
 /// For view memory: the pages of `[start, end)`'s blocks written since
 /// they were last guarded (all of a block's pages), guarding them again
-/// before the caller copies them. `None` if the range contains no mapped view
-/// (or contains committed non-view memory).
-fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
+/// before the caller copies them, and publishing their dirty epochs into
+/// [`DIR`] strictly before any block becomes visible as clean. Returns
+/// `(published_epoch, written_pages)` where `published_epoch == 0` when every
+/// block was already clean, or `None` if the range contains no mapped view (or
+/// contains committed non-view memory, or VEH installation failed).
+fn guard_and_publish(start: usize, end: usize) -> Option<(u64, Vec<usize>)> {
     let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
     // Every block in `GuardClean` is also in `GuardProtected` (previously
     // verified as mapped view memory and still read-only). When the entire
     // range is clean, skip both the kernel query and shard locks.
     if guard_bits_fast_enabled() && DIR.all_guard_clean(first, last) {
-        return Some(Vec::new());
+        return Some((0, Vec::new()));
     }
     if !known_view(start) && !has_mapped(start, end) {
         return None;
     }
-    install();
+    if !install() {
+        return None;
+    }
+    let mut written = Vec::new();
+    let mut max_epoch = 0u64;
+    let mut dirty_shards = 0usize;
     if guard_bits_fast_enabled() {
         let runs = DIR.collect_clear_runs(first, last, BitField::GuardClean);
-        let mut written = Vec::new();
         if runs.is_empty() {
-            return Some(written);
+            return Some((0, written));
         }
         // Split each run at guard-shard boundaries so each pass locks only 1
         // shard and unrelated workers / title write faults never contend.
         for (from, to) in runs {
             for_each_shard_run(from, to, |shard, s_from, s_to| {
-                guard_run_shard(shard, s_from, s_to, &mut written);
+                let ep = guard_run_shard(shard, s_from, s_to, &mut written);
+                if ep != 0 {
+                    max_epoch = max_epoch.max(ep);
+                    dirty_shards += 1;
+                }
             });
         }
-        return Some(written);
+    } else {
+        for_each_shard_run(first, last, |shard, s_from, s_to| {
+            let ep = guard_run_shard(shard, s_from, s_to, &mut written);
+            if ep != 0 {
+                max_epoch = max_epoch.max(ep);
+                dirty_shards += 1;
+            }
+        });
     }
-    let mut written = Vec::new();
-    for_each_shard_run(first, last, |shard, s_from, s_to| {
-        guard_run_shard(shard, s_from, s_to, &mut written);
-    });
-    Some(written)
+    if dirty_shards > 1 {
+        // Each dirty shard already published its pages before marking them
+        // clean, so concurrent readers could never miss a write; unify all
+        // pages reported by this call under one asking epoch.
+        max_epoch = DIR.publish_written(&written);
+    }
+    Some((max_epoch, written))
 }
 
-/// [`guard`] for a shard-local sub-run `first..last` where every block maps to
-/// `shard`. Locks only `shard`.
-fn guard_run_shard(shard: usize, first: usize, last: usize, written: &mut Vec<usize>) {
+/// Test-facing wrapper around [`guard_and_publish`] returning only the dirty
+/// pages of `[start, end)`.
+#[cfg(test)]
+fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
+    guard_and_publish(start, end).map(|(_, written)| written)
+}
+
+/// [`guard_and_publish`] for a shard-local sub-run `first..last` where every
+/// block maps to `shard`. Locks only `shard`, publishes dirty records into
+/// [`DIR`] strictly before making blocks visible as clean/protected/absent,
+/// and returns the published epoch (or `0` when all blocks were already clean).
+fn guard_run_shard(shard: usize, first: usize, last: usize, written: &mut Vec<usize>) -> u64 {
+    use windows_sys::Win32::System::Memory::PAGE_READONLY;
     if first >= last {
-        return;
+        return 0;
     }
     let g = guard_shard(shard);
     let access = SingleShard { shard, guard: &g };
     let mut run: Option<usize> = None;
     let mut uncommitted_until = first;
+    let mut shard_written: Vec<usize> = Vec::new();
+    let mut alias_clean: Vec<usize> = Vec::new();
+    let mut newly_protected: Vec<(usize, usize)> = Vec::new();
+    let mut newly_absent: Vec<(usize, usize)> = Vec::new();
     for block in first..=last {
         let is_clean = block < last && DIR.is_guard_clean(block);
         let mut open = block < last && !is_clean;
@@ -1892,22 +2212,63 @@ fn guard_run_shard(shard: usize, first: usize, last: usize, written: &mut Vec<us
             }
         }
         if open {
-            written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
+            shard_written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
             if g.announced(block) {
                 // Announced kernel write still to land: leave open, reported
                 // written at every check until `kernel_wrote`.
             } else if DIR.is_guard_protected(block) {
                 // Written through the runtime (`mapped_pages_written`), still read-only.
-                DIR.set_bit(block, BitField::GuardClean, true, Ordering::SeqCst);
+                // Defer marking `GuardClean` until after dirty epochs are published.
+                alias_clean.push(block);
             } else {
                 run.get_or_insert(block);
                 continue;
             }
         }
         if let Some(from) = run.take() {
-            protect_here(&access, from, block);
+            debug_assert_range_locked(&access, from, block);
+            virtual_protect_adaptive(
+                from,
+                block,
+                PAGE_READONLY,
+                true,
+                &mut |ok_from, ok_to| newly_protected.push((ok_from, ok_to)),
+                &mut |abs_from, abs_to| newly_absent.push((abs_from, abs_to)),
+                &mut |_| {},
+            );
         }
     }
+    if shard_written.is_empty() {
+        return 0;
+    }
+    // Publish dirty records strictly before making any block visible as
+    // `GuardClean`, `GuardProtected`, or `GuardAbsent` so lock-free readers
+    // never observe a clean block ahead of its write record.
+    let epoch = DIR.publish_written(&shard_written);
+    for block in alias_clean {
+        DIR.set_bit(block, BitField::GuardClean, true, Ordering::SeqCst);
+    }
+    for (ok_from, ok_to) in newly_protected {
+        DIR.set_bits_range(
+            ok_from,
+            ok_to,
+            BitField::GuardProtected,
+            true,
+            Ordering::SeqCst,
+        );
+        DIR.set_bits_range(ok_from, ok_to, BitField::GuardClean, true, Ordering::SeqCst);
+    }
+    for (abs_from, abs_to) in newly_absent {
+        DIR.set_bits_range(
+            abs_from,
+            abs_to,
+            BitField::GuardAbsent,
+            true,
+            Ordering::SeqCst,
+        );
+    }
+    written.extend_from_slice(&shard_written);
+    epoch
 }
 
 /// Whether `[start, end)` contains a mapped view and no committed non-view
@@ -1996,9 +2357,10 @@ fn mapped(at: usize) -> bool {
 }
 
 /// Shared adaptive `VirtualProtect` coalescer over `[from, to)` blocks.
-/// Calls `VirtualProtect` on the whole range first; on failure, skips
-/// uncommitted placeholder runs (when `check_absent` is true) and bisects
-/// (or falls back per-block when `coalesce_enabled()` is false).
+/// When `coalesce_enabled()` is false, changes protection block by block;
+/// otherwise calls `VirtualProtect` on the whole range first and on failure
+/// skips uncommitted placeholder runs (when `check_absent` is true) and
+/// bisects.
 fn virtual_protect_adaptive(
     from: usize,
     to: usize,
@@ -2013,19 +2375,6 @@ fn virtual_protect_adaptive(
         return;
     }
     let mut old = 0u32;
-    // SAFETY: title memory block range; only protection changes.
-    if unsafe {
-        VirtualProtect(
-            (from * BLOCK) as *const _,
-            (to - from) * BLOCK,
-            prot,
-            &mut old,
-        )
-    } != 0
-    {
-        on_ok(from, to);
-        return;
-    }
     if !coalesce_enabled() {
         for block in from..to {
             // SAFETY: single block protection change.
@@ -2037,6 +2386,19 @@ fn virtual_protect_adaptive(
                 on_err(block);
             }
         }
+        return;
+    }
+    // SAFETY: title memory block range; only protection changes.
+    if unsafe {
+        VirtualProtect(
+            (from * BLOCK) as *const _,
+            (to - from) * BLOCK,
+            prot,
+            &mut old,
+        )
+    } != 0
+    {
+        on_ok(from, to);
         return;
     }
     if to - from == 1 {
@@ -2075,39 +2437,6 @@ fn protect_block_runs(blocks: &[usize], prot: u32) {
             &mut |_| {},
         );
     });
-}
-
-/// Makes blocks `[from, to)` read-only and notes them guarded and clean;
-/// skips uncommitted placeholder runs and marks them `GuardAbsent`.
-fn protect_here(access: &impl ShardAccess, from: usize, to: usize) {
-    use windows_sys::Win32::System::Memory::PAGE_READONLY;
-    debug_assert_range_locked(access, from, to);
-    virtual_protect_adaptive(
-        from,
-        to,
-        PAGE_READONLY,
-        true,
-        &mut |ok_from, ok_to| {
-            DIR.set_bits_range(
-                ok_from,
-                ok_to,
-                BitField::GuardProtected,
-                true,
-                Ordering::SeqCst,
-            );
-            DIR.set_bits_range(ok_from, ok_to, BitField::GuardClean, true, Ordering::SeqCst);
-        },
-        &mut |abs_from, abs_to| {
-            DIR.set_bits_range(
-                abs_from,
-                abs_to,
-                BitField::GuardAbsent,
-                true,
-                Ordering::SeqCst,
-            );
-        },
-        &mut |_| {},
-    );
 }
 
 /// The end (exclusive) of the whole uncommitted blocks starting at `block`.
@@ -2272,6 +2601,12 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     if !to_restore.is_empty() {
         protect_block_runs(&to_restore, PAGE_READWRITE);
     }
+    // Invalidate any `ask_once` ahead coverage overlapping the remapped range
+    // and bump `ANNOUNCED_SEQ` so a concurrent `ask_once` batch discards stale
+    // pre-remap coverage. Lock order: `GUARD_SHARDS_TABLE` -> `AHEAD` (leaf).
+    ANNOUNCED_SEQ.fetch_add(1, Ordering::SeqCst);
+    let mut ahead = AHEAD.write().unwrap_or_else(|e| e.into_inner());
+    ahead.forget_ahead((first, end));
 }
 
 /// Coordinates in-place CPU reads of title memory with mapping changes.
@@ -2470,8 +2805,7 @@ fn open_cold_ro(access: &impl ShardAccess, at: usize) -> bool {
     if !DIR.is_cold_ro(block) {
         return false;
     }
-    let now = next_epoch();
-    DIR.record_written(block, now);
+    let _now = DIR.publish_written(&[block]);
     DIR.set_bit(block, BitField::ColdRo, false, Ordering::SeqCst);
     DIR.reset_cold(block, current_frame32());
     let mut old = 0u32;
@@ -2480,8 +2814,9 @@ fn open_cold_ro(access: &impl ShardAccess, at: usize) -> bool {
 }
 
 /// Registers the handler that takes writes to guarded and cold-promoted blocks,
-/// once, ahead of the crash reporter's.
-fn install() {
+/// once, ahead of the crash reporter's. Returns `true` if handler registration
+/// succeeded; callers must not make pages `PAGE_READONLY` if this returns `false`.
+fn install() -> bool {
     use windows_sys::Win32::Foundation::{EXCEPTION_ACCESS_VIOLATION, NTSTATUS};
     use windows_sys::Win32::System::Diagnostics::Debug::{
         AddVectoredExceptionHandler, EXCEPTION_CONTINUE_EXECUTION, EXCEPTION_CONTINUE_SEARCH,
@@ -2527,11 +2862,11 @@ fn install() {
             EXCEPTION_CONTINUE_SEARCH
         }
     }
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    // SAFETY: the handler only touches our guard state and protections.
-    ONCE.call_once(|| unsafe {
-        AddVectoredExceptionHandler(1, Some(on_write));
-    });
+    static INSTALLED: OnceLock<bool> = OnceLock::new();
+    *INSTALLED.get_or_init(|| {
+        // SAFETY: the handler only touches our guard state and protections.
+        unsafe { !AddVectoredExceptionHandler(1, Some(on_write)).is_null() }
+    })
 }
 
 /// Whether `at` is committed read-write memory now.
@@ -2750,6 +3085,7 @@ mod tests {
     /// lands and the block counts as written.
     #[test]
     fn kernel_reads_into_guarded_blocks_after_opening() {
+        let _serial = JOURNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         use std::io::{Read, Seek, Write};
         use windows_sys::Win32::Foundation::CloseHandle;
         use windows_sys::Win32::System::Memory::{
@@ -2820,6 +3156,7 @@ mod tests {
     /// read-protected.
     #[test]
     fn guard_handles_unmapped_prefix_and_rejects_committed_private_prefix() {
+        let _serial = JOURNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         use windows_sys::Win32::Foundation::CloseHandle;
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFileEx,
@@ -2926,6 +3263,7 @@ mod tests {
     /// to overflow. Up there no test has guarded blocks.
     #[test]
     fn ranges_past_the_address_space_end_do_not_overflow() {
+        let _serial = JOURNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let top = usize::MAX - 16;
         writing(top, PAGE);
         title_memory_remapped(top, usize::MAX);
@@ -2936,6 +3274,7 @@ mod tests {
     /// whole address space), and landing it leaves nothing announced.
     #[test]
     fn a_saturated_kernel_read_is_announced_in_one_step() {
+        let _serial = JOURNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Kernel half of the address space: no user allocation of another
         // test running at the same time can fall in the announced range.
         let at = 0xFFFF_8000_0000_0000;
@@ -2955,6 +3294,7 @@ mod tests {
     /// into one buffer) is one counted entry, and a remap over it drops it.
     #[test]
     fn repeated_announcements_are_counted_and_a_remap_drops_them() {
+        let _serial = JOURNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let at = 0xFFFF_9000_0000_0000;
         let range = (at / BLOCK, (at + BLOCK).div_ceil(BLOCK));
         let s = shard_of(at / BLOCK);
@@ -2973,6 +3313,7 @@ mod tests {
     /// the next refresh guards its block again.
     #[test]
     fn an_announced_kernel_read_survives_a_refresh_before_it() {
+        let _serial = JOURNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         use std::io::{Read, Seek, Write};
         use windows_sys::Win32::Foundation::CloseHandle;
         use windows_sys::Win32::System::Memory::{
@@ -3139,6 +3480,7 @@ mod tests {
 
     #[test]
     fn guard_clean_fast_path_returns_empty_and_still_detects_faults() {
+        let _serial = JOURNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         use windows_sys::Win32::Foundation::CloseHandle;
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
@@ -3181,6 +3523,7 @@ mod tests {
 
     #[test]
     fn writes_in_partly_committed_view_blocks_are_reported() {
+        let _serial = JOURNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
@@ -3241,6 +3584,7 @@ mod tests {
     /// again (they cannot be guarded) until the runtime maps them.
     #[test]
     fn unmapped_blocks_are_reported_once_until_mapped() {
+        let _serial = JOURNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         use windows_sys::Win32::Foundation::CloseHandle;
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, MEM_PRESERVE_PLACEHOLDER, MEM_REPLACE_PLACEHOLDER,
@@ -3332,10 +3676,12 @@ mod tests {
         struct ViewGuard {
             section: HANDLE,
             view_p: usize,
+            pages: usize,
         }
         impl Drop for ViewGuard {
             fn drop(&mut self) {
-                title_memory_remapped(self.view_p, PAGE);
+                title_memory_remapped(self.view_p, self.pages * PAGE);
+                DIR.clear_written_range(self.view_p / PAGE, self.view_p / PAGE + self.pages);
                 // SAFETY: clean up view and section owned by this test.
                 unsafe {
                     UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
@@ -3349,20 +3695,27 @@ mod tests {
         let _serial = JOURNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let alloc = WatchedAllocGuard::new(1);
         let priv_p = alloc.base;
-        // SAFETY: fresh pagefile section view.
+        // Reserve and map two pages so both the primary page and the alias page
+        // tested via `wrote_own` belong to this fixture.
+        // SAFETY: fresh 2-page pagefile section view.
         let view_guard = unsafe {
             let section = CreateFileMappingW(
                 INVALID_HANDLE_VALUE,
                 std::ptr::null(),
                 PAGE_READWRITE,
                 0,
-                PAGE as u32,
+                (2 * PAGE) as u32,
                 std::ptr::null(),
             );
             assert!(!section.is_null());
-            let view_p = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, PAGE).Value as usize;
+            let view_p = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 2 * PAGE).Value as usize;
             assert_ne!(view_p, 0);
-            ViewGuard { section, view_p }
+            DIR.clear_written_range(view_p / PAGE, view_p / PAGE + 2);
+            ViewGuard {
+                section,
+                view_p,
+                pages: 2,
+            }
         };
         let view_p = view_guard.view_p;
 
@@ -3390,10 +3743,14 @@ mod tests {
         );
         drop(ask_guard);
 
-        // `wrote_own` records both the page and its aliases in `PageDir`.
+        // `wrote_own` records both the page and its fixture-owned alias in `PageDir`.
         let (before, own_now) = wrote_own(view_p / PAGE, &[view_p / PAGE + 1]);
         assert!(own_now > before);
-        DIR.clear_written_range(view_p / PAGE, view_p / PAGE + 2);
+        let (entries, _) = DIR.collect_written(view_p / PAGE, view_p / PAGE + 2);
+        assert_eq!(
+            entries,
+            vec![(view_p / PAGE, own_now), (view_p / PAGE + 1, own_now)]
+        );
     }
 
     #[test]
@@ -3510,6 +3867,7 @@ mod tests {
 
     #[test]
     fn coalesced_virtual_protect_handles_mixed_views_and_holes() {
+        let _serial = JOURNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         use windows_sys::Win32::Foundation::CloseHandle;
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, MEM_PRESERVE_PLACEHOLDER, MEM_REPLACE_PLACEHOLDER,
@@ -3826,6 +4184,321 @@ mod tests {
         assert_eq!(guard(one, one + SIZE), Some(Vec::new()));
         assert!(guard(two, two + SIZE).is_some());
         assert_eq!(guard(two, two + SIZE), Some(Vec::new()));
+    }
+
+    #[test]
+    fn cold_promotion_skips_readonly_and_mixed_protection_blocks() {
+        use windows_sys::Win32::System::Memory::{
+            MEMORY_BASIC_INFORMATION, PAGE_NOACCESS, PAGE_READONLY, VirtualProtect, VirtualQuery,
+        };
+        let _serial = JOURNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let threshold = cold_after();
+        if threshold == 0 {
+            return;
+        }
+        let alloc = WatchedAllocGuard::new(3);
+        let base = alloc.base;
+        let mut old = 0u32;
+
+        // Block 0: all PAGE_READONLY; Block 1: mixed PAGE_READWRITE + PAGE_NOACCESS;
+        // Block 2: ordinary all-PAGE_READWRITE control block.
+        // SAFETY: committed pages owned by `alloc`.
+        unsafe {
+            assert_ne!(
+                VirtualProtect(base as *const _, PAGE, PAGE_READONLY, &mut old),
+                0
+            );
+            assert_ne!(
+                VirtualProtect(
+                    (base + PAGE + KERNEL_PAGE) as *const _,
+                    KERNEL_PAGE,
+                    PAGE_NOACCESS,
+                    &mut old,
+                ),
+                0
+            );
+        }
+
+        // Baseline reset and `threshold` clean frames.
+        assert!(writes(base, base + 3 * PAGE, false).is_some());
+        let mut token = 0u64;
+        for _ in 0..threshold {
+            let _ = crate::frame::wait(std::ptr::null(), 0, 0, std::ptr::null(), 2, &mut token);
+            assert!(writes(base, base + 3 * PAGE, false).is_some());
+        }
+
+        assert!(
+            !DIR.is_cold_ro(base / PAGE),
+            "read-only watched block must not be cold-promoted"
+        );
+        assert!(
+            !DIR.is_cold_ro(base / PAGE + 1),
+            "mixed-protection watched block must not be cold-promoted"
+        );
+        assert!(
+            DIR.is_cold_ro(base / PAGE + 2),
+            "plain PAGE_READWRITE block should still promote"
+        );
+
+        let query_prot = |at: usize| {
+            let mut info = MEMORY_BASIC_INFORMATION::default();
+            // SAFETY: metadata query on `alloc`.
+            let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+            assert_ne!(n, 0);
+            info.Protect
+        };
+        assert_eq!(query_prot(base), PAGE_READONLY);
+        assert_eq!(query_prot(base + PAGE), PAGE_READWRITE);
+        assert_eq!(query_prot(base + PAGE + KERNEL_PAGE), PAGE_NOACCESS);
+    }
+
+    #[test]
+    fn title_memory_remapped_invalidates_ahead_coverage() {
+        let _serial = JOURNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let alloc = WatchedAllocGuard::new(2);
+        let base = alloc.base;
+        assert!(writes(base, base + 2 * PAGE, false).is_some());
+
+        let _ask = AskOnceGuard;
+        ask_once(&[(base, base + 2 * PAGE)]);
+        let (before, _) = asked(base, base + PAGE).expect("covered by ask_once");
+
+        title_memory_remapped(base, PAGE);
+        assert!(
+            asked(base, base + PAGE).is_none(),
+            "remap must drop overlapping ahead coverage"
+        );
+
+        // SAFETY: committed write-watched page owned by `alloc`.
+        unsafe { ((base + 16) as *mut u8).write_volatile(0x33) };
+        let (after, found) = writes(base, base + PAGE, false).expect("watched");
+        assert!(after > before);
+        assert!(
+            found.iter().any(|&(p, w)| p == base / PAGE && w > before),
+            "post-remap write must be observed immediately"
+        );
+    }
+
+    #[test]
+    fn writes_preserves_reset_dirty_watched_block_when_later_run_fails() {
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFileEx,
+            PAGE_NOACCESS, UnmapViewOfFile,
+        };
+        let _serial = JOURNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        // Build adjacent [2-page MEM_WRITE_WATCH | 1-page mapped view].
+        // SAFETY: 1-page pagefile section.
+        let section = unsafe {
+            CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                PAGE as u32,
+                std::ptr::null(),
+            )
+        };
+        assert!(!section.is_null());
+
+        let mut pair = None;
+        for _ in 0..32 {
+            // SAFETY: probe for a free 3-page region.
+            let probe =
+                unsafe { VirtualAlloc(std::ptr::null(), 3 * PAGE, MEM_RESERVE, PAGE_NOACCESS) }
+                    as usize;
+            assert_ne!(probe, 0);
+            // SAFETY: release probe immediately.
+            assert_ne!(unsafe { VirtualFree(probe as *mut _, 0, MEM_RELEASE) }, 0);
+            // SAFETY: allocate 2 write-watched pages at `probe`.
+            let watched = unsafe {
+                VirtualAlloc(
+                    probe as *const _,
+                    2 * PAGE,
+                    MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                    PAGE_READWRITE,
+                )
+            } as usize;
+            if watched != probe {
+                if watched != 0 {
+                    // SAFETY: release our allocation.
+                    unsafe { VirtualFree(watched as *mut _, 0, MEM_RELEASE) };
+                }
+                continue;
+            }
+            // SAFETY: map 1-page section immediately after `watched`.
+            let view = unsafe {
+                MapViewOfFileEx(
+                    section,
+                    FILE_MAP_WRITE,
+                    0,
+                    0,
+                    PAGE,
+                    (probe + 2 * PAGE) as *const _,
+                )
+                .Value as usize
+            };
+            if view == probe + 2 * PAGE {
+                pair = Some((watched, view));
+                break;
+            }
+            if view != 0 {
+                // SAFETY: unmap our view.
+                unsafe {
+                    UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
+                        Value: view as *mut _,
+                    });
+                }
+            }
+            // SAFETY: release our allocation.
+            unsafe { VirtualFree(watched as *mut _, 0, MEM_RELEASE) };
+        }
+        let (watched, view) = pair.expect("allocate adjacent watched pages + mapped view");
+        DIR.clear_written_range(watched / PAGE, watched / PAGE + 3);
+
+        // Baseline clean; if cold promotion is active, promote block 1 to ColdRo
+        // so `[watched..view+PAGE)` splits into two non-cold runs around it.
+        assert!(writes(watched, watched + 2 * PAGE, false).is_some());
+        let threshold = cold_after();
+        if threshold > 0 {
+            let mut token = 0u64;
+            for _ in 0..threshold {
+                let _ = crate::frame::wait(std::ptr::null(), 0, 0, std::ptr::null(), 2, &mut token);
+                assert!(writes(watched + PAGE, watched + 2 * PAGE, false).is_some());
+            }
+            assert!(DIR.is_cold_ro(watched / PAGE + 1));
+        }
+
+        let (before, _) = writes(watched, watched + PAGE, false).expect("watched baseline");
+        // Dirty block 0 (non-cold watched), then query across `[watched, view + PAGE)`
+        // which resets block 0 and then fails on the mapped tail.
+        // SAFETY: committed write-watched page owned by this test.
+        unsafe { ((watched + 8) as *mut u8).write_volatile(0x5a) };
+        assert!(
+            writes(watched, view + PAGE, false).is_none(),
+            "range ending in mapped view is not write-watched"
+        );
+
+        // A follow-up query for just the watched block MUST still see the write
+        // whose kernel bit was already reset above.
+        let (after, found) = writes(watched, watched + PAGE, false).expect("watched");
+        assert!(after > before);
+        assert!(
+            found
+                .iter()
+                .any(|&(p, w)| p == watched / PAGE && w > before),
+            "dirty watched block reset before a failing run must not be lost"
+        );
+
+        // Also verify `ask_once` over a spanning `[watched | unguarded mapped]`
+        // range skips the mapped view cleanly and still covers the private part.
+        // SAFETY: committed write-watched page owned by this test.
+        unsafe { ((watched + 12) as *mut u8).write_volatile(0x6b) };
+        let _ask = AskOnceGuard;
+        ask_once(&[(watched, view + PAGE)]);
+        let (ask_now, ask_found) =
+            asked(watched, watched + PAGE).expect("private prefix covered by ask_once");
+        assert!(
+            ask_found
+                .iter()
+                .any(|&(p, w)| p == watched / PAGE && w == ask_now),
+            "private write must be reported even when spanning an unguarded mapped view"
+        );
+        assert!(
+            asked(view, view + PAGE).is_none(),
+            "unguarded mapped view must not be claimed as ahead-covered"
+        );
+        drop(_ask);
+
+        title_memory_remapped(watched, 3 * PAGE);
+        DIR.clear_written_range(watched / PAGE, watched / PAGE + 3);
+        // SAFETY: clean up our view, section, and watched allocation.
+        unsafe {
+            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
+                Value: view as *mut _,
+            });
+            CloseHandle(section);
+            VirtualFree(watched as *mut _, 0, MEM_RELEASE);
+        }
+    }
+
+    #[test]
+    fn mapped_pages_written_concurrent_readers_never_skip_alias_write() {
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
+            UnmapViewOfFile,
+        };
+        let _serial = JOURNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        const SIZE: usize = 2 * BLOCK;
+        // SAFETY: 2-block pagefile section mapped read-write.
+        let view = unsafe {
+            let section = CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                SIZE as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            let v = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, SIZE).Value as usize;
+            CloseHandle(section);
+            v
+        };
+        assert_ne!(view, 0);
+        DIR.clear_written_range(view / PAGE, view / PAGE + 2);
+        let _ = writes(view, view + SIZE, true).expect("guard view");
+
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let mut readers = Vec::new();
+        for _ in 0..2 {
+            let stop = stop.clone();
+            readers.push(std::thread::spawn(move || {
+                let mut last_watch = 0u64;
+                while !stop.load(Ordering::Acquire) {
+                    let (now, list) = writes(view, view + SIZE, true).expect("guarded");
+                    for &(_, w) in &list {
+                        assert!(w <= now, "returned watermark must cover all reported pages");
+                    }
+                    last_watch = now;
+                }
+                last_watch
+            }));
+        }
+
+        for _ in 0..500 {
+            mapped_pages_written([view, view + BLOCK].into_iter());
+            std::thread::yield_now();
+        }
+        stop.store(true, Ordering::Release);
+        let saved: Vec<u64> = readers.into_iter().map(|h| h.join().unwrap()).collect();
+
+        // Publish one final alias write after all concurrent readers stopped,
+        // and verify every reader's saved watermark is strictly below it.
+        mapped_pages_written(std::iter::once(view + BLOCK));
+        let (final_now, final_list) = writes(view, view + SIZE, true).expect("final guarded");
+        let page1_epoch = final_list
+            .iter()
+            .find(|&&(p, _)| p == view / PAGE + 1)
+            .map(|&(_, w)| w)
+            .expect("page 1 written");
+        for prev in saved {
+            assert!(
+                page1_epoch > prev && page1_epoch <= final_now,
+                "saved watermark {prev} must not skip subsequent alias write {page1_epoch}"
+            );
+        }
+
+        title_memory_remapped(view, SIZE);
+        DIR.clear_written_range(view / PAGE, view / PAGE + 2);
+        // SAFETY: unmap view owned by this test.
+        unsafe {
+            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
+                Value: view as *mut _,
+            });
+        }
     }
 }
 
