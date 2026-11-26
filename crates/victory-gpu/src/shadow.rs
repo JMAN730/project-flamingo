@@ -346,8 +346,9 @@ impl Shadow {
         address - self.start
     }
 
-    /// `len` bytes at a title address from the host copy, for the log: the
-    /// bytes the copy holds, as of its last refresh (None outside the buffer).
+    /// `len` bytes at a title address from the host copy: the bytes the copy
+    /// holds, as of its last refresh (None outside the buffer). Tests only.
+    #[cfg(test)]
     pub(crate) fn bytes(&self, address: u64, len: u64) -> Option<&[u8]> {
         if address < self.start || len == 0 || len > self.left(address) {
             return None;
@@ -1126,32 +1127,6 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
         )));
     }
     entry.shadow.clone()
-}
-
-/// The copy of the innermost title buffer holding `[address, address +
-/// len)`, if one has already been made: the same lookup as [`find`] without
-/// making a copy, for paths that must not allocate one.
-pub(crate) fn peek(address: u64, len: u64) -> Option<Arc<Shadow>> {
-    let end = address.checked_add(len.max(1))?;
-    let map = BUFFERS.read().unwrap_or_else(|e| e.into_inner());
-    let shadow = map
-        .range(..=(address, usize::MAX))
-        .rev()
-        .take(64)
-        .find(|(_, e)| e.end >= end)
-        .and_then(|(_, e)| e.shadow.clone());
-    if shadow.is_some() {
-        return shadow;
-    }
-    drop(map);
-    let start = address & !(WINDOW - 1);
-    let len = end.next_multiple_of(WINDOW) - start;
-    LOOSE
-        .read()
-        .unwrap_or_else(|e| e.into_inner())
-        .entries
-        .get(&(start, len))
-        .cloned()
 }
 
 /// Titles also use memory outside any buffer object as GPU memory (from their
