@@ -872,7 +872,7 @@ pub(super) fn blocked_ranges(
                         return Some(WHY_READ);
                     }
                 }
-                Step::Texture(staging) => {
+                Step::Texture(staging, _) => {
                     let (start, end) = staging.memory_range();
                     if touches(written, start, end) {
                         if count {
