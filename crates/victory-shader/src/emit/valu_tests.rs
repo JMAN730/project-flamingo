@@ -2018,6 +2018,70 @@ fn sums_of_absolute_differences() {
     }
 }
 
+/// The CPU model of the integer dot products: `c` plus the products of
+/// `a` and `b`'s fields of `width` bits, sign- or zero-extended, wrapping.
+fn dot(a: u32, b: u32, c: u32, width: u32, signed: bool) -> u32 {
+    let field = |x: u32, n: u32| {
+        if signed {
+            (((x << (32 - width * (n + 1))) as i32) >> (32 - width)) as u32
+        } else {
+            x >> (width * n) & ((1u64 << width) - 1) as u32
+        }
+    };
+    (0..32 / width).fold(c, |s, n| {
+        s.wrapping_add(field(a, n).wrapping_mul(field(b, n)))
+    })
+}
+
+#[test]
+fn dot_model_follows_the_isa() {
+    // 1*5 + 2*6 + 3*7 + 4*8 = 70.
+    assert_eq!(dot(0x0403_0201, 0x0807_0605, 0, 8, false), 70);
+    // Every byte -1 times 2: -8, plus 10.
+    assert_eq!(dot(0xFFFF_FFFF, 0x0202_0202, 10, 8, true), 2);
+    // Unsigned, the same bytes are 255: 4 * 510.
+    assert_eq!(dot(0xFFFF_FFFF, 0x0202_0202, 0, 8, false), 2040);
+    // -32768 * -32768 twice is 2^31: it wraps.
+    assert_eq!(dot(0x8000_8000, 0x8000_8000, 0, 16, true), 0x8000_0000);
+    // Nibbles: 8 * (-8 * -8) = 512; unsigned 8 * 64 the same.
+    assert_eq!(dot(0x8888_8888, 0x8888_8888, 0, 4, true), 512);
+    assert_eq!(dot(0xFFFF_FFFF, 0x7777_7777, 100, 4, true), 44);
+    assert_eq!(dot(0xFFFF_FFFF, 0x7777_7777, 100, 4, false), 100 + 8 * 105);
+}
+
+/// `v_dot2_{i32_i16,u32_u16}`, `v_dot4_{i32_i8,u32_u8}` and
+/// `v_dot8_{i32_i4,u32_u4}` with op_sel_hi as assemblers write it.
+#[test]
+fn integer_dot_products() {
+    let inputs: Vec<[u32; 4]> = vec![
+        [0, 0, 0, 0],
+        [0x0403_0201, 0x0807_0605, 7, 0],
+        [0xFFFF_FFFF, 0x0202_0202, 10, 0],
+        [0x8000_8000, 0x8000_8000, 0x7FFF_FFFF, 0],
+        [0x8888_8888, 0x7777_7777, 0xFFFF_FF00, 0],
+        [0x1234_5678, 0x9ABC_DEF0, 0x0BAD_F00D, 0],
+    ];
+    for (op, width, signed, what) in [
+        (0x14, 16, true, "v_dot2_i32_i16"),
+        (0x15, 16, false, "v_dot2_u32_u16"),
+        (0x16, 8, true, "v_dot4_i32_i8"),
+        (0x17, 8, false, "v_dot4_u32_u8"),
+        (0x18, 4, true, "v_dot8_i32_i4"),
+        (0x19, 4, false, "v_dot8_u32_u4"),
+    ] {
+        let [w0, w1] = vop3p(op, 0, vgpr(1), vgpr(2), vgpr(3));
+        // op_sel_hi:[1,1,1]
+        let shader = build_valu_cs(&[w0 | 1 << 14, w1 | 3 << 27]);
+        run_cases(&shader, &inputs, |backend, i, x, got| {
+            let want = dot(x[0], x[1], x[2], width, signed);
+            assert_eq!(
+                got, want,
+                "{backend}: {what} case {i}: {got:#010x}, want {want:#010x}"
+            );
+        });
+    }
+}
+
 /// `v_mad_u32_u16` / `v_mad_i32_i16` (op_sel halves) and `v_lerp_u8` (#405).
 #[test]
 fn mad_u32_u16_i32_i16_and_lerp_u8() {

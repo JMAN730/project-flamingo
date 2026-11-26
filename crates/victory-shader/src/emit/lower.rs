@@ -8096,6 +8096,54 @@ impl<'a> Lower<'a> {
                 }
                 self.s.m.bin(c, Bin::Add, sum, d)
             }
+            // VOP3P integer dot products: src0 and src1 hold packed fields of
+            // 16, 8 or 4 bits, src2 is a 32-bit accumulator, and the sum of the
+            // field products and the accumulator wraps at 32 bits (RDNA2 ISA).
+            // shortcut: only the form assemblers write (op_sel 0, op_sel_hi
+            // all set, no neg, register sources); `clamp` is refused by
+            // `write_i`.
+            "v_dot2_i32_i16" | "v_dot2_u32_u16" | "v_dot4_i32_i8" | "v_dot4_u32_u8"
+            | "v_dot8_i32_i4" | "v_dot8_u32_u4" => {
+                let Fields::Valu(v) = &inst.fields else {
+                    unreachable!()
+                };
+                if v.opsel != 0 || v.opsel_hi != 7 || v.neg_hi != 0 {
+                    return Err("a dot product's operand modifiers");
+                }
+                if v.src
+                    .iter()
+                    .take(2)
+                    .any(|o| !matches!(o, Operand::Vector { .. } | Operand::Scalar { .. }))
+                {
+                    return Err("a dot product of constants");
+                }
+                let width: u32 = match name {
+                    "v_dot2_i32_i16" | "v_dot2_u32_u16" => 16,
+                    "v_dot4_i32_i8" | "v_dot4_u32_u8" => 8,
+                    _ => 4,
+                };
+                let signed = name.contains("_i32_");
+                let (a, b, mut sum) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
+                for n in 0..32 / width {
+                    let field = |l: &mut Self, x: V| {
+                        if signed {
+                            // Up to the top, then back with its sign.
+                            let up = k(l, 32 - width * (n + 1));
+                            let down = k(l, 32 - width);
+                            let t = l.s.m.bin(c, Bin::Shl, x, up);
+                            l.s.m.bin(c, Bin::AShr, t, down)
+                        } else {
+                            let (sh, mask) = (k(l, width * n), k(l, (1 << width) - 1));
+                            let t = l.s.m.bin(c, Bin::LShr, x, sh);
+                            l.s.m.bin(c, Bin::And, t, mask)
+                        }
+                    };
+                    let (x, y) = (field(self, a), field(self, b));
+                    let p = self.s.m.bin(c, Bin::Mul, x, y);
+                    sum = self.s.m.bin(c, Bin::Add, sum, p);
+                }
+                sum
+            }
             // 16×16→32 multiply-add: op_sel[0]/[1] pick high/low halves of
             // src0/src1; src2 is a full 32-bit addend. Clamp stays refused.
             "v_mad_u32_u16" | "v_mad_i32_i16" => {
