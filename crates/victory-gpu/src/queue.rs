@@ -121,7 +121,7 @@ extern "system" fn release(this: This) -> u32 {
 /// Pins a queued [`crate::host::HostList`] epoch until execution completes or
 /// the unrun closure is dropped on early queue teardown.
 #[cfg(windows)]
-struct InFlight(Option<Arc<crate::host::HostList>>);
+pub(crate) struct InFlight(Option<Arc<crate::host::HostList>>);
 
 #[cfg(windows)]
 impl InFlight {
@@ -130,11 +130,11 @@ impl InFlight {
         Self(Some(list))
     }
 
-    fn list(&self) -> &crate::host::HostList {
+    pub(crate) fn list(&self) -> &crate::host::HostList {
         self.0.as_deref().expect("in-flight host list")
     }
 
-    fn take(mut self) -> Arc<crate::host::HostList> {
+    pub(crate) fn take(mut self) -> Arc<crate::host::HostList> {
         let list = self.0.take().expect("in-flight host list");
         list.end_submit();
         list
@@ -148,6 +148,59 @@ impl Drop for InFlight {
             list.cancel_submit();
         }
     }
+}
+
+/// Whether queue submissions run on a dedicated worker thread instead of on
+/// the title's calling thread (`VICTORY_ASYNC_SUBMIT=1`; off by default, and
+/// requires asynchronous GPU submissions `crate::host::late()`).
+#[cfg(windows)]
+pub(crate) fn async_submit() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        crate::host::late() && std::env::var_os("VICTORY_ASYNC_SUBMIT").is_some_and(|v| v == "1")
+    })
+}
+
+/// Enqueues `timeline` on the `"victory-submit"` worker thread when
+/// `VICTORY_ASYNC_SUBMIT=1` is active.
+#[cfg(windows)]
+pub(crate) fn async_schedule(timeline: &Arc<Timeline>) {
+    use std::collections::VecDeque;
+    use std::sync::{Condvar, Mutex, Once, Weak};
+
+    static QUEUE: (Mutex<VecDeque<Weak<Timeline>>>, Condvar) =
+        (Mutex::new(VecDeque::new()), Condvar::new());
+    static WORKER: Once = Once::new();
+
+    WORKER.call_once(|| {
+        if let Err(e) = std::thread::Builder::new()
+            .name("victory-submit".into())
+            .spawn(|| {
+                loop {
+                    let next = {
+                        let mut q = QUEUE.0.lock().unwrap_or_else(|e| e.into_inner());
+                        loop {
+                            if let Some(weak) = q.pop_front() {
+                                break weak;
+                            }
+                            q = QUEUE.1.wait(q).unwrap_or_else(|e| e.into_inner());
+                        }
+                    };
+                    if let Some(tl) = next.upgrade() {
+                        tl.wake();
+                    }
+                }
+            })
+        {
+            tracing::warn!(error = %e, "could not spawn victory-submit thread");
+        }
+    });
+    let mut q = QUEUE.0.lock().unwrap_or_else(|e| e.into_inner());
+    let weak = Arc::downgrade(timeline);
+    if !q.iter().any(|existing| existing.ptr_eq(&weak)) {
+        q.push_back(weak);
+    }
+    QUEUE.1.notify_one();
 }
 
 /// Runs the lists' host lists and waits for them (decision 0007), once
@@ -166,6 +219,14 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
             .flat_map(|&l| crate::list::segments(l))
             .collect();
         let timeline = &queue(this).timeline;
+        let async_mode = async_submit();
+        let submit_op = |op: Op| {
+            if async_mode {
+                timeline.submit_async(op);
+            } else {
+                timeline.submit(op);
+            }
+        };
         let mut batch = Vec::new();
         let flush = |batch: &mut Vec<InFlight>| {
             if batch.is_empty() {
@@ -174,17 +235,21 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
             // Held until they run: the title may reset its lists before.
             // Every flushed batch (including segments queued behind a fence or
             // mid-list memory wait) keeps its `InFlight` pin until execution
-            // completes.
+            // completes (or lands, when `host::late()` is active).
             let in_flight = std::mem::take(batch);
-            timeline.submit(Op::Run(Box::new(move || {
+            submit_op(Op::Run(Box::new(move || {
                 if let Some(host) = crate::host::host() {
                     crate::descriptor::sync_all_heaps();
-                    let runs: Vec<_> = in_flight.iter().map(InFlight::list).collect();
-                    host.execute(&runs);
-                    for entry in in_flight {
-                        let list = entry.take();
-                        if let Ok(orphan) = Arc::try_unwrap(list) {
-                            host.recycle_list(orphan);
+                    if crate::host::late() {
+                        host.execute_late(in_flight);
+                    } else {
+                        let runs: Vec<_> = in_flight.iter().map(InFlight::list).collect();
+                        host.execute(&runs);
+                        for entry in in_flight {
+                            let list = entry.take();
+                            if let Ok(orphan) = Arc::try_unwrap(list) {
+                                host.recycle_list(orphan);
+                            }
                         }
                     }
                 }
@@ -195,7 +260,7 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
                 crate::list::Segment::List(list) => batch.push(InFlight::new(list)),
                 crate::list::Segment::Wait(wait) => {
                     flush(&mut batch);
-                    timeline.submit(Op::WaitMemory(wait, None));
+                    submit_op(Op::WaitMemory(wait, None));
                 }
             }
         }
@@ -239,9 +304,20 @@ extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
         return E_INVALIDARG;
     }
     let fence = Held::new(fence);
-    queue(this)
-        .timeline
-        .submit(Op::Run(Box::new(move || fence.signal(value))));
+    let op = Op::Run(Box::new(move || {
+        #[cfg(windows)]
+        if let Err(fence) = crate::host::late_signal(fence, value) {
+            fence.signal(value);
+        }
+        #[cfg(not(windows))]
+        fence.signal(value);
+    }));
+    #[cfg(windows)]
+    if async_submit() {
+        queue(this).timeline.submit_async(op);
+        return S_OK;
+    }
+    queue(this).timeline.submit(op);
     S_OK
 }
 /// Holds the queue's later work back until the fence reaches `value`; the
@@ -449,6 +525,10 @@ fn show(
         crate::capture::dump_targets(frame);
     }
     #[cfg(windows)]
+    if crate::host::late() {
+        crate::host::settle_for_present();
+    }
+    #[cfg(windows)]
     if let Some(resource) = resource.as_ref().map(object::Held::get)
         && let Some(copy) = crate::resource::host_copy_ref(resource)
         && let Some(host) = crate::host::host()
@@ -472,9 +552,13 @@ fn show(
         };
         #[cfg(feature = "diagnostics")]
         blinks(frame, resource, state, shown);
-        #[cfg(not(feature = "diagnostics"))]
+        #[cfg(not(windows))]
+        let _ = (state, shown);
+        #[cfg(all(windows, not(feature = "diagnostics")))]
         let _ = (state, shown);
     }
+    #[cfg(all(windows, feature = "diagnostics"))]
+    crate::faultbook::frame();
     #[cfg(not(windows))]
     let _ = resource;
 }

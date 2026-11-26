@@ -21,8 +21,17 @@ use windows::core::{HRESULT, Interface, PCWSTR, w};
 
 use crate::present_compositor::PresentCompositor;
 
+#[path = "host_prep.rs"]
+mod prep;
+#[path = "host_relay.rs"]
+mod relay;
+pub(crate) use relay::*;
+
 #[cfg(all(test, feature = "diagnostics"))]
 mod present_tests;
+
+/// A reusable direct or copy command allocator and command list pair.
+pub(super) type Prelude = (ID3D12CommandAllocator, ID3D12GraphicsCommandList);
 
 /// Resource states without the console's own bits (compression hints from
 /// bit 25 up), which the host rejects.
@@ -41,8 +50,21 @@ pub(crate) fn texture_state(state: u32) -> u32 {
 /// Render target views live only until their command is recorded, so a
 /// ring of host descriptors is enough.
 const RTV_RING: u32 = 1024;
-/// Maximum number of detached host lists kept for reuse after pending resets.
-const LIST_POOL_CAP: usize = 64;
+/// Default maximum number of detached host lists kept for reuse after pending
+/// resets (overridable via `VICTORY_LIST_POOL_MOST`).
+const LIST_POOL_CAP: usize = 512;
+
+/// Maximum number of detached host lists kept for reuse
+/// (`VICTORY_LIST_POOL_MOST`, default 512).
+fn list_pool_cap() -> usize {
+    static MOST: OnceLock<usize> = OnceLock::new();
+    *MOST.get_or_init(|| {
+        std::env::var("VICTORY_LIST_POOL_MOST")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(LIST_POOL_CAP)
+    })
+}
 
 /// Maximum reusable readback buffer kept cached for ReBAR UAV copy-backs.
 /// One-off readbacks larger than this are dropped right after use.
@@ -134,9 +156,15 @@ pub(crate) struct Host {
     rebar_loose_budget: u64,
     rebar_readback: Mutex<RebarReadback>,
     queue: ID3D12CommandQueue,
+    /// Optional dedicated `D3D12_COMMAND_LIST_TYPE_COPY` queue for relay DMA
+    /// readbacks (`VICTORY_RELAY_COPY_QUEUE=0` disables).
+    copy_queue: Option<ID3D12CommandQueue>,
     fence: ID3D12Fence,
     /// The last value signalled on `fence`, behind the submission lock.
     submitted: Mutex<u64>,
+    /// Latest `(fence_value, QUEUE_ORDER)` signalled on `queue`, used to
+    /// synchronize auxiliary `COPY` queues behind direct-queue work.
+    last_signalled: Mutex<(u64, u64)>,
     event: HANDLE,
     rtvs: ID3D12DescriptorHeap,
     rtv_size: u32,
@@ -311,6 +339,23 @@ pub(crate) static PREPARING: [std::sync::atomic::AtomicU64; 4] = [
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
 ];
+
+/// Detailed preparation counters for `host_prep` (`watch` ask-ahead us, fill
+/// us, fill count, fill bytes).
+pub(super) const PREP_WATCH_US: usize = 0;
+pub(super) const PREP_FILL_US: usize = 1;
+pub(super) const PREP_FILL_COUNT: usize = 2;
+pub(super) const PREP_FILL_BYTES: usize = 3;
+pub(super) static PREPARING_COPIES: [std::sync::atomic::AtomicU64; 4] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+pub(super) fn wide_refresh() -> bool {
+    crate::shadow::wide_copy()
+}
 
 /// What the runtime does when the host GPU fails for good: report it like a
 /// crash and end the run. The console has no such state, and carrying on
@@ -491,6 +536,23 @@ fn create() -> windows::core::Result<Host> {
             Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
             ..Default::default()
         })?;
+        let copy_queue: Option<ID3D12CommandQueue> = if relay_copy_queue() {
+            match device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                Type: D3D12_COMMAND_LIST_TYPE_COPY,
+                ..Default::default()
+            }) {
+                Ok(q) => Some(q),
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "no D3D12 COPY command queue; relay readbacks will share the direct queue"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
         let event = CreateEventW(None, false, false, None)?;
         let rtvs: ID3D12DescriptorHeap =
@@ -539,8 +601,10 @@ fn create() -> windows::core::Result<Host> {
             rebar_loose_budget,
             rebar_readback: Mutex::default(),
             queue,
+            copy_queue,
             fence,
             submitted: Mutex::new(0),
+            last_signalled: Mutex::new((0, 0)),
             event,
             rtvs,
             rtv_size,
@@ -1391,13 +1455,37 @@ impl Host {
     }
 
     /// Returns a finished, unreferenced host list to the pool up to
-    /// [`LIST_POOL_CAP`], releasing all retained uploads, tracked resources,
+    /// [`list_pool_cap`], releasing all retained uploads, tracked resources,
     /// scratch buffers, and retirement pins immediately.
     pub(crate) fn recycle_list(&self, list: HostList) {
         list.release_for_pool();
         let mut pool = self.free_lists.lock().unwrap_or_else(|e| e.into_inner());
-        if pool.len() < LIST_POOL_CAP {
+        if pool.len() < list_pool_cap() {
             pool.push(list);
+        }
+    }
+
+    /// Optional dedicated `D3D12_COMMAND_LIST_TYPE_COPY` queue for relay DMA.
+    #[allow(dead_code)]
+    pub(crate) fn copy_queue(&self) -> Option<&ID3D12CommandQueue> {
+        self.copy_queue.as_ref()
+    }
+
+    /// Creates a closed direct command allocator and command list pair for
+    /// internal host passes (card sync/compare/fetch, relay fallback).
+    pub(super) fn make_prelude(&self) -> Option<Prelude> {
+        // SAFETY: plain D3D12 object creation on our live device.
+        unsafe {
+            let allocator: ID3D12CommandAllocator = self
+                .device
+                .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
+                .ok()?;
+            let list: ID3D12GraphicsCommandList = self
+                .device
+                .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None)
+                .ok()?;
+            list.Close().ok()?;
+            Some((allocator, list))
         }
     }
 
@@ -1454,16 +1542,56 @@ impl Host {
         }
     }
 
-    /// Runs closed lists and waits for them.
+    /// Runs closed lists and waits for them (settling any in-flight async
+    /// submissions first when [`late`] is active).
     pub(crate) fn execute(&self, runs: &[&HostList]) {
+        let _ = self.submit(runs, false);
+    }
+
+    /// Runs closed lists either synchronously (`late == false`) or returns
+    /// `(submitted, Sent)` with the GPU running ahead (`late == true`).
+    fn submit<'a>(
+        &'a self,
+        runs: &[&HostList],
+        late: bool,
+    ) -> Option<(std::sync::MutexGuard<'a, u64>, Sent)> {
         // D3D12 requires NumCommandLists >= 1; an empty submission is a no-op
         // (VIC-BT-035 / #440).
         if runs.is_empty() {
-            return;
+            return None;
         }
+        let ptrs: Vec<usize> = runs
+            .iter()
+            .map(|list| std::ptr::from_ref(*list) as usize)
+            .collect();
+        let batches = unique_list_batches(&ptrs);
+        // If the same HostList appears twice in one submission, fall back to
+        // synchronous batch-by-batch execution so prelude() never resets an
+        // in-flight allocator.
+        let late = late && batches.len() == 1;
+
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        let mut deferred_woken = crate::fence::Woken::default();
+        if !late {
+            deferred_woken.add(self.settle(&mut submitted, relay::WHY_SYNC));
+        } else if let Some(why) = relay::late_blocked(runs) {
+            if why == relay::WHY_READ && relay::relay_exact() {
+                relay::relay_wait(relay::WHY_READ, |line| {
+                    relay::blocked_ranges(&line.written, runs, false).is_none()
+                });
+            } else {
+                deferred_woken.add(self.settle(&mut submitted, why));
+            }
+        }
+        let behind = late && relay::flying();
+        if !behind {
+            crate::inplace::tick();
+        }
+        let this_submission = relay::STARTED.fetch_add(1, Ordering::AcqRel) + 1;
+        crate::shadow::preparing(this_submission);
+
         #[cfg(test)]
         let exec_scope = runs
             .iter()
@@ -1482,34 +1610,27 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::Submissions, 1);
         let mut batch = Batch::default();
-        // Coalesce `GetWriteWatch` queries across all buffer and watched-texture
-        // refreshes in this submission so repeated copy/UAV flush boundaries do
-        // not re-query the kernel thousands of times per frame.
+        let mut settled = std::time::Duration::ZERO;
+
         struct AskOnceGuard;
         impl Drop for AskOnceGuard {
             fn drop(&mut self) {
                 crate::watch::ask_once_end();
             }
         }
-        let mut watch_ranges = Vec::new();
-        for list in runs {
-            for step in &list.deferred().copies {
-                match step {
-                    Step::Refresh(_, address, len) if *len > 0 => {
-                        watch_ranges.push((*address, address.saturating_add(*len)));
-                    }
-                    Step::Texture(staging) => {
-                        let (start, end) = staging.memory_range();
-                        if start < end {
-                            watch_ranges.push((start, end));
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
+        let watch_ranges = collect_ask_once_ranges(runs);
         crate::watch::ask_once(&watch_ranges);
         let watch_guard = AskOnceGuard;
+        if behind && relay::stale_under_flights(runs) {
+            let settling = std::time::Instant::now();
+            deferred_woken.add(self.settle(&mut submitted, relay::WHY_STALE));
+            settled += settling.elapsed();
+            crate::watch::ask_once_void();
+            crate::watch::ask_once(&watch_ranges);
+        }
+        if prep::ahead_of_writes() {
+            batch.refresh_ahead(runs);
+        }
         {
             #[cfg(test)]
             let _scope = enter_retire_scope(exec_scope.clone());
@@ -1517,41 +1638,76 @@ impl Host {
                 list.run_deferred(&mut batch, self, &mut submitted);
             }
         }
+        batch.fill();
         batch.flush();
         drop(watch_guard);
+
+        let mut back: Vec<relay::Declared> = Vec::new();
         let mut non_rebar_writes = Vec::new();
         let mut rebar_entries: Vec<RebarWriteEntry> = Vec::new();
         for (shadow, address, len) in batch.gpu_writes {
-            if shadow.is_rebar() {
-                let (from, to) = shadow.inside(address, len);
-                match rebar_entries
+            let end = address.saturating_add(len);
+            if address < end {
+                match back
                     .iter_mut()
-                    .find(|p| std::sync::Arc::ptr_eq(&p.shadow, &shadow))
+                    .find(|(s, _)| std::sync::Arc::ptr_eq(s, &shadow))
                 {
-                    Some(entry) => {
-                        if from < to {
-                            entry.declared_spans.push((from, to));
+                    Some((_, ranges)) => {
+                        if !ranges.contains(&(address, end)) {
+                            ranges.push((address, end));
                         }
                     }
-                    None => {
-                        let declared_spans = if from < to {
-                            vec![(from, to)]
-                        } else {
-                            Vec::new()
-                        };
-                        rebar_entries.push(RebarWriteEntry {
-                            shadow,
-                            declared_spans,
-                            piece_runs: Vec::new(),
-                            compare_out_base: None,
-                            compare_pieces: 0,
-                        });
-                    }
+                    None => back.push((shadow.clone(), vec![(address, end)])),
                 }
-            } else {
-                non_rebar_writes.push((shadow, address, len));
+            }
+            if !late {
+                if shadow.is_rebar() {
+                    let (from, to) = shadow.inside(address, len);
+                    match rebar_entries
+                        .iter_mut()
+                        .find(|p| std::sync::Arc::ptr_eq(&p.shadow, &shadow))
+                    {
+                        Some(entry) => {
+                            if from < to {
+                                entry.declared_spans.push((from, to));
+                            }
+                        }
+                        None => {
+                            let declared_spans = if from < to {
+                                vec![(from, to)]
+                            } else {
+                                Vec::new()
+                            };
+                            rebar_entries.push(RebarWriteEntry {
+                                shadow,
+                                declared_spans,
+                                piece_runs: Vec::new(),
+                                compare_out_base: None,
+                                compare_pieces: 0,
+                            });
+                        }
+                    }
+                } else if !shadow.carded() {
+                    non_rebar_writes.push((shadow, address, len));
+                }
             }
         }
+        let card_declared: Vec<relay::Declared> = if crate::shadow::cards() {
+            back.iter()
+                .filter(|(s, _)| s.carded())
+                .map(|(s, r)| (s.clone(), r.clone()))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let flown = late && relay::relay();
+        if flown && self.card_results_low() {
+            let settling = std::time::Instant::now();
+            deferred_woken.add(self.settle(&mut submitted, relay::WHY_MOST));
+            settled += settling.elapsed();
+        }
+        let card = self.card_before(card_declared, flown);
+
         for entry in &mut rebar_entries {
             entry.declared_spans = merge_ranges(std::mem::take(&mut entry.declared_spans));
             entry.piece_runs = spans_to_piece_runs(&entry.declared_spans);
@@ -1562,6 +1718,75 @@ impl Host {
             self.prepare_rebar_hash_plan(&mut rebar_entries)
         };
         let prepared = std::time::Instant::now();
+
+        if late {
+            let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len() + 2);
+            {
+                #[cfg(test)]
+                let _scope = enter_retire_scope(exec_scope.clone());
+                for list in runs {
+                    if let Some(prelude) = list.prelude() {
+                        lists.push(Some(prelude));
+                    }
+                    lists.push(list.list.cast().ok());
+                }
+            }
+            if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
+                lists.push(Some(check));
+            }
+            *submitted += 1;
+            // SAFETY: closed lists; the fence is ours under `submitted`.
+            let signalled = unsafe {
+                self.queue.ExecuteCommandLists(&lists);
+                self.queue.Signal(&self.fence, *submitted)
+            };
+            if signalled.is_ok() {
+                self.note_signalled(*submitted);
+            } else if let Err(e) = signalled {
+                fail(format_args!(
+                    "host GPU fence signal failed after an async submission of {} lists ({e}){}{}",
+                    runs.len(),
+                    self.removal_data(runs),
+                    last_notes(runs)
+                ));
+            }
+            let mut readback_ranges = Vec::new();
+            for list in runs {
+                for rb in &list.deferred().readbacks {
+                    let span = if rb.dst_pitch == rb.src_pitch {
+                        rb.total
+                    } else {
+                        rb.lines.saturating_mul(rb.dst_pitch)
+                    };
+                    readback_ranges.push((rb.dst, rb.dst.saturating_add(span)));
+                }
+            }
+            let writes = runs
+                .iter()
+                .flat_map(|l| l.deferred().writes.clone())
+                .collect();
+            SUBMISSION_US[0].fetch_add(
+                (prepared - started).saturating_sub(settled).as_micros() as u64,
+                Ordering::Relaxed,
+            );
+            // Any woken timelines from an inline settle cannot run while
+            // `submitted` is returned held; hand them to `victory-late-wait`.
+            if !deferred_woken.is_empty() {
+                relay::enqueue_woken(deferred_woken);
+            }
+            return Some((
+                submitted,
+                Sent {
+                    number: this_submission,
+                    card,
+                    back,
+                    readback_ranges,
+                    writes,
+                    exec_epoch,
+                },
+            ));
+        }
+
         // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`).
         #[cfg(feature = "diagnostics")]
         let timed = timing();
@@ -1571,29 +1796,17 @@ impl Host {
         if timed && let Some(pre) = rebar_hash_plan.pre_list.take() {
             pre_hash_ok = self.submit_helper_list(&mut submitted, pre, "ReBAR pre-hash");
         }
-        // Each HostList owns one reusable prelude allocator/list. A submission
-        // may name the same list twice (queue segments, re-executes); calling
-        // prelude() again would Reset that allocator while the first recording
-        // is still queued. Split into batches where each pointer appears once,
-        // waiting between batches so the prelude can be re-recorded safely
-        // (VIC-BT-001 / #440).
-        let ptrs: Vec<usize> = runs
-            .iter()
-            .map(|list| std::ptr::from_ref(*list) as usize)
-            .collect();
-        let batches = unique_list_batches(&ptrs);
         let last_batch = batches.len().saturating_sub(1);
         for (batch_idx, range) in batches.into_iter().enumerate() {
             let batch_runs = &runs[range];
             let mut lists: Vec<Option<ID3D12CommandList>> =
-                Vec::with_capacity(2 * batch_runs.len() + 2);
+                Vec::with_capacity(2 * batch_runs.len() + 3);
             if !timed
                 && batch_idx == 0
                 && let Some(pre) = rebar_hash_plan.pre_list.take()
             {
                 lists.push(Some(pre));
             }
-            // Where each run's lists start in `lists`.
             let mut firsts = Vec::with_capacity(batch_runs.len());
             {
                 #[cfg(test)]
@@ -1605,6 +1818,11 @@ impl Host {
                     }
                     lists.push(list.list.cast().ok());
                 }
+            }
+            if batch_idx == last_batch
+                && let Some(check) = card.as_ref().and_then(|c| c.check.clone())
+            {
+                lists.push(Some(check));
             }
             if !timed
                 && batch_idx == last_batch
@@ -1630,25 +1848,28 @@ impl Host {
                 unsafe {
                     self.queue.ExecuteCommandLists(group);
                     match self.queue.Signal(&self.fence, *submitted) {
-                        Ok(()) => match self.fence.SetEventOnCompletion(*submitted, self.event) {
-                            Ok(()) => {
-                                let waited = WaitForSingleObject(self.event, INFINITE);
-                                if waited != WAIT_OBJECT_0 {
+                        Ok(()) => {
+                            self.note_signalled(*submitted);
+                            match self.fence.SetEventOnCompletion(*submitted, self.event) {
+                                Ok(()) => {
+                                    let waited = WaitForSingleObject(self.event, INFINITE);
+                                    if waited != WAIT_OBJECT_0 {
+                                        tracing::warn!(
+                                            wait = waited.0,
+                                            "host fence event wait failed; polling fence"
+                                        );
+                                        self.poll_fence(*submitted);
+                                    }
+                                }
+                                Err(e) => {
                                     tracing::warn!(
-                                        wait = waited.0,
-                                        "host fence event wait failed; polling fence"
+                                        error = %e,
+                                        "host fence event registration failed; polling fence"
                                     );
                                     self.poll_fence(*submitted);
                                 }
                             }
-                            Err(e) => {
-                                tracing::warn!(
-                                    error = %e,
-                                    "host fence event registration failed; polling fence"
-                                );
-                                self.poll_fence(*submitted);
-                            }
-                        },
+                        }
                         Err(e) => fail(format_args!(
                             "host GPU fence signal failed after a submission of {} lists ({e}){}{}",
                             runs.len(),
@@ -1684,10 +1905,13 @@ impl Host {
             post_compare_ok =
                 pre_hash_ok && self.submit_helper_list(&mut submitted, post, "ReBAR post-compare");
         }
+        relay::FINISHED.store(this_submission, Ordering::Release);
         let gpu = prepared.elapsed();
-        SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
+        SUBMISSION_US[0].fetch_add(
+            (prepared - started).saturating_sub(settled).as_micros() as u64,
+            Ordering::Relaxed,
+        );
         SUBMISSION_US[1].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
-        // The host resets a device whose submission runs for about 2 s.
         if gpu > std::time::Duration::from_millis(250) {
             let pipelines: std::collections::BTreeSet<String> = runs
                 .iter()
@@ -1714,11 +1938,18 @@ impl Host {
                 last_notes(runs)
             ));
         }
-        // What shaders wrote goes back before the bottom-of-pipe writes,
-        // which tell the title the GPU is done; each range once per
-        // submission, however many dispatches declared it (the world's
-        // passes declare the same big ranges dozens of times).
         let copying = std::time::Instant::now();
+        if let Some(card) = &card {
+            self.card_back(card, &mut submitted, &mut std::collections::HashSet::new());
+        }
+        if let Some(card) = card {
+            self.card_done(card);
+        }
+        for (shadow, ranges) in &back {
+            if shadow.carded() {
+                shadow.copy_back_done(ranges);
+            }
+        }
         for (shadow, address, len) in non_rebar_writes {
             let written = shadow.copy_back(address, len);
             COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
@@ -1735,39 +1966,71 @@ impl Host {
             );
         }
         for list in runs {
-            for rb in &list.deferred().readbacks {
-                let written = if rb.dst_pitch == rb.src_pitch {
-                    crate::watch::writing(rb.dst, rb.total);
-                    write_mapped(rb.dst as *mut u8, rb.src as *const u8, rb.total);
-                    rb.total
-                } else {
-                    let mut n = 0;
-                    for line in 0..rb.lines {
-                        let to = rb.dst + line * rb.dst_pitch;
-                        let from = rb.src + line * rb.src_pitch;
-                        crate::watch::writing(to, rb.row_bytes);
-                        write_mapped(to as *mut u8, from as *const u8, rb.row_bytes);
-                        n += rb.row_bytes;
-                    }
-                    n
-                };
-                COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
-            }
+            read_backs(list);
         }
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
-        // Queues these writes release run their work once no lock is held:
-        // it submits lists itself (this lock, the lists' `deferred`).
-        let mut woken = crate::fence::Woken::default();
+        // Queues these writes release run their work once no lock is held.
+        let mut woken = deferred_woken;
         for list in runs {
             for &(at, what, bytes) in &list.deferred().writes {
                 woken.add(what.write(at as *mut u8, bytes));
             }
         }
         self.log_messages();
+        if relay::relay() {
+            crate::shadow::relay_fetched(
+                *relay::QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner()),
+            );
+        }
         drop(submitted);
         drop(exec_epoch);
         woken.run();
+        relay::drain_woken();
+        None
     }
+}
+
+/// Copies a finished list's texture-to-buffer readbacks into title memory.
+pub(super) fn read_backs(list: &HostList) {
+    for rb in &list.deferred().readbacks {
+        let written = if rb.dst_pitch == rb.src_pitch {
+            crate::watch::writing(rb.dst, rb.total);
+            write_mapped(rb.dst as *mut u8, rb.src as *const u8, rb.total);
+            rb.total
+        } else {
+            let mut n = 0;
+            for line in 0..rb.lines {
+                let to = rb.dst + line * rb.dst_pitch;
+                let from = rb.src + line * rb.src_pitch;
+                crate::watch::writing(to, rb.row_bytes);
+                write_mapped(to as *mut u8, from as *const u8, rb.row_bytes);
+                n += rb.row_bytes;
+            }
+            n
+        };
+        COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+    }
+}
+
+fn collect_ask_once_ranges(runs: &[&HostList]) -> Vec<(usize, usize)> {
+    let mut watch_ranges = Vec::new();
+    for list in runs {
+        for step in &list.deferred().copies {
+            match step {
+                Step::Refresh(_, address, len) if *len > 0 => {
+                    watch_ranges.push((*address, address.saturating_add(*len)));
+                }
+                Step::Texture(staging) => {
+                    let (start, end) = staging.memory_range();
+                    if start < end {
+                        watch_ranges.push((start, end));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    watch_ranges
 }
 
 /// Index ranges into a submission where each `HostList` pointer appears at
@@ -2825,7 +3088,7 @@ impl HostList {
     }
 
     /// Copies `len` bytes from `src` to title memory at `dst` when the list
-    /// is submitted (`Step::Copy` → `copy_mapped(..., title_dst = true)`).
+    /// is submitted (`Step::Copy` -> `copy_mapped(..., title_dst = true)`).
     ///
     /// Title destinations keep the `VirtualQuery` commitment guard. Host-owned
     /// mapped upload memory must use [`Self::defer_fill`] instead: under
@@ -2850,10 +3113,10 @@ impl HostList {
     }
 
     /// Copies `len` bytes of title memory at `src` into host-owned upload
-    /// memory at `dst` when the list is submitted (`Step::Fill` →
+    /// memory at `dst` when the list is submitted (`Step::Fill` ->
     /// `copy_mapped(..., title_dst = false)`).
     ///
-    /// Buffer→texture staging in `copy_texture_region` uses this; buffer→buffer
+    /// Buffer->texture staging in `copy_texture_region` uses this; buffer->buffer
     /// title copies stay on [`Self::defer_copy`].
     pub(crate) fn defer_fill(&self, dst: *mut u8, src: *const u8, len: usize) {
         self.mark_work();
@@ -3203,6 +3466,10 @@ impl HostList {
                         add(C::Copies, 1);
                         add(C::CopyBytes, len as u64);
                     }
+                    if prep::wide_fills() {
+                        batch.fills.push((dst, src, len));
+                        continue;
+                    }
                     crate::shadow::copy_mapped_wide(dst as *mut u8, src as *const u8, len);
                     len
                 }
@@ -3277,6 +3544,10 @@ struct Batch {
     declared_writes: std::collections::HashSet<(usize, usize, usize)>,
     /// Staging buffers (by address) refreshed since the last title write.
     textures: std::collections::HashSet<usize>,
+    /// Deferred `Step::Fill` copies batched for parallel execution (`host_prep`).
+    fills: Vec<(usize, usize, usize)>,
+    /// Shadows already refreshed ahead of their first `Step::GpuWrite` (`host_prep`).
+    ahead: std::collections::HashMap<usize, (usize, usize)>,
 }
 
 impl Batch {
@@ -3294,6 +3565,8 @@ impl Batch {
         len: usize,
     ) {
         if self.new_gpu_write(shadow, address, len) {
+            self.ahead
+                .remove(&(std::sync::Arc::as_ptr(shadow) as usize));
             // The first declaration needs the refreshed bytes for its snapshot.
             // Another declaration of this exact range is already pending until
             // the GPU submission finishes, so it needs no refresh boundary.
@@ -3307,6 +3580,12 @@ impl Batch {
 
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
         let end = address + len;
+        if let Some(&(a, b)) = self.ahead.get(&(std::sync::Arc::as_ptr(shadow) as usize))
+            && a <= address
+            && end <= b
+        {
+            return;
+        }
         match self
             .refreshes
             .iter_mut()
@@ -3324,10 +3603,12 @@ impl Batch {
             .insert(std::sync::Arc::as_ptr(staging) as *const () as usize)
     }
 
-    /// Before a step that writes title memory: pending refreshes are done
-    /// first, and textures are checked again after it.
+    /// Before a step that writes title memory: pending fills and refreshes are
+    /// done first, and pre-write refreshes and textures are cleared.
     fn title_written(&mut self) {
+        self.fill();
         self.flush();
+        self.ahead.clear();
         self.textures.clear();
     }
 
@@ -3429,6 +3710,34 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     } else {
         read_pieces(src, dst, len);
     }
+}
+
+/// Fast-path title read that returns `true` if the entire copy succeeded
+/// without faulting (`false` lets the caller fall back to [`copy_mapped`]).
+pub(crate) fn copy_mapped_raw_checked(
+    dst: *mut u8,
+    src: *const u8,
+    len: usize,
+    title_dst: bool,
+) -> bool {
+    if len == 0 {
+        return true;
+    }
+    if !title_dst && fast_fill() {
+        // SAFETY: `dst` is writable host memory; any fault on `src` is caught
+        // by `fast_fill`'s VEH and returns `0`.
+        return unsafe { victory_copy_try(dst, src, len) } != 0;
+    }
+    if !title_dst {
+        return read(src, dst, len);
+    }
+    false
+}
+
+/// Non-materializing variant of [`copy_mapped`] (hook for lazy copy-back).
+#[allow(dead_code)]
+pub(crate) fn copy_mapped_raw(dst: *mut u8, src: *const u8, len: usize, title_dst: bool) {
+    copy_mapped(dst, src, len, title_dst);
 }
 
 // Non-overlapping vectorized copies that may fault on their source: both
@@ -3902,6 +4211,11 @@ pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
     });
 }
 
+/// Non-materializing variant of [`write_mapped`] (hook for lazy copy-back).
+pub(crate) fn write_mapped_raw(dst: *mut u8, src: *const u8, len: usize) {
+    write_mapped(dst, src, len);
+}
+
 /// Calls `f` with the pieces of `[start, start + len)` cut at multiples of
 /// `step`.
 fn for_pieces(start: usize, len: usize, step: usize, mut f: impl FnMut(usize, usize)) {
@@ -4026,7 +4340,7 @@ mod title_copies {
     /// Host-owned staging (`title_dst = false`, `defer_fill`) still copies;
     /// title destinations (`title_dst = true`, `defer_copy`) keep the
     /// commitment guard. Wine+vkd3d can report Map memory as MEM_FREE, which
-    /// is why buffer→texture staging must not use the title path (#518).
+    /// is why buffer->texture staging must not use the title path (#518).
     #[test]
     fn host_staging_fill_copies_while_title_dst_keeps_the_commitment_guard() {
         let from = pattern();
@@ -4132,7 +4446,7 @@ fn query_local_vram_budget(adapter: &IDXGIAdapter3) -> Option<u64> {
 ///   in unified local memory without write-combining read penalties).
 /// - On discrete GPUs with ReBAR support, scales the shadow VRAM budget by local
 ///   VRAM so low-VRAM cards (`<= 8 GiB`) stay safely on system-RAM shadows while
-///   12–32+ GiB cards keep hot buffers resident in VRAM.
+///   12-32+ GiB cards keep hot buffers resident in VRAM.
 fn rebar_policy(
     gpu_upload_supported: bool,
     uma: bool,
@@ -4353,6 +4667,11 @@ impl Host {
         ])
     }
 
+    /// Adapter local VRAM budget in bytes, if reported by DXGI.
+    pub(crate) fn local_vram_budget(&self) -> Option<u64> {
+        self.video_memory().map(|[budget, ..]| budget)
+    }
+
     /// Whether allocating `extra_bytes` of local VRAM stays under 85% of the
     /// adapter's current local VRAM budget (leaves headroom for textures and
     /// render targets).
@@ -4522,15 +4841,18 @@ impl Host {
         unsafe {
             self.queue.ExecuteCommandLists(&[Some(cmd)]);
             match self.queue.Signal(&self.fence, *submitted) {
-                Ok(()) => match self.fence.SetEventOnCompletion(*submitted, self.event) {
-                    Ok(()) => {
-                        let waited = WaitForSingleObject(self.event, INFINITE);
-                        if waited != WAIT_OBJECT_0 {
-                            self.poll_fence(*submitted);
+                Ok(()) => {
+                    self.note_signalled(*submitted);
+                    match self.fence.SetEventOnCompletion(*submitted, self.event) {
+                        Ok(()) => {
+                            let waited = WaitForSingleObject(self.event, INFINITE);
+                            if waited != WAIT_OBJECT_0 {
+                                self.poll_fence(*submitted);
+                            }
                         }
+                        Err(_) => self.poll_fence(*submitted),
                     }
-                    Err(_) => self.poll_fence(*submitted),
-                },
+                }
                 Err(e) => {
                     tracing::warn!(error = %e, "{label} fence signal failed");
                     return false;
@@ -5362,6 +5684,8 @@ impl Meter {
                     }
                 );
             }
+            crate::watch::asks_say(logged_frames);
+            relay::log_stats(logged_frames);
             #[cfg(feature = "diagnostics")]
             {
                 crate::copystat::log(logged_frames);
@@ -5880,6 +6204,12 @@ impl Host {
         self.default_buffer_in_state(size, D3D12_RESOURCE_STATE_COMMON)
     }
 
+    /// A GPU-only default-heap buffer starting in `UNORDERED_ACCESS` (e.g.
+    /// card shadow hash buffers).
+    pub(crate) fn uav_buffer(&self, size: u64) -> Option<ID3D12Resource> {
+        self.default_buffer_in_state(size, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)
+    }
+
     /// A GPU-only default-heap UAV buffer created in `initial_state`.
     fn default_buffer_in_state(
         &self,
@@ -6255,1928 +6585,11 @@ impl Drop for DropCounter {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn present_result_distinguishes_occlusion_from_success_and_failure() {
-        assert!(present_result(HRESULT(0)).unwrap());
-        assert!(!present_result(DXGI_STATUS_OCCLUDED).unwrap());
-        assert_eq!(
-            present_result(DXGI_ERROR_DEVICE_REMOVED)
-                .unwrap_err()
-                .code(),
-            DXGI_ERROR_DEVICE_REMOVED
-        );
-    }
-
-    #[test]
-    fn shadow_buffer_transitions_between_writes_and_reads() {
-        let uav = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-        let srv = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-        let index = D3D12_RESOURCE_STATE_INDEX_BUFFER;
-        assert_eq!(shadow_transition(D3D12_RESOURCE_STATE_COMMON, uav), None);
-        assert_eq!(shadow_transition(D3D12_RESOURCE_STATE_COMMON, srv), None);
-        assert_eq!(shadow_transition(uav, srv), Some(srv));
-        assert_eq!(shadow_transition(srv, index), Some(srv | index));
-        assert_eq!(shadow_transition(srv | index, srv), None);
-        assert_eq!(shadow_transition(srv | index, uav), Some(uav));
-        assert_eq!(shadow_transition(uav, uav), None);
-    }
-
-    #[test]
-    fn warp_adapter_accepts_only_software() {
-        // This probes DXGI without creating a D3D12 device or running a title.
-        // SAFETY: plain DXGI adapter queries.
-        let raw = unsafe {
-            let Ok(factory) = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
-            else {
-                return;
-            };
-            factory.EnumWarpAdapter::<IDXGIAdapter>()
-        };
-        let Ok(raw) = raw else { return };
-        // SAFETY: a live adapter the factory just returned.
-        let desc = unsafe { raw.cast::<IDXGIAdapter1>().unwrap().GetDesc1().unwrap() };
-        eprintln!(
-            "EnumWarpAdapter: vendor={:#x}, flags={:#x}",
-            desc.VendorId, desc.Flags
-        );
-        assert_eq!(
-            warp_adapter().is_ok(),
-            desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0,
-        );
-    }
-
-    #[test]
-    fn adapter_name_stops_at_nul() {
-        let raw = [b'R' as u16, b'T' as u16, b'X' as u16, 0, b'X' as u16];
-        assert_eq!(adapter_name(&raw), "RTX");
-        assert_eq!(adapter_name(&[b'X' as u16, b'e' as u16]), "Xe");
-    }
-
-    #[test]
-    fn adapter_filter_matches_case_insensitively() {
-        assert!(adapter_matches("NVIDIA GeForce RTX 3070 Ti", "rtx 3070"));
-        assert!(adapter_matches("Intel(R) Iris(R) Xe Graphics", "  INTEL "));
-        assert!(!adapter_matches("Intel(R) Iris(R) Xe Graphics", "RTX"));
-    }
-
-    #[test]
-    fn unknown_adapter_filter_fails_instead_of_falling_back() {
-        let err = pick_hardware_adapter(Some("__victory_no_such_adapter__")).unwrap_err();
-        assert_eq!(err.code(), DXGI_ERROR_NOT_FOUND);
-    }
-
-    #[test]
-    fn default_adapter_is_hardware_when_present() {
-        if let Ok(picked) = pick_hardware_adapter(None) {
-            assert_eq!(picked.desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32, 0);
-            // SAFETY: `GetAdapterLuid` is a plain getter on a live D3D12 device.
-            let luid = unsafe { picked.device.GetAdapterLuid() };
-            assert_eq!(
-                (luid.LowPart, luid.HighPart),
-                (
-                    picked.desc.AdapterLuid.LowPart,
-                    picked.desc.AdapterLuid.HighPart,
-                ),
-            );
-        }
-    }
-
-    #[test]
-    fn only_textures_made_for_rendering_take_render_target_views() {
-        let Some(host) = host() else { return };
-        let make = |flags: D3D12_RESOURCE_FLAGS| {
-            let desc = D3D12_RESOURCE_DESC {
-                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
-                Width: 4,
-                Height: 4,
-                DepthOrArraySize: 1,
-                MipLevels: 1,
-                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
-                SampleDesc: DXGI_SAMPLE_DESC {
-                    Count: 1,
-                    Quality: 0,
-                },
-                Flags: flags,
-                ..Default::default()
-            };
-            let heap = D3D12_HEAP_PROPERTIES {
-                Type: D3D12_HEAP_TYPE_DEFAULT,
-                ..Default::default()
-            };
-            let mut texture: Option<ID3D12Resource> = None;
-            // SAFETY: a full description and our out pointer.
-            unsafe {
-                host.device
-                    .CreateCommittedResource(
-                        &heap,
-                        D3D12_HEAP_FLAG_NONE,
-                        &desc,
-                        D3D12_RESOURCE_STATE_COMMON,
-                        None,
-                        &mut texture,
-                    )
-                    .unwrap();
-            }
-            texture.unwrap()
-        };
-        assert!(renders_to(&make(D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)));
-        assert!(!renders_to(&make(D3D12_RESOURCE_FLAG_NONE)));
-        // The view bound in such a texture's place is a legal one.
-        host.rtv(None, Some(&null_target()));
-        // SAFETY: a plain query.
-        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
-    }
-
-    #[test]
-    fn retire_drops_immediately_when_no_epoch_is_active() {
-        let _retire = isolated_retire_scope();
-        let (counter, drops) = DropCounter::new();
-        retire(counter);
-        assert_eq!(drops.load(Ordering::SeqCst), 1);
-    }
-
-    #[test]
-    fn idle_list_does_not_block_retirement() {
-        let _retire = isolated_retire_scope();
-        let Some(host) = host() else {
-            return;
-        };
-        let idle = host.new_list().expect("host list");
-        let (counter, drops) = DropCounter::new();
-        retire(counter);
-        assert_eq!(drops.load(Ordering::SeqCst), 1);
-        drop(idle);
-    }
-
-    #[test]
-    fn open_marked_list_pins_retired_objects_across_other_executions() {
-        let _retire = isolated_retire_scope();
-        let Some(host) = host() else {
-            return;
-        };
-        let open = host.new_list().expect("open list");
-        open.mark_work();
-
-        let (c1, d1) = DropCounter::new();
-        retire(c1);
-        assert_eq!(d1.load(Ordering::SeqCst), 0);
-
-        // Submitting and executing a DIFFERENT list must not drop objects
-        // retired while `open` is still active.
-        let other = host.new_list().expect("other list");
-        other.mark_work();
-        other.close();
-        host.execute(&[&other]);
-        other.reset();
-        drop(other);
-        assert_eq!(
-            d1.load(Ordering::SeqCst),
-            0,
-            "executing another list must not release an open list's epoch"
-        );
-
-        // Closing and resetting the open list releases its epoch.
-        open.close();
-        open.reset();
-        assert_eq!(d1.load(Ordering::SeqCst), 1);
-
-        // Marking work again and dropping the list also releases its epoch.
-        open.mark_work();
-        let (c2, d2) = DropCounter::new();
-        retire(c2);
-        assert_eq!(d2.load(Ordering::SeqCst), 0);
-        drop(open);
-        assert_eq!(d2.load(Ordering::SeqCst), 1);
-
-        // A closed list pinned via begin_submit stays active across execution
-        // until end_submit.
-        let submitted = host.new_list().expect("submitted list");
-        submitted.mark_work();
-        submitted.begin_submit();
-        let (c3, d3) = DropCounter::new();
-        retire(c3);
-        submitted.close();
-        host.execute(&[&submitted]);
-        assert_eq!(d3.load(Ordering::SeqCst), 0);
-        submitted.end_submit();
-        assert_eq!(d3.load(Ordering::SeqCst), 1);
-    }
-
-    #[test]
-    fn empty_execute_does_not_submit() {
-        // D3D12 forbids ExecuteCommandLists with NumCommandLists == 0.
-        let Some(host) = host() else {
-            return;
-        };
-        let before = *host.submitted.lock().unwrap_or_else(|e| e.into_inner());
-        host.execute(&[]);
-        let after = *host.submitted.lock().unwrap_or_else(|e| e.into_inner());
-        assert_eq!(before, after, "empty execute must not bump the fence");
-    }
-
-    #[test]
-    fn unique_list_batches_splits_on_repeated_pointers() {
-        assert!(unique_list_batches(&[]).is_empty());
-        assert_eq!(unique_list_batches(&[1]), vec![0..1]);
-        assert_eq!(unique_list_batches(&[1, 2, 3]), vec![0..3]);
-        assert_eq!(unique_list_batches(&[1, 1]), vec![0..1, 1..2]);
-        assert_eq!(unique_list_batches(&[1, 2, 1]), vec![0..2, 2..3]);
-        assert_eq!(unique_list_batches(&[1, 2, 1, 2]), vec![0..2, 2..4]);
-        assert_eq!(unique_list_batches(&[7, 7, 7]), vec![0..1, 1..2, 2..3]);
-    }
-
-    #[test]
-    fn duplicate_list_execute_splits_submissions() {
-        // VIC-BT-001: the same HostList twice must not Reset its prelude
-        // allocator while the first recording is still queued. Exact batch
-        // counts are covered by `unique_list_batches` (process-wide
-        // `submitted` races with parallel GPU tests).
-        let Some(host) = host() else {
-            return;
-        };
-        let list = host.new_list().expect("host list");
-        list.close();
-        let other = host.new_list().expect("other list");
-        other.close();
-
-        let before = *host.submitted.lock().unwrap_or_else(|e| e.into_inner());
-        host.execute(&[&list]);
-        let after_one = *host.submitted.lock().unwrap_or_else(|e| e.into_inner());
-        assert!(
-            after_one > before,
-            "one list must wait at least one submission"
-        );
-
-        host.execute(&[&list, &other]);
-        let after_unique = *host.submitted.lock().unwrap_or_else(|e| e.into_inner());
-        assert!(
-            after_unique > after_one,
-            "two distinct lists must submit at least once"
-        );
-
-        host.execute(&[&list, &list]);
-        let after_dup = *host.submitted.lock().unwrap_or_else(|e| e.into_inner());
-        assert!(
-            after_dup > after_unique,
-            "a repeated HostList must submit again (separate waited batches)"
-        );
-        // SAFETY: plain device-removed query after the duplicate submission.
-        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
-    }
-
-    #[test]
-    fn duplicate_list_execute_preserves_texture_state() {
-        // Synthetic reproducer from VIC-BT-001: list L transitions a texture
-        // (first != last). Submitting [L, L] must leave host state at `last`
-        // and must not remove the device from a clobbered prelude barrier.
-        let Some(host) = host() else {
-            return;
-        };
-        let list = host.new_list().expect("host list");
-        let null = std::ptr::null();
-        let heap = D3D12_HEAP_PROPERTIES {
-            Type: D3D12_HEAP_TYPE_DEFAULT,
-            ..Default::default()
-        };
-        let desc = D3D12_RESOURCE_DESC {
-            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
-            Width: 4,
-            Height: 4,
-            DepthOrArraySize: 1,
-            MipLevels: 1,
-            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
-            SampleDesc: DXGI_SAMPLE_DESC {
-                Count: 1,
-                Quality: 0,
-            },
-            Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
-            ..Default::default()
-        };
-        let iid = ID3D12Resource::IID;
-        let mut tex = null;
-        assert_eq!(
-            crate::resource::create_committed(
-                null,
-                (&raw const heap).cast(),
-                0,
-                (&raw const desc).cast(),
-                0,
-                null.cast(),
-                (&raw const iid).cast(),
-                &mut tex,
-            ),
-            crate::object::S_OK
-        );
-        const COPY_DEST: u32 = 0x400;
-        const RENDER_TARGET: u32 = 0x4;
-        // Record real barriers so prelude first/last states match the GPU list.
-        crate::list::ensure_state(&list, tex, COPY_DEST);
-        crate::list::ensure_state(&list, tex, RENDER_TARGET);
-        list.close();
-
-        host.execute(&[&list, &list]);
-
-        let copy = crate::resource::host_copy(tex).expect("host copy");
-        assert_eq!(
-            copy.state.load(Ordering::Relaxed),
-            RENDER_TARGET,
-            "duplicate execute must leave the texture at the list's end state"
-        );
-        // SAFETY: plain device-removed query after prelude barriers ran twice.
-        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
-    }
-
-    #[test]
-    fn active_execution_epoch_pins_objects_retired_during_execute() {
-        let _retire = isolated_retire_scope();
-        let Some(host) = host() else {
-            return;
-        };
-        let list = host.new_list().expect("host list");
-        let drops = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let drops_during = drops.clone();
-        // Use an unmarked deferred step without `begin_submit()` so `list`
-        // itself pins no epoch; only `Host::execute`'s `exec_epoch` keeps the
-        // object alive until execution finishes.
-        list.defer_unmarked(move || {
-            let counter = DropCounter(drops_during.clone());
-            retire(counter);
-            assert_eq!(drops_during.load(Ordering::SeqCst), 0);
-        });
-        assert!(!list.has_epoch());
-        list.close();
-        host.execute(&[&list]);
-        assert_eq!(drops.load(Ordering::SeqCst), 1);
-    }
-
-    #[test]
-    fn stale_pinned_list_does_not_block_newer_born_retirements() {
-        let _retire = isolated_retire_scope();
-        let Some(host) = host() else {
-            return;
-        };
-        // Simulate an early command list (e.g. oldest_epoch=2) that recorded
-        // work once and stays unreset indefinitely.
-        let stale = host.new_list().expect("stale list");
-        stale.mark_work();
-
-        // A resource born after `stale` last recorded work must drop
-        // immediately once no newer epoch is active, without head-of-line
-        // blocking behind `stale`.
-        let born1 = birth_seq();
-        let (c1, d1) = DropCounter::new();
-        retire_born(c1, born1);
-        assert_eq!(
-            d1.load(Ordering::SeqCst),
-            1,
-            "stale pinned epoch must not block a resource created after its last work"
-        );
-
-        // A resource born before a newer active list must wait for that newer
-        // list, then drop as soon as the newer list finishes — still while
-        // `stale` remains pinned.
-        let born2 = birth_seq();
-        let active = host.new_list().expect("active list");
-        active.mark_work();
-        let (c2, d2) = DropCounter::new();
-        retire_born(c2, born2);
-        assert_eq!(d2.load(Ordering::SeqCst), 0);
-        active.close();
-        active.reset();
-        assert_eq!(
-            d2.load(Ordering::SeqCst),
-            1,
-            "resource must drop once its own blocking epoch finishes"
-        );
-
-        // If the older open list subsequently records new work after `born3`,
-        // its `work_seq` advances and `c3` MUST wait for `stale` to finish.
-        let born3 = birth_seq();
-        stale.mark_work();
-        let (c3, d3) = DropCounter::new();
-        retire_born(c3, born3);
-        assert_eq!(
-            d3.load(Ordering::SeqCst),
-            0,
-            "an open list that records work after birth_seq must pin that resource"
-        );
-        stale.close();
-        stale.reset();
-        assert_eq!(d3.load(Ordering::SeqCst), 1);
-    }
-
-    #[test]
-    fn resubmitted_closed_list_preserves_work_seq_until_second_completion() {
-        let _retire = isolated_retire_scope();
-        let Some(host) = host() else {
-            return;
-        };
-        let born = birth_seq();
-        let list = host.new_list().expect("reused list");
-        list.mark_work();
-        list.close();
-
-        // First submission completes and releases the epoch, but keeps
-        // `work_seq` because the list was not reset.
-        list.begin_submit();
-        host.execute(&[&list]);
-        list.end_submit();
-        assert!(!list.has_epoch());
-
-        // Second submission re-acquires an epoch preserving `work_seq >= born`.
-        list.begin_submit();
-        let (c, d) = DropCounter::new();
-        retire_born(c, born);
-        assert_eq!(
-            d.load(Ordering::SeqCst),
-            0,
-            "resubmitted closed list must keep resources from its recording alive"
-        );
-        host.execute(&[&list]);
-        assert_eq!(d.load(Ordering::SeqCst), 0);
-        list.end_submit();
-        assert_eq!(d.load(Ordering::SeqCst), 1);
-    }
-
-    #[test]
-    fn retire_executing_pins_only_active_execute_epochs_without_bumping_resource_seq() {
-        let _retire = isolated_retire_scope();
-        let Some(host) = host() else {
-            return;
-        };
-        let open = host.new_list().expect("open list");
-        open.mark_work();
-
-        let seq_before = RESOURCE_SEQ.load(Ordering::SeqCst);
-        let (c_open, d_open) = DropCounter::new();
-        retire_executing(c_open);
-        assert_eq!(
-            RESOURCE_SEQ.load(Ordering::SeqCst),
-            seq_before,
-            "retire_executing must not bump global RESOURCE_SEQ"
-        );
-        assert_eq!(
-            d_open.load(Ordering::SeqCst),
-            1,
-            "newly opened list with finite work_seq must not pin retire_executing objects"
-        );
-
-        let exec_guard = crate::retire::acquire_exec_guard();
-        let (c_exec, d_exec) = DropCounter::new();
-        retire_executing(c_exec);
-        assert_eq!(RESOURCE_SEQ.load(Ordering::SeqCst), seq_before);
-        assert_eq!(
-            d_exec.load(Ordering::SeqCst),
-            0,
-            "active Host::execute epoch (work_seq == u64::MAX) must pin retire_executing objects"
-        );
-        drop(exec_guard);
-        assert_eq!(
-            d_exec.load(Ordering::SeqCst),
-            1,
-            "finishing Host::execute epoch must drop pinned object"
-        );
-
-        drop(open);
-    }
-
-    #[test]
-    fn state_gen_bumps_only_on_new_or_changed_texture_states() {
-        let Some(host) = host() else {
-            return;
-        };
-        let list = host.new_list().expect("host list");
-        assert_eq!(list.state_gen(), 0);
-        let null = std::ptr::null();
-        let heap = D3D12_HEAP_PROPERTIES {
-            Type: D3D12_HEAP_TYPE_DEFAULT,
-            ..Default::default()
-        };
-        let desc = D3D12_RESOURCE_DESC {
-            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
-            Width: 4,
-            Height: 4,
-            DepthOrArraySize: 1,
-            MipLevels: 1,
-            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
-            SampleDesc: DXGI_SAMPLE_DESC {
-                Count: 1,
-                Quality: 0,
-            },
-            ..Default::default()
-        };
-        let iid = ID3D12Resource::IID;
-        let mut tex = null;
-        assert_eq!(
-            crate::resource::create_committed(
-                null,
-                (&raw const heap).cast(),
-                0,
-                (&raw const desc).cast(),
-                0,
-                null.cast(),
-                (&raw const iid).cast(),
-                &mut tex,
-            ),
-            crate::object::S_OK
-        );
-
-        const SHADER_RESOURCE: u32 = 0x40 | 0x80;
-        const COPY_SOURCE: u32 = 0x800;
-        assert!(list.transition(tex, SHADER_RESOURCE).is_none());
-        assert_eq!(list.state_gen(), 1);
-        // Same state does not bump state_gen.
-        assert!(list.transition(tex, SHADER_RESOURCE).is_none());
-        assert_eq!(list.state_gen(), 1);
-        // Changing state bumps state_gen and returns the prior state.
-        assert!(list.transition(tex, COPY_SOURCE).is_some());
-        assert_eq!(list.state_gen(), 2);
-
-        list.close();
-        list.reset();
-        assert_eq!(list.state_gen(), 0);
-        list.close();
-
-        let release =
-            crate::object::slot::<extern "system" fn(crate::object::This) -> u32>(tex, 0x10);
-        assert_eq!(release(tex), 0);
-    }
-
-    #[test]
-    fn host_list_reset_trims_excess_scratch_chunks() {
-        let _retire = isolated_retire_scope();
-        let Some(host) = host() else {
-            return;
-        };
-        let list = host.new_list().expect("host list");
-
-        // Allocate 3 x 3 MiB so 3 distinct 4 MiB scratch chunks are created.
-        for _ in 0..3 {
-            let (gpu, ptr) = list.scratch(3 << 20).expect("scratch allocation");
-            assert_ne!(gpu, 0);
-            assert!(!ptr.is_null());
-        }
-        assert!(
-            list.scratch
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .chunks
-                .len()
-                >= 2,
-            "multi-chunk scratch spike should allocate at least two chunks"
-        );
-
-        // Also spill past one rect counter chunk to verify counter truncation.
-        for _ in 0..=RECT_COUNTER_CHUNK {
-            assert!(list.rect_counter().is_some());
-        }
-        assert_eq!(
-            list.rect_scratch
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .counters
-                .len(),
-            2
-        );
-
-        let errors_before = host.d3d12_errors();
-        list.close();
-        list.reset();
-
-        {
-            let scratch = list.scratch.lock().unwrap_or_else(|e| e.into_inner());
-            assert_eq!(
-                scratch.chunks.len(),
-                1,
-                "reset should keep at most one warm scratch chunk"
-            );
-            assert_eq!((scratch.current, scratch.used), (0, 0));
-        }
-        {
-            let rect = list.rect_scratch.lock().unwrap_or_else(|e| e.into_inner());
-            assert_eq!(
-                rect.counters.len(),
-                1,
-                "reset should keep at most one warm rect counter chunk"
-            );
-            assert_eq!((rect.counter_chunk, rect.counter_used), (0, 0));
-        }
-
-        // Subsequent allocations reuse the warm chunks and execute cleanly.
-        let (gpu, ptr) = list.scratch(4096).expect("warm scratch allocation");
-        assert_ne!(gpu, 0);
-        assert!(!ptr.is_null());
-        assert_eq!(
-            list.scratch
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .chunks
-                .len(),
-            1
-        );
-        assert!(list.rect_counter().is_some());
-        assert_eq!(
-            list.rect_scratch
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .counters
-                .len(),
-            1
-        );
-
-        list.close();
-        host.execute(&[&list]);
-        assert_eq!(host.d3d12_errors(), errors_before);
-    }
-
-    #[test]
-    fn recycle_list_releases_scratch_uploads_and_tracked_resources_immediately() {
-        let _retire = isolated_retire_scope();
-        let Some(host) = host() else {
-            return;
-        };
-        let list = host.new_list().expect("host list");
-        let list_raw = list.list.as_raw() as usize;
-
-        // Track a title texture on the list, then release the title object so
-        // only the list's tracked state and epoch keep HostTexture alive.
-        let null = std::ptr::null();
-        let heap = D3D12_HEAP_PROPERTIES {
-            Type: D3D12_HEAP_TYPE_DEFAULT,
-            ..Default::default()
-        };
-        let desc = D3D12_RESOURCE_DESC {
-            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
-            Width: 4,
-            Height: 4,
-            DepthOrArraySize: 1,
-            MipLevels: 1,
-            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
-            SampleDesc: DXGI_SAMPLE_DESC {
-                Count: 1,
-                Quality: 0,
-            },
-            ..Default::default()
-        };
-        let iid = ID3D12Resource::IID;
-        let mut tex = null;
-        assert_eq!(
-            crate::resource::create_committed(
-                null,
-                (&raw const heap).cast(),
-                0,
-                (&raw const desc).cast(),
-                0,
-                null.cast(),
-                (&raw const iid).cast(),
-                &mut tex,
-            ),
-            crate::object::S_OK
-        );
-        const SHADER_RESOURCE: u32 = 0x40 | 0x80;
-        list.transition(tex, SHADER_RESOURCE);
-        let weak_tex = std::sync::Arc::downgrade(
-            &crate::resource::host_copy(tex).expect("tracked host texture"),
-        );
-        let release =
-            crate::object::slot::<extern "system" fn(crate::object::This) -> u32>(tex, 0x10);
-        assert_eq!(release(tex), 0);
-        assert!(weak_tex.upgrade().is_some());
-
-        // Populate scratch chunks, uploads, kept objects, shadow states,
-        // rect scratch, deferred work, pipelines, and a pinned retirement epoch.
-        assert!(list.scratch(3 << 20).is_some());
-        assert!(list.scratch(3 << 20).is_some());
-        let (upload_res, _) = list.upload(host, 4096).expect("list upload");
-        list.keep(&upload_res);
-        drop(upload_res);
-        let shadow_buf = host.default_buffer(256).expect("shadow buffer");
-        list.use_shadow(&shadow_buf, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-        drop(shadow_buf);
-        assert!(list.rect_vertices(4096).is_some());
-        assert!(list.rect_args(4096).is_some());
-        assert!(list.rect_counter().is_some());
-        list.used_pipeline("recycle_test_pipeline");
-        let (deferred_counter, deferred_drops) = DropCounter::new();
-        list.defer_host(move || {
-            let _ = &deferred_counter;
-        });
-        let (retired_counter, retired_drops) = DropCounter::new();
-        retire(retired_counter);
-        assert!(list.has_epoch());
-        assert_eq!(retired_drops.load(Ordering::SeqCst), 0);
-
-        let errors_before = host.d3d12_errors();
-        list.close();
-        host.execute(&[&list]);
-
-        assert!(weak_tex.upgrade().is_some());
-        assert_eq!(deferred_drops.load(Ordering::SeqCst), 0);
-        assert_eq!(retired_drops.load(Ordering::SeqCst), 0);
-        assert_eq!(
-            list.scratch
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .chunks
-                .len(),
-            2
-        );
-
-        // Ensure room in free_lists so recycling parks the list rather than dropping it.
-        {
-            let mut pool = host.free_lists.lock().unwrap_or_else(|e| e.into_inner());
-            if pool.len() >= LIST_POOL_CAP {
-                pool.pop();
-            }
-        }
-        let reused_before = host.reused_lists();
-        host.recycle_list(list);
-
-        assert!(
-            weak_tex.upgrade().is_none(),
-            "tracked HostTexture must drop immediately when list is recycled"
-        );
-        assert_eq!(
-            deferred_drops.load(Ordering::SeqCst),
-            1,
-            "deferred closures must drop immediately when list is recycled"
-        );
-        assert_eq!(
-            retired_drops.load(Ordering::SeqCst),
-            1,
-            "list epoch must release immediately when list is recycled"
-        );
-
-        {
-            let pool = host.free_lists.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(pooled) = pool.iter().find(|l| l.list.as_raw() as usize == list_raw) {
-                assert!(
-                    pooled
-                        .scratch
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .chunks
-                        .is_empty(),
-                    "pooled list must hold 0 scratch chunks"
-                );
-                let rect = pooled
-                    .rect_scratch
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
-                assert!(rect.vertices.is_none());
-                assert!(rect.args.is_none());
-                assert!(rect.counters.is_empty());
-                assert_eq!((rect.counter_chunk, rect.counter_used), (0, 0));
-                assert!(
-                    pooled
-                        .states
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .is_empty()
-                );
-                assert!(
-                    pooled
-                        .shadow_states
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .is_empty()
-                );
-                assert!(
-                    pooled
-                        .dirty_resources
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .is_empty()
-                );
-                assert!(
-                    pooled
-                        .pipelines
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .is_empty()
-                );
-                assert_eq!(pooled.state_gen(), 0);
-                assert!(!pooled.has_epoch());
-                let deferred = pooled.deferred();
-                assert!(deferred.uploads.is_empty());
-                assert!(deferred.kept.is_empty());
-                assert!(deferred.copies.is_empty());
-            } else {
-                assert!(
-                    host.reused_lists() > reused_before,
-                    "recycled list should sit in free_lists unless popped concurrently"
-                );
-            }
-        }
-
-        // Pop from the pool and verify D3D12 reset + recording + execution
-        // succeed cleanly with zero debug-layer errors.
-        let reused = host.acquire_list().expect("acquire recycled list");
-        let (gpu, ptr) = reused.scratch(4096).expect("scratch after pool reuse");
-        assert_ne!(gpu, 0);
-        assert!(!ptr.is_null());
-        assert!(reused.rect_vertices(4096).is_some());
-        assert!(reused.rect_args(4096).is_some());
-        assert!(reused.rect_counter().is_some());
-        reused.close();
-        host.execute(&[&reused]);
-        assert_eq!(host.d3d12_errors(), errors_before);
-    }
-}
-
-#[cfg(test)]
-mod batch {
-    // Batch::texture_due lives here; `mod tests` is already taken above
-    use super::Batch;
-    use std::sync::Arc;
-
-    #[test]
-    fn exact_gpu_writes_are_declared_once_per_submission() {
-        let mut batch = Batch::default();
-        let (a, b) = (Arc::new(0), Arc::new(0));
-        assert!(batch.new_gpu_write(&a, 4096, 16));
-        assert!(!batch.new_gpu_write(&a.clone(), 4096, 16));
-        assert!(batch.new_gpu_write(&a, 4096, 32));
-        assert!(batch.new_gpu_write(&a, 4104, 16));
-        assert!(batch.new_gpu_write(&b, 4096, 16));
-        // CPU copies can flush refreshes, but these GPU writes stay pending.
-        batch.title_written();
-        assert!(!batch.new_gpu_write(&a, 4096, 16));
-        assert!(Batch::default().new_gpu_write(&a, 4096, 16));
-    }
-
-    #[test]
-    fn a_texture_is_checked_once_per_submission() {
-        let mut batch = Batch::default();
-        let (a, b) = (Arc::new([0u8; 16]), Arc::new([0u8; 16]));
-        // The first list sampling each texture checks it ...
-        assert!(batch.texture_due(&a));
-        assert!(batch.texture_due(&b));
-        // ... later lists of the same submission do not.
-        assert!(!batch.texture_due(&a));
-        assert!(!batch.texture_due(&a.clone()));
-        assert!(!batch.texture_due(&b));
-    }
-
-    #[test]
-    fn title_writes_make_textures_due_again() {
-        let mut batch = Batch::default();
-        let a = Arc::new(1u32);
-        assert!(batch.texture_due(&a));
-        assert!(!batch.texture_due(&a));
-        // A copy into title memory or work that may write it may have
-        // changed the texture's memory.
-        batch.title_written();
-        assert!(batch.texture_due(&a));
-        assert!(!batch.texture_due(&a));
-        // A fresh submission starts over.
-        let mut next = Batch::default();
-        assert!(next.texture_due(&a));
-    }
-
-    /// The hashing a submission does for textures in physical-page memory,
-    /// with every list checking the textures it samples (before) and with
-    /// each checked once (after). Run with
-    /// `cargo test --release -p victory-gpu -- --ignored --nocapture texture_checks`.
-    #[test]
-    #[ignore = "benchmark"]
-    fn texture_checks_per_submission() {
-        const TEXTURES: usize = 48;
-        const SIZE: usize = 4 << 20;
-        const LISTS: usize = 12;
-        let textures: Vec<Arc<Vec<u8>>> = (0..TEXTURES)
-            .map(|t| Arc::new((0..SIZE).map(|i| (i * 31 + t) as u8).collect()))
-            .collect();
-        let submit = |dedupe: bool| {
-            let mut batch = Batch::default();
-            let mut hashed = 0usize;
-            let started = std::time::Instant::now();
-            for _ in 0..LISTS {
-                for t in &textures {
-                    if !dedupe || batch.texture_due(t) {
-                        std::hint::black_box(blake3::hash(t));
-                        hashed += 1;
-                    }
-                }
-            }
-            (started.elapsed(), hashed)
-        };
-        submit(false); // warm up
-        let (before, n_before) = submit(false);
-        let (after, n_after) = submit(true);
-        assert_eq!((n_before, n_after), (TEXTURES * LISTS, TEXTURES));
-        println!(
-            "{LISTS} lists sampling {TEXTURES} textures of {} MiB: \
-             before {n_before} hashes in {before:?}, after {n_after} in {after:?} ({:.1}x)",
-            SIZE >> 20,
-            before.as_secs_f64() / after.as_secs_f64()
-        );
-    }
-}
-
-#[cfg(all(test, feature = "diagnostics"))]
-mod eager_gbv_tests {
-    use super::*;
-    use std::ffi::OsStr;
-
-    #[test]
-    fn parse_eager_gbv_respects_off_current_and_guarded_values() {
-        assert_eq!(parse_eager_gbv(None), None);
-        assert_eq!(parse_eager_gbv(Some(OsStr::new(""))), None);
-        assert_eq!(parse_eager_gbv(Some(OsStr::new("0"))), None);
-        assert_eq!(
-            parse_eager_gbv(Some(OsStr::new("1"))),
-            Some(EagerGbv::Current)
-        );
-        assert_eq!(
-            parse_eager_gbv(Some(OsStr::new("guarded"))),
-            Some(EagerGbv::Guarded)
-        );
-    }
-
-    #[test]
-    fn front_load_flag_matches_patch_mode() {
-        assert_eq!(
-            front_load_flag_for(
-                D3D12_GPU_BASED_VALIDATION_SHADER_PATCH_MODE_GUARDED_VALIDATION
-            ),
-            Ok(
-                D3D12_GPU_BASED_VALIDATION_PIPELINE_STATE_CREATE_FLAG_FRONT_LOAD_CREATE_GUARDED_VALIDATION_SHADERS
-            )
-        );
-        assert_eq!(
-            front_load_flag_for(
-                D3D12_GPU_BASED_VALIDATION_SHADER_PATCH_MODE_UNGUARDED_VALIDATION
-            ),
-            Ok(
-                D3D12_GPU_BASED_VALIDATION_PIPELINE_STATE_CREATE_FLAG_FRONT_LOAD_CREATE_UNGUARDED_VALIDATION_SHADERS
-            )
-        );
-        assert_eq!(
-            front_load_flag_for(
-                D3D12_GPU_BASED_VALIDATION_SHADER_PATCH_MODE_STATE_TRACKING_ONLY
-            ),
-            Ok(
-                D3D12_GPU_BASED_VALIDATION_PIPELINE_STATE_CREATE_FLAG_FRONT_LOAD_CREATE_TRACKING_ONLY_SHADERS
-            )
-        );
-    }
-
-    #[test]
-    #[ignore = "requires an isolated process with the D3D12 debug layer and a WARP software adapter"]
-    fn eager_gbv_round_trips_and_preserves_unrelated_flags_on_warp() -> windows::core::Result<()> {
-        // SAFETY: runs only in an isolated test process with debug layer and WARP.
-        unsafe {
-            let mut layer: Option<ID3D12Debug> = None;
-            D3D12GetDebugInterface(&mut layer)?;
-            let layer = layer.ok_or_else(windows::core::Error::empty)?;
-            layer.EnableDebugLayer();
-            layer
-                .cast::<ID3D12Debug1>()?
-                .SetEnableGPUBasedValidation(true);
-            let adapter = warp_adapter()?;
-            let mut device: Option<ID3D12Device> = None;
-            D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
-            let device = device.ok_or_else(windows::core::Error::empty)?;
-
-            let debug = device.cast::<ID3D12DebugDevice1>()?;
-            let kind = D3D12_DEBUG_DEVICE_PARAMETER_GPU_BASED_VALIDATION_SETTINGS;
-            let size = size_of::<D3D12_DEBUG_DEVICE_GPU_BASED_VALIDATION_SETTINGS>() as u32;
-            let mut settings = D3D12_DEBUG_DEVICE_GPU_BASED_VALIDATION_SETTINGS::default();
-            debug.GetDebugParameter(kind, (&raw mut settings).cast(), size)?;
-            // Turn on an unrelated create flag (`FRONT_LOAD_CREATE_TRACKING_ONLY_SHADERS`)
-            // and verify eager configuration preserves it alongside the added front-load bit.
-            let preserved =
-                D3D12_GPU_BASED_VALIDATION_PIPELINE_STATE_CREATE_FLAG_FRONT_LOAD_CREATE_TRACKING_ONLY_SHADERS;
-            settings.PipelineStateCreateFlags.0 |= preserved.0;
-            debug.SetDebugParameter(kind, (&raw const settings).cast(), size)?;
-
-            configure_eager_gbv(&device, EagerGbv::Current)?;
-            let mut after_current = D3D12_DEBUG_DEVICE_GPU_BASED_VALIDATION_SETTINGS::default();
-            debug.GetDebugParameter(kind, (&raw mut after_current).cast(), size)?;
-            assert_ne!(after_current.PipelineStateCreateFlags.0 & preserved.0, 0);
-
-            configure_eager_gbv(&device, EagerGbv::Guarded)?;
-            let mut after_guarded = D3D12_DEBUG_DEVICE_GPU_BASED_VALIDATION_SETTINGS::default();
-            debug.GetDebugParameter(kind, (&raw mut after_guarded).cast(), size)?;
-            assert_eq!(
-                after_guarded.DefaultShaderPatchMode,
-                D3D12_GPU_BASED_VALIDATION_SHADER_PATCH_MODE_GUARDED_VALIDATION
-            );
-            assert_ne!(
-                after_guarded.PipelineStateCreateFlags.0
-                    & D3D12_GPU_BASED_VALIDATION_PIPELINE_STATE_CREATE_FLAG_FRONT_LOAD_CREATE_GUARDED_VALIDATION_SHADERS
-                        .0,
-                0
-            );
-            assert_ne!(after_guarded.PipelineStateCreateFlags.0 & preserved.0, 0);
-            Ok(())
-        }
-    }
-}
-
 /// Whether D3D12 wave-ops capabilities allow fixed `WaveSize(32)`.
 fn wave32_supported(wave_ops: bool, min: u32, max: u32) -> bool {
     wave_ops && min <= 32 && max >= 32
 }
 
 #[cfg(test)]
-mod wave_tests {
-    use super::{
-        REBAR_HASH_SOURCE, flagged_piece_byte_runs, host, intersect_ranges, merge_ranges,
-        parse_rebar_mb_override, rebar_hash_pipeline, rebar_loose_policy, rebar_policy,
-        resolve_rebar_budgets, spans_to_piece_runs, transition, wave32_supported,
-    };
-    use crate::watch::PAGE;
-
-    #[test]
-    fn wave32_support_matches_adapter_lane_range() {
-        assert!(wave32_supported(true, 32, 32)); // NVIDIA
-        assert!(wave32_supported(true, 32, 64)); // AMD RDNA
-        assert!(wave32_supported(true, 16, 32)); // Intel Xe/Arc
-        assert!(wave32_supported(true, 4, 128)); // WARP
-        assert!(!wave32_supported(true, 64, 64)); // Wave64-only (GCN/Vega)
-        assert!(!wave32_supported(false, 32, 32)); // No wave ops
-    }
-
-    #[test]
-    fn rebar_policy_handles_all_hardware_tiers_and_fallbacks() {
-        const MIB: u64 = 1 << 20;
-        const GIB: u64 = 1 << 30;
-
-        // Non-ReBAR, WARP, UMA/APU, or explicitly disabled always stay off.
-        assert_eq!(rebar_policy(false, false, Some(32 * GIB), true), (false, 0));
-        assert_eq!(rebar_policy(true, true, Some(64 * GIB), true), (false, 0));
-        assert_eq!(rebar_policy(true, false, Some(32 * GIB), false), (false, 0));
-        assert_eq!(rebar_policy(true, false, None, true), (false, 0));
-        assert_eq!(rebar_loose_policy(false, false, Some(32 * GIB), true), 0);
-        assert_eq!(rebar_loose_policy(true, true, Some(64 * GIB), true), 0);
-        assert_eq!(rebar_loose_policy(true, false, Some(32 * GIB), false), 0);
-        assert_eq!(rebar_loose_policy(true, false, None, true), 0);
-
-        // Low-VRAM discrete GPUs (<= 8 GiB) stay on system-RAM shadows.
-        assert_eq!(rebar_policy(true, false, Some(4 * GIB), true), (false, 0));
-        assert_eq!(rebar_policy(true, false, Some(8 * GIB), true), (false, 0));
-        assert_eq!(rebar_loose_policy(true, false, Some(8 * GIB), true), 0);
-
-        // 12–14 GiB tier: conservative 512 MiB buffer budget, 0 loose budget.
-        assert_eq!(
-            rebar_policy(true, false, Some(12 * GIB), true),
-            (true, 512 * MIB)
-        );
-        assert_eq!(
-            rebar_policy(true, false, Some(14 * GIB), true),
-            (true, 512 * MIB)
-        );
-        assert_eq!(rebar_loose_policy(true, false, Some(12 * GIB), true), 0);
-        assert_eq!(rebar_loose_policy(true, false, Some(14 * GIB), true), 0);
-
-        // 16 GiB tier (< 20 GiB): 1 GiB buffer budget, 2 GiB loose budget.
-        assert_eq!(rebar_policy(true, false, Some(16 * GIB), true), (true, GIB));
-        assert_eq!(
-            rebar_loose_policy(true, false, Some(16 * GIB), true),
-            2 * GIB
-        );
-
-        // 20–24 GiB tier (< 28 GiB): 2 GiB buffer budget, 4 GiB loose budget.
-        assert_eq!(
-            rebar_policy(true, false, Some(20 * GIB), true),
-            (true, 2 * GIB)
-        );
-        assert_eq!(
-            rebar_policy(true, false, Some(24 * GIB), true),
-            (true, 2 * GIB)
-        );
-        assert_eq!(
-            rebar_loose_policy(true, false, Some(20 * GIB), true),
-            4 * GIB
-        );
-        assert_eq!(
-            rebar_loose_policy(true, false, Some(24 * GIB), true),
-            4 * GIB
-        );
-
-        // 28–32+ GiB tier (>= 28 GiB, e.g. RTX 5090): 3 GiB buffer, 6 GiB loose.
-        assert_eq!(
-            rebar_policy(true, false, Some(28 * GIB), true),
-            (true, 3 * GIB)
-        );
-        assert_eq!(
-            rebar_policy(true, false, Some(32 * GIB), true),
-            (true, 3 * GIB)
-        );
-        assert_eq!(
-            rebar_policy(true, false, Some(48 * GIB), true),
-            (true, 3 * GIB)
-        );
-        assert_eq!(
-            rebar_loose_policy(true, false, Some(28 * GIB), true),
-            6 * GIB
-        );
-        assert_eq!(
-            rebar_loose_policy(true, false, Some(32 * GIB), true),
-            6 * GIB
-        );
-        assert_eq!(
-            rebar_loose_policy(true, false, Some(48 * GIB), true),
-            6 * GIB
-        );
-
-        // Pure env override parsing & policy composition (`VICTORY_REBAR_MB` / `VICTORY_REBAR_LOOSE_MB`).
-        assert_eq!(parse_rebar_mb_override(None), None);
-        assert_eq!(parse_rebar_mb_override(Some("  ")), None);
-        assert_eq!(parse_rebar_mb_override(Some("abc")), None);
-        assert_eq!(parse_rebar_mb_override(Some("0")), Some(0));
-        assert_eq!(parse_rebar_mb_override(Some(" 1536 ")), Some(1536 * MIB));
-
-        assert_eq!(
-            resolve_rebar_budgets(true, false, Some(32 * GIB), true, Some("2048"), Some("0")),
-            (true, 2 * GIB, 0)
-        );
-        assert_eq!(
-            resolve_rebar_budgets(true, false, Some(16 * GIB), true, Some("0"), Some("1024")),
-            (true, 0, GIB)
-        );
-        // `VICTORY_REBAR=0`, UMA, or unsupported GPU upload disables all ReBAR despite overrides.
-        assert_eq!(
-            resolve_rebar_budgets(
-                true,
-                false,
-                Some(32 * GIB),
-                false,
-                Some("2048"),
-                Some("4096")
-            ),
-            (false, 0, 0)
-        );
-        assert_eq!(
-            resolve_rebar_budgets(true, true, Some(64 * GIB), true, Some("2048"), Some("4096")),
-            (false, 0, 0)
-        );
-        assert_eq!(
-            resolve_rebar_budgets(
-                false,
-                false,
-                Some(32 * GIB),
-                true,
-                Some("2048"),
-                Some("4096")
-            ),
-            (false, 0, 0)
-        );
-    }
-
-    #[test]
-    fn merge_ranges_coalesces_overlapping_and_adjacent_spans() {
-        assert_eq!(merge_ranges(vec![]), vec![]);
-        assert_eq!(merge_ranges(vec![(10, 10), (20, 15)]), vec![]);
-        assert_eq!(
-            merge_ranges(vec![(100, 200), (0, 50), (50, 120), (300, 400)]),
-            vec![(0, 200), (300, 400)]
-        );
-        assert_eq!(
-            merge_ranges(vec![(0, 100), (10, 40), (20, 90)]),
-            vec![(0, 100)]
-        );
-    }
-
-    #[test]
-    fn piece_runs_and_flagged_intersection_dedupe_and_clamp() {
-        // Two disjoint spans inside piece 0 plus a span in piece 1 coalesce into
-        // one contiguous run `(0, 2)`, while piece 4 stays separate.
-        let declared = vec![
-            (0x100, 0x200),
-            (0x8000, 0x9000),
-            (PAGE + 16, PAGE + 64),
-            (4 * PAGE, 5 * PAGE + 128),
-        ];
-        let runs = spans_to_piece_runs(&declared);
-        assert_eq!(runs, vec![(0, 2), (4, 2)]);
-
-        // Flag pieces 0, 4, and 5 (skip piece 1); clamp end to buffer length.
-        let len = 5 * PAGE + 256;
-        let (flagged, changed) = flagged_piece_byte_runs(&runs, &[1, 0, 1, 1], len);
-        assert_eq!(changed, 3);
-        assert_eq!(flagged, vec![(0, PAGE), (4 * PAGE, len)]);
-
-        // Intersecting with declared spans yields only the declared bytes in
-        // flagged pieces (both disjoint spans inside piece 0 are preserved).
-        assert_eq!(
-            intersect_ranges(&flagged, &declared),
-            vec![(0x100, 0x200), (0x8000, 0x9000), (4 * PAGE, 5 * PAGE + 128)]
-        );
-
-        // Zero flagged pieces produces zero readback spans.
-        let (none, changed) = flagged_piece_byte_runs(&runs, &[0, 0, 0, 0], len);
-        assert_eq!(changed, 0);
-        assert!(none.is_empty());
-        assert!(intersect_ranges(&none, &declared).is_empty());
-    }
-
-    #[test]
-    fn rebar_hash_hlsl_compiles_and_builds_on_host() {
-        use crate::hlsl::{dxc_compile, system_compile};
-        let probe = r#"
-            RWByteAddressBuffer b : register(u0);
-            [RootSignature("UAV(u0)")]
-            [numthreads(1, 1, 1)]
-            void main() { b.Store(0, b.Load(0)); }
-        "#;
-        if system_compile("probe", probe).is_ok()
-            && let Err((e, msg)) = system_compile("rebar_hash", REBAR_HASH_SOURCE)
-        {
-            panic!("rebar_hash HLSL failed ({e}): {msg}");
-        }
-        if dxc_compile("probe", probe).is_ok()
-            && let Err(e) = dxc_compile("rebar_hash", REBAR_HASH_SOURCE)
-        {
-            panic!("rebar_hash HLSL failed with DXC ({e})");
-        }
-        if let Some(h) = host() {
-            assert!(rebar_hash_pipeline(&h.device).is_some());
-        }
-    }
-
-    #[test]
-    fn rebar_hash_shader_detects_single_byte_change_and_swap_on_gpu() {
-        use windows::Win32::Graphics::Direct3D12::*;
-
-        let Some(h) = host() else {
-            return; // no host GPU here
-        };
-        let Some(pipe) = rebar_hash_pipeline(&h.device) else {
-            panic!("rebar_hash compute pipeline failed to build on a live host");
-        };
-        let errors_before = h.d3d12_errors();
-        let total_bytes = (2 * PAGE) as u64;
-        let (src_buf, src_ptr) = h.shared_buffer(total_bytes).expect("shared src");
-        let hashes_buf = h
-            .default_buffer_in_state(32, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)
-            .expect("hashes UAV");
-        let flags_uav = h
-            .default_buffer_in_state(16, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)
-            .expect("flags UAV");
-        let (flags_rb, flags_ptr) = h.readback_buffer(16).expect("flags readback");
-
-        // Seed two 64 KiB pieces with distinct non-repeating synthetic bytes.
-        // SAFETY: `src_ptr` is mapped for `2 * PAGE` bytes.
-        let src_slice = unsafe { std::slice::from_raw_parts_mut(src_ptr, 2 * PAGE) };
-        for (i, b) in src_slice.iter_mut().enumerate() {
-            *b = ((i.wrapping_mul(37) ^ (i >> 8)) & 0xFF) as u8;
-        }
-
-        // SAFETY: live D3D12 resources.
-        let (src_gpu, hashes_gpu, flags_gpu) = unsafe {
-            (
-                src_buf.GetGPUVirtualAddress(),
-                hashes_buf.GetGPUVirtualAddress(),
-                flags_uav.GetGPUVirtualAddress(),
-            )
-        };
-
-        let run_pass = |mode: u32| -> [u32; 2] {
-            let list = h.new_list().expect("host list");
-            let l = &list.list;
-            let constants = [0u32, total_bytes as u32, 0u32, mode, 2u32];
-            // SAFETY: open list with live buffers and valid state transitions.
-            unsafe {
-                l.ResourceBarrier(&[transition(
-                    &src_buf,
-                    D3D12_RESOURCE_STATE_COMMON,
-                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-                )]);
-                l.SetComputeRootSignature(&pipe.root);
-                l.SetPipelineState(&pipe.pso);
-                l.SetComputeRoot32BitConstants(0, 5, constants.as_ptr().cast(), 0);
-                l.SetComputeRootShaderResourceView(1, src_gpu);
-                l.SetComputeRootUnorderedAccessView(2, hashes_gpu);
-                l.SetComputeRootUnorderedAccessView(3, flags_gpu);
-                l.Dispatch(2, 1, 1);
-                if mode != 0 {
-                    l.ResourceBarrier(&[
-                        transition(
-                            &flags_uav,
-                            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                            D3D12_RESOURCE_STATE_COPY_SOURCE,
-                        ),
-                        transition(
-                            &src_buf,
-                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-                            D3D12_RESOURCE_STATE_COMMON,
-                        ),
-                    ]);
-                    l.CopyBufferRegion(&flags_rb, 0, &flags_uav, 0, 8);
-                    l.ResourceBarrier(&[transition(
-                        &flags_uav,
-                        D3D12_RESOURCE_STATE_COPY_SOURCE,
-                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                    )]);
-                } else {
-                    l.ResourceBarrier(&[transition(
-                        &src_buf,
-                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-                        D3D12_RESOURCE_STATE_COMMON,
-                    )]);
-                }
-            }
-            list.close();
-            h.execute(&[&list]);
-            list.reset();
-            // SAFETY: fence completed and `flags_ptr` covers 16 bytes of READBACK.
-            let out = unsafe { std::slice::from_raw_parts(flags_ptr.cast::<u32>(), 2) };
-            [out[0], out[1]]
-        };
-
-        // 1. Compute initial hashes.
-        let _ = run_pass(0);
-        // 2. Compare unchanged -> both flags must be 0.
-        assert_eq!(run_pass(1), [0, 0]);
-        // 3. Flip a single byte in piece 1 -> only piece 1 flagged (and hash updated).
-        src_slice[PAGE + 12345] ^= 0x01;
-        assert_eq!(run_pass(1), [0, 1]);
-        // 4. Re-compare without further writes -> stored hash was updated, so [0, 0].
-        assert_eq!(run_pass(1), [0, 0]);
-        // 5. Swap two 16-byte chunks at different lanes in piece 0 -> non-commutative
-        //    reduction must detect the swap on piece 0 only.
-        for i in 0..16 {
-            src_slice.swap(i, 16 + i);
-        }
-        assert_eq!(run_pass(1), [1, 0]);
-        assert_eq!(run_pass(1), [0, 0]);
-        assert_eq!(
-            h.d3d12_errors(),
-            errors_before,
-            "unexpected D3D12 debug layer error during rebar_hash test"
-        );
-    }
-}
-
-#[cfg(test)]
-mod plane_shaders {
-    /// Build the actual pipelines so a blob without a usable root signature
-    /// cannot pass on the strength of a successfully compiled vertex shader.
-    #[cfg(victory_bundled_hlsl)]
-    #[test]
-    fn bundled_depth_helpers_build_both_pipelines() {
-        use windows::Win32::Graphics::Dxgi::Common::{
-            DXGI_FORMAT_D24_UNORM_S8_UINT, DXGI_FORMAT_D32_FLOAT_S8X24_UINT,
-        };
-        if super::host().is_none() {
-            return;
-        }
-        for (steps, format) in [
-            (true, DXGI_FORMAT_D24_UNORM_S8_UINT),
-            (false, DXGI_FORMAT_D32_FLOAT_S8X24_UINT),
-        ] {
-            super::PlanePass::make(steps, format).expect("depth plane pipeline");
-        }
-    }
-
-    /// The pass's shaders compile with one of our two compilers, whichever
-    /// this machine has (the system's `d3dcompiler` first, DXC when it
-    /// refuses them: Wine's builtin refuses other helpers' source), and the
-    /// bytecode is a DXBC container with the root signature inside.
-    #[test]
-    fn depth_plane_pass_shaders_compile() {
-        use victory_shader::{Container, FourCC};
-        let stages = [
-            ("corner", super::PLANE_CORNERS, "vs_5_1"),
-            ("plane", super::PLANE_STEPS, "ps_5_1"),
-            ("plane", super::PLANE_FLOATS, "ps_5_1"),
-        ];
-        for (entry, source, target) in stages {
-            let bytes = crate::hlsl::compile_stage("depth plane probe", source, entry, target)
-                .unwrap_or_else(|e| panic!("{entry} ({target}): {e}"));
-            let container = Container::parse(&bytes).unwrap();
-            if entry == "plane" {
-                assert!(
-                    [FourCC::RTS0, FourCC(*b"RDAT")]
-                        .iter()
-                        .any(|&part| container.part(part).is_some()),
-                    "{entry}: no root signature in the shader"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn depth_plane_draw_preserves_first_and_last_array_slices() {
-        use super::*;
-        let Some(host) = host() else {
-            eprintln!("Skipping depth plane array readback: no D3D12 device");
-            return;
-        };
-        const SLICES: u16 = 257;
-        let list = host.new_list().unwrap();
-        let texture = |format, flags, state| {
-            let desc = D3D12_RESOURCE_DESC {
-                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
-                Width: 1,
-                Height: 1,
-                DepthOrArraySize: SLICES,
-                MipLevels: 1,
-                Format: format,
-                SampleDesc: DXGI_SAMPLE_DESC {
-                    Count: 1,
-                    Quality: 0,
-                },
-                Flags: flags,
-                ..Default::default()
-            };
-            let heap = D3D12_HEAP_PROPERTIES {
-                Type: D3D12_HEAP_TYPE_DEFAULT,
-                ..Default::default()
-            };
-            let mut texture: Option<ID3D12Resource> = None;
-            // SAFETY: the descriptors live through the call and the output slot is ours.
-            unsafe {
-                host.device
-                    .CreateCommittedResource(
-                        &heap,
-                        D3D12_HEAP_FLAG_NONE,
-                        &desc,
-                        state,
-                        None,
-                        &mut texture,
-                    )
-                    .unwrap()
-            };
-            texture.unwrap()
-        };
-        let plane = texture(
-            DXGI_FORMAT_R32_TYPELESS,
-            D3D12_RESOURCE_FLAG_NONE,
-            D3D12_RESOURCE_STATE_COPY_DEST,
-        );
-        let depth = texture(
-            DXGI_FORMAT_R32G8X24_TYPELESS,
-            D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
-            D3D12_RESOURCE_STATE_DEPTH_WRITE,
-        );
-        let (upload, input) = host.upload_buffer(1024).unwrap();
-        let (readback, output) = host.readback_buffer(1024).unwrap();
-        let subresource = |resource: &ID3D12Resource, index| D3D12_TEXTURE_COPY_LOCATION {
-            // SAFETY: the resources remain live through submission; these descriptors borrow them.
-            pResource: unsafe { std::mem::transmute_copy(resource) },
-            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                SubresourceIndex: index,
-            },
-        };
-        let location = |resource: &ID3D12Resource, texture: &ID3D12Resource, index, offset| {
-            let mut footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
-            // SAFETY: the texture is live; index is in range, and one footprint is requested.
-            unsafe {
-                host.device.GetCopyableFootprints(
-                    &texture.GetDesc(),
-                    index,
-                    1,
-                    offset,
-                    Some(&mut footprint),
-                    None,
-                    None,
-                    None,
-                )
-            };
-            D3D12_TEXTURE_COPY_LOCATION {
-                // SAFETY: as for the subresource locations above.
-                pResource: unsafe { std::mem::transmute_copy(resource) },
-                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
-                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                    PlacedFootprint: footprint,
-                },
-            }
-        };
-        let samples = [(0, 0, 0.25_f32), (u32::from(SLICES) - 1, 512, 0.75_f32)];
-        for (index, offset, expected) in samples {
-            // SAFETY: an aligned f32 fits inside the 1024-byte upload buffer at both offsets.
-            unsafe { input.add(offset).cast::<f32>().write(expected) };
-            let src = location(&upload, &plane, index, offset as u64);
-            // SAFETY: both resources are in copy states and the locations cover one full texel.
-            unsafe {
-                list.list
-                    .CopyTextureRegion(&subresource(&plane, index), 0, 0, 0, &src, None)
-            };
-        }
-        // SAFETY: the plane was created in COPY_DEST and the list has not changed that state.
-        unsafe {
-            list.list.ResourceBarrier(&[transition(
-                &plane,
-                D3D12_RESOURCE_STATE_COPY_DEST,
-                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
-            )])
-        };
-        let plane_views = OnceLock::new();
-        record_plane_pass(&list.list, &depth, &plane, &plane_views);
-        // SAFETY: depth was created in DEPTH_WRITE and the pass leaves it in that state.
-        unsafe {
-            list.list.ResourceBarrier(&[transition(
-                &depth,
-                D3D12_RESOURCE_STATE_DEPTH_WRITE,
-                D3D12_RESOURCE_STATE_COPY_SOURCE,
-            )])
-        };
-        for (index, offset, _) in samples {
-            let dst = location(&readback, &depth, index, offset as u64);
-            // SAFETY: both locations are live, in their copy states and cover one full depth texel.
-            unsafe {
-                list.list
-                    .CopyTextureRegion(&dst, 0, 0, 0, &subresource(&depth, index), None)
-            };
-        }
-        list.mark_work();
-        list.close();
-        host.execute(&[&list]);
-        for (index, offset, expected) in samples {
-            // SAFETY: execute waited for the readback and both offsets are aligned within the mapping.
-            let actual = unsafe { output.add(offset).cast::<f32>().read() };
-            assert_eq!(actual, expected, "depth slice {index}");
-        }
-    }
-
-    /// `defer_host_read` runs after preceding deferred copies and holds a
-    /// byte-range mapping guard over its source range while executing.
-    #[test]
-    fn defer_host_read_guards_its_range_against_overlapping_remaps() {
-        let _retire = super::isolated_retire_scope();
-        let Some(host) = super::host() else { return };
-        let list = host.new_list().expect("host list");
-        let src = [0x5Au8; 64];
-        let mut dst = [0u8; 64];
-        let dst_ptr = dst.as_mut_ptr();
-        let dst_addr = dst_ptr as usize;
-        list.defer_copy(dst_ptr, src.as_ptr(), src.len());
-
-        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let observed = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0));
-        let observed_read = observed.clone();
-        list.defer_host_read(dst_ptr, 64, move || {
-            // SAFETY: `dst` lives until after `run_deferred` finishes.
-            let first = unsafe { *(dst_addr as *const u8) };
-            observed_read.store(first, std::sync::atomic::Ordering::SeqCst);
-            entered_tx.send(()).unwrap();
-            release_rx.recv().unwrap();
-        });
-
-        let remapped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let remapped_worker = remapped.clone();
-        let waiter = std::thread::spawn(move || {
-            entered_rx.recv().unwrap();
-            let (started_tx, started_rx) = std::sync::mpsc::channel();
-            let remap = std::thread::spawn(move || {
-                started_tx.send(()).unwrap();
-                let _guard = crate::watch::title_memory_remapping(dst_addr, 64);
-                remapped_worker.store(true, std::sync::atomic::Ordering::SeqCst);
-            });
-            started_rx.recv().unwrap();
-            std::thread::sleep(std::time::Duration::from_millis(50));
-            assert!(
-                !remapped.load(std::sync::atomic::Ordering::SeqCst),
-                "overlapping remap proceeded during defer_host_read"
-            );
-            release_tx.send(()).unwrap();
-            remap.join().unwrap();
-            assert!(remapped.load(std::sync::atomic::Ordering::SeqCst));
-        });
-
-        let mut batch = super::Batch::default();
-        let mut submitted = 0u64;
-        list.run_deferred(&mut batch, host, &mut submitted);
-        waiter.join().unwrap();
-        assert_eq!(observed.load(std::sync::atomic::Ordering::SeqCst), 0x5A);
-        list.close();
-        list.reset();
-    }
-}
-
-#[cfg(test)]
-mod title_memory_io {
-    use super::{copy_mapped, write_mapped};
-    use windows_sys::Win32::System::Memory::{
-        MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
-    };
-
-    const PAGE: usize = 4096;
-
-    /// Two committed pages followed by one reserved (not committed) page.
-    fn region() -> *mut u8 {
-        // SAFETY: a fresh reservation of ours, of which two pages are committed.
-        unsafe {
-            let base = VirtualAlloc(std::ptr::null(), 3 * PAGE, MEM_RESERVE, PAGE_READWRITE);
-            assert!(!base.is_null());
-            let committed = VirtualAlloc(base, 2 * PAGE, MEM_COMMIT, PAGE_READWRITE);
-            assert!(!committed.is_null());
-            base.cast()
-        }
-    }
-
-    fn release(base: *mut u8) {
-        // SAFETY: the reservation made by `region`.
-        unsafe { VirtualFree(base.cast(), 0, MEM_RELEASE) };
-    }
-
-    #[test]
-    fn write_mapped_writes_mapped_pages_and_skips_the_rest() {
-        let base = region();
-        let data = vec![0xabu8; 3 * PAGE];
-        // The third page is not committed: its piece is skipped, the others land.
-        write_mapped(base, data.as_ptr(), 3 * PAGE);
-        // SAFETY: the two committed pages of `region`.
-        let written = unsafe { std::slice::from_raw_parts(base, 2 * PAGE) };
-        assert!(written.iter().all(|&b| b == 0xab));
-        release(base);
-    }
-
-    #[test]
-    fn copy_into_title_memory_that_is_not_all_mapped_is_left_alone() {
-        let base = region();
-        let from = vec![0x5au8; 3 * PAGE];
-        copy_mapped(base, from.as_ptr(), 3 * PAGE, true);
-        // A whole copy into mapped memory works without asking the system first.
-        copy_mapped(base, from.as_ptr(), 2 * PAGE, true);
-        // SAFETY: the two committed pages of `region`.
-        let now = unsafe { std::slice::from_raw_parts(base, 2 * PAGE) };
-        assert!(now.iter().all(|&b| b == 0x5a));
-        release(base);
-    }
-
-    #[test]
-    fn victory_copy_try_variants_preserve_bytes_and_recover_from_faults() {
-        use windows_sys::Win32::System::Memory::{
-            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_GUARD, PAGE_NOACCESS, PAGE_READWRITE,
-            VirtualAlloc, VirtualFree, VirtualProtect,
-        };
-        super::install_fast_copy_handler();
-
-        let variants: Vec<(&str, unsafe extern "C" fn(*mut u8, *const u8, usize) -> u32)> = {
-            let mut v: Vec<(&str, unsafe extern "C" fn(*mut u8, *const u8, usize) -> u32)> =
-                vec![("sse2", super::victory_copy_try_sse2)];
-            if std::is_x86_feature_detected!("avx2") {
-                v.push(("avx2", super::victory_copy_try_avx2));
-            }
-            v
-        };
-
-        // 1. Verify exact copies across lengths 0..=4097 and unaligned src/dst
-        // offsets without clobbering sentinel guard bytes.
-        let src: Vec<u8> = (0..8192usize)
-            .map(|i| ((i.wrapping_mul(53) ^ (i >> 5) ^ 0x3c) & 0xff) as u8)
-            .collect();
-        let mut dst = vec![0xEEu8; 8192];
-        for &(name, copy_fn) in &variants {
-            for dst_off in [0usize, 1, 7, 15, 16, 17, 31, 32, 33] {
-                for src_off in [0usize, 3, 15, 16, 31] {
-                    for len in [
-                        0usize, 1, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65, 95,
-                        127, 128, 129, 159, 160, 161, 255, 256, 257, 4097,
-                    ] {
-                        dst.fill(0xEE);
-                        // SAFETY: disjoint buffers with `dst_off + len < 8192`.
-                        let ok = unsafe {
-                            copy_fn(
-                                dst.as_mut_ptr().add(dst_off),
-                                src.as_ptr().add(src_off),
-                                len,
-                            )
-                        };
-                        assert_eq!(ok, 1, "{name} copy failed for len={len}");
-                        assert_eq!(
-                            &dst[dst_off..dst_off + len],
-                            &src[src_off..src_off + len],
-                            "{name} mismatch dst_off={dst_off} src_off={src_off} len={len}"
-                        );
-                        assert!(
-                            dst[..dst_off].iter().all(|&b| b == 0xEE)
-                                && dst[dst_off + len..].iter().all(|&b| b == 0xEE),
-                            "{name} overwrote guard bytes dst_off={dst_off} len={len}"
-                        );
-                    }
-                }
-            }
-        }
-
-        // 2. Verify fault recovery on an uncommitted page at multiple distances
-        // (hits small tail, alignment prologue, and 128B/64B main vector loops)
-        // and verify `is_fast_copy_rip` covers both routines.
-        assert!(super::is_fast_copy_rip(
-            &raw const super::victory_copy_try_avx2_start as u64
-        ));
-        assert!(super::is_fast_copy_rip(
-            &raw const super::victory_copy_try_sse2_start as u64
-        ));
-        assert!(!super::is_fast_copy_rip(
-            &raw const super::victory_copy_try_avx2_end as u64
-        ));
-        assert!(!super::is_fast_copy_rip(
-            &raw const super::victory_copy_try_sse2_end as u64
-        ));
-
-        const MEM_TOP_DOWN: u32 = 0x10_0000;
-        // SAFETY: reserve 2 pages, commit only the first.
-        unsafe {
-            let base = VirtualAlloc(
-                std::ptr::null(),
-                2 * 4096,
-                MEM_RESERVE | MEM_TOP_DOWN,
-                PAGE_NOACCESS,
-            )
-            .cast::<u8>();
-            assert!(!base.is_null());
-            assert_eq!(
-                VirtualAlloc(base.cast(), 4096, MEM_COMMIT, PAGE_READWRITE),
-                base.cast()
-            );
-            base.write_bytes(0x42, 4096);
-            let mut out = vec![0u8; 2 * 4096];
-            for &(name, copy_fn) in &variants {
-                for &(start_off, len) in &[
-                    (4096usize, 16usize),
-                    (4096 - 3, 16),
-                    (4096 - 32, 64),
-                    (4096 - 100, 256),
-                    (0, 2 * 4096),
-                ] {
-                    let ok = copy_fn(out.as_mut_ptr().add(7), base.add(start_off), len);
-                    assert_eq!(
-                        ok, 0,
-                        "{name} must return 0 on unmapped page (start_off={start_off}, len={len})"
-                    );
-                }
-            }
-
-            // 3. Verify `PAGE_GUARD` source fault also recovers cleanly to 0.
-            let mut old = 0u32;
-            assert_ne!(
-                VirtualProtect(base.cast(), 4096, PAGE_READWRITE | PAGE_GUARD, &mut old),
-                0
-            );
-            let ok = super::victory_copy_try(out.as_mut_ptr(), base, 256);
-            assert_eq!(ok, 0, "PAGE_GUARD read must recover cleanly");
-
-            assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
-        }
-    }
-
-    #[test]
-    fn read_into_raw_probe_and_sparse_copy_handle_holes_and_noaccess() {
-        use windows_sys::Win32::System::Memory::{
-            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc,
-            VirtualFree, VirtualProtect,
-        };
-
-        // Allocate 192 KiB: [0..64 KiB) committed, [64 KiB..128 KiB) reserved hole,
-        // [128 KiB..192 KiB) committed, with its last 4 KiB set to PAGE_NOACCESS.
-        const MEM_TOP_DOWN: u32 = 0x10_0000;
-        const BLOCK: usize = 64 << 10;
-        const TOTAL: usize = 3 * BLOCK;
-        // SAFETY: isolated reservation freed before returning.
-        let base = unsafe {
-            VirtualAlloc(
-                std::ptr::null(),
-                TOTAL,
-                MEM_RESERVE | MEM_TOP_DOWN,
-                PAGE_NOACCESS,
-            )
-            .cast::<u8>()
-        };
-        assert!(!base.is_null());
-        // SAFETY: commit blocks 0 and 2, protect the final 4 KiB page as NOACCESS.
-        unsafe {
-            assert_eq!(
-                VirtualAlloc(base.cast(), BLOCK, MEM_COMMIT, PAGE_READWRITE),
-                base.cast()
-            );
-            assert_eq!(
-                VirtualAlloc(
-                    base.add(2 * BLOCK).cast(),
-                    BLOCK,
-                    MEM_COMMIT,
-                    PAGE_READWRITE
-                ),
-                base.add(2 * BLOCK).cast()
-            );
-            base.write_bytes(0x31, BLOCK);
-            base.add(2 * BLOCK).write_bytes(0x74, BLOCK);
-            let mut old = 0u32;
-            assert_ne!(
-                VirtualProtect(base.add(TOTAL - PAGE).cast(), PAGE, PAGE_NOACCESS, &mut old),
-                0
-            );
-        }
-
-        // `read_into_raw` and `read_into_probe` agree on readable, unmapped, and NOACCESS spans.
-        let mut buf = [0u8; 64];
-        assert!(super::read_into_raw(base, &mut buf));
-        assert!(buf.iter().all(|&b| b == 0x31));
-        buf.fill(0);
-        assert!(super::read_into_probe(base, &mut buf));
-        assert!(buf.iter().all(|&b| b == 0x31));
-        assert!(!super::read_into_raw(base.wrapping_add(BLOCK), &mut buf));
-        assert!(!super::read_into_probe(base.wrapping_add(BLOCK), &mut buf));
-        assert!(!super::read_into_raw(
-            base.wrapping_add(TOTAL - PAGE),
-            &mut buf
-        ));
-        assert!(!super::read_into_probe(
-            base.wrapping_add(TOTAL - PAGE),
-            &mut buf
-        ));
-
-        // `copy_mapped` (len >= 64 KiB -> `read_sparse` fallback) copies committed spans
-        // and zeroes both reserved holes and `PAGE_NOACCESS` pages.
-        let mut dst = vec![0xAAu8; TOTAL];
-        copy_mapped(dst.as_mut_ptr(), base, TOTAL, false);
-        assert!(dst[..BLOCK].iter().all(|&b| b == 0x31));
-        assert!(dst[BLOCK..2 * BLOCK].iter().all(|&b| b == 0));
-        assert!(dst[2 * BLOCK..TOTAL - PAGE].iter().all(|&b| b == 0x74));
-        assert!(dst[TOTAL - PAGE..].iter().all(|&b| b == 0));
-
-        // SAFETY: free test reservation.
-        assert_ne!(unsafe { VirtualFree(base.cast(), 0, MEM_RELEASE) }, 0);
-    }
-}
-
-#[cfg(test)]
-mod present_retry {
-    use super::{PresentStep, Retry, retry_delay};
-    use std::time::{Duration, Instant};
-
-    #[test]
-    fn the_backoff_starts_short_and_stops_at_a_second() {
-        let schedule: Vec<u64> = (1..=7).map(|n| retry_delay(n).as_millis() as u64).collect();
-        assert_eq!(schedule, [100, 200, 400, 800, 1_000, 1_000, 1_000]);
-    }
-
-    #[test]
-    fn a_failed_attempt_waits_before_the_next_one() {
-        let start = Instant::now();
-        let mut retry = Retry::new();
-        // Nothing has failed, so an attempt is due.
-        assert!(retry.due(start));
-        retry.failed(start);
-        assert_eq!(retry.attempts, 1);
-        assert!(!retry.due(start));
-        assert!(!retry.due(start + Duration::from_millis(99)));
-        assert!(retry.due(start + Duration::from_millis(100)));
-        // A second failure doubles the wait and counts.
-        let second = start + Duration::from_millis(100);
-        retry.failed(second);
-        assert_eq!(retry.attempts, 2);
-        assert!(!retry.due(second + Duration::from_millis(199)));
-        assert!(retry.due(second + Duration::from_millis(200)));
-    }
-
-    #[test]
-    fn a_working_attempt_clears_the_state_and_reports_the_failures() {
-        let start = Instant::now();
-        let mut retry = Retry::new();
-        for _ in 0..3 {
-            retry.failed(start);
-        }
-        assert_eq!(retry.attempts, 3);
-        assert_eq!(retry.reset(), 3);
-        assert_eq!(retry.attempts, 0);
-        assert!(retry.due(start));
-        // A later failure starts the schedule over.
-        retry.failed(start);
-        assert!(!retry.due(start + Duration::from_millis(99)));
-    }
-
-    /// A minute behind a desktop that never appears: one attempt per backoff
-    /// instead of one per presented frame.
-    #[test]
-    fn a_minute_without_a_desktop_asks_a_bounded_number_of_times() {
-        let mut retry = Retry::new();
-        let mut now = Instant::now();
-        let mut attempts = 0u32;
-        for _ in 0..1_200 {
-            // 60 s at 20 fps.
-            if retry.due(now) {
-                attempts += 1;
-                retry.failed(now);
-            }
-            now += Duration::from_millis(50);
-        }
-        assert!(
-            (59..=64).contains(&attempts),
-            "{attempts} attempts in a minute, one per backoff expected"
-        );
-    }
-
-    #[test]
-    fn every_step_of_a_presenter_has_a_name() {
-        for step in [
-            PresentStep::Window,
-            PresentStep::Factory,
-            PresentStep::SwapChain,
-            PresentStep::List,
-        ] {
-            assert!(!step.name().is_empty());
-        }
-    }
-}
+#[path = "host_tests.rs"]
+mod tests;
