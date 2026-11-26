@@ -363,6 +363,7 @@ pub(crate) fn retire_executing_batch<T: 'static>(objects: Vec<T>) {
 }
 
 /// Drops `object` once every epoch active now has finished: at once if none is.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn retire<T: 'static>(object: T) {
     retire_born(object, 0);
 }
