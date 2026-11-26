@@ -646,9 +646,11 @@ extern "system" fn copy_page_mappings(
     pool_pages: u32,
     _flags: u32,
 ) -> HRESULT {
-    let Some(map) = crate::resource::page_mapper() else {
+    let batch_map = crate::resource::page_batch_mapper();
+    let single_map = crate::resource::page_mapper();
+    if batch_map.is_none() && single_map.is_none() {
         return E_INVALIDARG;
-    };
+    }
     if batches.is_null() && count > 0 {
         return E_INVALIDARG;
     }
@@ -695,35 +697,68 @@ extern "system" fn copy_page_mappings(
         }
     }
     queue(this).timeline.submit(Op::Run(Box::new(move || {
-        apply_page_mappings(map, pool, &ops)
+        apply_page_mappings(batch_map, single_map, pool, &ops)
     })));
     S_OK
 }
 
-fn apply_page_mappings(map: crate::resource::PageMapper, pool: u64, ops: &[PageOp]) {
+fn apply_page_mappings(
+    batch_map: Option<crate::resource::PageBatchMapper>,
+    single_map: Option<crate::resource::PageMapper>,
+    pool: u64,
+    ops: &[PageOp],
+) {
+    use crate::resource::{
+        PageMapOp,
+        PageMapping::{Consecutive, Repeated},
+    };
     let mut ok = true;
-    for &op in ops {
-        ok &= match op {
-            PageOp::Copy { at, source, len } => {
-                #[cfg(windows)]
-                let _remapping = crate::watch::title_memory_remapping(at as usize, len as usize);
-                map(at, source, len)
+    if let Some(batch_map) = batch_map {
+        let mut batch_ops = Vec::with_capacity(ops.len());
+        for &op in ops {
+            match op {
+                PageOp::Copy { at, source, len } if len > 0 => batch_ops.push(PageMapOp {
+                    to: at,
+                    from: source,
+                    len,
+                    mapping: Consecutive,
+                }),
+                PageOp::Fill { at, source, count } if count > 0 => batch_ops.push(PageMapOp {
+                    to: at,
+                    from: source,
+                    len: count.saturating_mul(PAGE),
+                    mapping: Repeated,
+                }),
+                PageOp::Unmap { at, len } if len > 0 => batch_ops.push(PageMapOp {
+                    to: at,
+                    from: 0,
+                    len,
+                    mapping: Consecutive,
+                }),
+                PageOp::Copy { .. } | PageOp::Fill { .. } | PageOp::Unmap { .. } => {}
+                PageOp::Invalid => ok = false,
             }
-            PageOp::Fill { at, source, count } => {
-                #[cfg(windows)]
-                let _remapping = crate::watch::title_memory_remapping(
-                    at as usize,
-                    count.saturating_mul(PAGE) as usize,
-                );
-                (0..count).all(|k| map(at + k * PAGE, source, PAGE))
-            }
-            PageOp::Unmap { at, len } => {
-                #[cfg(windows)]
-                let _remapping = crate::watch::title_memory_remapping(at as usize, len as usize);
-                map(at, 0, len)
-            }
-            PageOp::Invalid => false,
-        };
+        }
+        if !batch_ops.is_empty() {
+            ok &= batch_map(&batch_ops);
+        }
+    } else if let Some(map) = single_map {
+        // The runtime's page mapper (`xmem::map_alias`) acquires `PHYSICAL`
+        // and `title_memory_remapping(touched_span)` itself; do not take
+        // `title_memory_remapping` here (it is non-reentrant and would invert
+        // lock order).
+        for &op in ops {
+            ok &= match op {
+                PageOp::Copy { at, source, len } => map(at, source, len, Consecutive),
+                PageOp::Fill { at, source, count } => {
+                    map(at, source, count.saturating_mul(PAGE), Repeated)
+                }
+                PageOp::Unmap { at, len } => map(at, 0, len, Consecutive),
+                PageOp::Invalid => false,
+            };
+        }
+    } else {
+        ok = false;
     }
     if !ok {
         static ONCE: std::sync::Once = std::sync::Once::new();
@@ -1069,14 +1104,15 @@ mod tests {
     /// reached, and must capture caller-owned batch/range arrays at call time.
     #[test]
     fn page_mappings_run_after_a_queues_wait() {
+        use crate::resource::{PageMapOp, PageMapping};
         use std::sync::Mutex;
 
-        static CALLS: Mutex<Vec<(u64, u64, u64)>> = Mutex::new(Vec::new());
-        fn record(to: u64, from: u64, len: u64) -> bool {
+        static CALLS: Mutex<Vec<(u64, u64, u64, PageMapping)>> = Mutex::new(Vec::new());
+        fn record(to: u64, from: u64, len: u64, mapping: PageMapping) -> bool {
             CALLS
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .push((to, from, len));
+                .push((to, from, len, mapping));
             true
         }
         crate::resource::use_page_mapper(record);
@@ -1155,10 +1191,14 @@ mod tests {
         assert_eq!(
             *CALLS.lock().unwrap(),
             vec![
-                (dst, pool + PAGE, 2 * PAGE),
-                (dst + 2 * PAGE, pool + 3 * PAGE, PAGE),
-                (dst + 3 * PAGE, pool + 3 * PAGE, PAGE),
-                (dst + 4 * PAGE, 0, PAGE),
+                (dst, pool + PAGE, 2 * PAGE, PageMapping::Consecutive),
+                (
+                    dst + 2 * PAGE,
+                    pool + 3 * PAGE,
+                    2 * PAGE,
+                    PageMapping::Repeated
+                ),
+                (dst + 4 * PAGE, 0, PAGE, PageMapping::Consecutive),
             ]
         );
 
@@ -1175,7 +1215,65 @@ mod tests {
             ranges: &range,
         };
         assert_eq!(copy_pages(waits)(waits, 1, &batch, pool, 4, 0), S_OK);
-        assert_eq!(*CALLS.lock().unwrap(), vec![(dst, 0, PAGE)]);
+        assert_eq!(
+            *CALLS.lock().unwrap(),
+            vec![(dst, 0, PAGE, PageMapping::Consecutive)]
+        );
+
+        // Verify batched dispatch groups all non-empty ops into one batch callback.
+        static BATCH_OPS: Mutex<Vec<Vec<PageMapOp>>> = Mutex::new(Vec::new());
+        fn record_batch(ops: &[PageMapOp]) -> bool {
+            BATCH_OPS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(ops.to_vec());
+            true
+        }
+        BATCH_OPS.lock().unwrap().clear();
+        apply_page_mappings(
+            Some(record_batch),
+            None,
+            pool,
+            &[
+                PageOp::Copy {
+                    at: dst,
+                    source: pool + PAGE,
+                    len: 2 * PAGE,
+                },
+                PageOp::Fill {
+                    at: dst + 2 * PAGE,
+                    source: pool + 3 * PAGE,
+                    count: 2,
+                },
+                PageOp::Unmap {
+                    at: dst + 4 * PAGE,
+                    len: PAGE,
+                },
+            ],
+        );
+        assert_eq!(
+            *BATCH_OPS.lock().unwrap(),
+            vec![vec![
+                PageMapOp {
+                    to: dst,
+                    from: pool + PAGE,
+                    len: 2 * PAGE,
+                    mapping: PageMapping::Consecutive,
+                },
+                PageMapOp {
+                    to: dst + 2 * PAGE,
+                    from: pool + 3 * PAGE,
+                    len: 2 * PAGE,
+                    mapping: PageMapping::Repeated,
+                },
+                PageMapOp {
+                    to: dst + 4 * PAGE,
+                    from: 0,
+                    len: PAGE,
+                    mapping: PageMapping::Consecutive,
+                },
+            ]]
+        );
 
         for object in [waits, signals, ready, done] {
             assert_eq!(release(object), 0);

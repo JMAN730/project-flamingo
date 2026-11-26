@@ -1014,7 +1014,7 @@ pub(crate) fn stretch(at: usize, end: usize, reach: usize) -> Option<(usize, usi
 /// the views, their sections, the longest view, and the runs of views that
 /// follow one another in their section too (one run: the range is one
 /// stretch of a section).
-#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+#[allow(dead_code)]
 pub(crate) fn layout(at: usize, len: usize) -> (usize, usize, usize, usize) {
     let views = views_read();
     let end = at.saturating_add(len);

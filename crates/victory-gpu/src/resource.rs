@@ -885,10 +885,32 @@ pub fn use_allocator(alloc: AllocRoutine, free: FreeRoutine) {
     let _ = ALLOCATOR.set((alloc, free));
 }
 
+/// Whether to advance through the source pages or use the first page for
+/// each destination page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PageMapping {
+    Consecutive,
+    Repeated,
+}
+
+/// One page-mapping operation within a `CopyPageMappingsBatchX` call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PageMapOp {
+    pub to: u64,
+    pub from: u64,
+    pub len: u64,
+    pub mapping: PageMapping,
+}
+
 /// Maps the physical pages behind one range of title memory at another,
-/// `(to, from, len)` (`from` 0 unmaps); false on failure.
-pub type PageMapper = fn(u64, u64, u64) -> bool;
+/// `(to, from, len, mapping)` (`from` 0 unmaps); false on failure.
+pub type PageMapper = fn(u64, u64, u64, PageMapping) -> bool;
 static PAGE_MAPPER: std::sync::OnceLock<PageMapper> = std::sync::OnceLock::new();
+
+/// Maps physical pages across an entire `CopyPageMappingsBatchX` call in one
+/// batch (`from == 0` unmaps); false if any range failed.
+pub type PageBatchMapper = fn(&[PageMapOp]) -> bool;
+static PAGE_BATCH_MAPPER: std::sync::OnceLock<PageBatchMapper> = std::sync::OnceLock::new();
 
 /// The runtime's page mapper, for the queues' page-mapping copies (memory
 /// is the runtime's, as on the console).
@@ -896,8 +918,18 @@ pub fn use_page_mapper(mapper: PageMapper) {
     let _ = PAGE_MAPPER.set(mapper);
 }
 
+/// Registers a batched page mapper for `CopyPageMappingsBatchX` so the runtime
+/// can coalesce locks and skip no-op unmaps or identical alias re-mappings.
+pub fn use_page_batch_mapper(mapper: PageBatchMapper) {
+    let _ = PAGE_BATCH_MAPPER.set(mapper);
+}
+
 pub(crate) fn page_mapper() -> Option<PageMapper> {
     PAGE_MAPPER.get().copied()
+}
+
+pub(crate) fn page_batch_mapper() -> Option<PageBatchMapper> {
+    PAGE_BATCH_MAPPER.get().copied()
 }
 
 /// Allocation attributes for resource memory: allocator id, page size
@@ -1450,6 +1482,42 @@ pub(crate) fn dropped_mips(this: This) -> u32 {
     resource(this).host(this).map_or(0, |h| h.dropped)
 }
 
+/// Width, height and format of single-sampled 2D texture `this` (`None` for
+/// buffers, non-2D or multisampled textures), for `crate::texback`'s kinds.
+#[cfg(windows)]
+pub(crate) fn texture_kind(this: This) -> Option<(u64, u32, u32)> {
+    if this.is_null() {
+        return None;
+    }
+    let r = resource(this);
+    (r.desc.dimension == TEXTURE_2D && r.desc.sample_count <= 1).then_some((
+        r.desc.width,
+        r.desc.height,
+        r.desc.format,
+    ))
+}
+
+/// Texture `this`'s console layout (one plane), where it lies in title
+/// memory and the bytes that layout takes, for `crate::texback`; `None` for
+/// a buffer or a multi-plane texture.
+#[cfg(windows)]
+pub(crate) fn title_texture(
+    this: This,
+) -> Option<(victory_formats::texture::Layout, usize, usize)> {
+    if this.is_null() {
+        return None;
+    }
+    let r = resource(this);
+    if r.desc.dimension == BUFFER {
+        return None;
+    }
+    let t = texture_layout(&r.desc)?;
+    let [plane] = &t.planes[..] else {
+        return None;
+    };
+    Some((plane.layout.clone(), r.data() as usize, t.size as usize))
+}
+
 /// A host texture like the title's: same description, in GPU memory,
 /// without the console's layout and flags, the state it was made in
 /// (what the transitions that follow start from), and how many top mip
@@ -1800,9 +1868,12 @@ fn hand_out_resource(
     if desc.dimension == BUFFER {
         let at = std::ptr::from_ref::<Resource>(&resource) as usize;
         crate::shadow::register(at, resource.data() as u64, desc.width);
-    } else if host_writes(&desc) {
-        let at = std::ptr::from_ref::<Resource>(&resource) as usize;
-        targets().insert(resource.data() as u64, at);
+    } else {
+        crate::texback::replaced(resource.data() as usize);
+        if host_writes(&desc) {
+            let at = std::ptr::from_ref::<Resource>(&resource) as usize;
+            targets().insert(resource.data() as u64, at);
+        }
     }
     object::hand_out(RESOURCE, resource, iid, &RESOURCE_IIDS, out)
 }
@@ -1832,8 +1903,12 @@ impl Drop for Resource {
         // Forget descriptor/staging/target entries before retiring the host
         // copy so no concurrent bindless sweep can observe it after retirement
         // snapshots active epochs.
-        crate::texture::forget(std::ptr::from_ref::<Resource>(self) as usize);
-        crate::descriptor::forget(std::ptr::from_ref::<Resource>(self) as usize);
+        let address = std::ptr::from_ref::<Resource>(self) as usize;
+        if self.desc.dimension != BUFFER {
+            crate::texback::released(address);
+        }
+        crate::texture::forget(address);
+        crate::descriptor::forget(address);
         if self.desc.dimension != BUFFER && host_writes(&self.desc) {
             let mut targets = targets();
             let at = self.data() as u64;
