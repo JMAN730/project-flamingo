@@ -171,6 +171,13 @@ pub extern "system" fn XMemVirtualAlloc(
             );
         }
     }
+    if placeholder && constrained && !at.is_null() {
+        let start = at as usize;
+        let end = start.saturating_add(size);
+        physical()
+            .holes
+            .retain(|&addr, _| addr < start || addr >= end);
+    }
     if base.is_null() {
         tracing::debug!(
             size,
@@ -1565,15 +1572,24 @@ fn map(
     // region, a successful split gives exact bounds without another query.
     let split_prefix =
         first.is_some_and(|(start, stop)| start == base && end < stop && split_reserved(base, len));
-    if !split_prefix {
+    let single_view = if split_prefix {
+        true
+    } else {
         split_at(base, first);
-        split_at(end, placeholder(end));
-    }
+        let after_end = placeholder(end);
+        let tail_split = split_at(end, after_end);
+        // For these XMem ranges, the Physical lock serializes mapper changes.
+        // A successful split at the end establishes its lower piece. When
+        // neither endpoint needed a split, the first exact bounds still apply.
+        reuse_placeholder_bounds()
+            && (tail_split == Some(base)
+                || (first == Some((base, end)) && after_end.is_none_or(|(start, _)| start >= end)))
+    };
     let mut made: Vec<(usize, usize, Slice)> = Vec::new();
     let mut at = base;
     while at < end {
         // What is not a placeholder fails in `map_view`.
-        let next = if split_prefix {
+        let next = if single_view {
             end
         } else {
             placeholder(at).map_or(end, |(_, stop)| stop.min(end))
@@ -1663,6 +1679,29 @@ fn map_view(base: usize, len: usize, slice: &Slice, commitment: PageCommitment) 
 thread_local! {
     static PLACEHOLDER_QUERIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static COMMIT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static REUSE_PLACEHOLDER_BOUNDS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+fn reuse_placeholder_bounds() -> bool {
+    #[cfg(test)]
+    if let Some(enabled) = REUSE_PLACEHOLDER_BOUNDS.with(std::cell::Cell::get) {
+        return enabled;
+    }
+    #[cfg(feature = "diagnostics")]
+    {
+        // Opt-in so both mapper paths can be compared in the same executable.
+        static ENABLED: LazyLock<bool> = LazyLock::new(|| {
+            let enabled =
+                std::env::var("VICTORY_XMEM_REUSE_PLACEHOLDER_BOUNDS").as_deref() == Ok("1");
+            if enabled {
+                tracing::info!("experimental XMem placeholder bounds reuse enabled");
+            }
+            enabled
+        });
+        *ENABLED
+    }
+    #[cfg(not(feature = "diagnostics"))]
+    false
 }
 
 /// The start and end of the placeholder holding `at`, if it may be one
@@ -1685,16 +1724,19 @@ fn placeholder(at: usize) -> Option<(usize, usize)> {
 }
 
 /// Splits the placeholder holding `at` in two there, if it starts below.
+/// Returns the start of the lower piece after a successful split.
 /// The same call frees reserved memory that replaced a placeholder back to
 /// one, committed pages and all, so everything below `at` in it must be
 /// reserved: nothing committed is ever freed here.
-fn split_at(at: usize, containing: Option<(usize, usize)>) {
+fn split_at(at: usize, containing: Option<(usize, usize)>) -> Option<usize> {
     if let Some((start, _)) = containing
         && start < at
         && placeholder(start).is_some_and(|(_, stop)| stop >= at)
+        && split_reserved(start, at - start)
     {
-        split_reserved(start, at - start);
+        return Some(start);
     }
+    None
 }
 
 /// The caller has checked that the whole range, starting at the allocation
@@ -2706,6 +2748,63 @@ mod tests {
         unsafe {
             assert_ne!(VirtualFree(base, 0, MEM_RELEASE), 0);
             assert_ne!(VirtualFree(base.wrapping_byte_add(PAGE), 0, MEM_RELEASE), 0);
+        }
+    }
+
+    fn queries_to_map_one_page(at: *mut c_void, page: usize, reuse: bool) -> usize {
+        REUSE_PLACEHOLDER_BOUNDS.with(|enabled| enabled.set(Some(reuse)));
+        PLACEHOLDER_QUERIES.with(|queries| queries.set(0));
+        let mapped = XMemMapPhysicalPages(at, 1, &page);
+        let queries = PLACEHOLDER_QUERIES.with(std::cell::Cell::get);
+        REUSE_PLACEHOLDER_BOUNDS.with(|enabled| enabled.set(None));
+        assert_eq!(mapped, at);
+        queries
+    }
+
+    #[test]
+    fn an_exact_placeholder_reuses_the_first_query() {
+        for (reuse, expected_queries) in [(false, 3), (true, 2)] {
+            let (pages, base) = pages_and_reservation(1);
+            assert_eq!(
+                queries_to_map_one_page(base, pages[0], reuse),
+                expected_queries
+            );
+            assert_eq!(query(base).host.State, MEM_COMMIT);
+            assert_eq!(XMemMapPhysicalPages(base, 1, std::ptr::null()), base);
+            assert_eq!(XMemFreePhysicalPages(1, pages.as_ptr()), 1);
+            // SAFETY: the test's own placeholder, unmapped above.
+            assert_ne!(unsafe { VirtualFree(base, 0, MEM_RELEASE) }, 0);
+        }
+    }
+
+    #[test]
+    fn an_interior_mapping_reuses_the_last_successful_split() {
+        for (reuse, expected_queries) in [(false, 5), (true, 4)] {
+            let (pages, base) = pages_and_reservation(3);
+            let middle = base.wrapping_byte_add(PAGE);
+            let last = base.wrapping_byte_add(2 * PAGE);
+            assert_eq!(
+                queries_to_map_one_page(middle, pages[1], reuse),
+                expected_queries
+            );
+            assert_eq!(query(base).host.State, MEM_RESERVE);
+            assert_eq!(query(middle).host.State, MEM_COMMIT);
+            assert_eq!(query(last).host.State, MEM_RESERVE);
+
+            // SAFETY: the middle page is mapped read-write.
+            unsafe { middle.cast::<u8>().write(0x5a) };
+            assert_eq!(XMemMapPhysicalPages(middle, 1, std::ptr::null()), middle);
+            assert_eq!(XMemMapPhysicalPages(middle, 1, &pages[1]), middle);
+            // SAFETY: the original physical page is mapped again.
+            assert_eq!(unsafe { middle.cast::<u8>().read() }, 0x5a);
+            assert_eq!(XMemMapPhysicalPages(middle, 1, std::ptr::null()), middle);
+            assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
+            // SAFETY: all three test placeholders are independent and unmapped.
+            unsafe {
+                for at in [base, middle, last] {
+                    assert_ne!(VirtualFree(at, 0, MEM_RELEASE), 0);
+                }
+            }
         }
     }
 

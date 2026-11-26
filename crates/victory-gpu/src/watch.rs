@@ -49,7 +49,8 @@ impl Journal {
     fn forget_ahead(&mut self, (first, last): (usize, usize)) {
         const _: () = assert!(BLOCK == PAGE);
         self.ahead.retain(|&(a, b)| b <= first || last <= a);
-        self.kept = !self.ahead.is_empty();
+        let kept = !self.ahead.is_empty();
+        set_kept(self, kept);
     }
 
     fn snapshot(&self, first: usize, last: usize) -> (u64, Vec<(usize, u64)>) {
@@ -70,6 +71,22 @@ static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
     ahead: Vec::new(),
     kept: false,
 });
+
+/// Mirrors `Journal::kept` so `ask_once_end` and `wrote` can skip taking
+/// `JOURNAL.lock()` when no submission-wide `ask_once` asking stands.
+static ASK_KEPT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[inline]
+fn set_kept(j: &mut Journal, kept: bool) {
+    j.kept = kept;
+    ASK_KEPT.store(kept, std::sync::atomic::Ordering::Release);
+}
+
+/// Whether a submission-wide write-watch asking (`ask_once`) currently stands.
+#[inline]
+pub(crate) fn ask_kept() -> bool {
+    ASK_KEPT.load(std::sync::atomic::Ordering::Acquire)
+}
 
 /// Ranges of one submission closer than this are asked about together:
 /// walking the pages between them costs less than another `GetWriteWatch`
@@ -171,7 +188,7 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
     // lock and invalidates its range before the caller starts writing.
     let pending: Vec<_> = guards().announced.keys().copied().collect();
     j.ahead.clear();
-    j.kept = false;
+    set_kept(j, false);
     j.asked += 1;
     let now = j.asked;
     let mut i = 0;
@@ -197,7 +214,8 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
             j.ahead.push((first, last));
         }
     }
-    j.kept = !j.ahead.is_empty();
+    let kept = !j.ahead.is_empty();
+    set_kept(j, kept);
     for range in pending {
         j.forget_ahead(range);
     }
@@ -206,9 +224,12 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
 /// Ends the active per-submission coalesced asking so later [`writes`] calls
 /// query the kernel again.
 pub(crate) fn ask_once_end() {
+    if !ask_kept() {
+        return;
+    }
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     if j.kept {
-        j.kept = false;
+        set_kept(&mut j, false);
         j.ahead.clear();
     }
 }
@@ -217,7 +238,7 @@ pub(crate) fn ask_once_end() {
 /// coalesced asking stands, so refreshes recorded after the copy see those
 /// pages as written without ending coalescing for the rest of the submission.
 pub(crate) fn wrote(at: usize, len: usize) {
-    if len == 0 {
+    if len == 0 || !ask_kept() {
         return;
     }
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
@@ -635,6 +656,7 @@ pub fn mapped_pages_written(addresses: impl Iterator<Item = usize>) {
 /// writes announced wholly inside it are moot (an overlapped read that
 /// never said it landed no longer keeps those blocks open).
 pub fn title_memory_remapped(at: usize, len: usize) {
+    crate::texback::remapped(at, len);
     let (first, end) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
     let mut g = guards();
     let blocks: Vec<usize> = g.protected.range(first..end).copied().collect();
@@ -860,10 +882,15 @@ fn install() {
         // SAFETY: the system passes the exception being dispatched.
         let r = unsafe { &*(*info).ExceptionRecord };
         const WRITE: usize = 1;
-        if r.ExceptionCode != EXCEPTION_ACCESS_VIOLATION as NTSTATUS
-            || r.NumberParameters < 2
-            || r.ExceptionInformation[0] != WRITE
-        {
+        if r.ExceptionCode != EXCEPTION_ACCESS_VIOLATION as NTSTATUS || r.NumberParameters < 2 {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+        // SAFETY: `ContextRecord` is valid when Windows dispatches an exception.
+        let rip = unsafe { (*(*info).ContextRecord).Rip };
+        if crate::host::is_fast_copy_rip(rip) {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+        if r.ExceptionInformation[0] != WRITE {
             return EXCEPTION_CONTINUE_SEARCH;
         }
         let at = r.ExceptionInformation[1];
@@ -1047,6 +1074,13 @@ mod tests {
             )
         } as usize;
         assert_ne!(p, 0);
+        // A previous test may have used and released these virtual addresses.
+        {
+            let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+            for page in p / PAGE..(p + 2 * PAGE) / PAGE {
+                j.written.remove(&page);
+            }
+        }
         let (_, none) = writes(p, p + 2 * PAGE, false).expect("nothing can be written there");
         assert!(none.is_empty());
         // SAFETY: committing and writing a page of our reservation.

@@ -1482,6 +1482,42 @@ pub(crate) fn dropped_mips(this: This) -> u32 {
     resource(this).host(this).map_or(0, |h| h.dropped)
 }
 
+/// Width, height and format of single-sampled 2D texture `this` (`None` for
+/// buffers, non-2D or multisampled textures), for `crate::texback`'s kinds.
+#[cfg(windows)]
+pub(crate) fn texture_kind(this: This) -> Option<(u64, u32, u32)> {
+    if this.is_null() {
+        return None;
+    }
+    let r = resource(this);
+    (r.desc.dimension == TEXTURE_2D && r.desc.sample_count <= 1).then_some((
+        r.desc.width,
+        r.desc.height,
+        r.desc.format,
+    ))
+}
+
+/// Texture `this`'s console layout (one plane), where it lies in title
+/// memory and the bytes that layout takes, for `crate::texback`; `None` for
+/// a buffer or a multi-plane texture.
+#[cfg(windows)]
+pub(crate) fn title_texture(
+    this: This,
+) -> Option<(victory_formats::texture::Layout, usize, usize)> {
+    if this.is_null() {
+        return None;
+    }
+    let r = resource(this);
+    if r.desc.dimension == BUFFER {
+        return None;
+    }
+    let t = texture_layout(&r.desc)?;
+    let [plane] = &t.planes[..] else {
+        return None;
+    };
+    Some((plane.layout.clone(), r.data() as usize, t.size as usize))
+}
+
 /// A host texture like the title's: same description, in GPU memory,
 /// without the console's layout and flags, the state it was made in
 /// (what the transitions that follow start from), and how many top mip
@@ -1832,9 +1868,12 @@ fn hand_out_resource(
     if desc.dimension == BUFFER {
         let at = std::ptr::from_ref::<Resource>(&resource) as usize;
         crate::shadow::register(at, resource.data() as u64, desc.width);
-    } else if host_writes(&desc) {
-        let at = std::ptr::from_ref::<Resource>(&resource) as usize;
-        targets().insert(resource.data() as u64, at);
+    } else {
+        crate::texback::replaced(resource.data() as usize);
+        if host_writes(&desc) {
+            let at = std::ptr::from_ref::<Resource>(&resource) as usize;
+            targets().insert(resource.data() as u64, at);
+        }
     }
     object::hand_out(RESOURCE, resource, iid, &RESOURCE_IIDS, out)
 }
@@ -1864,8 +1903,12 @@ impl Drop for Resource {
         // Forget descriptor/staging/target entries before retiring the host
         // copy so no concurrent bindless sweep can observe it after retirement
         // snapshots active epochs.
-        crate::texture::forget(std::ptr::from_ref::<Resource>(self) as usize);
-        crate::descriptor::forget(std::ptr::from_ref::<Resource>(self) as usize);
+        let address = std::ptr::from_ref::<Resource>(self) as usize;
+        if self.desc.dimension != BUFFER {
+            crate::texback::released(address);
+        }
+        crate::texture::forget(address);
+        crate::descriptor::forget(address);
         if self.desc.dimension != BUFFER && host_writes(&self.desc) {
             let mut targets = targets();
             let at = self.data() as u64;
