@@ -221,9 +221,7 @@ pub(crate) struct State {
 
 impl Drop for State {
     fn drop(&mut self) {
-        for &(heap, first, n) in &self.dynamic {
-            crate::descriptor::release_dynamic(heap, first, n);
-        }
+        crate::descriptor::release_dynamic_batch(&self.dynamic);
     }
 }
 
@@ -769,6 +767,17 @@ impl State {
     /// not be made.
     fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
         list.mark_work();
+        // Refresh `list.work_seq` when `bind` returns (including early `false`
+        // exits) so resources created lazily during descriptor binding (`tables` ->
+        // `host.make_at`, `memory::ready`, root views) cannot get
+        // `born_seq > list.work_seq`.
+        struct MarkWorkGuard<'a>(&'a HostList);
+        impl Drop for MarkWorkGuard<'_> {
+            fn drop(&mut self) {
+                self.0.mark_work();
+            }
+        }
+        let _mark_after = MarkWorkGuard(list);
         self.depth_sampled = false;
         let l = &list.list;
         let needs_root_heap = self.heaps[0] == 0

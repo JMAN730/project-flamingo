@@ -310,6 +310,7 @@ pub(crate) fn recording_heap(key: usize) -> Option<&'static host::HostHeap> {
 /// Gives back dynamic slots of the host heap behind the title heap at
 /// `heap`, if that heap still exists.
 #[cfg(windows)]
+#[allow(dead_code)]
 pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
     if heap == ROOT_VIEW_HEAP {
         if let Some(host) = recording_heap(heap) {
@@ -324,6 +325,45 @@ pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
     {
         host.release(first, n);
     }
+}
+
+/// Gives back a batch of dynamic slot ranges `(heap, first, n)` under at most
+/// one `SHADER_HEAPS` lock, one `HostHeap::next` lock per contiguous heap run,
+/// and a single `retire_executing_batch` call for all displaced resources.
+#[cfg(windows)]
+pub(crate) fn release_dynamic_batch(ranges: &[(usize, u32, u32)]) {
+    if ranges.is_empty() {
+        return;
+    }
+    let mut retired = Vec::new();
+    {
+        let mut heaps_guard = None;
+        let mut i = 0;
+        let mut run = Vec::new();
+        while i < ranges.len() {
+            let heap = ranges[i].0;
+            run.clear();
+            while i < ranges.len() && ranges[i].0 == heap {
+                run.push((ranges[i].1, ranges[i].2));
+                i += 1;
+            }
+            if heap == ROOT_VIEW_HEAP {
+                if let Some(host) = recording_heap(ROOT_VIEW_HEAP) {
+                    host.release_many(&run, &mut retired);
+                }
+            } else {
+                let heaps = heaps_guard
+                    .get_or_insert_with(|| SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner()));
+                if heaps.iter().any(|&(_, _, h)| h == heap)
+                    // SAFETY: registered heaps are live (removed when dropped).
+                    && let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get()
+                {
+                    host.release_many(&run, &mut retired);
+                }
+            }
+        }
+    }
+    crate::host::retire_executing_batch(retired);
 }
 
 /// Mirrors any descriptor slots the title copied directly in memory across all
