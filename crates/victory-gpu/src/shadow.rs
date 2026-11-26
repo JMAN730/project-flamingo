@@ -1190,6 +1190,20 @@ impl Shadow {
         Some(unsafe { std::slice::from_raw_parts(self.data.add(at), len) })
     }
 
+    /// Clamps `[address, address + len)` to this copy's title-address span,
+    /// returning `None` if the intersection is empty.
+    #[inline]
+    pub(crate) fn clamp_range(&self, address: u64, len: u64) -> Option<(u64, u64)> {
+        let from = address.max(self.start);
+        let clamped = range_inside(
+            from,
+            len.saturating_sub(from.saturating_sub(address)),
+            self.start,
+            self.len,
+        );
+        (clamped > 0).then_some((from, clamped))
+    }
+
     /// Brings `len` bytes at `address` up to date when `list` is submitted,
     /// and keeps the copy alive until the list is reset, without recording a
     /// resource-state transition on `list` itself (used when `list`'s prelude
@@ -1215,6 +1229,12 @@ impl Shadow {
         self.refresh_as(list, address, len, D3D12_RESOURCE_STATE_GENERIC_READ);
     }
 
+    /// Whether this buffer is placed directly in title memory (no host copy).
+    #[inline]
+    pub(crate) fn is_placed(&self) -> bool {
+        self.place.is_some()
+    }
+
     /// Refresh a range and prepare its host buffer for the specified GPU use.
     /// Clamped to the copy.
     pub(crate) fn refresh_as(
@@ -1228,16 +1248,9 @@ impl Shadow {
         if self.place.is_some() {
             return;
         }
-        let from = address.max(self.start);
-        let len = range_inside(
-            from,
-            len.saturating_sub(from.saturating_sub(address)),
-            self.start,
-            self.len,
-        );
-        if len == 0 {
+        let Some((from, len)) = self.clamp_range(address, len) else {
             return;
-        }
+        };
         list.defer_refresh(self, from as usize, len as usize);
     }
 

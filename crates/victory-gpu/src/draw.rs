@@ -63,7 +63,7 @@ struct DepthTarget {
     state: u32,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
 struct StructuredBinding {
     slot: u8,
     entry: u32,
@@ -106,6 +106,50 @@ struct RawBufferRange {
     resource: usize,
     offset: u64,
     len: u64,
+}
+
+/// What a render target or depth view of the host is made from: the host
+/// texture (`0`: typed null view, `1`: fallback null target), and
+/// [`crate::descriptor::RtvRecord::key`].
+type TargetKey = (usize, (usize, [u32; 7]));
+
+/// Render targets and depth currently bound on the host list
+/// ([`State::host_targets`]), stored inline for the standard `<= 8` RTVs so
+/// cache hits allocate nothing on the heap.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BoundTargets {
+    rtvs: [TargetKey; 8],
+    len: u8,
+    extra: Vec<TargetKey>,
+    dsv: Option<TargetKey>,
+}
+
+impl BoundTargets {
+    fn new() -> Self {
+        Self {
+            rtvs: [(0, (0, [0; 7])); 8],
+            len: 0,
+            extra: Vec::new(),
+            dsv: None,
+        }
+    }
+
+    fn push(&mut self, key: TargetKey) {
+        if self.extra.is_empty() && usize::from(self.len) < self.rtvs.len() {
+            self.rtvs[usize::from(self.len)] = key;
+            self.len += 1;
+        } else {
+            self.extra.push(key);
+        }
+    }
+}
+
+/// Whether [`State::set_targets`] skips redundant `OMSetRenderTargets` and
+/// host RTV/DSV descriptor writes when the resolved targets match what is
+/// already bound on the host list (`VICTORY_BIND_CACHE=0` binds every time).
+fn bind_cache() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BIND_CACHE").is_none_or(|v| v != "0"))
 }
 
 /// Snapshot of a resolved render-target view captured at `OMSetRenderTargets`
@@ -285,6 +329,9 @@ pub(crate) struct State {
     stencil_ref: Option<u32>,
     bound_rtvs: Vec<BoundRtv>,
     bound_dsv: Option<BoundDsv>,
+    /// The render target views and depth view currently bound on the host list
+    /// ([`State::set_targets`]), cleared on list split or reset.
+    host_targets: Option<BoundTargets>,
     /// What the host list has: pipeline, root signature, heaps.
     host_pipeline: usize,
     /// Graphics, compute.
@@ -307,6 +354,9 @@ pub(crate) struct State {
     table_failed: bool,
     /// One slot per view and access kind in each heap, including null views.
     root_view_slots: std::collections::HashMap<(usize, RawAccess, Option<RawBufferRange>), u32>,
+    /// This recording, for [`crate::descriptor::host::HostHeap::make_listed`]
+    /// (`0`: none assigned yet).
+    recording: u64,
     /// Fast-path and incremental-sync cache for [`State::bindless_textures`].
     bindless_cache: Option<BindlessCache>,
     /// Reusable scratch buffers for single-pass descriptor table hashing and
@@ -320,6 +370,9 @@ pub(crate) struct State {
 
 impl Drop for State {
     fn drop(&mut self) {
+        if self.recording != 0 {
+            crate::descriptor::host::clear_list_views(self.recording);
+        }
         crate::descriptor::release_dynamic_batch(&self.dynamic);
     }
 }
@@ -445,6 +498,10 @@ impl State {
         // A following segment must acquire its own slots before recording a bind.
         self.fresh_tables.clear();
         self.root_view_slots.clear();
+        if self.recording != 0 {
+            crate::descriptor::host::clear_list_views(self.recording);
+            self.recording = 0;
+        }
         std::mem::take(&mut self.dynamic)
     }
 
@@ -517,6 +574,7 @@ impl State {
         if let Some(reference) = self.stencil_ref {
             stencil_ref(new_list, reference);
         }
+        self.host_targets = None;
         if !self.bound_rtvs.is_empty() || self.bound_dsv.is_some() {
             self.apply_targets(new_list, false);
         }
@@ -586,16 +644,26 @@ impl State {
         self.index = view.copied().unwrap_or_default();
     }
 
-    /// Render targets and depth, resolved at bind time and set on the host list.
+    /// Render targets and depth, resolved at bind time and set on the host
+    /// list, unless the host list already has the exact same targets bound
+    /// (`VICTORY_BIND_CACHE=0` binds every time).
     pub(crate) fn set_targets(&mut self, list: &HostList, handles: &[u64], depth: u64) {
-        self.targets.clear();
-        self.bound_rtvs.clear();
-        self.depth = None;
-        self.bound_dsv = None;
         self.depth_sampled = false;
         if crate::host::host().is_none() {
+            self.targets.clear();
+            self.bound_rtvs.clear();
+            self.depth = None;
+            self.bound_dsv = None;
+            self.host_targets = None;
             return;
         }
+        #[derive(Clone, Copy)]
+        enum PendingRtv {
+            Null(D3D12_RENDER_TARGET_VIEW_DESC),
+            Live(&'static ID3D12Resource, crate::descriptor::RtvRecord),
+        }
+        let mut views: Few<Option<PendingRtv>, 8> = Few::default();
+        let mut now = BoundTargets::new();
         for &h in handles {
             let Some(record) = crate::descriptor::rtv_record(h) else {
                 once!(
@@ -607,10 +675,8 @@ impl State {
             if record.resource.is_null() {
                 // A typed null RTV discards writes without changing the output slot.
                 if let Some(desc) = record.desc() {
-                    self.bound_rtvs.push(BoundRtv {
-                        host: None,
-                        desc: Some(desc),
-                    });
+                    views.push(Some(PendingRtv::Null(desc)));
+                    now.push((0, record.key()));
                 }
                 continue;
             }
@@ -622,23 +688,48 @@ impl State {
                     resource = format_args!("{:#x}", record.resource as usize),
                     "render target the host cannot render to; bound as a null view"
                 );
-                self.bound_rtvs.push(BoundRtv {
-                    host: None,
-                    desc: Some(crate::host::null_target()),
-                });
+                views.push(Some(PendingRtv::Null(crate::host::null_target())));
+                now.push((1, (0, [0; 7])));
                 continue;
             }
-            self.targets.push(record.resource as usize);
-            #[cfg(feature = "diagnostics")]
-            crate::capture::note_target(record.resource);
-            self.bound_rtvs.push(BoundRtv {
-                host: Some(texture.clone()),
-                desc: record.desc(),
-            });
+            views.push(Some(PendingRtv::Live(texture, record)));
+            now.push((texture.as_raw() as usize, record.key()));
         }
-        if let Some(record) = crate::descriptor::dsv_record(depth)
-            && let Some(texture) = crate::resource::host_resource(record.resource)
-        {
+        let dsv = crate::descriptor::dsv_record(depth).and_then(|record| {
+            let texture = crate::resource::host_resource(record.resource)?;
+            Some((texture, record))
+        });
+        now.dsv = dsv
+            .as_ref()
+            .map(|(texture, record)| (texture.as_raw() as usize, record.key()));
+        if bind_cache() && self.host_targets.as_ref() == Some(&now) {
+            return;
+        }
+        self.host_targets = Some(now);
+        self.targets.clear();
+        self.bound_rtvs.clear();
+        for view in views.iter().flatten().copied() {
+            match view {
+                PendingRtv::Null(desc) => {
+                    self.bound_rtvs.push(BoundRtv {
+                        host: None,
+                        desc: Some(desc),
+                    });
+                }
+                PendingRtv::Live(texture, record) => {
+                    self.targets.push(record.resource as usize);
+                    #[cfg(feature = "diagnostics")]
+                    crate::capture::note_target(record.resource);
+                    self.bound_rtvs.push(BoundRtv {
+                        host: Some(texture.clone()),
+                        desc: record.desc(),
+                    });
+                }
+            }
+        }
+        self.depth = None;
+        self.bound_dsv = None;
+        if let Some((texture, record)) = dsv {
             let desc = record.depth_desc();
             self.depth = Some(DepthTarget {
                 resource: record.resource as usize,
@@ -667,20 +758,17 @@ impl State {
         if mark_work && (!self.bound_rtvs.is_empty() || self.bound_dsv.is_some()) {
             list.mark_work();
         }
-        let rtvs: Vec<D3D12_CPU_DESCRIPTOR_HANDLE> = self
-            .bound_rtvs
-            .iter()
-            .map(|rtv| {
-                if let Some(tex) = &rtv.host {
-                    if mark_work {
-                        list.keep(tex);
-                    } else {
-                        list.keep_unmarked(tex);
-                    }
+        let mut rtvs: Few<D3D12_CPU_DESCRIPTOR_HANDLE, 8> = Few::default();
+        for rtv in &self.bound_rtvs {
+            if let Some(tex) = &rtv.host {
+                if mark_work {
+                    list.keep(tex);
+                } else {
+                    list.keep_unmarked(tex);
                 }
-                host.rtv(rtv.host.as_ref(), rtv.desc.as_ref())
-            })
-            .collect();
+            }
+            rtvs.push(host.rtv(rtv.host.as_ref(), rtv.desc.as_ref()));
+        }
         let dsv = self.bound_dsv.as_ref().map(|dsv| {
             if mark_work {
                 list.keep(&dsv.host);
@@ -1153,7 +1241,8 @@ impl State {
         // address may be reused by a new heap (ABA), which still needs a
         // fresh `SetDescriptorHeaps`.
         if keys != self.host_heaps || ids != self.host_heap_ids {
-            let mut heaps = Vec::new();
+            let mut heaps: [Option<ID3D12DescriptorHeap>; 2] = [None, None];
+            let mut heap_len = 0usize;
             for (key, id) in keys.into_iter().zip(ids) {
                 if key == 0 {
                     continue;
@@ -1167,10 +1256,11 @@ impl State {
                     return false;
                 };
                 list.keep(&heap.heap);
-                heaps.push(Some(heap.heap.clone()));
+                heaps[heap_len] = Some(heap.heap.clone());
+                heap_len += 1;
             }
             // SAFETY: an open list and shader-visible heaps retained for the recording.
-            unsafe { list.list.SetDescriptorHeaps(&heaps) };
+            unsafe { list.list.SetDescriptorHeaps(&heaps[..heap_len]) };
             self.host_heaps = keys;
             self.host_heap_ids = ids;
             self.host_roots = [0; 2];
@@ -1827,6 +1917,7 @@ impl State {
         aliases: &[StructuredBinding],
     ) -> Vec<(u8, u32)> {
         self.tables_with_strides(list, used, compute, aliases, &[])
+            .to_vec()
     }
 
     fn tables_with_strides(
@@ -1836,17 +1927,22 @@ impl State {
         compute: bool,
         aliases: &[StructuredBinding],
         structured_strides: &[(victory_shader::emit::StructuredBinding, u32)],
-    ) -> Vec<(u8, u32)> {
+    ) -> Few<(u8, u32), 16> {
         let read_only_depth = self.read_only_depth(compute);
         let tables = |u: &&UsedResource| u.root == RootType::Table;
-        let mut fresh: Vec<u8> = used
+        let mut fresh: Few<u8, 16> = Few::default();
+        for slot in used
             .iter()
             .filter(tables)
             .filter(|u| matches!(u.kind, ResourceType::Cbv | ResourceType::Srv))
             .map(|u| u.slot)
             .chain(aliases.iter().map(|a| a.slot))
             .chain(structured_strides.iter().map(|(binding, _)| binding.slot))
-            .collect();
+        {
+            if !fresh.contains(&slot) {
+                fresh.push(slot);
+            }
+        }
         // Tables reaching past a host heap smaller than the title's (the
         // host's limit, 1,000,000 views on NVIDIA, 2,048 samplers anywhere)
         // are made afresh too: the title's slots there have no host slot of
@@ -1870,28 +1966,39 @@ impl State {
             }
         }
         fresh.sort_unstable();
-        fresh.dedup();
         for u in used.iter().filter(tables) {
             if !fresh.contains(&u.slot) {
                 self.table_entry(list, u, compute);
             }
         }
-        let mut made = Vec::new();
-        for slot in fresh {
+        let list_views = crate::descriptor::host::list_views();
+        let list_ptr = std::ptr::from_ref(list) as usize;
+        let mut made: Few<(u8, u32), 16> = Few::default();
+        for &slot in fresh.iter() {
             let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
                 continue;
             };
-            let entries: Vec<&UsedResource> = used
-                .iter()
-                .filter(tables)
-                .filter(|u| u.slot == slot)
-                .collect();
-            let table_aliases: Vec<StructuredBinding> =
-                aliases.iter().copied().filter(|a| a.slot == slot).collect();
-            let table_strides: Vec<_> = structured_strides
-                .iter()
-                .filter(|(binding, _)| binding.slot == slot)
-                .collect();
+            // Their places among `used`, on the stack for the common <= 32 entries.
+            let mut places: Few<u16, 32> = Few::default();
+            for (i, u) in used.iter().enumerate() {
+                if u.root == RootType::Table && u.slot == slot {
+                    places.push(i as u16);
+                }
+            }
+            let entries = || places.iter().map(|&i| &used[usize::from(i)]);
+            let mut table_aliases: Few<StructuredBinding, 4> = Few::default();
+            for &a in aliases {
+                if a.slot == slot {
+                    table_aliases.push(a);
+                }
+            }
+            let mut table_strides: Few<Option<(victory_shader::emit::StructuredBinding, u32)>, 8> =
+                Few::default();
+            for &(binding, stride) in structured_strides {
+                if binding.slot == slot {
+                    table_strides.push(Some((binding, stride)));
+                }
+            }
             let Some(heap) = self.heap_of(table) else {
                 self.table_failed |= !table_strides.is_empty();
                 continue;
@@ -1902,24 +2009,24 @@ impl State {
             };
             let step_dwords: u32 = if heap.samplers() { 4 } else { 8 };
             let step_bytes: u64 = u64::from(step_dwords) * 4;
-            let min_slot = entries
-                .iter()
+            let min_slot = entries()
                 .map(|u| u.table_offset_dwords / step_dwords)
                 .chain(table_aliases.iter().map(|a| a.entry))
                 .chain(
                     table_strides
                         .iter()
+                        .flatten()
                         .map(|(b, _)| b.offset_dwords / step_dwords),
                 )
                 .min()
                 .unwrap_or(0);
-            let max_slot = entries
-                .iter()
+            let max_slot = entries()
                 .map(|u| u.table_offset_dwords / step_dwords)
                 .chain(table_aliases.iter().map(|a| a.entry))
                 .chain(
                     table_strides
                         .iter()
+                        .flatten()
                         .map(|(b, _)| b.offset_dwords / step_dwords),
                 )
                 .max()
@@ -1936,9 +2043,7 @@ impl State {
                 0
             };
             debug_assert!(
-                entries
-                    .iter()
-                    .all(|u| u.table_offset_dwords / step_dwords >= start_slot),
+                entries().all(|u| u.table_offset_dwords / step_dwords >= start_slot),
                 "table entry offset below start_slot"
             );
             let n = max_slot - start_slot + 1;
@@ -1947,7 +2052,7 @@ impl State {
                 .and_then(|bytes| table.checked_add(bytes));
             if last.and_then(|end| heap.index(end)).is_none() {
                 self.table_failed |= !table_strides.is_empty();
-                for u in entries {
+                for u in entries() {
                     self.table_entry(list, u, compute);
                 }
                 continue;
@@ -1964,6 +2069,7 @@ impl State {
             // shared read lock (and zero `View` clones), then hash and verify
             // cache hits from those same buffers without re-locking `VIEWS`.
             let heap_ptr = std::ptr::from_ref(heap) as usize;
+            let copy_gen = list.copy_gen();
             self.table_raws.clear();
             self.table_raws.reserve(n as usize);
             for k in start_slot..=max_slot {
@@ -1981,10 +2087,10 @@ impl State {
                     raw.hash(&mut h);
                     dead.hash(&mut h);
                 }
-                for alias in &table_aliases {
+                for alias in table_aliases.iter() {
                     (alias.entry - start_slot, alias.stride).hash(&mut h);
                 }
-                for (binding, stride) in &table_strides {
+                for (binding, stride) in table_strides.iter().flatten() {
                     (
                         binding.offset_dwords / step_dwords - start_slot,
                         binding.uav,
@@ -1996,7 +2102,7 @@ impl State {
             };
             let key = FreshTableKey {
                 heap: heap_ptr,
-                copy_gen: list.copy_gen(),
+                copy_gen,
                 slots: n,
                 records_hash,
             };
@@ -2040,15 +2146,15 @@ impl State {
                         self.table_failed = true;
                         continue;
                     };
-                    for alias in &table_aliases {
-                        if !entries.iter().any(|u| {
+                    for alias in table_aliases.iter() {
+                        if !entries().any(|u| {
                             u.kind != ResourceType::Cbv
                                 && u.table_offset_dwords / step_dwords == alias.entry
                         }) {
                             let _ = host.refresh_slot(first + (alias.entry - start_slot), list);
                         }
                     }
-                    for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
+                    for u in entries().filter(|u| u.kind != ResourceType::Cbv) {
                         let dyn_index = first + (u.table_offset_dwords / step_dwords - start_slot);
                         if !host.refresh_slot(dyn_index, list) {
                             let handle = table + u64::from(u.table_offset_dwords) * 4;
@@ -2075,6 +2181,12 @@ impl State {
                 self.table_failed = true;
                 continue;
             };
+            let use_list_views = list_views && !heap.samplers();
+            if use_list_views && self.recording == 0 {
+                static NEXT: AtomicU64 = AtomicU64::new(1);
+                self.recording = NEXT.fetch_add(1, Ordering::Relaxed);
+            }
+            let recording = self.recording;
             // Compile the whole compact range before publishing it in
             // `fresh_tables` / `dynamic`: a shader may index entries between
             // `start_slot` and `max_slot` not listed in `entries` (descriptor
@@ -2082,14 +2194,34 @@ impl State {
             // partial range cached for subsequent draws.
             let mut complete = true;
             let mut dead_slots = Vec::new();
+            let mut listed_slots: Few<Option<([u32; 3], crate::descriptor::host::Listed)>, 32> =
+                Few::default();
             for k in start_slot..=max_slot {
-                let index = first + (k - start_slot);
+                let rel = k - start_slot;
+                let idx = rel as usize;
+                let index = first + rel;
                 let at = table + u64::from(k) * step_bytes;
-                let view = crate::descriptor::view(at);
-                if let Some((binding, stride)) = table_strides
+                let stride_req = table_strides
                     .iter()
-                    .find(|(b, _)| b.offset_dwords / step_dwords == k)
+                    .flatten()
+                    .find(|(b, _)| b.offset_dwords / step_dwords == k);
+                // A view this list has made before: copy its descriptor from
+                // thread-local CPU-only staging via `CopyDescriptorsSimple`,
+                // skipping repeated D3D12 view creation and repeated buffer-SRV
+                // refreshes on the same host list (`VICTORY_LIST_VIEWS`).
+                if use_list_views
+                    && stride_req.is_none()
+                    && !table_aliases.iter().any(|a| a.entry == k)
+                    && !self.table_dead[idx]
+                    && self.table_raws[idx][0] == crate::descriptor::VIEW_TAG
+                    && let Some(listed) = host.make_listed(recording, self.table_raws[idx], index)
                 {
+                    listed_slots.push(Some((self.table_raws[idx], listed)));
+                    continue;
+                }
+                listed_slots.push(None);
+                let view = crate::descriptor::view(at);
+                if let Some((binding, stride)) = stride_req {
                     // Check the same view that is copied to the list's heap.
                     // Failure to mirror it must not bind a null of another kind.
                     complete = view.is_some_and(|view| {
@@ -2125,16 +2257,10 @@ impl State {
                     }
                     None => {
                         host.make_null(index);
-                        // SAFETY: verified in-bounds of `heap` above.
-                        if unsafe { (at as *const u32).read_unaligned() }
-                            == crate::descriptor::VIEW_TAG
-                        {
-                            dead_slots.push(k - start_slot);
+                        if self.table_raws[idx][0] == crate::descriptor::VIEW_TAG {
+                            dead_slots.push(rel);
                         }
-                        if entries
-                            .iter()
-                            .any(|u| u.table_offset_dwords / step_dwords == k)
-                        {
+                        if entries().any(|u| u.table_offset_dwords / step_dwords == k) {
                             once!(slot, "a table entry without a view");
                         }
                     }
@@ -2146,17 +2272,40 @@ impl State {
                 continue;
             }
             for k in start_slot..=max_slot {
-                let index = first + (k - start_slot);
+                let rel = k - start_slot;
+                let index = first + rel;
                 if !host.refresh_slot(index, list) {
-                    let at = table + u64::from(k) * step_bytes;
-                    if let Some(view) = crate::descriptor::view(at)
-                        && !matches!(view, View::Constant(..))
-                    {
-                        for u in entries
-                            .iter()
-                            .filter(|u| u.table_offset_dwords / step_dwords == k)
+                    if let Some((words, mut listed)) = listed_slots[rel as usize] {
+                        let was = listed.ready;
+                        for u in entries().filter(|u| u.table_offset_dwords / step_dwords == k) {
+                            let shadow_gen = list.shadow_state_gen();
+                            if u.kind == ResourceType::Srv
+                                && listed.buffer_only
+                                && listed.ready == (list_ptr, copy_gen, shadow_gen)
+                            {
+                                continue;
+                            }
+                            if let Some(view) =
+                                crate::descriptor::host::listed_view(recording, words)
+                            {
+                                self.depth_sampled |= readable(list, u, &view, read_only_depth);
+                                if u.kind == ResourceType::Srv && listed.buffer_only {
+                                    listed.ready = (list_ptr, copy_gen, list.shadow_state_gen());
+                                }
+                            }
+                        }
+                        if listed.ready != was {
+                            crate::descriptor::host::note_listed(recording, words, listed);
+                        }
+                    } else {
+                        let at = table + u64::from(k) * step_bytes;
+                        if let Some(view) = crate::descriptor::view(at)
+                            && !matches!(view, View::Constant(..))
                         {
-                            self.depth_sampled |= readable(list, u, &view, read_only_depth);
+                            for u in entries().filter(|u| u.table_offset_dwords / step_dwords == k)
+                            {
+                                self.depth_sampled |= readable(list, u, &view, read_only_depth);
+                            }
                         }
                     }
                 }
@@ -2924,6 +3073,60 @@ impl State {
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         true
+    }
+}
+
+/// A few things, up to `N` of them without heap allocation: used while
+/// walking a draw's descriptor tables and targets.
+struct Few<T, const N: usize> {
+    few: [T; N],
+    len: usize,
+    /// All of them, if they exceed `N`.
+    many: Vec<T>,
+}
+
+impl<T: Copy + Default, const N: usize> Default for Few<T, N> {
+    fn default() -> Self {
+        Few {
+            few: [T::default(); N],
+            len: 0,
+            many: Vec::new(),
+        }
+    }
+}
+
+impl<T: Copy, const N: usize> Few<T, N> {
+    fn push(&mut self, what: T) {
+        if self.many.is_empty() && self.len < N {
+            self.few[self.len] = what;
+            self.len += 1;
+        } else {
+            if self.many.is_empty() {
+                self.many.extend_from_slice(&self.few);
+            }
+            self.many.push(what);
+        }
+    }
+}
+
+impl<T, const N: usize> std::ops::Deref for Few<T, N> {
+    type Target = [T];
+    fn deref(&self) -> &[T] {
+        if self.many.is_empty() {
+            &self.few[..self.len]
+        } else {
+            &self.many
+        }
+    }
+}
+
+impl<T, const N: usize> std::ops::DerefMut for Few<T, N> {
+    fn deref_mut(&mut self) -> &mut [T] {
+        if self.many.is_empty() {
+            &mut self.few[..self.len]
+        } else {
+            &mut self.many
+        }
     }
 }
 
@@ -6294,6 +6497,503 @@ void main() {
         unsafe { std::ptr::copy_nonoverlapping(stage_b as *const u8, target_slot as *mut u8, 32) };
         assert_eq!(title_heap.sync_direct_copies(true), 1);
         assert_eq!(run_and_read(&buf_b), pat_b);
+    }
+
+    #[test]
+    fn few_keeps_items_in_order_inline_and_on_spill() {
+        for n in 0..10u32 {
+            let mut few: super::Few<u32, 4> = super::Few::default();
+            (0..n).for_each(|i| few.push(n - i));
+            assert_eq!(few.to_vec(), (0..n).map(|i| n - i).collect::<Vec<_>>());
+            few.sort_unstable();
+            assert_eq!(few.to_vec(), (1..=n).collect::<Vec<_>>());
+        }
+    }
+
+    #[test]
+    fn bound_targets_compares_inline_and_depth_keys() {
+        let mut a = super::BoundTargets::new();
+        let mut b = super::BoundTargets::new();
+        assert_eq!(a, b);
+        let k1 = (0x1000usize, (0x2000usize, [1, 28, 4, 0, 0, 0, 0]));
+        let k2 = (0x3000usize, (0x4000usize, [1, 28, 4, 1, 0, 0, 0]));
+        a.push(k1);
+        assert_ne!(a, b);
+        b.push(k1);
+        assert_eq!(a, b);
+        a.dsv = Some(k2);
+        assert_ne!(a, b);
+        b.dsv = Some(k2);
+        assert_eq!(a, b);
+        // Pushing past 8 RTVs spills cleanly into `extra`.
+        for i in 0..9usize {
+            let k = (0x1000 + i, (0x2000 + i, [0; 7]));
+            a.push(k);
+            b.push(k);
+        }
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn set_targets_bind_cache_skips_redundant_binds_and_clears_on_split() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU
+        };
+        let list1 = host.new_list().expect("host list 1");
+        let list2 = host.new_list().expect("host list 2");
+        let mut state = super::State::default();
+
+        // Two typed null RTV descriptors with distinct formats.
+        let mut rtv_a = [0u64; 16];
+        let mut rtv_b = [0u64; 16];
+        let h_a = rtv_a.as_mut_ptr() as u64;
+        let h_b = rtv_b.as_mut_ptr() as u64;
+        let desc_a = [28u32, 4, 0, 0, 0, 0];
+        let desc_b = [10u32, 4, 0, 0, 0, 0];
+        crate::descriptor::create_rtv(std::ptr::null(), std::ptr::null(), &desc_a, h_a);
+        crate::descriptor::create_rtv(std::ptr::null(), std::ptr::null(), &desc_b, h_b);
+
+        state.set_targets(&list1, &[h_a], 0);
+        let first_key = state.host_targets.clone().expect("cached bound targets");
+        assert_eq!(state.bound_rtvs.len(), 1);
+
+        // Identical bind hits cache and preserves cached key without mutating state.
+        state.set_targets(&list1, &[h_a], 0);
+        assert_eq!(state.host_targets.as_ref(), Some(&first_key));
+
+        // Changing target invalidates cache and binds the new target.
+        state.set_targets(&list1, &[h_b], 0);
+        assert_ne!(state.host_targets.as_ref(), Some(&first_key));
+
+        // Mid-list split (`reapply_host`) clears `host_targets` so the new list re-binds.
+        state.reapply_host(&list2, &list1);
+        assert!(state.host_targets.is_none());
+        state.set_targets(&list2, &[h_b], 0);
+        assert!(state.host_targets.is_some());
+
+        list1.close();
+        list2.close();
+    }
+
+    /// Regression test for `VICTORY_LIST_VIEWS`: SRV -> UAV -> SRV across
+    /// distinct fresh tables in the same recording must still emit the
+    /// UAV -> SRV barrier when `shadow_state_gen` advances (even though
+    /// `copy_gen` is unchanged).
+    #[test]
+    fn listed_buffer_srv_emits_uav_to_srv_barrier_across_fresh_tables() {
+        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+        use windows::Win32::Graphics::Direct3D::ID3DBlob;
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R32_TYPELESS, DXGI_SAMPLE_DESC};
+        use windows::core::s;
+
+        struct DropHeap(This);
+        impl Drop for DropHeap {
+            fn drop(&mut self) {
+                if !self.0.is_null() {
+                    crate::object::slot::<extern "system" fn(This) -> u32>(self.0, 0x10)(self.0);
+                }
+            }
+        }
+        struct UnregShadow(usize, u64);
+        impl Drop for UnregShadow {
+            fn drop(&mut self) {
+                crate::shadow::unregister(self.0, self.1);
+            }
+        }
+
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU
+        };
+
+        let compile = |source: &str| -> (ID3D12RootSignature, ID3D12PipelineState) {
+            let mut blob: Option<ID3DBlob> = None;
+            let mut errors: Option<ID3DBlob> = None;
+            // SAFETY: valid static HLSL source and entry point strings.
+            unsafe {
+                D3DCompile(
+                    source.as_ptr().cast(),
+                    source.len(),
+                    s!("listed_srv_uav_srv"),
+                    None,
+                    None,
+                    s!("main"),
+                    s!("cs_5_1"),
+                    0,
+                    0,
+                    &mut blob,
+                    Some(&mut errors),
+                )
+                .unwrap();
+            }
+            let blob = blob.unwrap();
+            // SAFETY: compiled DXBC with embedded root signature.
+            let code = unsafe {
+                std::slice::from_raw_parts(
+                    blob.GetBufferPointer().cast::<u8>(),
+                    blob.GetBufferSize(),
+                )
+            };
+            // SAFETY: valid DXBC root signature and compute PSO creation.
+            unsafe {
+                let root: ID3D12RootSignature = host.device.CreateRootSignature(0, code).unwrap();
+                let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&root),
+                    CS: D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: code.as_ptr().cast(),
+                        BytecodeLength: code.len(),
+                    },
+                    ..Default::default()
+                };
+                let pso: ID3D12PipelineState =
+                    host.device.CreateComputePipelineState(&desc).unwrap();
+                (root, pso)
+            }
+        };
+
+        let (read_root, read_pso) = compile(
+            r#"
+#define RS "DescriptorTable(SRV(t0, numDescriptors=1)), UAV(u0), RootConstants(num32BitConstants=1, b0)"
+ByteAddressBuffer src : register(t0);
+RWByteAddressBuffer dst : register(u0);
+cbuffer Params : register(b0) { uint out_off; };
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main() {
+    dst.Store(out_off, src.Load(0));
+}
+"#,
+        );
+        let (write_root, write_pso) = compile(
+            r#"
+#define RS "DescriptorTable(UAV(u0, numDescriptors=1))"
+RWByteAddressBuffer dst : register(u0);
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main() {
+    dst.Store(0, 0xDEADBEEFu);
+}
+"#,
+        );
+
+        let make_buffer = |kind: D3D12_HEAP_TYPE, flags, state| -> ID3D12Resource {
+            let mut b: Option<ID3D12Resource> = None;
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: 256,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                Flags: flags,
+                ..Default::default()
+            };
+            let heap = D3D12_HEAP_PROPERTIES {
+                Type: kind,
+                ..Default::default()
+            };
+            // SAFETY: valid buffer creation parameters.
+            unsafe {
+                host.device
+                    .CreateCommittedResource(
+                        &heap,
+                        D3D12_HEAP_FLAG_NONE,
+                        &desc,
+                        state,
+                        None,
+                        &mut b,
+                    )
+                    .unwrap();
+            }
+            b.unwrap()
+        };
+        let out = make_buffer(
+            D3D12_HEAP_TYPE_DEFAULT,
+            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_COMMON,
+        );
+        let readback = make_buffer(
+            D3D12_HEAP_TYPE_READBACK,
+            D3D12_RESOURCE_FLAG_NONE,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+        );
+
+        let backing = vec![0x1111_1111u32; 1024];
+        let base = backing.as_ptr() as u64;
+        let _unreg = UnregShadow(base as usize, base);
+        crate::shadow::register(base as usize, base, 4096);
+        let shadow = crate::shadow::find(base, 64).expect("registered shadow");
+
+        #[repr(C)]
+        struct ExtendedHeap([u32; 4], [u64; 2]);
+        let ext = ExtendedHeap([0, 8, 1, 0], [0, 0]);
+        let mut heap_ptr: This = std::ptr::null();
+        assert_eq!(
+            crate::descriptor::create_heap(
+                std::ptr::null(),
+                (&raw const ext.0).cast(),
+                &crate::object::guid(
+                    0x8efb471d,
+                    0x616c,
+                    0x4f49,
+                    [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51],
+                ),
+                &mut heap_ptr,
+            ),
+            crate::object::S_OK
+        );
+        let _drop_heap = DropHeap(heap_ptr);
+        let title_heap = crate::descriptor::heap(heap_ptr);
+        let host_heap = title_heap.host().expect("host view heap");
+        let start = title_heap.start;
+
+        let mut res_words = [0u32; 14];
+        res_words[0] = 1; // BUFFER
+        res_words[4] = 4096;
+
+        let srv_desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R32_TYPELESS,
+            ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Buffer: D3D12_BUFFER_SRV {
+                    FirstElement: 0,
+                    NumElements: 16,
+                    StructureByteStride: 0,
+                    Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+                },
+            },
+        };
+        let uav_desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            Format: DXGI_FORMAT_R32_TYPELESS,
+            ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                Buffer: D3D12_BUFFER_UAV {
+                    FirstElement: 0,
+                    NumElements: 16,
+                    StructureByteStride: 0,
+                    CounterOffsetInBytes: 0,
+                    Flags: D3D12_BUFFER_UAV_FLAG_RAW,
+                },
+            },
+        };
+        let mut srv_words = [0u32; 16];
+        let mut uav_words = [0u32; 16];
+        // SAFETY: both D3D12 view descriptions are 40 bytes (`[u32; 10]`).
+        unsafe {
+            srv_words[..10].copy_from_slice(
+                &std::ptr::from_ref(&srv_desc)
+                    .cast::<[u32; 10]>()
+                    .read_unaligned(),
+            );
+            uav_words[..10].copy_from_slice(
+                &std::ptr::from_ref(&uav_desc)
+                    .cast::<[u32; 10]>()
+                    .read_unaligned(),
+            );
+        }
+        srv_words[10] = base as u32;
+        srv_words[11] = (base >> 32) as u32;
+        uav_words[10] = base as u32;
+        uav_words[11] = (base >> 32) as u32;
+
+        // Table A (slots 0..=1): raw SRV + CBV1
+        crate::descriptor::create_placed_srv(std::ptr::null(), &res_words, &srv_words, start);
+        crate::descriptor::create_cbv(
+            std::ptr::null(),
+            &[base as u32, (base >> 32) as u32, 256, 0],
+            start + 32,
+        );
+        // Table B (slot 2): raw UAV of the same buffer
+        crate::descriptor::create_placed_uav(
+            std::ptr::null(),
+            &res_words,
+            &uav_words,
+            start + 2 * 32,
+        );
+        // Table C (slots 3..=4): identical SRV record as slot 0 + distinct CBV2 so
+        // `fresh_tables` misses and `make_listed` reuses the cached SRV entry.
+        crate::descriptor::create_placed_srv(
+            std::ptr::null(),
+            &res_words,
+            &srv_words,
+            start + 3 * 32,
+        );
+        let cbv2_addr = base + 256;
+        crate::descriptor::create_cbv(
+            std::ptr::null(),
+            &[cbv2_addr as u32, (cbv2_addr >> 32) as u32, 256, 0],
+            start + 4 * 32,
+        );
+
+        let srv_table_used = [
+            UsedResource {
+                kind: ResourceType::Srv,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 8,
+                user_data: 0,
+                slot: 0,
+            },
+            UsedResource {
+                kind: ResourceType::Cbv,
+                root: RootType::Table,
+                table_offset_dwords: 8,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 8,
+                user_data: 0,
+                slot: 0,
+            },
+        ];
+        let uav_used = [UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 8,
+            user_data: 0,
+            slot: 0,
+        }];
+
+        let list = host.new_list().expect("host list");
+        let mut state = super::State::default();
+        state.set_heaps(&[heap_ptr]);
+
+        // Pass 1 (SRV via fresh table A -> populates `ListViews` cache and sets GENERIC_READ).
+        state.set_table(true, 0, start);
+        let made_a = state.tables(&list, &srv_table_used, true, &[]);
+        assert_eq!(made_a.len(), 1);
+        assert_eq!(
+            list.shadow_state_of(&shadow.buffer),
+            Some(D3D12_RESOURCE_STATE_GENERIC_READ)
+        );
+        let gen_after_p1 = list.shadow_state_gen();
+        assert!(gen_after_p1 > 0);
+        let srv_a_gpu = host_heap.gpu(made_a[0].1 / 32);
+
+        // SAFETY: `list` is open with live PSO, heap, and resources.
+        unsafe {
+            let l = &list.list;
+            l.SetDescriptorHeaps(&[Some(host_heap.heap.clone())]);
+            l.SetComputeRootSignature(&read_root);
+            l.SetPipelineState(&read_pso);
+            l.SetComputeRootDescriptorTable(0, srv_a_gpu);
+            l.SetComputeRootUnorderedAccessView(1, out.GetGPUVirtualAddress());
+            l.SetComputeRoot32BitConstant(2, 0, 0);
+            l.Dispatch(1, 1, 1);
+        }
+
+        // Pass 2 (UAV on the same shadow -> transitions GENERIC_READ -> UNORDERED_ACCESS;
+        // `copy_gen` stays 0 while `shadow_state_gen` advances).
+        state.set_table(true, 0, start + 2 * 32);
+        let made_uav = state.tables(&list, &uav_used, true, &[]);
+        assert!(made_uav.is_empty());
+        assert_eq!(list.copy_gen(), 0);
+        assert_eq!(
+            list.shadow_state_of(&shadow.buffer),
+            Some(D3D12_RESOURCE_STATE_UNORDERED_ACCESS)
+        );
+        let gen_after_p2 = list.shadow_state_gen();
+        assert!(gen_after_p2 > gen_after_p1);
+
+        // SAFETY: `list` is open with live write PSO and canonical UAV slot 2.
+        unsafe {
+            let l = &list.list;
+            l.SetComputeRootSignature(&write_root);
+            l.SetPipelineState(&write_pso);
+            l.SetComputeRootDescriptorTable(0, host_heap.gpu(2));
+            l.Dispatch(1, 1, 1);
+        }
+
+        // Pass 3 (SRV via fresh table C with identical SRV record -> `make_listed` hits
+        // `ListViews`, sees `shadow_state_gen` changed, re-runs `readable()`, and emits
+        // the required UNORDERED_ACCESS -> GENERIC_READ barrier).
+        state.set_table(true, 0, start + 3 * 32);
+        let made_c = state.tables(&list, &srv_table_used, true, &[]);
+        assert_eq!(made_c.len(), 1);
+        assert_ne!(made_c[0].1, made_a[0].1, "table C must be a fresh table");
+        assert_eq!(
+            list.shadow_state_of(&shadow.buffer),
+            Some(D3D12_RESOURCE_STATE_GENERIC_READ),
+            "listed buffer SRV must transition shadow back to GENERIC_READ after UAV write"
+        );
+        assert!(list.shadow_state_gen() > gen_after_p2);
+        let srv_c_gpu = host_heap.gpu(made_c[0].1 / 32);
+
+        // SAFETY: `list` is open with live read PSO and output buffer.
+        unsafe {
+            let l = &list.list;
+            l.SetComputeRootSignature(&read_root);
+            l.SetPipelineState(&read_pso);
+            l.SetComputeRootDescriptorTable(0, srv_c_gpu);
+            l.SetComputeRootUnorderedAccessView(1, out.GetGPUVirtualAddress());
+            l.SetComputeRoot32BitConstant(2, 4, 0);
+            l.Dispatch(1, 1, 1);
+            l.ResourceBarrier(&[crate::host::transition(
+                &out,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+            l.CopyBufferRegion(&readback, 0, &out, 0, 8);
+        }
+
+        let iq = host.device.cast::<ID3D12InfoQueue>().ok();
+        let before_msgs = iq
+            .as_ref()
+            // SAFETY: plain InfoQueue query.
+            .map_or(0, |q| unsafe { q.GetNumStoredMessages() });
+
+        list.close();
+        host.execute(&[&list]);
+
+        if let Some(iq) = iq {
+            // SAFETY: inspects D3D12 debug messages added during execution.
+            unsafe {
+                let after = iq.GetNumStoredMessages();
+                for idx in before_msgs.min(after)..after {
+                    let mut size = 0usize;
+                    if iq.GetMessage(idx, None, &mut size).is_err() || size == 0 {
+                        continue;
+                    }
+                    let mut raw = vec![0u64; size.div_ceil(8)];
+                    let msg = raw.as_mut_ptr().cast::<D3D12_MESSAGE>();
+                    if iq.GetMessage(idx, Some(msg), &mut size).is_ok() {
+                        let m = &*msg;
+                        let desc =
+                            std::slice::from_raw_parts(m.pDescription, m.DescriptionByteLength);
+                        let text = String::from_utf8_lossy(desc);
+                        assert!(
+                            m.Severity.0 > D3D12_MESSAGE_SEVERITY_ERROR.0,
+                            "unexpected D3D12 error {}: {text}",
+                            m.ID.0
+                        );
+                    }
+                }
+            }
+        }
+
+        let mut mapped = std::ptr::null_mut();
+        let mut got = [0u32; 2];
+        // SAFETY: execution completed and readback holds 8 bytes.
+        unsafe {
+            let range = D3D12_RANGE { Begin: 0, End: 8 };
+            readback.Map(0, Some(&range), Some(&mut mapped)).unwrap();
+            std::ptr::copy_nonoverlapping(mapped.cast::<u32>(), got.as_mut_ptr(), 2);
+            readback.Unmap(0, None);
+        }
+        assert_eq!(got, [0x1111_1111, 0xDEAD_BEEF]);
+
+        list.reset();
+        assert_eq!(list.shadow_state_gen(), 0);
+        // SAFETY: plain device health query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }
 
     #[test]

@@ -749,6 +749,9 @@ pub(crate) struct HostList {
     states: Mutex<States>,
     /// Actual D3D12 access state per host buffer for this recording.
     shadow_states: Mutex<std::collections::HashMap<usize, (ID3D12Resource, D3D12_RESOURCE_STATES)>>,
+    /// Incremented whenever `shadow_states` inserts or transitions a shadow
+    /// buffer's D3D12 access state; reset to 0 when the list is reset.
+    shadow_state_gen: std::sync::atomic::AtomicU64,
     /// Incremented whenever `states` inserts a new texture or transitions a
     /// texture to a different state; reset to 0 when the list is reset.
     state_gen: std::sync::atomic::AtomicU64,
@@ -1571,6 +1574,7 @@ impl Host {
                 scratch: Mutex::default(),
                 states: Mutex::default(),
                 shadow_states: Mutex::default(),
+                shadow_state_gen: std::sync::atomic::AtomicU64::new(0),
                 state_gen: std::sync::atomic::AtomicU64::new(0),
                 dirty_resources: Mutex::default(),
                 twins: Mutex::default(),
@@ -2484,9 +2488,27 @@ impl HostList {
                     .ResourceBarrier(&[transition(buffer, before, after)])
             };
             *state = after;
+            self.shadow_state_gen.fetch_add(1, Ordering::Release);
         } else if before == D3D12_RESOURCE_STATE_COMMON {
             *state = wanted;
+            self.shadow_state_gen.fetch_add(1, Ordering::Release);
         }
+    }
+
+    /// Monotonic count of shadow-buffer state transitions recorded on this
+    /// list since reset (`VICTORY_LIST_VIEWS` buffer-SRV readiness key).
+    pub(crate) fn shadow_state_gen(&self) -> u64 {
+        self.shadow_state_gen.load(Ordering::Acquire)
+    }
+
+    /// Current tracked D3D12 access state for `buffer` on this list (tests).
+    #[cfg(test)]
+    pub(crate) fn shadow_state_of(&self, buffer: &ID3D12Resource) -> Option<D3D12_RESOURCE_STATES> {
+        self.shadow_states
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&(buffer.as_raw() as usize))
+            .map(|(_, state)| *state)
     }
 
     pub(crate) fn close(&self) {
@@ -2661,6 +2683,7 @@ impl HostList {
             .unwrap_or_else(|e| e.into_inner())
             .clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.shadow_state_gen.store(0, Ordering::Release);
         self.state_gen.store(0, Ordering::Relaxed);
         self.dirty_resources
             .lock()
@@ -3306,6 +3329,86 @@ impl HostList {
             deferred
                 .copies
                 .push(Step::Refresh(shadow.clone(), address, len));
+        }
+    }
+
+    /// Batched [`crate::shadow::Shadow::refresh_as`] and [`HostList::defer_refresh`]:
+    /// acquires `shadow_states` and `deferred` at most once for all
+    /// `(shadow, address, len, access)` ranges and emits any resource state
+    /// transitions in a single `ResourceBarrier`.
+    pub(crate) fn defer_refresh_batch<'a>(
+        &self,
+        reserve: usize,
+        items: impl IntoIterator<
+            Item = (
+                &'a std::sync::Arc<crate::shadow::Shadow>,
+                u64,
+                u64,
+                D3D12_RESOURCE_STATES,
+            ),
+        >,
+    ) {
+        let mut staged: Vec<(&'a std::sync::Arc<crate::shadow::Shadow>, usize, usize)> =
+            Vec::with_capacity(reserve);
+        let mut any = false;
+        {
+            let mut states = self.shadow_states.lock().unwrap_or_else(|e| e.into_inner());
+            let mut barriers: Vec<D3D12_RESOURCE_BARRIER> = Vec::new();
+            let mut barrier_keys: Vec<usize> = Vec::new();
+            let mut transitioned = false;
+            for (shadow, address, len, wanted) in items {
+                if !any {
+                    self.mark_work();
+                    any = true;
+                }
+                let buffer = &shadow.buffer;
+                let raw_key = buffer.as_raw() as usize;
+                let (_, state) = states
+                    .entry(raw_key)
+                    .or_insert_with(|| (buffer.clone(), D3D12_RESOURCE_STATE_COMMON));
+                let before = *state;
+                if let Some(after) = shadow_transition(before, wanted) {
+                    if barrier_keys.contains(&raw_key) {
+                        // SAFETY: open list; flush before a second transition on the same resource.
+                        unsafe { self.list.ResourceBarrier(&barriers) };
+                        barriers.clear();
+                        barrier_keys.clear();
+                    }
+                    barriers.push(transition(buffer, before, after));
+                    barrier_keys.push(raw_key);
+                    *state = after;
+                    transitioned = true;
+                } else if before == D3D12_RESOURCE_STATE_COMMON {
+                    *state = wanted;
+                    transitioned = true;
+                }
+                if !shadow.is_placed()
+                    && let Some((from, clamped)) = shadow.clamp_range(address, len)
+                {
+                    staged.push((shadow, from as usize, clamped as usize));
+                }
+            }
+            if !barriers.is_empty() {
+                // SAFETY: this open list retains every transitioned resource in `states`.
+                unsafe { self.list.ResourceBarrier(&barriers) };
+            }
+            if transitioned {
+                self.shadow_state_gen.fetch_add(1, Ordering::Release);
+            }
+        }
+        if !any || staged.is_empty() {
+            return;
+        }
+        let mut deferred = self.deferred();
+        deferred.refreshed.reserve(staged.len());
+        deferred.copies.reserve(staged.len());
+        for (shadow, address, len) in staged {
+            let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
+            if deferred.refreshed.insert(key) {
+                deferred
+                    .copies
+                    .push(Step::Refresh(shadow.clone(), address, len));
+            }
         }
     }
 
