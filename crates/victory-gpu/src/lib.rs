@@ -64,6 +64,8 @@ pub mod queue;
 #[cfg(windows)]
 mod rectangles;
 pub mod resource;
+#[cfg(windows)]
+pub(crate) mod retire;
 pub mod root;
 #[cfg(windows)]
 mod sampler;
@@ -76,6 +78,8 @@ mod switch;
 #[cfg(windows)]
 mod texture;
 mod timeline;
+#[cfg(windows)]
+mod upload_pool;
 #[cfg(windows)]
 mod watch;
 

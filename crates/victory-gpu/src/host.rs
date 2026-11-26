@@ -244,267 +244,46 @@ unsafe impl Send for Host {}
 // SAFETY: as above.
 unsafe impl Sync for Host {}
 
-/// Warn once when pinned epochs hold back this many retired host objects
-/// (for example, an unreset command list or a submission stalled behind an
-/// unsignalled fence).
-const RETIRED_WARN_THRESHOLD: usize = 4096;
+pub(crate) use crate::retire::*;
 
-/// Monotonic sequence bumped whenever a tracked host resource (`HostTexture`,
-/// `Shadow`, `Staging`) is created. Starts at 1 so `0` means "unbounded /
-/// existed before any sequence" (used by legacy [`retire`]).
-static RESOURCE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-
-/// Returns a strictly increasing birth sequence for a newly allocated host
-/// resource. Active command lists whose last recorded command occurred before
-/// this sequence cannot reference the resource and do not block its release.
-pub(crate) fn birth_seq() -> u64 {
-    RESOURCE_SEQ.fetch_add(1, Ordering::AcqRel) + 1
+/// Milliseconds since the first call.
+pub(crate) fn now_ms() -> u64 {
+    static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
+    EPOCH
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_millis() as u64
 }
 
-/// Sentinel work sequence shared by active [`Host::execute`] submissions so
-/// any object retired while the GPU is executing stays alive until execution
-/// finishes.
-fn exec_work_seq() -> std::sync::Arc<std::sync::atomic::AtomicU64> {
-    static SEQ: OnceLock<std::sync::Arc<std::sync::atomic::AtomicU64>> = OnceLock::new();
-    SEQ.get_or_init(|| std::sync::Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX)))
-        .clone()
+/// Available host physical RAM in bytes reported by Windows, or `None` if the
+/// query fails.
+pub(crate) fn available_physical_ram() -> Option<u64> {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    // SAFETY: plain data filled in by `GlobalMemoryStatusEx`.
+    let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+    // SAFETY: valid out pointer with `dwLength` matching `MEMORYSTATUSEX`.
+    let ok = unsafe { GlobalMemoryStatusEx(&mut m) } != 0;
+    ok.then_some(m.ullAvailPhys)
 }
 
-struct ActiveEpoch {
-    /// Highest [`RESOURCE_SEQ`] observed when this epoch's owner recorded work
-    /// (or `u64::MAX` for an active [`Host::execute`] submission).
-    work_seq: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    /// Slab indices in [`RetireState::retired`] waiting on this epoch.
-    waiting: Vec<usize>,
-}
-
-struct RetiredEntry {
-    remaining: usize,
-    object: Option<Retired>,
-}
-
-/// Host objects the title let go of while an open list or a queued/running
-/// submission may still use them (a texture its descriptors name, a descriptor
-/// slot's old resource, a buffer shadow, or texture staging). The title's
-/// descriptor writes and releases reach the host at once, from its own threads,
-/// while lists are recorded or submissions run for most of a second in the
-/// world: freeing there was a GPU page fault on the freed texture
-/// (DXGI_ERROR_DEVICE_HUNG, 2026-11-24, RX 7600).
-///
-/// Each retired object tracks only the specific active epochs whose recorded
-/// `work_seq` is at or after the object's `born_seq` (or all active epochs when
-/// `born_seq == 0`). When an epoch finishes, only the objects waiting on it
-/// decrement their blocker count and drop when it hits zero — avoiding global
-/// head-of-line blocking when an older unreset list or stalled wait stays
-/// pinned while newer resources are created and freed.
-///
-/// Lock invariant: `RETIRE_STATE` is a strict leaf lock — never lock anything
-/// else while holding it, and ALWAYS drop retired objects AFTER releasing it.
-struct RetireState {
-    next_epoch: u64,
-    active_epochs: std::collections::BTreeMap<u64, ActiveEpoch>,
-    retired: Vec<Option<RetiredEntry>>,
-    free_slots: Vec<usize>,
-    pending_count: usize,
-    warned: bool,
-}
-
-impl RetireState {
-    const fn new() -> Self {
-        Self {
-            next_epoch: 1,
-            active_epochs: std::collections::BTreeMap::new(),
-            retired: Vec::new(),
-            free_slots: Vec::new(),
-            pending_count: 0,
-            warned: false,
-        }
-    }
-}
-
-static RETIRE_STATE: Mutex<RetireState> = Mutex::new(RetireState::new());
-
-#[cfg(test)]
-thread_local! {
-    static RETIRE_SCOPE: std::cell::RefCell<Option<std::sync::Arc<Mutex<RetireState>>>> =
-        const { std::cell::RefCell::new(None) };
-}
-
-#[cfg(test)]
-pub(crate) struct RetireTestScope {
-    prev: Option<std::sync::Arc<Mutex<RetireState>>>,
-}
-
-#[cfg(test)]
-impl Drop for RetireTestScope {
-    fn drop(&mut self) {
-        RETIRE_SCOPE.with(|cell| *cell.borrow_mut() = self.prev.take());
-    }
-}
-
-#[cfg(test)]
-fn current_retire_scope() -> Option<std::sync::Arc<Mutex<RetireState>>> {
-    RETIRE_SCOPE.with(|cell| cell.borrow().clone())
-}
-
-#[cfg(test)]
-fn enter_retire_scope(scope: Option<std::sync::Arc<Mutex<RetireState>>>) -> RetireTestScope {
-    let prev = RETIRE_SCOPE.with(|cell| std::mem::replace(&mut *cell.borrow_mut(), scope));
-    RetireTestScope { prev }
-}
-
-/// Isolates retirement epochs and queued drops on the current test thread (and
-/// any `HostList` created or acquired on it) from concurrent GPU tests.
-#[cfg(test)]
-pub(crate) fn isolated_retire_scope() -> RetireTestScope {
-    let fresh = std::sync::Arc::new(Mutex::new(RetireState::new()));
-    let prev = RETIRE_SCOPE.with(|cell| cell.borrow_mut().replace(fresh));
-    RetireTestScope { prev }
-}
-
-/// A retired object, dropped on whatever thread finishes its last blocking
-/// epoch.
-struct Retired(#[allow(dead_code)] Box<dyn std::any::Any>);
-// SAFETY: what is retired is D3D12 objects (free-threaded) and the
-// reference-counted wrappers holding them, dropped once.
-unsafe impl Send for Retired {}
-
-/// Acquires a monotonically increasing epoch (never 0) that keeps retired
-/// objects alive until [`release_epoch_in`] is called with it.
-fn acquire_epoch_in(
-    retire_state: &Mutex<RetireState>,
-    work_seq: std::sync::Arc<std::sync::atomic::AtomicU64>,
-) -> u64 {
-    let mut state = retire_state.lock().unwrap_or_else(|e| e.into_inner());
-    let e = state.next_epoch;
-    state.next_epoch += 1;
-    state.active_epochs.insert(
-        e,
-        ActiveEpoch {
-            work_seq,
-            waiting: Vec::new(),
-        },
-    );
-    e
-}
-
-/// Releases an epoch acquired with [`acquire_epoch_in`] and drops any retired
-/// objects whose blocking epochs have all completed, after releasing the lock.
-fn release_epoch_in(retire_state: &Mutex<RetireState>, epoch: u64) {
-    if epoch == 0 {
-        return;
-    }
-    let done: Vec<Retired> = {
-        let mut state = retire_state.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(active) = state.active_epochs.remove(&epoch) else {
-            return;
-        };
-        let mut done = Vec::new();
-        for idx in active.waiting {
-            if let Some(entry) = state.retired.get_mut(idx).and_then(Option::as_mut) {
-                entry.remaining -= 1;
-                if entry.remaining == 0 {
-                    if let Some(obj) = entry.object.take() {
-                        done.push(obj);
-                    }
-                    state.retired[idx] = None;
-                    state.free_slots.push(idx);
-                    state.pending_count = state.pending_count.saturating_sub(1);
-                }
-            }
-        }
-        done
+/// Effective idle timeout (in milliseconds) for RAM-backed staging pools,
+/// scaled down under physical RAM pressure.
+pub(crate) fn ram_idle_ms(avail_phys: Option<u64>) -> u64 {
+    const GIB: u64 = 1024 * 1024 * 1024;
+    const NORMAL_MS: u64 = 10_000;
+    const MODERATE_MS: u64 = 5_000;
+    const HIGH_MS: u64 = 2_000;
+    let Some(avail) = avail_phys else {
+        return NORMAL_MS;
     };
-    drop(done);
-}
-
-fn retire_in<T: 'static>(retire_state: &Mutex<RetireState>, object: T, born_seq: u64) {
-    let warn = {
-        let mut state = retire_state.lock().unwrap_or_else(|e| e.into_inner());
-        let slot = state.free_slots.pop().unwrap_or(state.retired.len());
-        let mut blockers = 0usize;
-        for entry in state.active_epochs.values_mut() {
-            // Pairs with `AcqRel` `work_seq` updates in `HostList::mark_work`.
-            if born_seq == 0 || entry.work_seq.load(Ordering::Acquire) >= born_seq {
-                entry.waiting.push(slot);
-                blockers += 1;
-            }
-        }
-        if blockers == 0 {
-            if slot < state.retired.len() {
-                state.free_slots.push(slot);
-            }
-            drop(state);
-            drop(object);
-            return;
-        }
-        let item = Some(RetiredEntry {
-            remaining: blockers,
-            object: Some(Retired(Box::new(object))),
-        });
-        if slot == state.retired.len() {
-            state.retired.push(item);
-        } else {
-            state.retired[slot] = item;
-        }
-        state.pending_count += 1;
-        if !state.warned && state.pending_count >= RETIRED_WARN_THRESHOLD {
-            state.warned = true;
-            let (oldest_epoch, oldest_work_seq) = state
-                .active_epochs
-                .iter()
-                .next()
-                .map_or((0, 0), |(&e, entry)| {
-                    (e, entry.work_seq.load(Ordering::Relaxed))
-                });
-            Some((
-                state.pending_count,
-                oldest_epoch,
-                oldest_work_seq,
-                RESOURCE_SEQ.load(Ordering::Relaxed),
-                state.active_epochs.len(),
-                state.next_epoch.saturating_sub(1),
-            ))
-        } else {
-            None
-        }
-    };
-    if let Some((
-        pending,
-        oldest_epoch,
-        oldest_work_seq,
-        current_seq,
-        active_epochs,
-        latest_epoch,
-    )) = warn
-    {
-        tracing::warn!(
-            pending,
-            oldest_epoch,
-            oldest_work_seq,
-            current_seq,
-            active_epochs,
-            latest_epoch,
-            "retired host resource queue grew past threshold; an unreset command list or stalled wait may be pinning epochs"
-        );
+    if avail < 2 * GIB {
+        HIGH_MS
+    } else if avail < 4 * GIB {
+        MODERATE_MS
+    } else {
+        NORMAL_MS
     }
-}
-
-/// Drops `object` once every active epoch that could have observed a resource
-/// born at `born_seq` (`work_seq >= born_seq`, or all active epochs when
-/// `born_seq == 0`) has finished: at once if none matches.
-pub(crate) fn retire_born<T: 'static>(object: T, born_seq: u64) {
-    #[cfg(test)]
-    if let Some(scope) = current_retire_scope() {
-        retire_in(&scope, object, born_seq);
-        return;
-    }
-    retire_in(&RETIRE_STATE, object, born_seq);
-}
-
-/// Drops `object` once every epoch active now has finished: at once if none is.
-pub(crate) fn retire<T: 'static>(object: T) {
-    retire_born(object, 0);
 }
 
 /// Time spent in submissions since the last frame-rate line, in
@@ -1679,17 +1458,9 @@ impl Host {
         let exec_state: &Mutex<RetireState> = exec_scope.as_deref().unwrap_or(&RETIRE_STATE);
         #[cfg(not(test))]
         let exec_state: &Mutex<RetireState> = &RETIRE_STATE;
-        struct ExecEpochGuard<'a> {
-            state: &'a Mutex<RetireState>,
-            epoch: u64,
-        }
-        impl Drop for ExecEpochGuard<'_> {
-            fn drop(&mut self) {
-                release_epoch_in(self.state, self.epoch);
-            }
-        }
         let exec_epoch = ExecEpochGuard {
-            state: exec_state,
+            #[cfg(test)]
+            scope: exec_scope.clone(),
             epoch: acquire_epoch_in(exec_state, exec_work_seq()),
         };
         let started = std::time::Instant::now();
@@ -2246,9 +2017,7 @@ impl HostList {
             .clear();
         let dynamic =
             std::mem::take(&mut *self.kept_dynamic.lock().unwrap_or_else(|e| e.into_inner()));
-        for (heap, first, n) in dynamic {
-            crate::descriptor::release_dynamic(heap, first, n);
-        }
+        crate::descriptor::release_dynamic_batch(&dynamic);
     }
 
     /// The timestamp heap and its read-back buffer (diagnostics, timing on).
@@ -2416,15 +2185,15 @@ impl HostList {
     /// advances `work_seq` lock-free when new resources have been created
     /// since the last command on this list.
     pub(crate) fn mark_work(&self) {
-        let seq = RESOURCE_SEQ.load(Ordering::Acquire);
+        let seq = RESOURCE_SEQ.load(Ordering::SeqCst);
         if self.epoch.load(Ordering::Acquire) != 0 {
-            if self.work_seq.load(Ordering::Relaxed) < seq {
-                self.work_seq.fetch_max(seq, Ordering::AcqRel);
+            if self.work_seq.load(Ordering::SeqCst) < seq {
+                self.work_seq.fetch_max(seq, Ordering::SeqCst);
             }
             return;
         }
         let guard = self.epoch_lock.lock().unwrap_or_else(|e| e.into_inner());
-        self.work_seq.fetch_max(seq, Ordering::AcqRel);
+        self.work_seq.fetch_max(seq, Ordering::SeqCst);
         self.ensure_epoch(&guard);
     }
 
@@ -2477,7 +2246,7 @@ impl HostList {
             let _guard = self.epoch_lock.lock().unwrap_or_else(|e| e.into_inner());
             if self.in_flight.load(Ordering::Acquire) == 0 {
                 if clear_work_seq {
-                    self.work_seq.store(0, Ordering::Relaxed);
+                    self.work_seq.store(0, Ordering::Release);
                 }
                 self.epoch.swap(0, Ordering::AcqRel)
             } else {
@@ -4899,7 +4668,8 @@ impl Host {
                 )
                 .and_then(|()| {
                     let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
-                    b.Map(0, None, Some(&mut data))
+                    let read_range = D3D12_RANGE { Begin: 0, End: 0 };
+                    b.Map(0, Some(&read_range), Some(&mut data))
                 })
         };
         match made {
@@ -5085,8 +4855,7 @@ impl Presenter {
 struct Meter {
     since: std::time::Instant,
     frames: u32,
-    #[cfg(feature = "diagnostics")]
-    copy_stats_frames: u64,
+    logged_frames: u64,
     drawn: u64,
     logged: std::time::Instant,
     /// The caption the window had, once read.
@@ -5101,8 +4870,7 @@ impl Meter {
         Meter {
             since: now,
             frames: 0,
-            #[cfg(feature = "diagnostics")]
-            copy_stats_frames: 0,
+            logged_frames: 0,
             drawn: crate::draw::drawn(),
             logged: now,
             caption: None,
@@ -5114,10 +4882,7 @@ impl Meter {
         #[cfg(feature = "diagnostics")]
         tracing::debug!(target: "victory_gpu::frame", token = crate::frame::current(), "present");
         self.frames += 1;
-        #[cfg(feature = "diagnostics")]
-        {
-            self.copy_stats_frames += 1;
-        }
+        self.logged_frames += 1;
         let elapsed = self.since.elapsed();
         if elapsed < std::time::Duration::from_secs(1) {
             return;
@@ -5144,6 +4909,8 @@ impl Meter {
         let drops = crate::pipeline::take_drops();
         if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
             self.logged = std::time::Instant::now();
+            let logged_frames = (std::mem::take(&mut self.logged_frames) as f64).max(1.0);
+            crate::upload_pool::trim_idle(ram_idle_ms(available_physical_ram()));
             tracing::info!(
                 "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
@@ -5165,7 +4932,7 @@ impl Meter {
             let [changes, waiting, under_way] = [0, 1, 2].map(|i| {
                 crate::watch::REMAPS[i].swap(0, Ordering::Relaxed) as f64
                     / [1.0, 1e3, 1e3][i]
-                    / frames
+                    / logged_frames
             });
             if changes > 0.0 {
                 tracing::info!(
@@ -5180,7 +4947,7 @@ impl Meter {
             }
             #[cfg(feature = "diagnostics")]
             {
-                crate::copystat::log(std::mem::take(&mut self.copy_stats_frames) as f64);
+                crate::copystat::log(logged_frames);
                 for (why, n) in drops.iter().take(40) {
                     tracing::info!(
                         "dropped {:.1}/frame without a host pipeline: {why}",
@@ -6538,6 +6305,48 @@ mod tests {
         assert_eq!(d.load(Ordering::SeqCst), 0);
         list.end_submit();
         assert_eq!(d.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn retire_executing_pins_only_active_execute_epochs_without_bumping_resource_seq() {
+        let _retire = isolated_retire_scope();
+        let Some(host) = host() else {
+            return;
+        };
+        let open = host.new_list().expect("open list");
+        open.mark_work();
+
+        let seq_before = RESOURCE_SEQ.load(Ordering::SeqCst);
+        let (c_open, d_open) = DropCounter::new();
+        retire_executing(c_open);
+        assert_eq!(
+            RESOURCE_SEQ.load(Ordering::SeqCst),
+            seq_before,
+            "retire_executing must not bump global RESOURCE_SEQ"
+        );
+        assert_eq!(
+            d_open.load(Ordering::SeqCst),
+            1,
+            "newly opened list with finite work_seq must not pin retire_executing objects"
+        );
+
+        let exec_guard = crate::retire::acquire_exec_guard();
+        let (c_exec, d_exec) = DropCounter::new();
+        retire_executing(c_exec);
+        assert_eq!(RESOURCE_SEQ.load(Ordering::SeqCst), seq_before);
+        assert_eq!(
+            d_exec.load(Ordering::SeqCst),
+            0,
+            "active Host::execute epoch (work_seq == u64::MAX) must pin retire_executing objects"
+        );
+        drop(exec_guard);
+        assert_eq!(
+            d_exec.load(Ordering::SeqCst),
+            1,
+            "finishing Host::execute epoch must drop pinned object"
+        );
+
+        drop(open);
     }
 
     #[test]

@@ -82,10 +82,9 @@ macro_rules! once {
 /// A texture's upload state: the staging buffer laid out as the host
 /// texture's subresources, and what was last detiled.
 pub(crate) struct Staging {
-    buffer: ID3D12Resource,
+    upload: crate::upload_pool::PooledUpload,
     /// Bytes in the host mapping (`GetCopyableFootprints` total).
     size: u64,
-    data: *mut u8,
     footprints: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
     rows: Vec<u32>,
     layout: victory_formats::texture::Layout,
@@ -125,13 +124,13 @@ unsafe impl Sync for Staging {}
 ///
 /// Evicted entries with `Arc::strong_count == 1` are safe to drop directly
 /// without going through [`crate::host::retire`]:
-/// - `Staging.buffer` is only used by [`upload`]/[`upload_from`], which
+/// - `Staging.upload` is only used by [`upload`]/[`upload_from`], which
 ///   immediately move their `Arc<Staging>` into `list.deferred.copies` via
 ///   `list.defer_texture(staging)` until `list.reset()` or `list.drop()`.
 /// - `Host::execute` holds `&HostList` until the GPU fence completes, so any
 ///   staging buffer referenced by an open or in-flight command list has
 ///   `Arc::strong_count >= 2` and is skipped by eviction.
-/// - No descriptor heap ever references `Staging.buffer`.
+/// - No descriptor heap ever references `Staging.upload`.
 #[derive(Default)]
 struct StagingCache {
     entries: HashMap<usize, Vec<Arc<Staging>>>,
@@ -139,14 +138,16 @@ struct StagingCache {
 }
 
 impl StagingCache {
-    fn insert(&mut self, key: usize, staging: Arc<Staging>) {
+    fn insert(&mut self, key: usize, staging: Arc<Staging>) -> Option<Arc<Staging>> {
         self.total_bytes = self.total_bytes.saturating_add(staging.size);
         let ranges = self.entries.entry(key).or_default();
         if let Some(existing) = ranges.iter_mut().find(|s| s.first == staging.first) {
             let previous = std::mem::replace(existing, staging);
             self.total_bytes = self.total_bytes.saturating_sub(previous.size);
+            Some(previous)
         } else {
             ranges.push(staging);
+            None
         }
     }
 
@@ -524,9 +525,9 @@ pub(crate) fn forget(resource: usize) {
         }
     }
     note_resident(resource as This, None);
-    for staging in stagings {
-        let born = staging.born_seq;
-        crate::host::retire_born(staging, born);
+    if !stagings.is_empty() {
+        let born = crate::retire::safe_batch_born_seq(stagings.iter().map(|s| s.born_seq));
+        crate::host::retire_batch_born(stagings, born);
     }
     let mut through = THROUGH.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(through) = through.as_mut() {
@@ -578,7 +579,12 @@ pub(crate) fn upload_from(list: &HostList, resource: This, texture: &ID3D12Resou
         {
             let f = footprint.Footprint;
             // SAFETY: live resources.
-            let (gpu, d) = unsafe { (staging.buffer.GetGPUVirtualAddress(), texture.GetDesc()) };
+            let (gpu, d) = unsafe {
+                (
+                    staging.upload.buffer().GetGPUVirtualAddress(),
+                    texture.GetDesc(),
+                )
+            };
             let len = staging.footprint_bytes(i) as u64;
             list.note_read(
                 || {
@@ -611,7 +617,7 @@ pub(crate) fn upload_from(list: &HostList, resource: This, texture: &ID3D12Resou
         };
         let from = D3D12_TEXTURE_COPY_LOCATION {
             // SAFETY: as above.
-            pResource: unsafe { std::mem::transmute_copy(&staging.buffer) },
+            pResource: unsafe { std::mem::transmute_copy(staging.upload.buffer()) },
             Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
             Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
                 PlacedFootprint: *footprint,
@@ -748,7 +754,10 @@ impl Staging {
             let len = self.footprint_bytes(i);
             // SAFETY: the subresource's part of the mapped staging buffer.
             let linear = unsafe {
-                std::slice::from_raw_parts_mut(self.data.add(footprint.Offset as usize), len)
+                std::slice::from_raw_parts_mut(
+                    self.upload.data().add(footprint.Offset as usize),
+                    len,
+                )
             };
             if sub < first {
                 linear.fill(0);
@@ -904,8 +913,8 @@ fn create_staging(
             Some(&mut total),
         );
     }
-    let (buffer, data) = host.upload_buffer(total)?;
-    crate::host::name(&buffer, || {
+    let upload = crate::upload_pool::acquire(host, total)?;
+    crate::host::name(upload.buffer(), || {
         format!(
             "staging of {resource:?} {}x{}x{} f{}",
             d.Width, d.Height, d.DepthOrArraySize, d.Format.0
@@ -913,11 +922,10 @@ fn create_staging(
     });
     tracing::debug!(?desc, total, "texture contents uploaded from title memory");
     Some(Arc::new(Staging {
-        buffer,
+        upload,
         size: total,
         first,
         tiled_bytes,
-        data,
         footprints,
         rows,
         layout,
@@ -935,7 +943,7 @@ fn create_staging(
 /// eviction).
 fn staging(resource: This, texture: &ID3D12Resource, requested: u32) -> Option<Arc<Staging>> {
     let key = resource as usize;
-    let (s, evicted) = {
+    let (s, replaced, evicted) = {
         let mut cache = STAGING.lock().unwrap_or_else(|e| e.into_inner());
         let cache = cache.get_or_insert_with(StagingCache::default);
         if let Some(s) = cache.entries.get(&key).and_then(|ranges| {
@@ -948,13 +956,13 @@ fn staging(resource: This, texture: &ID3D12Resource, requested: u32) -> Option<A
         }
         let s = create_staging(resource, texture, requested)?;
         let keep_first = s.first;
-        cache.insert(key, s.clone());
+        let replaced = cache.insert(key, s.clone());
         let evicted = cache.evict_to_budget(staging_budget(), key, keep_first);
-        (s, evicted)
+        (s, replaced, evicted)
     };
-    // Drop evicted staging buffers after releasing `STAGING` so freeing D3D12
-    // upload resources does not stall concurrent cache lookups.
-    drop(evicted);
+    // Drop replaced/evicted staging buffers after releasing `STAGING` so freeing
+    // D3D12 upload resources does not stall concurrent cache lookups.
+    drop((replaced, evicted));
     Some(s)
 }
 
@@ -1123,7 +1131,7 @@ mod tests {
                 .iter()
                 .map(|fp| {
                     // SAFETY: each footprint begins within the live mapped staging buffer.
-                    unsafe { s.data.add(fp.Offset as usize).read() }
+                    unsafe { s.upload.data().add(fp.Offset as usize).read() }
                 })
                 .collect::<Vec<_>>()
         };
@@ -1365,9 +1373,15 @@ mod tests {
             let row_bytes = fp.Footprint.Width as usize * 4;
             let rows = s.rows[0] as usize;
             let mut out = Vec::with_capacity(row_bytes * rows);
-            // SAFETY: `s.data` is a mapped upload buffer covering footprint 0.
-            let mapped =
-                unsafe { std::slice::from_raw_parts(s.data.add(fp.Offset as usize), pitch * rows) };
+            if rows == 0 {
+                return out;
+            }
+            let span = (rows - 1) * pitch + row_bytes;
+            assert!(fp.Offset as usize + span <= s.size as usize);
+            // SAFETY: `s.upload.data()` is a mapped upload buffer covering `fp.Offset..fp.Offset + span`.
+            let mapped = unsafe {
+                std::slice::from_raw_parts(s.upload.data().add(fp.Offset as usize), span)
+            };
             for row in 0..rows {
                 out.extend_from_slice(&mapped[row * pitch..row * pitch + row_bytes]);
             }
@@ -1386,9 +1400,14 @@ mod tests {
         assert_eq!(s3.size, entry_bytes);
 
         let mut cache = StagingCache::default();
-        cache.insert(t1 as usize, s1.clone());
-        cache.insert(t2 as usize, s2.clone());
-        cache.insert(t3 as usize, s3.clone());
+        assert!(cache.insert(t1 as usize, s1.clone()).is_none());
+        // Re-inserting the same key returns the replaced entry to the caller so it
+        // can be dropped after releasing the `STAGING` lock.
+        let s1_dup = s1.clone();
+        assert!(cache.insert(t1 as usize, s1_dup).is_some());
+        assert_eq!(cache.total_bytes, entry_bytes);
+        assert!(cache.insert(t2 as usize, s2.clone()).is_none());
+        assert!(cache.insert(t3 as usize, s3.clone()).is_none());
         assert_eq!(cache.total_bytes, 3 * entry_bytes);
 
         // Touch `t1` so LRU order is `t2` (oldest) < `t3` < `t1` (newest).
@@ -1411,7 +1430,7 @@ mod tests {
         // Insert `t4`, pushing `total_bytes` to 4 * `entry_bytes`.
         let s4 = create_staging(t4, h4, 0).expect("staging 4");
         assert_eq!(s4.size, entry_bytes);
-        cache.insert(t4 as usize, s4);
+        assert!(cache.insert(t4 as usize, s4).is_none());
         assert_eq!(cache.total_bytes, 4 * entry_bytes);
 
         // Budget of 3 entries must skip in-use `t2` and evict oldest idle `t3`,
