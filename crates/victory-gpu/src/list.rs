@@ -1776,38 +1776,17 @@ extern "system" fn execute_indirect(
         return;
     }
     INDIRECT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    // Once per signature and reason: what the records hold is only worth
-    // saying when the reason is new too.
+    // Once per signature and reason. The records themselves are title data
+    // and are never logged.
     static SEEN: std::sync::Mutex<Vec<(usize, &'static str)>> = std::sync::Mutex::new(Vec::new());
     let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
     if !seen.contains(&(signature as usize, dropped)) {
         seen.push((signature as usize, dropped));
-        // The records from a host copy that already exists, never one made
-        // here: its bytes are as of that copy's last refresh, before this
-        // submission and any producer earlier in this list. A buffer with no
-        // copy reads as absent rather than as zeroes.
-        #[cfg(windows)]
-        let records = address.and_then(|at| {
-            let shadow = crate::shadow::peek(at, u64::from(stride))?;
-            let bytes = shadow.bytes(at, u64::from(stride))?;
-            // A stride that is not a multiple of four leaves a tail out
-            // rather than panicking in this callback.
-            let (words, _tail) = bytes.as_chunks::<4>();
-            Some(
-                words
-                    .iter()
-                    .map(|w| u32::from_le_bytes(*w))
-                    .collect::<Vec<u32>>(),
-            )
-        });
-        #[cfg(not(windows))]
-        let records: Option<Vec<u32>> = None;
         tracing::info!(
             stride,
             // The command signature's descriptor, not the records: its
             // fields past the type are whatever the title left in the union.
             signature = ?args,
-            ?records,
             max,
             address = ?address.map(|a| format!("{a:#x}")),
             counted = !count.is_null(),
