@@ -229,6 +229,7 @@ The on/off switches below (`...=1`) are off when unset or set to `0`.
 | `VICTORY_LOG=<target>=debug,...` | debug and trace output |
 | `VICTORY_STACKS=20,60` | every thread's stack at those seconds |
 | `VICTORY_WATCH=<rva>,...` | logs a title u32 when it changes |
+| `VICTORY_XMEM_REUSE_PLACEHOLDER_BOUNDS=1` | experimental reuse of exact placeholder bounds within an XMem mapping call |
 | `VICTORY_KEYS=30:Enter,35:X` | presses keys at those seconds, focus or not |
 | `VICTORY_KEYS_FILE=<path>` | presses the keys named one per line in that file (same names), read while the title runs: each held 0.2 s, 0.2 s apart; append lines as screens appear (the legal-notices screen takes `Down`, `Down`, `Enter` a few seconds apart) |
 | `VICTORY_CRASH_BREAKPOINTS=1` | appends first-chance breakpoints to `crashes.log`, including ones a handler may recover from |
