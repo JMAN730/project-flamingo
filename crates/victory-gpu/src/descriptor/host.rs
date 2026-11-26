@@ -6800,18 +6800,90 @@ void main() {
                 .unwrap()
         );
         let index = heap.dynamic(1).unwrap();
+        assert_eq!(
+            heap.at(index).ptr,
+            a.ptr,
+            "writes target this thread's staging slot"
+        );
+        assert_ne!(
+            heap.at(index).ptr,
+            heap.cpu(index).ptr,
+            "staging slot is separate from the shader-visible heap"
+        );
         let bytes = |at: D3D12_CPU_DESCRIPTOR_HANDLE| {
             let mut bytes = [0u8; 32];
             crate::host::read_into(at.ptr as *const u8, &mut bytes).then_some(bytes)
         };
+        heap.null_raw_at(index);
+        let (slot_null, stage_null) = (bytes(heap.cpu(index)), bytes(a));
+        assert!(slot_null.is_some() && stage_null.is_some());
+
         heap.constant_at(index, 0x1000, 256);
-        let (slot, beside) = (bytes(heap.cpu(index)), bytes(staged(false).unwrap()));
-        assert_eq!(slot, beside, "copied whole from this thread's staging slot");
+        let (slot_cbv, stage_cbv) = (bytes(heap.cpu(index)), bytes(a));
+        assert_ne!(
+            stage_cbv, stage_null,
+            "view is built in this thread's CPU-only staging slot"
+        );
+        assert_ne!(
+            slot_cbv, slot_null,
+            "staged view is copied into the shader-visible heap"
+        );
+        // Compare against the same slot address rather than raw bytes across
+        // different handles: drivers like WARP embed a per-slot pointer inside
+        // CPU descriptor handles, so raw bytes differ between two handles even
+        // when `CopyDescriptorsSimple` copied the descriptor whole.
+        null_buffer_view(heap.cpu(index));
+        assert_eq!(
+            bytes(heap.cpu(index)),
+            slot_null,
+            "direct overwrite resets slot without touching staging"
+        );
+        assert_eq!(bytes(a), stage_cbv, "staging slot still holds the CBV");
+        // SAFETY: `index` is a live slot of `heap` and `a` is this thread's staging slot.
+        unsafe {
+            host.device.CopyDescriptorsSimple(
+                1,
+                heap.cpu(index),
+                a,
+                D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+            );
+        }
+        assert_eq!(
+            bytes(heap.cpu(index)),
+            slot_cbv,
+            "copied whole from this thread's staging slot"
+        );
+        let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
+            BufferLocation: 0x1000,
+            SizeInBytes: 256,
+        };
+        null_buffer_view(heap.cpu(index));
+        // SAFETY: `index` is a live dynamic slot of `heap`.
+        unsafe {
+            host.device
+                .CreateConstantBufferView(Some(&desc), heap.cpu(index));
+        }
+        assert_eq!(
+            bytes(heap.cpu(index)),
+            slot_cbv,
+            "staged copy matches a direct view at the same slot"
+        );
+
         heap.null_raw_at(index);
         assert_ne!(
             bytes(heap.cpu(index)),
-            slot,
+            slot_cbv,
             "updated after writing another view"
+        );
+        assert_eq!(
+            bytes(heap.cpu(index)),
+            slot_null,
+            "null view matches earlier null view at the same slot"
+        );
+        assert_eq!(
+            bytes(a),
+            stage_null,
+            "staging slot updated for the replacement view"
         );
         heap.release(index, 1);
         // SAFETY: plain query.
