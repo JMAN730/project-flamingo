@@ -369,6 +369,9 @@ pub(crate) struct Shadow {
 
 impl Drop for Shadow {
     fn drop(&mut self) {
+        if crate::lazy_back::active() {
+            crate::lazy_back::discard_shadow(self as *const Shadow as usize);
+        }
         if let Some(card) = &self.card {
             if card.is_window {
                 WINDOW_CARD_BYTES.fetch_sub(card.size, Ordering::Relaxed);
@@ -690,6 +693,21 @@ pub(crate) fn card_dirty(sent_as: u64) -> Vec<CardDirty> {
     out
 }
 
+#[cfg(test)]
+pub(crate) fn card_sent_max() -> usize {
+    let carded = CARDED.lock().unwrap_or_else(|e| e.into_inner());
+    carded
+        .iter()
+        .filter_map(|w| w.upgrade())
+        .filter_map(|s| {
+            s.card
+                .as_ref()
+                .map(|c| c.sent.lock().unwrap_or_else(|e| e.into_inner()).len())
+        })
+        .max()
+        .unwrap_or(0)
+}
+
 /// Ranges in order, those that overlap or touch merged as one.
 fn joined(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
     ranges.sort();
@@ -963,11 +981,27 @@ fn join_runs(runs: Vec<(usize, usize)>, gap: usize) -> Vec<(usize, usize)> {
     out
 }
 
-/// Acquires `guard = acquire()` and reads `[addr, addr + buf.len())` raw so
-/// the lock is held across the read (and released immediately if unmapped).
+/// Materializes any deferred `lazy_back` blocks in `[addr, addr + buf.len())`
+/// outside the per-`Shadow` lock, then acquires `acquire()` and reads via
+/// `read_into_raw`. If a concurrent relay thread re-deferred the block before
+/// the lock was acquired, drops the lock, materializes once, and retries.
 fn lock_and_read<G>(acquire: impl Fn() -> G, addr: usize, buf: &mut [u8]) -> Option<G> {
+    if crate::lazy_back::active() {
+        crate::lazy_back::materialize_range(addr, buf.len());
+    }
     let guard = acquire();
-    crate::host::read_into_raw(addr as *const u8, buf).then_some(guard)
+    if crate::host::read_into_raw(addr as *const u8, buf) {
+        return Some(guard);
+    }
+    drop(guard);
+    if crate::lazy_back::has_block_in_range(addr, buf.len()) {
+        crate::lazy_back::materialize_range(addr, buf.len());
+        let guard = acquire();
+        if crate::host::read_into_raw(addr as *const u8, buf) {
+            return Some(guard);
+        }
+    }
+    None
 }
 
 /// Scans `work` (`(shadow, from, to)` title-address spans of PC-backed shadows)
@@ -1066,9 +1100,46 @@ impl Shadow {
     }
 
     /// Start address of this shadow in title memory.
-    #[allow(dead_code)]
     pub(crate) fn start(&self) -> u64 {
         self.start
+    }
+
+    /// Whether this shadow is placed in-place (`VICTORY_INPLACE` / `VICTORY_STRETCH`).
+    pub(crate) fn is_placed(&self) -> bool {
+        self.place.is_some()
+    }
+
+    /// Marks 64 KiB hash dirty bits overlapping `[off, off + len)` for a ReBAR shadow.
+    pub(crate) fn mark_rebar_dirty_range(&self, off: usize, len: usize) {
+        if let Some(rebar) = &self.rebar {
+            rebar.mark_dirty_range(off, len);
+        }
+    }
+
+    /// Whether this shadow has any in-flight GPU writes on `Host::queue`
+    /// (declared shader writes in `pending` or unlanded card-copy uploads in `card.sent`).
+    pub(crate) fn has_inflight_gpu_write(&self) -> bool {
+        if !self
+            .pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty()
+        {
+            return true;
+        }
+        if let Some(card) = &self.card {
+            let fetched = RELAY_FETCHED.load(Ordering::Acquire);
+            if card
+                .sent
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .any(|&(_, _, s)| s > fetched)
+            {
+                return true;
+            }
+        }
+        false
     }
 
     /// Whether this shadow is known not to be write-watched (or in-place).
@@ -1567,6 +1638,27 @@ impl Shadow {
         true
     }
 
+    /// Pre-lock materialization of deferred `lazy_back` blocks overlapping ReBAR
+    /// GPU readback `spans` before taking `rebar.mirror.lock()`.
+    fn materialize_rebar_spans(&self, spans: &[(usize, usize)], gpu_slices: &[&[u8]]) {
+        if !crate::lazy_back::active() {
+            return;
+        }
+        let start = self.start as usize;
+        let limit = self.len as usize;
+        let ranges: Vec<(usize, usize)> = spans
+            .iter()
+            .zip(gpu_slices)
+            .filter_map(|(&(from, to), &gpu_span)| {
+                (from < to && to <= limit && gpu_span.len() == to - from)
+                    .then_some((start + from, to - from))
+            })
+            .collect();
+        if !ranges.is_empty() {
+            crate::lazy_back::materialize_ranges(&ranges);
+        }
+    }
+
     /// [`relay`] counterpart to [`Shadow::copy_back_rebar`]: merges GPU bytes
     /// DMAed by the relay thread (`gpu_slices`, for sorted disjoint buffer-offset
     /// `spans`) into title memory and the cached RAM mirror under `rebar.mirror`'s
@@ -1584,6 +1676,7 @@ impl Shadow {
             return 0;
         };
         let start = self.start as usize;
+        self.materialize_rebar_spans(spans, gpu_slices);
         let mut mirror_guard = rebar.mirror.lock().unwrap_or_else(|e| e.into_inner());
         let Some(mirror) = mirror_guard.as_mut() else {
             return 0;
@@ -1796,7 +1889,6 @@ impl Shadow {
 
     /// Own-view hook for lazy materialization of a ReBAR page without touching
     /// title view protections.
-    #[allow(dead_code)]
     pub(crate) fn relay_merge_rebar_via_own(&self, offset: usize, gpu: &[u8]) -> Option<usize> {
         let rebar = self.rebar.as_ref()?;
         let start = self.start as usize;
@@ -1838,6 +1930,9 @@ impl Shadow {
         let start = self.start as usize;
         if self.card.is_none() || at + gpu.len() > self.len as usize {
             return 0;
+        }
+        if crate::lazy_back::active() {
+            crate::lazy_back::materialize_range(start + at, gpu.len());
         }
         // SAFETY: inside the CPU-side staging mapping; only submitting thread writes it.
         let old = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), gpu.len()) };
@@ -1887,7 +1982,6 @@ impl Shadow {
     }
 
     /// Own-view hook for lazy materialization of a card page.
-    #[allow(dead_code)]
     pub(crate) fn card_merge_relay_via_own(
         &self,
         at: usize,
@@ -1912,6 +2006,9 @@ impl Shadow {
         };
         if at + gpu.len() > self.len as usize {
             return Some(0);
+        }
+        if !via_own && crate::lazy_back::active() {
+            crate::lazy_back::materialize_range(start + at, gpu.len());
         }
         let _side = self.before.read().unwrap_or_else(|e| e.into_inner());
         // SAFETY: inside staging mapping; `merge_under_writes` holds write lock on `before`.
@@ -1991,6 +2088,9 @@ impl Shadow {
         let start = self.start as usize;
         if self.card.is_some() || self.rebar.is_some() || n == 0 || at + n > self.len as usize {
             return 0;
+        }
+        if crate::lazy_back::active() {
+            crate::lazy_back::materialize_range(start + at, n);
         }
         let mut before = self.before.write().unwrap_or_else(|e| e.into_inner());
         let Some((taken, snap)) = before.snapshot.as_mut() else {
@@ -2092,11 +2192,23 @@ impl Shadow {
             return true;
         }
         let base = self.start as usize / PAGE;
+        let shadow_ptr = self as *const Shadow as usize;
+        // Acquire `LAZY_STATE` strictly outside `self.copied` (lock order).
+        let owned = if crate::lazy_back::active() {
+            let min_a = busy.iter().map(|&(a, _)| a).min().unwrap_or(0);
+            let max_e = busy.iter().map(|&(_, e)| e).max().unwrap_or(0);
+            crate::lazy_back::owned_blocks_in(shadow_ptr, min_a / PAGE, max_e.div_ceil(PAGE))
+        } else {
+            Vec::new()
+        };
         let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
         for (a, e) in busy {
             match crate::watch::asked(a, e) {
                 Some((_, written)) => {
-                    if !stale_pages_in(base, &copied, a, e, &written).is_empty() {
+                    if stale_pages_in(base, &copied, a, e, &written)
+                        .into_iter()
+                        .any(|page| owned.binary_search(&page).is_err())
+                    {
                         return true;
                     }
                 }
@@ -2126,6 +2238,7 @@ impl Shadow {
         }
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let base = start / PAGE;
+        let shadow_ptr = self as *const Shadow as usize;
         let mut title = vec![0u8; PAGE];
         for (a, e) in busy {
             let Some((now, written)) = crate::watch::writes(a, e, true) else {
@@ -2137,6 +2250,9 @@ impl Shadow {
                 stale_pages_in(base, &copied, a, e, &written)
             };
             for page in stale {
+                if crate::lazy_back::active() && crate::lazy_back::owns_block(shadow_ptr, page) {
+                    continue;
+                }
                 let (lo, hi) = ((page * PAGE).max(a), ((page + 1) * PAGE).min(e));
                 if lo >= hi {
                     continue;
@@ -2259,6 +2375,7 @@ impl Shadow {
         let Some(rebar) = &self.rebar else {
             return 0;
         };
+        self.materialize_rebar_spans(spans, gpu_slices);
         let mut mirror_guard = rebar.mirror.lock().unwrap_or_else(|e| e.into_inner());
         let mut written = 0;
         let mut vram_dirty: Vec<(usize, usize)> = Vec::new();
@@ -2360,14 +2477,17 @@ impl Shadow {
         if self.place.is_some() {
             return 0;
         }
+        let (from, to) = self.inside(address, len);
+        let start = self.start as usize;
+        if from < to && crate::lazy_back::active() {
+            crate::lazy_back::materialize_range(start + from, to - from);
+        }
         let mut before = self.before.write().unwrap_or_else(|e| e.into_inner());
         let Before {
             snapshot,
             unchanged,
         } = &mut *before;
         let mut written = 0;
-        let (from, to) = self.inside(address, len);
-        let start = self.start as usize;
         if let Some((taken, before)) = &*snapshot
             && *taken <= from
             && to <= taken + before.len()
@@ -2528,6 +2648,11 @@ impl Shadow {
         let mut title = vec![0u8; PAGE];
         let mut copied_bytes = 0usize;
         for page in stale {
+            if crate::lazy_back::active()
+                && crate::lazy_back::owns_block(self as *const Shadow as usize, page)
+            {
+                continue;
+            }
             let (lo, hi) = ((page * PAGE).max(from), ((page + 1) * PAGE).min(to));
             if lo >= hi {
                 continue;
@@ -2620,19 +2745,23 @@ impl Shadow {
     /// [`Shadow::plan_update`] of `[from, to)` (inside the buffer) where no
     /// shader writes.
     fn plan_update_free(&self, from: usize, to: usize, plan: &mut UpdatePlan) {
+        let run_base = plan.runs.len();
         if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
             if let Some((now, written)) = crate::watch::writes(from, to, true) {
                 self.watched.store(1, Ordering::Relaxed);
-                let before = plan.runs.len();
                 self.collect_stale(from, to, now, &written, &mut plan.runs);
+                Self::exclude_owned_lazy_runs(
+                    self as *const Shadow as usize,
+                    &mut plan.runs,
+                    run_base,
+                );
                 #[cfg(feature = "diagnostics")]
                 {
                     use crate::copystat::{C, add};
-                    let copied: usize = plan.runs[before..].iter().map(|&(a, b)| b - a).sum();
+                    let copied: usize = plan.runs[run_base..].iter().map(|&(a, b)| b - a).sum();
                     add(C::Checked, (to - from) as u64);
                     add(C::Unchanged, (to - from).saturating_sub(copied) as u64);
                 }
-                let _ = before;
                 return;
             }
             // Only mark the shadow permanently unwatched if it has never been
@@ -2644,6 +2773,48 @@ impl Shadow {
                     .compare_exchange(0, NOT_WATCHED, Ordering::Relaxed, Ordering::Relaxed);
         }
         plan.runs.push((from, to));
+        Self::exclude_owned_lazy_runs(self as *const Shadow as usize, &mut plan.runs, run_base);
+    }
+
+    /// Removes any 64 KiB page intervals in `runs[from_idx..]` currently deferred by `shadow_ptr`
+    /// in `lazy_back` so a shadow does not overwrite its own authoritative VRAM with stale RAM.
+    fn exclude_owned_lazy_runs(shadow_ptr: usize, runs: &mut Vec<(usize, usize)>, from_idx: usize) {
+        if !crate::lazy_back::active() || from_idx >= runs.len() {
+            return;
+        }
+        let min_lo = runs[from_idx..].iter().map(|&(a, _)| a).min().unwrap_or(0);
+        let max_hi = runs[from_idx..].iter().map(|&(_, b)| b).max().unwrap_or(0);
+        if min_lo >= max_hi {
+            return;
+        }
+        let owned =
+            crate::lazy_back::owned_blocks_in(shadow_ptr, min_lo / PAGE, max_hi.div_ceil(PAGE));
+        if owned.is_empty() {
+            return;
+        }
+        let tail: Vec<(usize, usize)> = runs.drain(from_idx..).collect();
+        for (mut a, b) in tail {
+            for &blk in &owned {
+                let p0 = blk * PAGE;
+                let p1 = p0 + PAGE;
+                if p1 <= a {
+                    continue;
+                }
+                if p0 >= b {
+                    break;
+                }
+                if a < p0 {
+                    runs.push((a, p0));
+                }
+                a = a.max(p1);
+                if a >= b {
+                    break;
+                }
+            }
+            if a < b {
+                runs.push((a, b));
+            }
+        }
     }
 
     /// Collects contiguous stale byte ranges `(lo, hi)` of `[from, to)`
@@ -2661,8 +2832,19 @@ impl Shadow {
         let base = self.start as usize / PAGE;
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let last = (to - 1) / PAGE;
+        // Acquire `LAZY_STATE` before `self.copied` (lock order).
+        let own_clean = if crate::lazy_back::active() {
+            crate::lazy_back::owned_cpu_clean_blocks_in(
+                self as *const Shadow as usize,
+                from / PAGE,
+                last + 1,
+            )
+        } else {
+            Vec::new()
+        };
         let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
         let mut writes = written.iter().peekable();
+        let mut clean_owned = own_clean.iter().peekable();
         let mut runs: Vec<(usize, usize, bool)> = Vec::new();
         let mut run: Option<(usize, bool)> = None;
         let mut again_at: Vec<(usize, u64)> = Vec::new();
@@ -2677,8 +2859,16 @@ impl Shadow {
                 }
                 _ => 0,
             };
+            let pre_epoch = match clean_owned.peek() {
+                Some(&&(p, e)) if p == page => {
+                    clean_owned.next();
+                    Some(e)
+                }
+                _ => None,
+            };
             let at = &mut copied[page - base];
-            if *at == 0 || write > *at {
+            let own_lazy_clean = pre_epoch.is_some_and(|pre| *at > 0 && pre <= *at);
+            if !own_lazy_clean && (*at == 0 || write > *at) {
                 let taken = *at;
                 if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
                     *at = now;
@@ -2768,6 +2958,7 @@ impl Shadow {
         if total == 0 {
             return 0;
         }
+        materialize_copy_segs(&segs);
         if let Some(rebar) = &self.rebar {
             let mut mirror = rebar.mirror.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(m) = mirror.as_mut() {
@@ -2779,14 +2970,31 @@ impl Shadow {
                     for s in &mut segs {
                         s.mirror = m_ptr + (s.src - start);
                     }
-                    run_copy_segs(&segs);
+                    let ok = run_copy_segs_checked(&segs);
                     drop(mirror);
+                    if !ok {
+                        materialize_copy_segs(&segs);
+                        let mut mirror = rebar.mirror.lock().unwrap_or_else(|e| e.into_inner());
+                        if let Some(m) = mirror.as_mut() {
+                            let m_ptr = m.as_mut_ptr() as usize;
+                            let m_len = m.len();
+                            if segs.iter().all(|s| (s.src - start) + s.len <= m_len) {
+                                for s in &mut segs {
+                                    s.mirror = m_ptr + (s.src - start);
+                                }
+                                let _ = run_copy_segs_checked(&segs);
+                            }
+                        }
+                    }
                     rebar.mark_dirty_segs(start, &segs);
                     return total;
                 }
             }
         }
-        run_copy_segs(&segs);
+        if !run_copy_segs_checked(&segs) {
+            materialize_copy_segs(&segs);
+            let _ = run_copy_segs_checked(&segs);
+        }
         self.finish_copy_segs(start, &segs);
         total
     }
@@ -2824,6 +3032,35 @@ impl Shadow {
             is_window: false,
         });
         Some(Arc::new(shadow))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_card_sized_for_test(
+        side_data: *mut u8,
+        title_start: u64,
+        len: u64,
+    ) -> Option<Arc<Shadow>> {
+        let h = host()?;
+        let alloc = len.max(64);
+        let (buffer, _) = h.shared_buffer(alloc)?;
+        let (staging, _) = h.shared_buffer(alloc)?;
+        let mut shadow = Shadow::new(buffer, side_data, 0, title_start, len, None);
+        shadow.card = Some(Card {
+            staging,
+            before: Mutex::new(None),
+            dirty: Mutex::default(),
+            sent: Mutex::default(),
+            size: 0,
+            is_window: false,
+        });
+        Some(Arc::new(shadow))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clear_card_dirty_for_test(&self) {
+        if let Some(card) = &self.card {
+            card.dirty.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        }
     }
 
     #[cfg(test)]
@@ -3063,20 +3300,47 @@ fn chunk_copy_segs(segs: &[CopySeg], chunk_bytes: usize) -> Vec<Vec<CopySeg>> {
     buckets
 }
 
+/// Materializes any deferred `lazy_back` blocks overlapping `segs` in one batched DMA.
+fn materialize_copy_segs(segs: &[CopySeg]) {
+    if !segs.is_empty() && crate::lazy_back::active() {
+        let ranges: Vec<(usize, usize)> = segs
+            .iter()
+            .filter(|s| s.len > 0)
+            .map(|s| (s.src, s.len))
+            .collect();
+        if !ranges.is_empty() {
+            crate::lazy_back::materialize_ranges(&ranges);
+        }
+    }
+}
+
 #[inline]
-fn execute_copy_seg(seg: CopySeg) {
+fn execute_copy_seg_checked(seg: CopySeg) -> bool {
     if seg.len == 0 {
-        return;
+        return true;
     }
     if seg.mirror != 0 {
-        crate::host::copy_mapped(seg.mirror as *mut u8, seg.src as *const u8, seg.len, false);
+        if !crate::host::copy_mapped_raw_checked(
+            seg.mirror as *mut u8,
+            seg.src as *const u8,
+            seg.len,
+            false,
+        ) {
+            return false;
+        }
         // SAFETY: `seg` lies inside the shadow's mirror and WC VRAM mapping
         // (`off + len <= self.len`), and chunks are strictly disjoint.
         unsafe {
             std::ptr::copy_nonoverlapping(seg.mirror as *const u8, seg.dst as *mut u8, seg.len);
         }
+        true
     } else {
-        crate::host::copy_mapped(seg.dst as *mut u8, seg.src as *const u8, seg.len, false);
+        crate::host::copy_mapped_raw_checked(
+            seg.dst as *mut u8,
+            seg.src as *const u8,
+            seg.len,
+            false,
+        )
     }
 }
 
@@ -3113,36 +3377,47 @@ fn run_copy_jobs(jobs: Vec<Job>) {
     });
 }
 
-fn run_copy_segs(segs: &[CopySeg]) {
+fn run_copy_segs_checked(segs: &[CopySeg]) -> bool {
     let total: usize = segs.iter().map(|s| s.len).sum();
     if total == 0 {
-        return;
+        return true;
     }
     if !wide_copy() || total < WIDE_COPY_MIN {
+        let mut ok = true;
         for &seg in segs {
-            execute_copy_seg(seg);
+            if !execute_copy_seg_checked(seg) {
+                ok = false;
+            }
         }
-        return;
+        return ok;
     }
     let chunk_bytes = (total / 4).clamp(256 << 10, WIDE_COPY_CHUNK);
     let buckets = chunk_copy_segs(segs, chunk_bytes);
     if buckets.len() < 2 {
+        let mut ok = true;
         for &seg in segs {
-            execute_copy_seg(seg);
+            if !execute_copy_seg_checked(seg) {
+                ok = false;
+            }
         }
-        return;
+        return ok;
     }
+    let all_ok = Arc::new(std::sync::atomic::AtomicBool::new(true));
     let jobs: Vec<Job> = buckets
         .into_iter()
         .map(|bucket| {
+            let all_ok = all_ok.clone();
             Box::new(move || {
                 for seg in bucket {
-                    execute_copy_seg(seg);
+                    if !execute_copy_seg_checked(seg) {
+                        all_ok.store(false, Ordering::Release);
+                    }
                 }
             }) as Job
         })
         .collect();
     run_copy_jobs(jobs);
+    all_ok.load(Ordering::Acquire)
 }
 
 /// Copies `len` bytes from title memory `src` into writable host memory `dst`,
@@ -3155,12 +3430,19 @@ pub(crate) fn copy_mapped_wide(dst: *mut u8, src: *const u8, len: usize) {
         crate::host::copy_mapped(dst, src, len, false);
         return;
     }
-    run_copy_segs(&[CopySeg {
+    if crate::lazy_back::active() {
+        crate::lazy_back::materialize_range(src as usize, len);
+    }
+    let seg = [CopySeg {
         src: src as usize,
         dst: dst as usize,
         mirror: 0,
         len,
-    }]);
+    }];
+    if !run_copy_segs_checked(&seg) {
+        crate::lazy_back::materialize_range(src as usize, len);
+        let _ = run_copy_segs_checked(&seg);
+    }
 }
 
 /// Dirty byte ranges discovered by [`Shadow::plan_update`] before copying.
@@ -3261,8 +3543,32 @@ pub(crate) fn refresh_batch(items: Vec<(Arc<Shadow>, usize, usize)>, parallel_pl
         }
     }
 
+    if crate::lazy_back::active() && (!all_segs.is_empty() || !mirrored.is_empty()) {
+        let mut ranges: Vec<(usize, usize)> = all_segs
+            .iter()
+            .filter(|s| s.len > 0)
+            .map(|s| (s.src, s.len))
+            .collect();
+        for &idx in &mirrored {
+            let (shadow, _, _, plan) = &planned[idx];
+            let (start, end) = (shadow.start as usize, (shadow.start + shadow.len) as usize);
+            for &(raw_from, raw_to) in &plan.runs {
+                let (from, to) = (raw_from.max(start), raw_to.min(end));
+                if from < to {
+                    ranges.push((from, to - from));
+                }
+            }
+        }
+        if !ranges.is_empty() {
+            crate::lazy_back::materialize_ranges(&ranges);
+        }
+    }
+
     if !all_segs.is_empty() {
-        run_copy_segs(&all_segs);
+        if !run_copy_segs_checked(&all_segs) {
+            materialize_copy_segs(&all_segs);
+            let _ = run_copy_segs_checked(&all_segs);
+        }
         for &(idx, seg_lo, seg_hi) in &non_mirrored {
             let shadow = &planned[idx].0;
             shadow.finish_copy_segs(shadow.start as usize, &all_segs[seg_lo..seg_hi]);
@@ -3374,6 +3680,9 @@ pub(crate) fn register(resource: usize, start: u64, len: u64) {
         },
     );
     if let Some(shadow) = before.and_then(|e| e.shadow) {
+        if crate::lazy_back::active() {
+            crate::lazy_back::materialize_shadow(Arc::as_ptr(&shadow) as usize);
+        }
         let born = shadow.born_seq;
         crate::host::retire_born(shadow, born);
     }
@@ -3473,6 +3782,9 @@ pub(crate) fn unregister(resource: usize, start: u64) {
         map.remove(&(start, resource)).and_then(|e| e.shadow)
     };
     if let Some(shadow) = shadow {
+        if crate::lazy_back::active() {
+            crate::lazy_back::materialize_shadow(Arc::as_ptr(&shadow) as usize);
+        }
         let born = shadow.born_seq;
         crate::host::retire_born(shadow, born);
     }
@@ -4123,6 +4435,9 @@ fn loose_in(
         (shadow, evicted)
     };
     for old in evicted {
+        if crate::lazy_back::active() {
+            crate::lazy_back::materialize_shadow(Arc::as_ptr(&old) as usize);
+        }
         let born = old.born_seq;
         crate::host::retire_born(old, born);
     }
@@ -5633,5 +5948,112 @@ mod tests {
             &[(0, 4096)]
         );
         let _ = staging;
+    }
+
+    #[test]
+    fn refresh_batch_materializes_deferred_lazy_block_instead_of_zeroing() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        const MEM_TOP_DOWN: u32 = 0x10_0000;
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+
+        let Some(h) = host() else {
+            return;
+        };
+        let pages = 2usize;
+        let len = pages * PAGE;
+        // SAFETY: isolated write-watched allocation freed at the end of the test.
+        // Use `MEM_TOP_DOWN` so bottom-up `watch` tests do not reuse this VA.
+        let title = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                len,
+                MEM_RESERVE | MEM_COMMIT | MEM_TOP_DOWN | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+            .cast::<u8>()
+        };
+        assert!(!title.is_null());
+        // SAFETY: committed above.
+        unsafe { std::ptr::write_bytes(title, 0xA5, len) };
+        let va0 = title as usize;
+
+        let mut side_a = vec![0xA5u8; len];
+        let mut side_b = vec![0x00u8; len];
+        let mut side_c = vec![0x00u8; len];
+        let Some(shadow_a) =
+            Shadow::new_card_sized_for_test(side_a.as_mut_ptr(), va0 as u64, len as u64)
+        else {
+            // SAFETY: cleanup.
+            unsafe { VirtualFree(title.cast(), 0, MEM_RELEASE) };
+            return;
+        };
+        let Some(shadow_b) =
+            Shadow::new_card_sized_for_test(side_b.as_mut_ptr(), va0 as u64, len as u64)
+        else {
+            drop(shadow_a);
+            // SAFETY: cleanup.
+            unsafe { VirtualFree(title.cast(), 0, MEM_RELEASE) };
+            return;
+        };
+        let Some(shadow_c) =
+            Shadow::new_card_sized_for_test(side_c.as_mut_ptr(), va0 as u64, len as u64)
+        else {
+            drop(shadow_b);
+            drop(shadow_a);
+            // SAFETY: cleanup.
+            unsafe { VirtualFree(title.cast(), 0, MEM_RELEASE) };
+            return;
+        };
+
+        // Seed shadow_a's GPU card buffer with `0xA5` across `len` and `0x5C` in the
+        // first 64 bytes so materialization merges `0x5C` into title RAM when `VICTORY_LAZY_BACK=1`.
+        let (up, up_ptr) = h.upload_buffer(len as u64).expect("upload");
+        // SAFETY: mapped `len`-byte upload buffer.
+        unsafe {
+            std::ptr::write_bytes(up_ptr, 0xA5, len);
+            std::ptr::write_bytes(up_ptr, 0x5C, 64);
+        }
+        let list = h.new_list().expect("seed list");
+        // SAFETY: live buffers on open command list.
+        unsafe {
+            list.list
+                .CopyBufferRegion(&shadow_a.buffer, 0, &up, 0, len as u64);
+        }
+        list.close();
+        h.execute(&[&list]);
+        list.reset();
+        shadow_a.writing(va0, PAGE, |_, _| None);
+
+        let deferred = crate::lazy_back::try_defer_page(&shadow_a, 0, PAGE, 0);
+        if deferred {
+            assert!(crate::lazy_back::has_block(va0 / PAGE));
+        }
+
+        // `refresh_batch` with >= 2 items exercises the flat `all_segs` +
+        // `run_copy_segs_checked` path across page 0 (`shadow_b`) and page 1 (`shadow_c`).
+        let copied = refresh_batch(
+            vec![
+                (shadow_b.clone(), va0, va0 + PAGE),
+                (shadow_c.clone(), va0 + PAGE, va0 + 2 * PAGE),
+            ],
+            false,
+        );
+        assert!(copied >= 2 * PAGE);
+        assert!(!crate::lazy_back::has_block(va0 / PAGE));
+        if deferred {
+            assert_eq!(&side_b[..64], &[0x5Cu8; 64]);
+        } else {
+            assert_eq!(&side_b[..64], &[0xA5u8; 64]);
+        }
+        assert_eq!(&side_c[PAGE..PAGE + 64], &[0xA5u8; 64]);
+
+        shadow_a.copy_back_done(&[(va0, va0 + PAGE)]);
+        drop(shadow_c);
+        drop(shadow_b);
+        drop(shadow_a);
+        // SAFETY: free test allocation.
+        unsafe { VirtualFree(title.cast(), 0, MEM_RELEASE) };
     }
 }

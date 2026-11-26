@@ -969,7 +969,6 @@ mod fill_ahead {
 }
 
 #[cfg(test)]
-#[allow(unused_imports)]
 pub(crate) use fill_ahead::read as test_fill_ahead_read;
 pub(crate) use fill_ahead::wrote as shaders_write;
 
@@ -1565,7 +1564,6 @@ impl Host {
 
     /// Synchronizes an auxiliary `COPY` queue behind the latest `self.queue`
     /// signal and returns the `QUEUE_ORDER` watermark visible after the wait.
-    #[allow(dead_code)]
     pub(crate) fn sync_copy_queue(
         &self,
         copy_queue: &ID3D12CommandQueue,
@@ -1576,7 +1574,6 @@ impl Host {
     /// Synchronizes an auxiliary `COPY` queue behind `self.queue` only when
     /// `wait_direct` is true and `self.fence` has not already completed past
     /// `last_signalled`.
-    #[allow(dead_code)]
     pub(crate) fn sync_copy_queue_for(
         &self,
         copy_queue: &ID3D12CommandQueue,
@@ -2092,9 +2089,14 @@ impl Host {
             offsets: Vec<u64>,
         }
 
+        let lazy = crate::lazy_back::enabled();
         let mut card_done_inflight = false;
         if inflight_fetch() {
-            let landed = self.relay_card_inflight(plans);
+            let landed = if lazy {
+                false
+            } else {
+                self.relay_card_inflight(plans)
+            };
             inflight_tickets_landed(plans);
             if landed {
                 card_done_inflight = true;
@@ -2138,6 +2140,16 @@ impl Host {
                             }
                             let (lo, hi) = r.shadow.card_piece(&r.span, p);
                             if lo < hi && seen.insert((copy, lo, hi)) {
+                                if lazy
+                                    && crate::lazy_back::try_defer_page(
+                                        &r.shadow,
+                                        lo,
+                                        hi - lo,
+                                        plan.sent_as,
+                                    )
+                                {
+                                    continue;
+                                }
                                 pieces.push((r.shadow.clone(), lo, hi, card_total));
                                 card_total += (hi - lo) as u64;
                             }
@@ -2160,7 +2172,35 @@ impl Host {
                 .map(|&(from, to)| shadow.inside(from, to.saturating_sub(from)))
                 .filter(|&(from, to)| from < to)
                 .collect();
-            let spans = merge_ranges(ranges);
+            let merged = merge_ranges(ranges);
+            if merged.is_empty() {
+                continue;
+            }
+            let spans = if lazy {
+                let start = shadow.start() as usize;
+                let page = crate::watch::PAGE;
+                let mut kept: Vec<(usize, usize)> = Vec::new();
+                for (from, to) in merged {
+                    let mut at = from;
+                    while at < to {
+                        let va = start + at;
+                        let step = (page - va % page).min(to - at);
+                        let next = at + step;
+                        if crate::lazy_back::try_defer_page(shadow, at, step, 0) {
+                            shadow.mark_rebar_dirty_range(at, step);
+                        } else {
+                            match kept.last_mut() {
+                                Some(last) if last.1 == at => last.1 = next,
+                                _ => kept.push((at, next)),
+                            }
+                        }
+                        at = next;
+                    }
+                }
+                kept
+            } else {
+                merged
+            };
             if spans.is_empty() {
                 continue;
             }

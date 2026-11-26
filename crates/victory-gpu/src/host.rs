@@ -3643,26 +3643,55 @@ impl Batch {
 /// `ReadProcessMemory`. Title destinations always run through the kernel copy
 /// so unmapped destination pages fail cleanly instead of faulting.
 pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: bool) {
+    if len == 0 {
+        return;
+    }
+    if crate::lazy_back::active() {
+        let addr = if title_dst {
+            dst as usize
+        } else {
+            src as usize
+        };
+        crate::lazy_back::materialize_range(addr, len);
+    }
+    copy_mapped_raw(dst, src, len, title_dst);
+}
+
+/// [`copy_mapped`] without triggering [`crate::lazy_back::materialize_range`].
+/// Callers holding a `Shadow` lock MUST materialize `[src, src + len)` (or
+/// `[dst, dst + len)`) before taking the lock and call this raw variant inside.
+pub(crate) fn copy_mapped_raw(dst: *mut u8, src: *const u8, len: usize, title_dst: bool) {
+    let _ = copy_mapped_raw_checked(dst, src, len, title_dst);
+}
+
+/// [`copy_mapped_raw`] that returns `false` instead of zero-filling if a
+/// `PAGE_NOACCESS` source page belongs to an active [`crate::lazy_back`] block.
+pub(crate) fn copy_mapped_raw_checked(
+    dst: *mut u8,
+    src: *const u8,
+    len: usize,
+    title_dst: bool,
+) -> bool {
     #[cfg(feature = "diagnostics")]
     match crate::copystat::mode() {
         1 => {
             // SAFETY: timing only: the caller vouches for the source.
             unsafe { std::ptr::copy(src, dst, len) };
-            return;
+            return true;
         }
-        2 => return,
+        2 => return true,
         _ => {}
     }
     if len == 0 {
-        return;
+        return true;
     }
     if !title_dst && fast_fill() {
         #[cfg(feature = "diagnostics")]
         let moved = std::time::Instant::now();
         // SAFETY: the destination is mapped writable host memory of `len` bytes;
         // a fault on the source is caught by `fast_fill`'s VEH and redirected to
-        // `fail`, so `read_sparse` / `read_pieces` handles unmapped holes
-        // directly without repeating a failing whole-range `ReadProcessMemory`
+        // `fail`, so `read_sparse_checked` / `read_pieces_checked` handles unmapped
+        // holes directly without repeating a failing whole-range `ReadProcessMemory`
         // syscall.
         let copied = unsafe { victory_copy_try(dst, src, len) } != 0;
         #[cfg(feature = "diagnostics")]
@@ -3671,16 +3700,15 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
             moved.elapsed().as_micros() as u64,
         );
         if copied {
-            return;
+            return true;
         }
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::Fallbacks, 1);
-        if len >= 64 << 10 {
-            read_sparse(src, dst, len);
+        return if len >= 64 << 10 {
+            read_sparse_checked(src, dst, len)
         } else {
-            read_pieces(src, dst, len);
-        }
-        return;
+            read_pieces_checked(src, dst, len)
+        };
     }
     if title_dst {
         // The kernel writes the destination: it must not be guarded.
@@ -3695,49 +3723,24 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
         moved.elapsed().as_micros() as u64,
     );
     if whole {
-        return;
+        return true;
     }
     // The copy stopped at an unmapped page. One of a title destination ends
     // it: the retries below write the destination themselves (zeros for
     // what cannot be read), and would fault there.
     if title_dst && !crate::texture::committed(dst, len) {
-        return;
+        return true;
     }
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::Fallbacks, 1);
     if !title_dst && len >= 64 << 10 {
-        read_sparse(src, dst, len);
+        read_sparse_checked(src, dst, len)
+    } else if !title_dst {
+        read_pieces_checked(src, dst, len)
     } else {
-        read_pieces(src, dst, len);
+        read_pieces_title_dst(src, dst, len);
+        true
     }
-}
-
-/// Fast-path title read that returns `true` if the entire copy succeeded
-/// without faulting (`false` lets the caller fall back to [`copy_mapped`]).
-pub(crate) fn copy_mapped_raw_checked(
-    dst: *mut u8,
-    src: *const u8,
-    len: usize,
-    title_dst: bool,
-) -> bool {
-    if len == 0 {
-        return true;
-    }
-    if !title_dst && fast_fill() {
-        // SAFETY: `dst` is writable host memory; any fault on `src` is caught
-        // by `fast_fill`'s VEH and returns `0`.
-        return unsafe { victory_copy_try(dst, src, len) } != 0;
-    }
-    if !title_dst {
-        return read(src, dst, len);
-    }
-    false
-}
-
-/// Non-materializing variant of [`copy_mapped`] (hook for lazy copy-back).
-#[allow(dead_code)]
-pub(crate) fn copy_mapped_raw(dst: *mut u8, src: *const u8, len: usize, title_dst: bool) {
-    copy_mapped(dst, src, len, title_dst);
 }
 
 // Non-overlapping vectorized copies that may fault on their source: both
@@ -4014,9 +4017,15 @@ fn install_fast_copy_handler() {
     });
 }
 
+fn range_has_lazy_block(at: usize, len: usize) -> bool {
+    crate::lazy_back::has_block_in_range(at, len)
+}
+
 /// After a failed bulk read into host memory, skip contiguous holes. Never
 /// cache the query across copies: the title may remap the same address.
-fn read_sparse(src: *const u8, dst: *mut u8, len: usize) {
+/// Returns `false` instead of zero-filling if any `PAGE_NOACCESS` span
+/// belongs to an active [`crate::lazy_back`] block.
+fn read_sparse_checked(src: *const u8, dst: *mut u8, len: usize) -> bool {
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery,
     };
@@ -4035,10 +4044,15 @@ fn read_sparse(src: *const u8, dst: *mut u8, len: usize) {
             .saturating_sub(at as usize)
             .min(remaining);
         if size != size_of_val(&info) || n == 0 {
-            read_pieces(at, to, remaining);
+            if !read_pieces_checked(at, to, remaining) {
+                return false;
+            }
             break;
         }
         if info.State != MEM_COMMIT || (info.Protect & PAGE_NOACCESS) != 0 {
+            if (info.Protect & PAGE_NOACCESS) != 0 && range_has_lazy_block(at as usize, n) {
+                return false;
+            }
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
             // SAFETY: this path is only used with a writable host destination.
@@ -4052,15 +4066,54 @@ fn read_sparse(src: *const u8, dst: *mut u8, len: usize) {
             // Fast userspace copy succeeded for this committed sub-region.
         } else if !read(at, to, n) {
             // A mapping may change between query and read.
-            read_pieces(at, to, n);
+            if !read_pieces_checked(at, to, n) {
+                return false;
+            }
         }
         offset += n;
     }
+    true
 }
 
-fn read_pieces(src: *const u8, dst: *mut u8, len: usize) {
+fn read_pieces_checked(src: *const u8, dst: *mut u8, len: usize) -> bool {
     // Something is unmapped: page by page (64 KiB, then 4 KiB in a piece
-    // that fails), zeros for what cannot be read.
+    // that fails), zeros for what cannot be read (unless a `lazy_back` block
+    // was concurrently armed on the source).
+    let mut ok = true;
+    for_pieces(src as usize, len, 64 << 10, |at, n| {
+        if !ok {
+            return;
+        }
+        let to = dst.wrapping_add(at - src as usize);
+        if !read(at as *const u8, to, n) {
+            if range_has_lazy_block(at, n) {
+                ok = false;
+                return;
+            }
+            for_pieces(at, n, 4 << 10, |at, n| {
+                if !ok {
+                    return;
+                }
+                let to = dst.wrapping_add(at - src as usize);
+                if !read(at as *const u8, to, n) {
+                    if range_has_lazy_block(at, n) {
+                        ok = false;
+                        return;
+                    }
+                    #[cfg(feature = "diagnostics")]
+                    crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
+                    // SAFETY: inside the destination, which is mapped.
+                    unsafe { to.write_bytes(0, n) };
+                }
+            });
+        }
+    });
+    ok
+}
+
+fn read_pieces_title_dst(src: *const u8, dst: *mut u8, len: usize) {
+    // Title destination fallback when a page is unmapped: copy 64 KiB / 4 KiB
+    // pieces, zeroing unmapped source pieces.
     for_pieces(src as usize, len, 64 << 10, |at, n| {
         let to = dst.wrapping_add(at - src as usize);
         if !read(at as *const u8, to, n) {
@@ -4080,18 +4133,19 @@ fn read_pieces(src: *const u8, dst: *mut u8, len: usize) {
 /// Reads title memory at `src` into `dst`; false if a page of it is not
 /// readable.
 pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
+    crate::lazy_back::materialize_range(src as usize, dst.len());
     read_into_raw(src, dst)
 }
 
-/// Reads title memory at `src` into `dst` using vectorized in-process copy
-/// when [`fast_fill`] is enabled, falling back to `ReadProcessMemory` on fault.
+/// [`read_into`] without calling [`crate::lazy_back::materialize_range`].
+/// Safe to call while holding `Shadow` locks after materializing outside.
 pub(crate) fn read_into_raw(src: *const u8, dst: &mut [u8]) -> bool {
     if dst.is_empty() {
         return true;
     }
     if fast_fill() {
         // SAFETY: `dst` is valid writable memory; faults on `src` redirect to
-        // `fail` via `fast_fill`'s VEH.
+        // `fail` via `fast_fill`'s VEH without invoking `lazy_back::handle_fault`.
         if unsafe { victory_copy_try(dst.as_mut_ptr(), src, dst.len()) } != 0 {
             return true;
         }
@@ -4104,6 +4158,27 @@ pub(crate) fn read_into_raw(src: *const u8, dst: &mut [u8]) -> bool {
 pub(crate) fn read_into_probe(src: *const u8, dst: &mut [u8]) -> bool {
     if dst.is_empty() {
         return true;
+    }
+    crate::lazy_back::materialize_range(src as usize, dst.len());
+    read(src, dst.as_mut_ptr(), dst.len())
+}
+
+/// Reads title memory at `src` into `dst`, materializing deferred lazy blocks
+/// and using [`victory_copy_try`] when `VICTORY_FAST_COPY` is active.
+#[cfg(test)]
+pub(crate) fn read_into_fast(src: *const u8, dst: &mut [u8]) -> bool {
+    if dst.is_empty() {
+        return true;
+    }
+    crate::lazy_back::materialize_range(src as usize, dst.len());
+    if fast_fill() {
+        // SAFETY: `dst` is mapped writable memory of `dst.len()` bytes; a
+        // fault on `src` is caught by `fast_fill`'s vectored handler and
+        // returns 0.
+        if unsafe { victory_copy_try(dst.as_mut_ptr(), src, dst.len()) } != 0 {
+            return true;
+        }
+        crate::lazy_back::materialize_range(src as usize, dst.len());
     }
     read(src, dst.as_mut_ptr(), dst.len())
 }
@@ -4176,6 +4251,16 @@ type NtWrite = unsafe extern "system" fn(
 /// the NT write directly, avoiding the region query and temporary changes
 /// to read-only page protections that WriteProcessMemory can perform.
 pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
+    if len == 0 {
+        return;
+    }
+    crate::lazy_back::materialize_range(dst as usize, len);
+    write_mapped_raw(dst, src, len);
+}
+
+/// [`write_mapped`] without calling [`crate::lazy_back::materialize_range`].
+/// Safe to call while holding `Shadow` locks after materializing outside.
+pub(crate) fn write_mapped_raw(dst: *mut u8, src: *const u8, len: usize) {
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let Some(method) = copy_back_method() else {
         return;
@@ -4209,11 +4294,6 @@ pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
             });
         }
     });
-}
-
-/// Non-materializing variant of [`write_mapped`] (hook for lazy copy-back).
-pub(crate) fn write_mapped_raw(dst: *mut u8, src: *const u8, len: usize) {
-    write_mapped(dst, src, len);
 }
 
 /// Calls `f` with the pieces of `[start, start + len)` cut at multiples of
@@ -5686,6 +5766,7 @@ impl Meter {
             }
             crate::watch::asks_say(logged_frames);
             relay::log_stats(logged_frames);
+            crate::lazy_back::log_stats(logged_frames);
             #[cfg(feature = "diagnostics")]
             {
                 crate::copystat::log(logged_frames);

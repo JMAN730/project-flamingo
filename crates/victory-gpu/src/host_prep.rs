@@ -1,12 +1,15 @@
 //! Submission-time parallel preparation helpers for [`super::Batch`]:
 //! - [`wide_fills`] (`VICTORY_WIDE_FILLS`, `=0` disables): batches `Step::Fill`
-//!   copies of title memory into upload memory across worker threads.
+//!   copies of title memory into upload memory across worker threads, with a
+//!   single batched [`crate::lazy_back::materialize_ranges`] pass when
+//!   `VICTORY_LAZY_BACK=1` is active so workers never spam single-page DMAs or
+//!   deadlock.
 //! - [`ahead_of_writes`] (`VICTORY_REFRESH_AHEAD`, `=0` disables): refreshes
 //!   shadows targeted by `Step::GpuWrite` ahead of a submission's deferred
 //!   steps in one parallel [`crate::shadow::refresh_batch`] pass.
 
 use std::collections::HashMap;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use super::{
@@ -78,9 +81,9 @@ fn written_spans(steps: impl Iterator<Item = Touch>) -> Vec<(usize, usize, usize
 }
 
 impl Batch {
-    /// Executes all pending deferred `Step::Fill` copies in `self.fills`,
-    /// dispatching across worker threads when the batch is large enough to
-    /// amortize thread-pool wakeups.
+    /// Executes all pending deferred `Step::Fill` copies in `self.fills`.
+    /// When `lazy_back` is active, materializes all source ranges in one
+    /// batched DMA before dispatching parallel `copy_mapped_raw_checked` work.
     pub(super) fn fill(&mut self) {
         // Below this many fills, thread dispatch costs more than it saves.
         const FEW: usize = 96;
@@ -92,21 +95,57 @@ impl Batch {
         let fills = std::mem::take(&mut self.fills);
         let count = fills.len() as u64;
         let bytes: u64 = fills.iter().map(|&(_, _, len)| len as u64).sum();
+        let lazy = crate::lazy_back::active();
+        if lazy {
+            let ranges: Vec<(usize, usize)> = fills
+                .iter()
+                .filter(|&&(_, _, len)| len > 0)
+                .map(|&(_, src, len)| (src, len))
+                .collect();
+            if !ranges.is_empty() {
+                crate::lazy_back::materialize_ranges(&ranges);
+            }
+        }
         if fills.len() < FEW {
             for &(dst, src, len) in &fills {
-                crate::shadow::copy_mapped_wide(dst as *mut u8, src as *const u8, len);
+                if lazy {
+                    if !copy_mapped_raw_checked(dst as *mut u8, src as *const u8, len, false) {
+                        copy_mapped(dst as *mut u8, src as *const u8, len, false);
+                    }
+                } else {
+                    crate::shadow::copy_mapped_wide(dst as *mut u8, src as *const u8, len);
+                }
             }
         } else {
             let fills = Arc::new(fills);
+            let all_ok = Arc::new(AtomicBool::new(true));
             let chunks = fills.len().div_ceil(PART);
             let fills_w = fills.clone();
+            let ok_w = all_ok.clone();
             crate::shadow::wide_each(chunks, move |i| {
                 for &(dst, src, len) in fills_w.iter().skip(i * PART).take(PART) {
+                    if !copy_mapped_raw_checked(dst as *mut u8, src as *const u8, len, false) {
+                        ok_w.store(false, Ordering::Release);
+                    }
+                }
+            });
+            if !all_ok.load(Ordering::Acquire) {
+                // A concurrent relay landing re-deferred a lazy block between
+                // pre-materialization and copy: re-materialize and retry safely.
+                let ranges: Vec<(usize, usize)> = fills
+                    .iter()
+                    .filter(|&&(_, _, len)| len > 0)
+                    .map(|&(_, src, len)| (src, len))
+                    .collect();
+                if !ranges.is_empty() {
+                    crate::lazy_back::materialize_ranges(&ranges);
+                }
+                for &(dst, src, len) in fills.iter() {
                     if !copy_mapped_raw_checked(dst as *mut u8, src as *const u8, len, false) {
                         copy_mapped(dst as *mut u8, src as *const u8, len, false);
                     }
                 }
-            });
+            }
         }
         let us = started.elapsed().as_micros() as u64;
         PREPARING[0].fetch_add(us, Ordering::Relaxed);
