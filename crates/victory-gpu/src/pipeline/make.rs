@@ -184,11 +184,29 @@ impl Pending {
                         });
                     }
                 }
+                let (does_store, addr_store) = victory_shader::Container::parse(&shader.container)
+                    .ok()
+                    .and_then(|c| {
+                        c.part(victory_shader::FourCC::DXIL)
+                            .map(|p| p.data.to_vec())
+                    })
+                    .and_then(|dxil| victory_shader::native_programs(&dxil).ok())
+                    .map_or((true, true), |programs| {
+                        (
+                            programs.is_empty() || programs.iter().any(super::stores),
+                            programs.is_empty() || programs.iter().any(super::stores_by_address),
+                        )
+                    });
                 Some(Arc::new(Shader {
                     stage: shader.stage,
                     hash: shader.hash.clone(),
                     container: Vec::new(),
-                    translated: OnceLock::from(Some(Translated { host, used })),
+                    translated: OnceLock::from(Some(Translated {
+                        host,
+                        used,
+                        stores: does_store,
+                        address_stores: addr_store,
+                    })),
                     #[cfg(feature = "diagnostics")]
                     wave64: OnceLock::new(),
                 }))

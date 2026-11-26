@@ -108,6 +108,11 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
 pub(crate) struct Translated {
     pub(crate) host: victory_shader::emit::HostShader,
     pub(crate) used: Vec<victory_shader::UsedResource>,
+    /// Whether the shader's code can store to buffer memory ([`stores`]);
+    /// true when its code is not known.
+    pub(crate) stores: bool,
+    /// Whether it can store to title memory by address ([`stores_by_address`]).
+    pub(crate) address_stores: bool,
 }
 
 #[cfg(windows)]
@@ -118,6 +123,9 @@ impl Shader {
         hw_stage: victory_shader::HwStage,
         used: Vec<victory_shader::UsedResource>,
     ) -> Arc<Self> {
+        let stores = used
+            .iter()
+            .any(|u| u.kind == victory_shader::ResourceType::Uav);
         let translated = OnceLock::new();
         let _ = translated.set(Some(Translated {
             host: victory_shader::emit::HostShader {
@@ -131,6 +139,8 @@ impl Shader {
                 root_uavs: Vec::new(),
             },
             used,
+            stores,
+            address_stores: false,
         }));
         Arc::new(Self {
             stage,
@@ -155,6 +165,8 @@ impl Shader {
         let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
         let io = io::raise(&p, &native).unwrap();
         let host = emit::emit(&c, &native, &p, &st, &io, &res).unwrap();
+        let does_store = stores(&native);
+        let addr_store = stores_by_address(&native);
         Arc::new(Self {
             stage: "compute",
             hash: blake3::hash(&host.dxil).to_hex()[..16].to_string(),
@@ -162,6 +174,8 @@ impl Shader {
             translated: OnceLock::from(Some(Translated {
                 host,
                 used: native.used,
+                stores: does_store,
+                address_stores: addr_store,
             })),
             #[cfg(feature = "diagnostics")]
             wave64: OnceLock::from(native.wave64),
@@ -211,21 +225,78 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
     use victory_shader::{Container, FourCC, HwStage};
     let host = crate::shader_cache::host_shader(container)?;
     let c = Container::parse(container).map_err(|e| e.to_string())?;
-    let used = match c.part(FourCC::DXIL) {
-        Some(part) => victory_shader::native_programs(part.data)
-            .map_err(|e| e.to_string())?
-            .into_iter()
-            .find(|p| {
-                matches!(
-                    p.stage,
-                    HwStage::Vs | HwStage::Ps | HwStage::Ms | HwStage::Cs
-                )
-            })
-            .map(|p| p.used)
-            .unwrap_or_default(),
+    let programs = match c.part(FourCC::DXIL) {
+        Some(part) => victory_shader::native_programs(part.data).map_err(|e| e.to_string())?,
         None => Vec::new(),
     };
-    Ok(Translated { host, used })
+    let does_store = programs.is_empty() || programs.iter().any(stores);
+    let addr_store = programs.is_empty() || programs.iter().any(stores_by_address);
+    let used = programs
+        .into_iter()
+        .find(|p| {
+            matches!(
+                p.stage,
+                HwStage::Vs | HwStage::Ps | HwStage::Ms | HwStage::Cs
+            )
+        })
+        .map(|p| p.used)
+        .unwrap_or_default();
+    Ok(Translated {
+        host,
+        used,
+        stores: does_store,
+        address_stores: addr_store,
+    })
+}
+
+/// Whether a console program can store to buffer memory: a buffer, flat,
+/// global or scalar-memory store or atomic, or code that is not all known
+/// (an instruction of those kinds outside our table, an indirect jump, code
+/// that does not decode). Stores to textures (image instructions) and to the
+/// program's own scratch memory do not count: neither reaches a buffer's
+/// host copy.
+#[cfg(windows)]
+pub(crate) fn stores(program: &victory_shader::NativeProgram) -> bool {
+    use victory_shader::gfx10::{Encoding, decode};
+    let Ok(code) = decode(&program.code) else {
+        return true;
+    };
+    code.iter().any(|i| {
+        let name = i.name();
+        match i.encoding {
+            Encoding::Mubuf
+            | Encoding::Mtbuf
+            | Encoding::Smem
+            | Encoding::Flat
+            | Encoding::Global => name.is_none_or(|n| {
+                (n.contains("store") || n.contains("atomic")) && !n.contains("scratch")
+            }),
+            Encoding::Sop1 => name.is_none_or(|n| matches!(n, "s_setpc_b64" | "s_swappc_b64")),
+            _ => false,
+        }
+    })
+}
+
+/// Whether a console program can store to title memory by address
+/// (`crate::memory`): a flat, global or scalar-memory store or atomic (the
+/// accesses that take a raw address), or code that is not all known, as in
+/// [`stores`].
+#[cfg(windows)]
+pub(crate) fn stores_by_address(program: &victory_shader::NativeProgram) -> bool {
+    use victory_shader::gfx10::{Encoding, decode};
+    let Ok(code) = decode(&program.code) else {
+        return true;
+    };
+    code.iter().any(|i| {
+        let name = i.name();
+        match i.encoding {
+            Encoding::Smem | Encoding::Flat | Encoding::Global => name.is_none_or(|n| {
+                (n.contains("store") || n.contains("atomic")) && !n.contains("scratch")
+            }),
+            Encoding::Sop1 => name.is_none_or(|n| matches!(n, "s_setpc_b64" | "s_swappc_b64")),
+            _ => false,
+        }
+    })
 }
 
 #[repr(C)]
