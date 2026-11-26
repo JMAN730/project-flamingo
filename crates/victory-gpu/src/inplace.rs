@@ -484,7 +484,11 @@ pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
 /// `offset` on. Call after [`crate::title_memory_remapped`] of the range.
 /// Returns `false` if an overlapping deferred lazy copy-back could not be
 /// materialized (in which case `[at, at + len)` is armed at `PAGE_NOACCESS`
-/// so stale RAM is never exposed).
+/// so stale RAM is never exposed). If protecting the newly mapped alias with
+/// `PAGE_NOACCESS` also fails, `views_mapped` rolls back the view registration
+/// and fails closed via [`crate::host::fail`] rather than exposing an
+/// unprotected stale alias.
+#[must_use]
 pub fn title_memory_view(at: usize, len: usize, section: usize, offset: u64) -> bool {
     {
         let mut v = views();
@@ -2038,7 +2042,12 @@ mod tests {
         // Addresses nothing has: only the record is asked.
         let at = 0x7ff1_0000_0000_usize;
         for (block, blocks) in [(0, 1), (1, 1), (4, 2)] {
-            super::title_memory_view(at + block * K64, blocks * K64, 7, 0);
+            assert!(super::title_memory_view(
+                at + block * K64,
+                blocks * K64,
+                7,
+                0
+            ));
         }
         let shown = |from: usize, len: usize| super::shown_bytes(at + from, len);
         assert_eq!(shown(0, 8 * K64), Some(4 * K64 as u64));
@@ -2092,8 +2101,8 @@ mod tests {
     #[test]
     fn remapped_memory_forgets_its_views() {
         let at = 0x7_4000_0000usize;
-        title_memory_view(at, 4 * K64, 77, 0);
-        title_memory_view(at + 4 * K64, K64, 77, 4 * K64 as u64);
+        assert!(title_memory_view(at, 4 * K64, 77, 0));
+        assert!(title_memory_view(at + 4 * K64, K64, 77, 4 * K64 as u64));
         assert_eq!(cover(at, 5 * K64), Cover::Run(77, 0));
         // One page inside the first view goes: the whole view is forgotten
         // (the runtime maps and tells again what stays of it).
@@ -2111,12 +2120,27 @@ mod tests {
         let base = 0x7a00_0000_0000usize;
         let (section, other) = (0x51, 0x52);
         for k in 0..3 {
-            title_memory_view(base + k * K64, K64, section, (k * K64) as u64);
+            assert!(title_memory_view(
+                base + k * K64,
+                K64,
+                section,
+                (k * K64) as u64
+            ));
         }
         // Next in memory, not in the section.
-        title_memory_view(base + 3 * K64, K64, section, (9 * K64) as u64);
+        assert!(title_memory_view(
+            base + 3 * K64,
+            K64,
+            section,
+            (9 * K64) as u64
+        ));
         // Next in the section's offsets, of another section.
-        title_memory_view(base + 4 * K64, K64, other, (10 * K64) as u64);
+        assert!(title_memory_view(
+            base + 4 * K64,
+            K64,
+            other,
+            (10 * K64) as u64
+        ));
         let reach = 1 << 30;
         assert_eq!(
             stretch(base + K64 + 8, base + K64 + 16, reach),
@@ -2280,8 +2304,13 @@ mod tests {
                 mem::PAGE_READWRITE,
             ) as u64;
             let view = 0x7_8000_0000u64;
-            title_memory_view(view as usize, 2 * K64, 5, 0);
-            title_memory_view(view as usize + 2 * K64, K64, 5, 9 * K64 as u64);
+            assert!(title_memory_view(view as usize, 2 * K64, 5, 0));
+            assert!(title_memory_view(
+                view as usize + 2 * K64,
+                K64,
+                5,
+                9 * K64 as u64
+            ));
             let lines = census_of(&[
                 (base, 2 * K64 as u64, false),
                 (base + 4 * K64 as u64, K64 as u64, true),
@@ -2335,8 +2364,8 @@ mod tests {
             (section as usize, one, two)
         };
         title_memory_section(section, SIZE as u64, true);
-        title_memory_view(one, SIZE, section, 0);
-        title_memory_view(two, SIZE, section, 0);
+        assert!(title_memory_view(one, SIZE, section, 0));
+        assert!(title_memory_view(two, SIZE, section, 0));
 
         // Guard view `one` so its pages are read-only and clean.
         assert!(crate::watch::writes(one, one + SIZE, true).is_some());
@@ -2422,7 +2451,7 @@ mod tests {
             (section as usize, view)
         };
         title_memory_section(section, SIZE as u64, true);
-        title_memory_view(title_view, SIZE, section, 0);
+        assert!(title_memory_view(title_view, SIZE, section, 0));
 
         let payload = [0x11u8, 0x22, 0x33, 0x44];
         assert!(write_own(title_view + 64, &payload).is_some());

@@ -3212,7 +3212,12 @@ mod relay_tests {
         let block = va / PAGE;
         crate::lazy_back::clear_hot_for_test_pub(block);
         crate::inplace::title_memory_section(section as usize, PAGE as u64, true);
-        crate::inplace::title_memory_view(va, PAGE, section as usize, 0);
+        assert!(crate::inplace::title_memory_view(
+            va,
+            PAGE,
+            section as usize,
+            0
+        ));
         // SAFETY: `ptr` is mapped RW for `PAGE` bytes.
         unsafe { std::ptr::write_bytes(ptr, 0x11, PAGE) };
 
@@ -3292,6 +3297,178 @@ mod relay_tests {
 
             drop(shadow);
         }
+
+        crate::lazy_back::clear_hot_for_test_pub(block);
+        crate::watch::title_memory_remapped(va, PAGE);
+        // SAFETY: cleanup.
+        unsafe {
+            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: view.Value });
+            CloseHandle(section);
+        }
+        h.log_messages();
+        assert_eq!(h.d3d12_errors(), errors_before);
+    }
+
+    #[test]
+    fn submission_aborts_before_execute_when_dirty_lazy_refresh_fails() {
+        use crate::watch::PAGE;
+        use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
+            PAGE_READWRITE, UnmapViewOfFile,
+        };
+
+        let Some(h) = host() else {
+            return;
+        };
+        let errors_before = h.d3d12_errors();
+        // SAFETY: anonymous 1-page section so `lazy_back` can defer and merge via own view.
+        let section: HANDLE = unsafe {
+            CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                PAGE as u32,
+                std::ptr::null(),
+            )
+        };
+        assert!(!section.is_null());
+        // SAFETY: map 1 page.
+        let view = unsafe { MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, PAGE) };
+        assert!(!view.Value.is_null());
+        let ptr = view.Value.cast::<u8>();
+        let va = ptr as usize;
+        let block = va / PAGE;
+        crate::lazy_back::clear_hot_for_test_pub(block);
+        crate::inplace::title_memory_section(section as usize, PAGE as u64, true);
+        assert!(crate::inplace::title_memory_view(
+            va,
+            PAGE,
+            section as usize,
+            0
+        ));
+        // SAFETY: seed committed view memory.
+        unsafe { std::ptr::write_bytes(ptr, 0x11, PAGE) };
+
+        let mut side = vec![0x11u8; PAGE];
+        let shadow = crate::shadow::Shadow::new_card_sized_for_test(
+            side.as_mut_ptr(),
+            va as u64,
+            PAGE as u64,
+        )
+        .expect("card shadow");
+        // Establish watched baseline epoch on page 0.
+        let _ = shadow.update(va, PAGE);
+        shadow.clear_card_dirty_for_test();
+
+        // Seed GPU bytes `0xBB` at offset 0..16, then write CPU byte `0x77` at offset 8192
+        // before arming page 0 so page 0 is a dirty lazy-owned page.
+        let (up, up_ptr) = h.upload_buffer(PAGE as u64).expect("upload");
+        // SAFETY: mapped upload buffer.
+        unsafe {
+            std::ptr::write_bytes(up_ptr, 0x11, PAGE);
+            std::ptr::write_bytes(up_ptr, 0xBB, 16);
+        }
+        let seed_list = h.new_list().expect("seed list");
+        // SAFETY: live upload and shadow buffers.
+        unsafe {
+            seed_list
+                .list
+                .CopyBufferRegion(&shadow.buffer, 0, &up, 0, PAGE as u64);
+        }
+        seed_list.close();
+        h.execute(&[&seed_list]);
+        seed_list.reset();
+
+        // SAFETY: dirty CPU write in another 4 KiB sub-part of page 0.
+        unsafe { ptr.add(8192).write(0x77) };
+        crate::lazy_back::clear_hot_for_test_pub(block);
+        assert!(crate::lazy_back::try_defer_page_for_test(
+            &shadow, 0, PAGE, 0
+        ));
+        assert!(crate::lazy_back::has_block(block));
+
+        let (rb, rb_ptr) = h.shared_buffer(PAGE as u64).expect("readback");
+        // SAFETY: mapped host-visible buffer initialized to sentinel `0xEE`.
+        unsafe { std::ptr::write_bytes(rb_ptr, 0xEE, PAGE) };
+
+        // 1. `Batch::flush` path (`Step::Refresh`): injected materialization failure
+        //    must abort `Host::execute` BEFORE `ExecuteCommandLists` so the GPU list
+        //    never runs with stale bytes.
+        let list_flush = h.new_list().expect("list_flush");
+        list_flush.defer_refresh(&shadow, va, PAGE);
+        // SAFETY: live shadow and readback buffers.
+        unsafe {
+            list_flush
+                .list
+                .CopyBufferRegion(&rb, 0, &shadow.buffer, 0, PAGE as u64);
+        }
+        list_flush.close();
+        {
+            let _fail_panics = fail_panics_for_test();
+            crate::lazy_back::set_fail_next_fetches_for_test(2);
+            let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                h.execute(&[&list_flush]);
+            }));
+            crate::lazy_back::set_fail_next_fetches_for_test(0);
+            assert!(
+                res.is_err(),
+                "Host::execute must abort when Batch::flush fails to materialize dirty lazy page"
+            );
+        }
+        // SAFETY: mapped readback buffer must remain untouched (`0xEE`), proving the list never ran.
+        let rb_after_flush = unsafe { std::slice::from_raw_parts(rb_ptr, 64) };
+        assert!(
+            rb_after_flush.iter().all(|&b| b == 0xEE),
+            "command list must NOT execute after failed dirty lazy refresh in Batch::flush"
+        );
+        assert!(
+            crate::lazy_back::has_block(block),
+            "dirty lazy page must remain armed after aborted Batch::flush submission"
+        );
+        list_flush.reset();
+
+        // 2. `Batch::refresh_ahead` path (`Step::Refresh` + `Step::GpuWrite`): injected
+        //    materialization failure must ALSO abort `Host::execute` BEFORE `ExecuteCommandLists`.
+        let list_ahead = h.new_list().expect("list_ahead");
+        list_ahead.defer_refresh(&shadow, va, PAGE);
+        list_ahead.defer_gpu_write(&shadow, va, PAGE);
+        // SAFETY: live shadow and readback buffers.
+        unsafe {
+            list_ahead
+                .list
+                .CopyBufferRegion(&rb, 0, &shadow.buffer, 0, PAGE as u64);
+        }
+        list_ahead.close();
+        {
+            let _fail_panics = fail_panics_for_test();
+            crate::lazy_back::set_fail_next_fetches_for_test(2);
+            let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                h.execute(&[&list_ahead]);
+            }));
+            crate::lazy_back::set_fail_next_fetches_for_test(0);
+            assert!(
+                res.is_err(),
+                "Host::execute must abort when Batch::refresh_ahead fails to materialize dirty lazy page"
+            );
+        }
+        // SAFETY: mapped readback buffer must remain untouched (`0xEE`), proving the list never ran.
+        let rb_after_ahead = unsafe { std::slice::from_raw_parts(rb_ptr, 64) };
+        assert!(
+            rb_after_ahead.iter().all(|&b| b == 0xEE),
+            "command list must NOT execute after failed dirty lazy refresh in Batch::refresh_ahead"
+        );
+        assert!(
+            crate::lazy_back::has_block(block),
+            "dirty lazy page must remain armed after aborted Batch::refresh_ahead submission"
+        );
+        list_ahead.reset();
+
+        // 3. Recovery: once DMA succeeds, a normal submission refreshes and runs cleanly.
+        assert!(crate::lazy_back::materialize_range(va, PAGE));
+        assert!(!crate::lazy_back::has_block(block));
+        drop(shadow);
 
         crate::lazy_back::clear_hot_for_test_pub(block);
         crate::watch::title_memory_remapped(va, PAGE);

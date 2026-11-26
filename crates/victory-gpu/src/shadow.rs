@@ -3042,17 +3042,30 @@ impl Shadow {
     /// At submission: copies what changed of `[address, address + len)`
     /// since it was last copied (all of it if the memory is not
     /// write-watched). Returns the bytes copied.
+    #[cfg(test)]
     pub(crate) fn update(&self, address: usize, len: usize) -> usize {
+        self.update_checked(address, len).0
+    }
+
+    /// Like [`Shadow::update`], also returning `false` if materializing or
+    /// copying a dirty lazy-owned page failed so the submission can abort
+    /// instead of reading stale bytes.
+    pub(crate) fn update_checked(&self, address: usize, len: usize) -> (usize, bool) {
         let plan = self.plan_update(address, len);
+        if plan.refresh_failed {
+            return (0, false);
+        }
         if plan.runs.is_empty() && plan.busy_ranges.is_empty() {
             self.commit_copied_epochs(&plan.epochs, &[]);
-            return 0;
+            return (0, true);
         }
-        let mut copied = self.copy_runs_with_epochs(&plan.runs, &plan.epochs);
+        let (mut copied, mut ok) = self.copy_runs_with_epochs(&plan.runs, &plan.epochs);
         for &(from, to) in &plan.busy_ranges {
-            copied += self.update_busy(from, to);
+            let (busy_bytes, busy_ok) = self.update_busy(from, to);
+            copied += busy_bytes;
+            ok &= busy_ok;
         }
-        copied
+        (copied, ok)
     }
 
     /// Computes the disjoint dirty byte runs of `[address, address + len)`
@@ -3106,12 +3119,12 @@ impl Shadow {
     /// Where an earlier flight's shaders may have written, copy only the
     /// changed bytes. A card-backed page slice named only by the submission
     /// being prepared can be uploaded as a single range before its lists run.
-    fn update_busy(&self, from: usize, to: usize) -> usize {
+    fn update_busy(&self, from: usize, to: usize) -> (usize, bool) {
         if self.watched.load(Ordering::Relaxed) == NOT_WATCHED {
-            return 0;
+            return (0, true);
         }
         let Some((now, written)) = crate::watch::writes(from, to, true) else {
-            return 0;
+            return (0, true);
         };
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let base = start / PAGE;
@@ -3152,10 +3165,10 @@ impl Shadow {
             }
         };
         if stale.is_empty() {
-            return 0;
+            return (0, true);
         }
-        if !dirty_lazy.is_empty() {
-            let _ = crate::lazy_back::materialize_ranges(&dirty_lazy);
+        if !dirty_lazy.is_empty() && !crate::lazy_back::materialize_ranges(&dirty_lazy) {
+            return (0, false);
         }
         // Preparation is serialized, so previously submitted ranges can
         // only disappear after this snapshot (the relay landed them).
@@ -3178,10 +3191,14 @@ impl Shadow {
         let mut page_runs: Vec<(usize, usize)> = Vec::new();
         let mut title = vec![0u8; PAGE];
         let mut copied_bytes = 0usize;
+        let mut all_ok = true;
         for page in stale {
             if crate::lazy_back::active()
                 && crate::lazy_back::owns_block(self as *const Shadow as usize, page)
+                && (!crate::lazy_back::materialize_range(page * PAGE, PAGE)
+                    || crate::lazy_back::owns_block(self as *const Shadow as usize, page))
             {
+                all_ok = false;
                 continue;
             }
             let (lo, hi) = ((page * PAGE).max(from), ((page + 1) * PAGE).min(to));
@@ -3322,7 +3339,7 @@ impl Shadow {
                 }
             }
         }
-        copied_bytes
+        (copied_bytes, all_ok)
     }
 
     /// [`Shadow::plan_update`] of `[from, to)` (inside the buffer) where no
@@ -3346,9 +3363,15 @@ impl Shadow {
                 if !dirty_lazy.is_empty() {
                     let ranges: Vec<(usize, usize)> =
                         dirty_lazy.into_iter().map(|p| (p * PAGE, PAGE)).collect();
-                    let _ = crate::lazy_back::materialize_ranges(&ranges);
+                    if !crate::lazy_back::materialize_ranges(&ranges) {
+                        plan.runs.truncate(run_base);
+                        plan.epochs.truncate(epoch_base);
+                        plan.refresh_failed = true;
+                        return;
+                    }
                     plan.runs.truncate(run_base);
                     plan.epochs.truncate(epoch_base);
+                    let mut still_dirty = Vec::new();
                     self.collect_stale(
                         from,
                         to,
@@ -3356,8 +3379,36 @@ impl Shadow {
                         &written,
                         &mut plan.runs,
                         &mut plan.epochs,
-                        None,
+                        Some(&mut still_dirty),
                     );
+                    if !still_dirty.is_empty() {
+                        let retry_ranges: Vec<(usize, usize)> =
+                            still_dirty.into_iter().map(|p| (p * PAGE, PAGE)).collect();
+                        if !crate::lazy_back::materialize_ranges(&retry_ranges) {
+                            plan.runs.truncate(run_base);
+                            plan.epochs.truncate(epoch_base);
+                            plan.refresh_failed = true;
+                            return;
+                        }
+                        plan.runs.truncate(run_base);
+                        plan.epochs.truncate(epoch_base);
+                        let mut final_dirty = Vec::new();
+                        self.collect_stale(
+                            from,
+                            to,
+                            now,
+                            &written,
+                            &mut plan.runs,
+                            &mut plan.epochs,
+                            Some(&mut final_dirty),
+                        );
+                        if !final_dirty.is_empty() {
+                            plan.runs.truncate(run_base);
+                            plan.epochs.truncate(epoch_base);
+                            plan.refresh_failed = true;
+                            return;
+                        }
+                    }
                 }
                 Self::exclude_owned_lazy_runs(
                     self as *const Shadow as usize,
@@ -3626,20 +3677,24 @@ impl Shadow {
     /// total bytes reach [`WIDE_COPY_MIN`]).
     #[cfg(test)]
     fn copy_runs(&self, runs: &[(usize, usize)]) -> usize {
-        self.copy_runs_with_epochs(runs, &[])
+        self.copy_runs_with_epochs(runs, &[]).0
     }
 
-    fn copy_runs_with_epochs(&self, runs: &[(usize, usize)], epochs: &[(usize, u64)]) -> usize {
+    fn copy_runs_with_epochs(
+        &self,
+        runs: &[(usize, usize)],
+        epochs: &[(usize, u64)],
+    ) -> (usize, bool) {
         if runs.is_empty() {
             self.commit_copied_epochs(epochs, &[]);
-            return 0;
+            return (0, true);
         }
         let start = self.start as usize;
         let mut segs = Vec::with_capacity(runs.len());
         let total = self.push_copy_segs(runs, &mut segs);
         if total == 0 {
             self.commit_copied_epochs(epochs, &[]);
-            return 0;
+            return (0, true);
         }
         materialize_copy_segs(&segs);
         if let Some(rebar) = &self.rebar {
@@ -3688,11 +3743,12 @@ impl Shadow {
                         }
                     }
                     let (_succeeded, failed, bytes) = partition_copy_segs(&segs, &ok);
+                    let all_ok = failed.is_empty();
                     // Invalidate ReBAR hashes for every chunk that wrote VRAM,
                     // including successful chunks of a partially failed segment.
                     rebar.mark_dirty_segs(start, &touched);
                     self.commit_copied_epochs(epochs, &failed);
-                    return bytes;
+                    return (bytes, all_ok);
                 }
             }
         }
@@ -3722,9 +3778,10 @@ impl Shadow {
         }
         publish_staged_card_segs(&segs, &staged);
         let (succeeded, failed, bytes) = partition_copy_segs(&segs, &ok);
+        let all_ok = failed.is_empty();
         self.finish_copy_segs(start, &succeeded, &touched);
         self.commit_copied_epochs(epochs, &failed);
-        bytes
+        (bytes, all_ok)
     }
 
     /// Post-copy metadata invalidation for non-mirrored `segs`, acquiring each
@@ -3782,6 +3839,38 @@ impl Shadow {
             is_window: false,
         });
         Some(Arc::new(shadow))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_card_registered_for_test(
+        title_start: u64,
+        len: u64,
+        fill: u8,
+    ) -> Option<Arc<Shadow>> {
+        let h = host()?;
+        let alloc = len.max(64);
+        let (buffer, buf_ptr) = h.shared_buffer(alloc)?;
+        let (staging, staging_ptr) = h.shared_buffer(alloc)?;
+        // SAFETY: freshly mapped host-visible buffers of `alloc >= len` bytes.
+        unsafe {
+            std::ptr::write_bytes(buf_ptr, fill, len as usize);
+            std::ptr::write_bytes(staging_ptr, fill, len as usize);
+        }
+        let mut shadow = Shadow::new(buffer, staging_ptr, 0, title_start, len, None);
+        shadow.card = Some(Card {
+            staging,
+            before: Mutex::new(None),
+            dirty: RwLock::default(),
+            sent: RwLock::default(),
+            size: 0,
+            is_window: false,
+        });
+        let arc = Arc::new(shadow);
+        CARDED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(Arc::downgrade(&arc));
+        Some(arc)
     }
 
     #[cfg(test)]
@@ -4410,6 +4499,7 @@ struct UpdatePlan {
     runs: Vec<(usize, usize)>,
     epochs: Vec<(usize, u64)>,
     busy_ranges: Vec<(usize, usize)>,
+    refresh_failed: bool,
 }
 
 /// Two-phase refresh for a [`crate::host::Batch`] flush:
@@ -4421,17 +4511,24 @@ struct UpdatePlan {
 ///    per-shadow metadata updates (ReBAR dirty bits) and copy any mirrored
 ///    ReBAR shadows.
 ///
+/// Returns `(bytes_copied, ok)` where `ok == false` if any dirty lazy-owned
+/// page failed to materialize or copy so the submission can abort rather than
+/// running with stale bytes.
+///
 /// This eliminates both straggler single-thread bottlenecks (one huge 50–174 MB
 /// buffer stalling a multi-shadow flush) and nested `wide` re-entrancy.
-pub(crate) fn refresh_batch(items: Vec<(Arc<Shadow>, usize, usize)>, parallel_plan: bool) -> usize {
+pub(crate) fn refresh_batch(
+    items: Vec<(Arc<Shadow>, usize, usize)>,
+    parallel_plan: bool,
+) -> (usize, bool) {
     if items.is_empty() {
-        return 0;
+        return (0, true);
     }
     if items.len() == 1 {
         let (shadow, from, to) = items.into_iter().next().unwrap();
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
-        let copied = shadow.update(from, to - from);
+        let (copied, ok) = shadow.update_checked(from, to - from);
         #[cfg(feature = "diagnostics")]
         {
             if let Some(bytes) = skipped(to - from, copied) {
@@ -4440,7 +4537,7 @@ pub(crate) fn refresh_batch(items: Vec<(Arc<Shadow>, usize, usize)>, parallel_pl
             }
             crate::copystat::range(from, to - from, started.elapsed().as_micros() as u64, 0);
         }
-        return copied;
+        return (copied, ok);
     }
 
     #[cfg(feature = "diagnostics")]
@@ -4484,8 +4581,13 @@ pub(crate) fn refresh_batch(items: Vec<(Arc<Shadow>, usize, usize)>, parallel_pl
     let mut mirrored: Vec<usize> = Vec::new();
     let mut item_copied = vec![0usize; planned.len()];
     let mut total_copied = 0usize;
+    let mut all_ok = true;
 
     for (idx, (shadow, _, _, plan)) in planned.iter().enumerate() {
+        if plan.refresh_failed {
+            all_ok = false;
+            continue;
+        }
         if plan.runs.is_empty() {
             shadow.commit_copied_epochs(&plan.epochs, &[]);
             continue;
@@ -4578,6 +4680,9 @@ pub(crate) fn refresh_batch(items: Vec<(Arc<Shadow>, usize, usize)>, parallel_pl
             publish_staged_card_segs(&all_segs, shadow_staged);
             let (succeeded, failed, bytes) =
                 partition_copy_segs(&all_segs[seg_lo..seg_hi], &ok[seg_lo..seg_hi]);
+            if !failed.is_empty() {
+                all_ok = false;
+            }
             shadow.finish_copy_segs(shadow.start as usize, &succeeded, shadow_touched);
             shadow.commit_copied_epochs(&plan.epochs, &failed);
             item_copied[idx] = bytes;
@@ -4587,14 +4692,23 @@ pub(crate) fn refresh_batch(items: Vec<(Arc<Shadow>, usize, usize)>, parallel_pl
 
     for idx in mirrored {
         let (shadow, _, _, plan) = &planned[idx];
-        let bytes = shadow.copy_runs_with_epochs(&plan.runs, &plan.epochs);
+        let (bytes, ok) = shadow.copy_runs_with_epochs(&plan.runs, &plan.epochs);
+        if !ok {
+            all_ok = false;
+        }
         item_copied[idx] = bytes;
         total_copied += bytes;
     }
 
     for (idx, (shadow, _, _, plan)) in planned.iter().enumerate() {
+        if plan.refresh_failed {
+            continue;
+        }
         for &(from, to) in &plan.busy_ranges {
-            let bytes = shadow.update_busy(from, to);
+            let (bytes, ok) = shadow.update_busy(from, to);
+            if !ok {
+                all_ok = false;
+            }
             item_copied[idx] += bytes;
             total_copied += bytes;
         }
@@ -4614,7 +4728,7 @@ pub(crate) fn refresh_batch(items: Vec<(Arc<Shadow>, usize, usize)>, parallel_pl
     #[cfg(not(feature = "diagnostics"))]
     let _ = item_copied;
 
-    total_copied
+    (total_copied, all_ok)
 }
 
 /// Pages of `[a, e)` that have never been copied (`copied == 0`) or were
@@ -6895,7 +7009,7 @@ mod tests {
             .map(|s| (s.clone(), s.start as usize, (s.start + s.len) as usize))
             .collect();
         let expected_total: usize = backing.iter().map(Vec::len).sum();
-        assert_eq!(refresh_batch(batch_items, true), expected_total);
+        assert_eq!(refresh_batch(batch_items, true), (expected_total, true));
         for (shadow, src) in shadows.iter().zip(&backing) {
             // SAFETY: `shadow.data` maps `shadow.len` bytes.
             let got = unsafe { std::slice::from_raw_parts(shadow.data, src.len()) };
@@ -7193,12 +7307,12 @@ mod tests {
         let va0 = title as usize;
         crate::inplace::title_memory_section(section as usize, len as u64, true);
         for k in 0..pages {
-            crate::inplace::title_memory_view(
+            assert!(crate::inplace::title_memory_view(
                 va0 + k * PAGE,
                 PAGE,
                 section as usize,
                 (k * PAGE) as u64,
-            );
+            ));
         }
         // SAFETY: committed above.
         unsafe { std::ptr::write_bytes(title, 0xA5, len) };
@@ -7263,14 +7377,14 @@ mod tests {
 
         // `refresh_batch` with >= 2 items exercises the flat `all_segs` +
         // `run_copy_segs_status` path across page 0 (`shadow_b`) and page 1 (`shadow_c`).
-        let copied = refresh_batch(
+        let (copied, ok) = refresh_batch(
             vec![
                 (shadow_b.clone(), va0, va0 + PAGE),
                 (shadow_c.clone(), va0 + PAGE, va0 + 2 * PAGE),
             ],
             false,
         );
-        assert!(copied >= 2 * PAGE);
+        assert!(ok && copied >= 2 * PAGE);
         assert!(!crate::lazy_back::has_block(va0 / PAGE));
         if deferred {
             assert_eq!(&side_b[..64], &[0x5Cu8; 64]);
@@ -7318,29 +7432,34 @@ mod tests {
         let block = va0 / PAGE;
         crate::lazy_back::clear_hot_for_test_pub(block);
         crate::inplace::title_memory_section(section as usize, PAGE as u64, true);
-        crate::inplace::title_memory_view(va0, PAGE, section as usize, 0);
+        assert!(crate::inplace::title_memory_view(
+            va0,
+            PAGE,
+            section as usize,
+            0
+        ));
         // SAFETY: seed memory.
         unsafe { std::ptr::write_bytes(ptr, 0x11, PAGE) };
 
-        if let Some(shadow) = Shadow::new_rebar_for_test(va0 as u64, PAGE as u64, 0x11) {
-            assert!(
-                crate::lazy_back::try_defer_page_for_test(&shadow, 0, PAGE, 0),
-                "must arm a lazy block so `lazy_back::active()` is true"
-            );
-            assert!(
-                crate::lazy_back::active(),
-                "lazy_back must be active so materialize_rebar_spans runs its filter/map path"
-            );
-            // Inverted span `(8, 4)` must return Some(0) without panicking in overflow-checked builds.
-            assert_eq!(shadow.relay_merge_rebar(&[(8, 4)], &[&[]]), Some(0));
-            assert!(
-                crate::lazy_back::has_block(block),
-                "inverted span must be ignored without materializing unrelated block"
-            );
-            assert!(crate::lazy_back::materialize_range(va0, PAGE));
-            assert!(!crate::lazy_back::has_block(block));
-            drop(shadow);
-        }
+        let shadow = Shadow::new_rebar_for_test(va0 as u64, PAGE as u64, 0x11)
+            .expect("rebar test shadow must be created when host is present");
+        assert!(
+            crate::lazy_back::try_defer_page_for_test(&shadow, 0, PAGE, 0),
+            "must arm a lazy block so `lazy_back::active()` is true"
+        );
+        assert!(
+            crate::lazy_back::active(),
+            "lazy_back must be active so materialize_rebar_spans runs its filter/map path"
+        );
+        // Inverted span `(8, 4)` must return Some(0) without panicking in overflow-checked builds.
+        assert_eq!(shadow.relay_merge_rebar(&[(8, 4)], &[&[]]), Some(0));
+        assert!(
+            crate::lazy_back::has_block(block),
+            "inverted span must be ignored without materializing unrelated block"
+        );
+        assert!(crate::lazy_back::materialize_range(va0, PAGE));
+        assert!(!crate::lazy_back::has_block(block));
+        drop(shadow);
 
         crate::lazy_back::clear_hot_for_test_pub(block);
         crate::watch::title_memory_remapped(va0, PAGE);
@@ -7392,7 +7511,12 @@ mod tests {
         let last_block = last_va / PAGE;
         crate::lazy_back::clear_hot_for_test_pub(last_block);
         crate::inplace::title_memory_section(section as usize, len as u64, true);
-        crate::inplace::title_memory_view(va0, len, section as usize, 0);
+        assert!(crate::inplace::title_memory_view(
+            va0,
+            len,
+            section as usize,
+            0
+        ));
         // SAFETY: `ptr` is mapped RW for `len` bytes.
         unsafe { std::ptr::write_bytes(ptr, 0x11, len) };
 
@@ -7423,9 +7547,13 @@ mod tests {
             // fails on both attempts while chunks 0..2 succeed and write `0x22` into VRAM.
             crate::lazy_back::set_fail_next_fetches_for_test(2);
             let epochs: Vec<(usize, u64)> = (0..pages).map(|p| (va0 / PAGE + p, 42)).collect();
-            let copied = shadow.copy_runs_with_epochs(&[(va0, va0 + len)], &epochs);
+            let (copied, ok) = shadow.copy_runs_with_epochs(&[(va0, va0 + len)], &epochs);
             crate::lazy_back::set_fail_next_fetches_for_test(0);
 
+            assert!(
+                !ok,
+                "failed segment must report ok == false so submission can abort"
+            );
             assert_eq!(
                 copied, 0,
                 "failed segment must not be counted as fully copied"
@@ -7500,7 +7628,12 @@ mod tests {
         let ptr = view.Value.cast::<u8>();
         let va0 = ptr as usize;
         crate::inplace::title_memory_section(section as usize, PAGE as u64, true);
-        crate::inplace::title_memory_view(va0, PAGE, section as usize, 0);
+        assert!(crate::inplace::title_memory_view(
+            va0,
+            PAGE,
+            section as usize,
+            0
+        ));
         // SAFETY: seed memory.
         unsafe { std::ptr::write_bytes(ptr, 0x11, PAGE) };
 
@@ -7623,7 +7756,12 @@ mod tests {
         let w1 = w0 + WINDOW as usize;
         if w1 + PAGE <= base + total_len {
             crate::inplace::title_memory_section(section as usize, total_len as u64, true);
-            crate::inplace::title_memory_view(w0, PAGE, section as usize, (w0 - base) as u64);
+            assert!(crate::inplace::title_memory_view(
+                w0,
+                PAGE,
+                section as usize,
+                (w0 - base) as u64
+            ));
             // SAFETY: seed page.
             unsafe { std::ptr::write_bytes(w0 as *mut u8, 0x11, PAGE) };
 
@@ -8470,7 +8608,12 @@ mod tests {
         let block = va0 / PAGE;
         crate::lazy_back::clear_hot_for_test_pub(block);
         crate::inplace::title_memory_section(section as usize, PAGE as u64, true);
-        crate::inplace::title_memory_view(va0, PAGE, section as usize, 0);
+        assert!(crate::inplace::title_memory_view(
+            va0,
+            PAGE,
+            section as usize,
+            0
+        ));
         // SAFETY: seed memory.
         unsafe { std::ptr::write_bytes(ptr, 0x11, PAGE) };
 
@@ -8555,41 +8698,67 @@ mod tests {
         let blk1 = va1 / PAGE;
         crate::lazy_back::clear_hot_for_test_pub(blk1);
         crate::inplace::title_memory_section(section as usize, len as u64, true);
-        crate::inplace::title_memory_view(va0, len, section as usize, 0);
+        assert!(crate::inplace::title_memory_view(
+            va0,
+            len,
+            section as usize,
+            0
+        ));
         // SAFETY: page 0 holds `0x22`, page 1 holds `0x11`.
         unsafe {
             std::ptr::write_bytes(ptr, 0x22, PAGE);
             std::ptr::write_bytes(ptr.add(PAGE), 0x11, PAGE);
         }
 
-        if let Some(shadow) = Shadow::new_rebar_for_test(va0 as u64, len as u64, 0x11) {
-            assert!(crate::lazy_back::try_defer_page_for_test(
-                &shadow, PAGE, PAGE, 0
-            ));
-            let mut mirror = vec![0x11u8; len];
-            let mut dst = vec![0x11u8; len];
-            let seg = CopySeg {
-                src: va0,
-                dst: dst.as_mut_ptr() as usize,
-                mirror: mirror.as_mut_ptr() as usize,
-                len,
-                stage_card: false,
-            };
-            assert!(
-                !execute_copy_seg_checked(seg),
-                "copy reaching deferred page 1 must fail"
-            );
-            assert!(
-                mirror.iter().all(|&b| b == 0x11),
-                "failed mirrored copy must NOT write partial prefix into mirror"
-            );
-            assert!(
-                dst.iter().all(|&b| b == 0x11),
-                "failed mirrored copy must NOT write partial prefix into VRAM dst"
-            );
-            assert!(crate::lazy_back::materialize_range(va1, PAGE));
-            drop(shadow);
-        }
+        let shadow =
+            Shadow::new_rebar_for_test(va0 as u64, len as u64, 0x11).expect("rebar test shadow");
+        // Start with ZERO armed lazy blocks (`!lazy_back::active()`), then arm
+        // page 1 *mid-copy* right after `execute_copy_seg_checked` selects its
+        // target buffer (`tmp` under `can_arm()`, vs `seg.mirror` under the
+        // old `active()` check). Under the old `active()` guard, `victory_copy_try`
+        // would write page 0 (`0x22`) directly into `mirror` before faulting on
+        // page 1; under `can_arm()`, `mirror` and `dst` stay completely untouched.
+        assert!(
+            !crate::lazy_back::active(),
+            "copy must begin with zero armed lazy blocks to exercise the can_arm() vs active() race"
+        );
+        let armed_mid_copy = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let armed_cb = armed_mid_copy.clone();
+        let shadow_cb = shadow.clone();
+        crate::host::set_before_copy_mapped_raw_hook(Some(Box::new(move || {
+            let ok = crate::lazy_back::try_defer_page_for_test(&shadow_cb, PAGE, PAGE, 0);
+            armed_cb.store(ok, Ordering::SeqCst);
+        })));
+        let mut mirror = vec![0x11u8; len];
+        let mut dst = vec![0x11u8; len];
+        let seg = CopySeg {
+            src: va0,
+            dst: dst.as_mut_ptr() as usize,
+            mirror: mirror.as_mut_ptr() as usize,
+            len,
+            stage_card: false,
+        };
+        let copy_ok = execute_copy_seg_checked(seg);
+        crate::host::set_before_copy_mapped_raw_hook(None);
+        assert!(
+            armed_mid_copy.load(Ordering::SeqCst),
+            "mid-copy hook must arm page 1"
+        );
+        assert!(
+            crate::lazy_back::has_block(blk1),
+            "page 1 must be armed by the mid-copy hook"
+        );
+        assert!(!copy_ok, "copy reaching mid-copy-armed page 1 must fail");
+        assert!(
+            mirror.iter().all(|&b| b == 0x11),
+            "failed mirrored copy must NOT write partial prefix into mirror"
+        );
+        assert!(
+            dst.iter().all(|&b| b == 0x11),
+            "failed mirrored copy must NOT write partial prefix into VRAM dst"
+        );
+        assert!(crate::lazy_back::materialize_range(va1, PAGE));
+        drop(shadow);
 
         crate::lazy_back::clear_hot_for_test_pub(blk1);
         crate::watch::title_memory_remapped(va0, len);
@@ -8635,7 +8804,12 @@ mod tests {
         let last_block = last_va / PAGE;
         crate::lazy_back::clear_hot_for_test_pub(last_block);
         crate::inplace::title_memory_section(section as usize, len as u64, true);
-        crate::inplace::title_memory_view(va0, len, section as usize, 0);
+        assert!(crate::inplace::title_memory_view(
+            va0,
+            len,
+            section as usize,
+            0
+        ));
         // SAFETY: segment 0 (page 0) = `0x33`, segment 1 (pages 2..pages) = `0x22`.
         unsafe {
             std::ptr::write_bytes(ptr, 0x33, PAGE);

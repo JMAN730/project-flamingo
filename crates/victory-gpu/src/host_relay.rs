@@ -490,7 +490,7 @@ struct CardRange {
 }
 
 /// What a submission does for copies in the card's memory.
-pub(super) struct CardPlan {
+pub(crate) struct CardPlan {
     ranges: Vec<CardRange>,
     sent_as: u64,
     pub(super) check: Option<ID3D12CommandList>,
@@ -1930,6 +1930,48 @@ impl Host {
     #[cfg(test)]
     pub(crate) fn submitted_queue_order_for_test(&self) -> u64 {
         SUBMITTED_QUEUE_ORDER.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn last_signalled_for_test(&self) -> (u64, u64) {
+        *self
+            .last_signalled
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn signal_direct_for_test(&self) -> u64 {
+        let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        let _lazy_order = crate::lazy_back::direct_submit_guard();
+        *submitted += 1;
+        // SAFETY: `self.queue` and `self.fence` are live.
+        unsafe { self.queue.Signal(&self.fence, *submitted) }.expect("signal direct fence");
+        self.note_signalled(*submitted);
+        *submitted
+    }
+
+    #[cfg(test)]
+    pub(crate) fn card_before_for_test(&self) -> Option<(CardPlan, u64)> {
+        let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        let plan = self.card_before(Vec::new(), false, &mut submitted)?;
+        Some((plan, *submitted))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn card_done_and_wait_for_test(&self, plan: CardPlan, fence_val: u64) {
+        // SAFETY: `self.fence` is live; local wait event avoids contending on `self.event`.
+        unsafe {
+            if self.fence.GetCompletedValue() < fence_val {
+                let ev = CreateEventW(None, false, false, None).expect("wait event");
+                self.fence
+                    .SetEventOnCompletion(fence_val, ev)
+                    .expect("set fence event");
+                WaitForSingleObject(ev, INFINITE);
+                let _ = windows::Win32::Foundation::CloseHandle(ev);
+            }
+        }
+        self.card_done(plan);
     }
 
     pub(super) fn note_signalled_with_order(&self, fence_val: u64, order: u64) {

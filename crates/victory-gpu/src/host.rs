@@ -369,6 +369,29 @@ pub fn on_failure(report: fn(&str) -> !) {
     let _ = ON_FAILURE.set(report);
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static FAIL_PANICS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) struct FailPanicsGuard(bool);
+
+#[cfg(test)]
+impl Drop for FailPanicsGuard {
+    fn drop(&mut self) {
+        FAIL_PANICS.with(|f| f.set(self.0));
+    }
+}
+
+/// Test helper: causes [`fail`] on the current thread to panic (catchable via
+/// `std::panic::catch_unwind`) instead of aborting the test process.
+#[cfg(test)]
+pub(crate) fn fail_panics_for_test() -> FailPanicsGuard {
+    let prev = FAIL_PANICS.with(|f| f.replace(true));
+    FailPanicsGuard(prev)
+}
+
 /// Ends the run on a host GPU failure: what failed, the removal reason and
 /// the debug layer's first error, if any (`VICTORY_D3D12_DEBUG=1` in a
 /// diagnostics build names the command).
@@ -388,6 +411,10 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
         }
     }
     tracing::error!("{text}");
+    #[cfg(test)]
+    if FAIL_PANICS.with(std::cell::Cell::get) {
+        panic!("{text}");
+    }
     match ON_FAILURE.get() {
         Some(report) => report(&text),
         None => std::process::abort(),
@@ -1763,6 +1790,14 @@ impl Host {
         if batch.fill_failed {
             fail(format_args!(
                 "title-to-upload fill failed after retrying lazy materialization before a submission of {} lists{}{}",
+                runs.len(),
+                self.removal_data(runs),
+                last_notes(runs)
+            ));
+        }
+        if batch.refresh_failed {
+            fail(format_args!(
+                "shadow refresh failed after lazy materialization failure before a submission of {} lists{}{}",
                 runs.len(),
                 self.removal_data(runs),
                 last_notes(runs)
@@ -4349,6 +4384,9 @@ struct Batch {
     rebar_init_failed: bool,
     /// Set if a `Step::Fill` copy from title memory failed after retrying lazy materialization.
     fill_failed: bool,
+    /// Set if a shadow refresh (`Batch::flush` / `Batch::refresh_ahead`) failed
+    /// to materialize or copy a dirty lazy-owned page.
+    refresh_failed: bool,
 }
 
 impl Batch {
@@ -4431,7 +4469,10 @@ impl Batch {
         }
         let started = std::time::Instant::now();
         let items = std::mem::take(&mut self.refreshes);
-        let copied = crate::shadow::refresh_batch(items, crate::shadow::wide_copy());
+        let (copied, ok) = crate::shadow::refresh_batch(items, crate::shadow::wide_copy());
+        if !ok {
+            self.refresh_failed = true;
+        }
         let us = started.elapsed().as_micros() as u64;
         PREPARING[0].fetch_add(us, Ordering::Relaxed);
         PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
@@ -4524,6 +4565,10 @@ pub(crate) fn copy_mapped_raw_checked(
     }
     if len == 0 {
         return true;
+    }
+    #[cfg(test)]
+    if let Some(hook) = BEFORE_COPY_MAPPED_RAW_HOOK.with(|h| h.borrow_mut().take()) {
+        hook();
     }
     if !title_dst && fast_fill() {
         #[cfg(feature = "diagnostics")]
@@ -4860,6 +4905,8 @@ fn install_fast_copy_handler() {
 std::thread_local! {
     static AFTER_DIRECT_SUBMIT_GUARD_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
+    static BEFORE_COPY_MAPPED_RAW_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
     static AFTER_VIRTUAL_QUERY_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
     static AFTER_READ_PIECES_FAIL_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
@@ -4869,6 +4916,11 @@ std::thread_local! {
 #[cfg(test)]
 pub(crate) fn set_after_direct_submit_guard_hook(hook: Option<Box<dyn FnOnce()>>) {
     AFTER_DIRECT_SUBMIT_GUARD_HOOK.with(|h| *h.borrow_mut() = hook);
+}
+
+#[cfg(test)]
+pub(crate) fn set_before_copy_mapped_raw_hook(hook: Option<Box<dyn FnOnce()>>) {
+    BEFORE_COPY_MAPPED_RAW_HOOK.with(|h| *h.borrow_mut() = hook);
 }
 
 fn range_has_lazy_block(at: usize, len: usize) -> bool {

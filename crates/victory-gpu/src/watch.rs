@@ -4307,35 +4307,36 @@ pub(crate) fn writing(at: usize, len: usize) {
     }
 }
 
-/// Unwind guard that clears a temporary kernel-write announcement if
-/// `lazy_back::materialize_range` unwinds before `kernel_writing` finishes its
-/// post-drain pin renewal.
-struct KernelWritingDrainGuard {
-    range: (usize, usize),
-    active: bool,
+/// RAII guard holding a non-expiring kernel-write announcement from
+/// [`kernel_writing`] across lazy materialization, `AHEAD.write()`, and caller
+/// dispatch until the write completes (or the guard is dropped).
+#[allow(dead_code)]
+#[must_use]
+pub struct KernelWriteGuard {
+    range: Option<(usize, usize)>,
 }
 
-impl Drop for KernelWritingDrainGuard {
+impl Drop for KernelWriteGuard {
     fn drop(&mut self) {
-        if self.active {
-            let mut locked = GuardLockSet::lock_range(self.range.0, self.range.1);
-            locked.unannounce_range(self.range);
+        if let Some(range) = self.range.take() {
+            let mut locked = GuardLockSet::lock_range(range.0, range.1);
+            locked.unannounce_range(range);
         }
     }
 }
 
 /// Before a write into title memory `[at, at + len)` through the kernel (which
 /// does not fault into our handler): opens its guarded/cold blocks, holds a
-/// non-expiring announcement across the entire blocking lazy drain so slow
-/// materialization cannot expire a timed pin, then renews [`PIN`] across all
-/// views before clearing the announcement. Returns `false` if lazy
-/// materialization failed.
+/// non-expiring announcement across the entire blocking lazy drain, across
+/// `AHEAD.write()`, and until the returned [`KernelWriteGuard`] is dropped
+/// after dispatch completes. Returns `None` (and releases the announcement
+/// immediately) if lazy materialization failed.
 #[allow(dead_code)]
 #[must_use]
-pub fn kernel_writing(at: usize, len: usize) -> bool {
+pub fn kernel_writing(at: usize, len: usize) -> Option<KernelWriteGuard> {
     use windows_sys::Win32::System::Memory::PAGE_READWRITE;
     if len == 0 {
-        return true;
+        return Some(KernelWriteGuard { range: None });
     }
     let end = at.saturating_add(len);
     let (first, last) = (at / BLOCK, end.div_ceil(BLOCK));
@@ -4344,8 +4345,8 @@ pub fn kernel_writing(at: usize, len: usize) -> bool {
     // and all aliases under their guard shards (ascending order) strictly BEFORE
     // any `VirtualProtect(..., PAGE_READWRITE)` and BEFORE
     // `lazy_back::materialize_range`, so neither a concurrent
-    // `try_arm_lazy_under_guards` nor a slow drain > `PIN` can re-arm the
-    // destination before dispatch.
+    // `try_arm_lazy_under_guards` nor a slow drain/dispatch delay > `PIN` can
+    // re-arm the destination before dispatch completes.
     {
         let (mut locked, alias_blocks) = lock_range_and_all_aliases(first, last);
         locked.prune_pins();
@@ -4395,14 +4396,11 @@ pub fn kernel_writing(at: usize, len: usize) -> bool {
             protect_block_runs(&to_restore, PAGE_READWRITE);
         }
     }
-    let mut drain_guard = KernelWritingDrainGuard {
-        range,
-        active: true,
-    };
+    let guard = KernelWriteGuard { range: Some(range) };
     let ok = crate::lazy_back::materialize_range(at, len);
-    // Atomically renew the timed `PIN` across the range and all current aliases
-    // BEFORE releasing the non-expiring announcement under the same shard locks
-    // so there is zero gap between drain completion and dispatch.
+    // Renew the timed `PIN` across the range and all current aliases while the
+    // non-expiring announcement remains held in `guard` across `AHEAD.write()`
+    // and through caller dispatch.
     {
         let (mut locked, alias_blocks) = lock_range_and_all_aliases(first, last);
         locked.prune_pins();
@@ -4411,12 +4409,17 @@ pub fn kernel_writing(at: usize, len: usize) -> bool {
         for_each_contiguous_run(&alias_blocks, |r_from, r_to| {
             locked.pin_range(r_from, r_to, until);
         });
-        locked.unannounce_range(range);
-        drain_guard.active = false;
     }
-    let mut ahead = AHEAD.write().unwrap_or_else(|e| e.into_inner());
-    ahead.forget_ahead(range);
-    ok
+    {
+        let mut ahead = AHEAD.write().unwrap_or_else(|e| e.into_inner());
+        ahead.forget_ahead(range);
+    }
+    if ok {
+        Some(guard)
+    } else {
+        drop(guard);
+        None
+    }
 }
 
 /// Test helper: clears all timed `PIN` entries across every guard shard without
@@ -4572,8 +4575,16 @@ pub(crate) fn views_mapped(at: usize, len: usize, section: usize, offset: u64) -
         {
             // Drain failed while an existing alias stays armed at PAGE_NOACCESS:
             // protect and attach the newly mapped alias before returning so it
-            // cannot silently read stale RAM without faulting.
-            crate::lazy_back::attach_new_alias_on_failed_materialize(at, len, section, offset);
+            // cannot silently read stale RAM without faulting. If protecting
+            // the newly mapped alias ALSO fails, roll back its view metadata
+            // and fail closed so stale RAM is never exposed.
+            if !crate::lazy_back::attach_new_alias_on_failed_materialize(at, len, section, offset) {
+                crate::inplace::views_gone(at, len);
+                crate::host::fail(format_args!(
+                    "failed to materialize deferred GPU bytes and failed to protect newly mapped alias {at:#x}..{:#x}",
+                    at.saturating_add(len)
+                ));
+            }
             materialized_ok = false;
         }
     }
@@ -5749,8 +5760,18 @@ mod tests {
             let two = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, bytes).Value as usize;
             assert_ne!(one, 0);
             assert_ne!(two, 0);
-            crate::inplace::title_memory_view(one, bytes, section as usize, 0);
-            crate::inplace::title_memory_view(two, bytes, section as usize, 0);
+            assert!(crate::inplace::title_memory_view(
+                one,
+                bytes,
+                section as usize,
+                0
+            ));
+            assert!(crate::inplace::title_memory_view(
+                two,
+                bytes,
+                section as usize,
+                0
+            ));
             (section as usize, one, two)
         }
     }
@@ -5817,7 +5838,7 @@ mod tests {
             "nothing written yet"
         );
         title_memory_remapped(other, SIZE);
-        crate::inplace::title_memory_view(other, SIZE, section, 0);
+        assert!(crate::inplace::title_memory_view(other, SIZE, section, 0));
         assert_eq!(
             guard(guarded, guarded + SIZE),
             Some(vec![pages(0), pages(1)])
@@ -5851,21 +5872,23 @@ mod tests {
         assert_eq!(guard(guarded, guarded + SIZE), Some(vec![pages(1)]));
         assert_eq!(guard(guarded, guarded + SIZE), Some(Vec::new()));
         // Async kernel write: pinned writable for 2 s across all views.
-        assert!(kernel_writing(other + BLOCK, BLOCK));
+        let kw1 = kernel_writing(other + BLOCK, BLOCK).expect("kernel_writing");
         assert_eq!(guard(guarded, guarded + SIZE), Some(vec![pages(1)]));
         assert!(writable(guarded + BLOCK));
         assert!(writable(other + BLOCK));
         assert_eq!(guard(guarded, guarded + SIZE), Some(vec![pages(1)]));
-        // Once the pin expires, the block re-guards cleanly.
+        // Once dispatch completes and the pin expires, the block re-guards cleanly.
+        drop(kw1);
         clear_all_pins();
         assert_eq!(guard(guarded, guarded + SIZE), Some(vec![pages(1)]));
         assert_eq!(guard(guarded, guarded + SIZE), Some(Vec::new()));
         // Half a page and the next: both blocks, not just the first's.
-        assert!(kernel_writing(other + BLOCK / 2, BLOCK));
+        let kw2 = kernel_writing(other + BLOCK / 2, BLOCK).expect("kernel_writing");
         assert_eq!(
             guard(guarded, guarded + SIZE),
             Some(vec![pages(0), pages(1)])
         );
+        drop(kw2);
         clear_all_pins();
         drop_views(section, &[guarded, other], SIZE);
     }
@@ -5950,7 +5973,12 @@ mod tests {
         let (section, one, two) = two_views(BLOCK);
         let filler = one + (1 << 45);
         for n in 0..MANY_VIEWS {
-            crate::inplace::title_memory_view(filler + n * BLOCK, BLOCK, section, 0);
+            assert!(crate::inplace::title_memory_view(
+                filler + n * BLOCK,
+                BLOCK,
+                section,
+                0
+            ));
         }
         assert_eq!(guard(one, one + BLOCK), Some(vec![one / PAGE]));
         assert!(writable(two), "another view of it is left alone");
@@ -6045,7 +6073,7 @@ mod tests {
 
         // Pin alias `b` via `kernel_writing`: `a` is opened and stays changed
         // on every `take` while `b` remains pinned.
-        assert!(kernel_writing(b, 16));
+        let kw_b = kernel_writing(b, 16).expect("kernel_writing b");
         assert!(writable(b));
         assert_eq!(t.take(a, a + PAGE), [(a, a + PAGE)]);
         assert_eq!(
@@ -6057,8 +6085,9 @@ mod tests {
         unsafe { (b as *mut u32).write_volatile(0x1234) };
         assert_eq!(t.take(a, a + PAGE), [(a, a + PAGE)]);
 
-        // Once `b`'s pin expires, `take` reports once more, guards both views,
-        // and becomes clean.
+        // Once `b`'s dispatch guard drops and pin expires, `take` reports once more,
+        // guards both views, and becomes clean.
+        drop(kw_b);
         clear_all_pins();
         assert_eq!(t.take(a, a + PAGE), [(a, a + PAGE)]);
         assert!(
@@ -6073,13 +6102,14 @@ mod tests {
         let (sec2, c, d) = two_views(BLOCK);
         // Make `c` alias `a`'s section in `inplace` while `c` is pinned.
         title_memory_remapped(c, BLOCK);
-        assert!(kernel_writing(c, 16));
-        crate::inplace::title_memory_view(c, BLOCK, section, 0);
+        let kw_c = kernel_writing(c, 16).expect("kernel_writing c");
+        assert!(crate::inplace::title_memory_view(c, BLOCK, section, 0));
         // `views_mapped` opened `a`; re-verify `take` stays changed while `c` is pinned.
         assert_eq!(t.take(a, a + PAGE), [(a, a + PAGE)]);
         assert_eq!(t.take(a, a + PAGE), [(a, a + PAGE)]);
-        // Clear `c`'s pin -> `a` becomes clean again, then pin `c` and exercise
+        // Clear `c`'s guard and pin -> `a` becomes clean again, then pin `c` and exercise
         // `title_memory_alias_rebound(c, BLOCK)` directly.
+        drop(kw_c);
         clear_all_pins();
         assert_eq!(t.take(a, a + PAGE), [(a, a + PAGE)]);
         assert!(t.take(a, a + PAGE).is_empty());
@@ -6405,9 +6435,10 @@ mod tests {
         assert!(writable(base + 2 * PAGE));
 
         assert!(DIR.is_cold_ro(base / PAGE + 3));
-        assert!(kernel_writing(base + 3 * PAGE, PAGE));
+        let kw_cold = kernel_writing(base + 3 * PAGE, PAGE).expect("kernel_writing cold");
         assert!(!DIR.is_cold_ro(base / PAGE + 3));
         assert!(writable(base + 3 * PAGE));
+        drop(kw_cold);
         clear_all_pins();
     }
 
@@ -6915,10 +6946,8 @@ mod tests {
         // Pin two blocks straddling the shard boundary via `kernel_writing`.
         let pin_lo = boundary - 1;
         let pin_hi = boundary + 1;
-        assert!(kernel_writing(
-            one + pin_lo * BLOCK,
-            (pin_hi - pin_lo) * BLOCK
-        ));
+        let kw_pin = kernel_writing(one + pin_lo * BLOCK, (pin_hi - pin_lo) * BLOCK)
+            .expect("kernel_writing cross-shard");
         for i in pin_lo..pin_hi {
             assert!(
                 writable(one + i * BLOCK),
@@ -6955,7 +6984,8 @@ mod tests {
         );
         assert!(DIR.is_guard_protected(b_one + unpinned_idx));
 
-        // Clearing pins allows immediate clean re-guarding across the boundary.
+        // Clearing guard + pins allows immediate clean re-guarding across the boundary.
+        drop(kw_pin);
         clear_all_pins();
         assert_eq!(
             guard(one, one + SIZE),

@@ -220,7 +220,10 @@ impl Batch {
             PREPARING_COPIES[PREP_WATCH_US].fetch_add(us, Ordering::Relaxed);
         }
         let started = std::time::Instant::now();
-        let copied = crate::shadow::refresh_batch(due, wide_refresh());
+        let (copied, ok) = crate::shadow::refresh_batch(due, wide_refresh());
+        if !ok {
+            self.refresh_failed = true;
+        }
         let us = started.elapsed().as_micros() as u64;
         PREPARING[0].fetch_add(us, Ordering::Relaxed);
         PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
