@@ -686,42 +686,47 @@ pub(super) struct Sent {
 }
 
 /// A submission on the card that has not been waited for ([`late`]).
-struct Flight {
-    number: u64,
-    fence: u64,
-    lists: Vec<crate::queue::InFlight>,
-    card: Option<CardPlan>,
-    back: Vec<Declared>,
-    readback_ranges: Vec<(usize, usize)>,
-    _exec_epoch: crate::retire::ExecEpochGuard,
+pub(super) struct Flight {
+    pub(super) number: u64,
+    pub(super) fence: u64,
+    pub(super) lists: Vec<crate::queue::InFlight>,
+    pub(super) card: Option<CardPlan>,
+    pub(super) back: Vec<Declared>,
+    pub(super) readback_ranges: Vec<(usize, usize)>,
+    pub(super) _exec_epoch: crate::retire::ExecEpochGuard,
 }
 
 /// One item in the ordered flight line.
-enum Late {
+pub(super) enum Late {
     Run(Flight),
     Write(usize, crate::queue::Written, usize),
     Signal(crate::fence::Held, u64),
 }
 
 pub(super) struct Line {
-    line: Vec<Late>,
+    pub(super) line: Vec<Late>,
     /// Joined title-memory ranges that in-flight shaders or readbacks may write.
     pub(super) written: Vec<(usize, usize)>,
     /// Host lists currently in flight.
-    lists: usize,
+    pub(super) lists: usize,
     /// Last fence value signalled behind a queued flight.
-    target: u64,
+    pub(super) target: u64,
     /// True while a settle or `relay_land` is actively draining flights.
     pub(super) settling: bool,
     /// Signals `victory-late-wait` to drain landed lists / woken timelines.
-    poke: bool,
+    pub(super) poke: bool,
     /// Finished flights' `InFlight` lists queued for async reset/recycle.
-    landed: Vec<Vec<crate::queue::InFlight>>,
+    pub(super) landed: Vec<Vec<crate::queue::InFlight>>,
     /// Bottom-of-pipe writes of flights currently being landed (`late_met`).
-    in_hand: Vec<(usize, crate::queue::Written, usize)>,
+    pub(super) in_hand: Vec<(usize, crate::queue::Written, usize)>,
+    /// With [`relay`]: `(shadow_ptr, from, to)` ranges declared in
+    /// `flight.back` (or `(0, from, to)` for `flight.readback_ranges`) of
+    /// flights currently being landed (`items` drained while `settling` is
+    /// true), for range-scoped `WHY_STALE` and `WHY_READ` waits.
+    pub(super) in_hand_back: Vec<(usize, usize, usize)>,
     /// Timelines woken by `Late::Write` / `Late::Signal`, drained outside
     /// `Host::submitted` and never on `victory-relay`.
-    pending_woken: Vec<crate::fence::Woken>,
+    pub(super) pending_woken: Vec<crate::fence::Woken>,
 }
 
 #[cfg(test)]
@@ -736,6 +741,7 @@ impl Line {
             poke: false,
             landed: Vec::new(),
             in_hand: Vec::new(),
+            in_hand_back: Vec::new(),
             pending_woken: Vec::new(),
         }
     }
@@ -754,6 +760,7 @@ static LINE: Mutex<Line> = Mutex::new(Line {
     poke: false,
     landed: Vec::new(),
     in_hand: Vec::new(),
+    in_hand_back: Vec::new(),
     pending_woken: Vec::new(),
 });
 
@@ -810,9 +817,18 @@ pub(super) fn flying() -> bool {
     line.settling || line.line.iter().any(|l| matches!(l, Late::Run(_)))
 }
 
+/// Result of checking `runs` against in-flight shader writes ([`late_blocked`]).
+pub(super) enum LateBlock {
+    /// A `Step::Run` step may read or write arbitrary title memory (`WHY_RUN`).
+    Run,
+    /// Joined title-memory ranges where copies/fills/host-reads/textures
+    /// conflict with in-flight shader writes or readbacks (`WHY_READ`).
+    Read(Vec<(usize, usize)>),
+}
+
 /// Checks whether `runs` reads or runs arbitrary code over title memory that
 /// in-flight shaders or readbacks may write (`WHY_READ` or `WHY_RUN`).
-pub(super) fn late_blocked(runs: &[&HostList]) -> Option<usize> {
+pub(super) fn late_blocked(runs: &[&HostList]) -> Option<LateBlock> {
     let written = {
         let line = line();
         if line.written.is_empty() {
@@ -827,10 +843,12 @@ pub(super) fn blocked_ranges(
     written: &[(usize, usize)],
     runs: &[&HostList],
     count: bool,
-) -> Option<usize> {
+) -> Option<LateBlock> {
     if written.is_empty() {
         return None;
     }
+    let mut ranges = Vec::new();
+    let mut first_stat: Option<usize> = None;
     for list in runs {
         for step in &list.deferred().copies {
             match step {
@@ -844,10 +862,14 @@ pub(super) fn blocked_ranges(
                             }
                             continue;
                         }
-                        if count {
-                            LATE_STATS[15].fetch_add(1, Ordering::Relaxed);
+                        if hit_dst {
+                            ranges.push((dst, dst + len));
+                            first_stat.get_or_insert(15);
                         }
-                        return Some(WHY_READ);
+                        if hit_src {
+                            ranges.push((src, src + len));
+                            first_stat.get_or_insert(15);
+                        }
                     }
                 }
                 &Step::Fill(_, src, len) => {
@@ -858,35 +880,36 @@ pub(super) fn blocked_ranges(
                             }
                             continue;
                         }
-                        if count {
-                            LATE_STATS[16].fetch_add(1, Ordering::Relaxed);
-                        }
-                        return Some(WHY_READ);
+                        ranges.push((src, src + len));
+                        first_stat.get_or_insert(16);
                     }
                 }
                 &Step::HostRead(src, len, _) => {
                     if touches(written, src, src + len) {
-                        if count {
-                            LATE_STATS[16].fetch_add(1, Ordering::Relaxed);
-                        }
-                        return Some(WHY_READ);
+                        ranges.push((src, src + len));
+                        first_stat.get_or_insert(16);
                     }
                 }
                 Step::Texture(staging, _) => {
                     let (start, end) = staging.memory_range();
                     if touches(written, start, end) {
-                        if count {
-                            LATE_STATS[17].fetch_add(1, Ordering::Relaxed);
-                        }
-                        return Some(WHY_READ);
+                        ranges.push((start, end));
+                        first_stat.get_or_insert(17);
                     }
                 }
-                Step::Run(_) => return Some(WHY_RUN),
+                Step::Run(_) => return Some(LateBlock::Run),
                 Step::Refresh(..) | Step::GpuWrite(..) | Step::Host(_) => {}
             }
         }
     }
-    None
+    if ranges.is_empty() {
+        return None;
+    }
+    if count && let Some(slot) = first_stat {
+        LATE_STATS[slot].fetch_add(1, Ordering::Relaxed);
+    }
+    join_ranges(&mut ranges, std::iter::empty());
+    Some(LateBlock::Read(ranges))
 }
 
 /// Fills of upload memory that read title memory flights may write are not
@@ -1128,13 +1151,88 @@ mod fill_ahead {
 pub(crate) use fill_ahead::read as test_fill_ahead_read;
 pub(crate) use fill_ahead::wrote as shaders_write;
 
-/// With flights in the air, checks whether `runs` refreshes any range of a
-/// host copy that has pending shader writes and dirty title pages. Under
-/// [`late_exact`] (`VICTORY_LATE_WAIT>=2`), merges changed title bytes into the
-/// copy in place (up to `VICTORY_LATE_MERGE_RUNS`, default 4096 runs per
-/// submission) and returns `true` only when settling is still required.
-pub(super) fn stale_under_flights(runs: &[&HostList]) -> bool {
+/// Whether `WHY_STALE` and `WHY_READ` wait only on flights whose declared
+/// write/readback ranges overlap the conflicting ranges
+/// (`VICTORY_RANGE_SETTLE=0` falls back to full [`Host::settle`]).
+pub(super) fn range_settle_enabled(setting: Option<&str>) -> bool {
+    setting != Some("0")
+}
+
+pub(super) fn range_settle() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| range_settle_enabled(std::env::var("VICTORY_RANGE_SETTLE").ok().as_deref()))
+}
+
+/// Whether any queued flight in `line.line` or currently landing flight in
+/// `line.in_hand_back` declares a `back` range overlapping any
+/// `(shadow_ptr, from, to)` in `stale`.
+pub(super) fn line_overlaps_stale(line: &Line, stale: &[(usize, usize, usize)]) -> bool {
+    if stale.is_empty() {
+        return false;
+    }
+    for &(s_ptr, a, b) in &line.in_hand_back {
+        if stale
+            .iter()
+            .any(|&(ptr, from, to)| ptr == s_ptr && a < to && from < b)
+        {
+            return true;
+        }
+    }
+    for item in &line.line {
+        let Late::Run(flight) = item else {
+            continue;
+        };
+        for (shadow, ranges) in &flight.back {
+            let s_ptr = std::sync::Arc::as_ptr(shadow) as usize;
+            if stale.iter().any(|&(ptr, from, to)| {
+                ptr == s_ptr && ranges.iter().any(|&(a, b)| a < to && from < b)
+            }) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Whether any queued flight in `line.line` or currently landing flight in
+/// `line.in_hand_back` declares a `back` or `readback_ranges` range
+/// overlapping any `(from, to)` in `ranges` (for range-scoped `WHY_READ`).
+pub(super) fn line_overlaps_read(line: &Line, ranges: &[(usize, usize)]) -> bool {
+    if ranges.is_empty() {
+        return false;
+    }
+    for &(_, a, b) in &line.in_hand_back {
+        if ranges.iter().any(|&(from, to)| a < to && from < b) {
+            return true;
+        }
+    }
+    for item in &line.line {
+        let Late::Run(flight) = item else {
+            continue;
+        };
+        if flight
+            .back
+            .iter()
+            .flat_map(|(_, r)| r.iter())
+            .chain(flight.readback_ranges.iter())
+            .any(|&(a, b)| ranges.iter().any(|&(from, to)| a < to && from < b))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// With flights in the air, collects `(shadow_ptr, from, to)` ranges where
+/// `runs` refreshes a range of a host copy that has pending shader writes and
+/// dirty title pages. Under [`late_exact`] (`VICTORY_LATE_WAIT>=2`), merges
+/// changed title bytes into the copy in place (up to `VICTORY_LATE_MERGE_RUNS`,
+/// default 4096 runs per submission for card shadows; ReBAR and PC shadows are
+/// uncapped) and returns only the subranges that still require settling.
+pub(super) fn stale_under_flights(runs: &[&HostList]) -> Vec<(usize, usize, usize)> {
     use std::sync::Arc;
+    // Per copy, the joined refreshed intervals (not a bounding box, so
+    // disjoint refreshes do not pull in unrelated pending shader writes).
     let mut by_shadow: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
     let mut spans: Vec<Declared> = Vec::new();
     for list in runs {
@@ -1156,10 +1254,13 @@ pub(super) fn stale_under_flights(runs: &[&HostList]) -> bool {
         }
     }
     if spans.is_empty() {
-        return false;
+        return Vec::new();
     }
+    let mut out = Vec::new();
+    let mut per_shadow = Vec::new();
     // `VICTORY_LATE_MERGE_RUNS`: card `CopyBufferRegion` run budget per
-    // submission (default 4096; ReBAR and PC shadows are uncapped).
+    // submission (4096 avoids stalling on scattered constant writes while
+    // keeping command-list recording negligible; ReBAR is uncapped).
     static RUNS: OnceLock<usize> = OnceLock::new();
     let mut runs_left = late_exact().then(|| {
         *RUNS.get_or_init(|| {
@@ -1171,18 +1272,21 @@ pub(super) fn stale_under_flights(runs: &[&HostList]) -> bool {
     });
     for (shadow, ranges) in &mut spans {
         join_ranges(ranges, std::iter::empty());
+        per_shadow.clear();
         for &(from, to) in ranges.iter() {
-            let stale = if let Some(left) = runs_left.as_mut() {
-                shadow.merge_under_writes(from, to - from, left)
+            if let Some(left) = runs_left.as_mut() {
+                shadow.merge_ranges_under_writes(from, to - from, left, &mut per_shadow);
             } else {
-                shadow.stale_under_writes(from, to - from)
-            };
-            if stale {
-                return true;
+                shadow.stale_ranges_under_writes(from, to - from, &mut per_shadow);
             }
         }
+        if !per_shadow.is_empty() {
+            join_ranges(&mut per_shadow, std::iter::empty());
+            let ptr = Arc::as_ptr(shadow) as usize;
+            out.extend(per_shadow.iter().map(|&(a, b)| (ptr, a, b)));
+        }
     }
-    false
+    out
 }
 
 /// Queues a fence signal behind in-flight submissions when [`late`] is active
@@ -1499,7 +1603,12 @@ pub(crate) fn settle_card_busy(shadow_ptr: usize, from: usize, to: usize) -> boo
     if !relay() || !late() {
         return false;
     }
-    let waited = if relay_exact() {
+    let waited = if relay_exact() && range_settle() {
+        wait_on_line(&LINE, &LINE_LANDED, WHY_STALE, true, |line| {
+            !line_overlaps_stale(line, &[(shadow_ptr, from, to)])
+        })
+        .is_some()
+    } else if relay_exact() {
         wait_on_line(&LINE, &LINE_LANDED, WHY_STALE, true, |line| {
             !line.settling
                 && !line.line.iter().any(|l| {
@@ -1575,6 +1684,24 @@ fn relay_worker() {
                         _ => None,
                     })
                     .collect();
+                line.in_hand_back.clear();
+                for item in &items {
+                    if let Late::Run(flight) = item {
+                        for (shadow, ranges) in &flight.back {
+                            let s_ptr = std::sync::Arc::as_ptr(shadow) as usize;
+                            for &(from, to) in ranges {
+                                if from < to {
+                                    line.in_hand_back.push((s_ptr, from, to));
+                                }
+                            }
+                        }
+                        for &(from, to) in &flight.readback_ranges {
+                            if from < to {
+                                line.in_hand_back.push((0, from, to));
+                            }
+                        }
+                    }
+                }
                 break Ok(items);
             }
         };
@@ -2776,12 +2903,14 @@ impl Host {
                 poke,
                 landed: kept,
                 in_hand,
+                in_hand_back,
                 pending_woken,
                 ..
             } = &mut *line;
             kept.extend(landed);
             pending_woken.push(woken);
             in_hand.clear();
+            in_hand_back.clear();
             written.clear();
             *lists = 0;
             let mut ranges = Vec::new();
@@ -3033,6 +3162,25 @@ impl Host {
             if pending >= 32 {
                 land();
             }
+        }
+    }
+
+    /// Settles only the flights in `LINE` whose `flight.back` overlaps `stale`
+    /// when range-scoped settle is enabled under [`relay_exact`], falling back
+    /// to a full [`Host::settle`] when `VICTORY_RANGE_SETTLE=0` or `!relay_exact()`.
+    pub(super) fn settle_stale(
+        &self,
+        submitted: &mut u64,
+        stale: &[(usize, usize, usize)],
+    ) -> crate::fence::Woken {
+        if !late() || stale.is_empty() {
+            return crate::fence::Woken::default();
+        }
+        if range_settle() && relay_exact() {
+            relay_wait(WHY_STALE, |line| !line_overlaps_stale(line, stale));
+            crate::fence::Woken::default()
+        } else {
+            self.settle(submitted, WHY_STALE)
         }
     }
 
