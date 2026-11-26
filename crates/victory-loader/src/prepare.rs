@@ -44,23 +44,44 @@ impl PreparedImage {
 /// * `FORCE_INTEGRITY` cleared, checksum zeroed: the copy is unsigned.
 pub fn prepare(original: &[u8]) -> Result<PreparedImage, PrepareError> {
     let info = ImageInfo::parse(original)?;
+    let original_hash = blake3::hash(original);
     let mut bytes = original.to_vec();
+    patch_in_place(&mut bytes, &info)?;
+    Ok(PreparedImage {
+        info,
+        bytes,
+        original_hash,
+    })
+}
 
-    let fh = layout::file_header_offset(&bytes).ok_or(PrepareError::Patch("no file header"))?;
+/// Like [`prepare`], patching an owned byte buffer in place without cloning it.
+pub fn prepare_owned(mut bytes: Vec<u8>) -> Result<PreparedImage, PrepareError> {
+    let info = ImageInfo::parse(&bytes)?;
+    let original_hash = blake3::hash(&bytes);
+    patch_in_place(&mut bytes, &info)?;
+    Ok(PreparedImage {
+        info,
+        bytes,
+        original_hash,
+    })
+}
+
+fn patch_in_place(bytes: &mut [u8], info: &ImageInfo) -> Result<(), PrepareError> {
+    let fh = layout::file_header_offset(bytes).ok_or(PrepareError::Patch("no file header"))?;
     let opt =
-        layout::optional_header_offset(&bytes).ok_or(PrepareError::Patch("no optional header"))?;
+        layout::optional_header_offset(bytes).ok_or(PrepareError::Patch("no optional header"))?;
 
     let characteristics = info.characteristics | file_flags::DLL;
     write_u16(
-        &mut bytes,
+        bytes,
         fh + layout::FILE_HEADER_CHARACTERISTICS,
         characteristics,
     )?;
-    write_u32(&mut bytes, opt + layout::OPT_ADDRESS_OF_ENTRY_POINT, 0)?;
-    write_u32(&mut bytes, opt + layout::OPT_CHECKSUM, 0)?;
+    write_u32(bytes, opt + layout::OPT_ADDRESS_OF_ENTRY_POINT, 0)?;
+    write_u32(bytes, opt + layout::OPT_CHECKSUM, 0)?;
     let dll_characteristics = info.dll_characteristics & !dll_flags::FORCE_INTEGRITY;
     write_u16(
-        &mut bytes,
+        bytes,
         opt + layout::OPT_DLL_CHARACTERISTICS,
         dll_characteristics,
     )?;
@@ -68,20 +89,20 @@ pub fn prepare(original: &[u8]) -> Result<PreparedImage, PrepareError> {
     // Windows 10 assigns static TLS to the prepared DLL when its empty
     // import table is present. The parser has already walked one descriptor
     // per module up to the null terminator, regardless of the recorded Size.
-    if let Some(at) = layout::data_directory_offset(&bytes, dir::IMPORT) {
-        let rva = layout::read_u32(&bytes, at).ok_or(PrepareError::Patch("no import RVA"))?;
+    if let Some(at) = layout::data_directory_offset(bytes, dir::IMPORT) {
+        let rva = layout::read_u32(bytes, at).ok_or(PrepareError::Patch("no import RVA"))?;
         if rva != 0 {
             let terminator = u32::try_from(info.imports.len())
                 .ok()
                 .and_then(|count| count.checked_mul(IMPORT_DESCRIPTOR_SIZE))
                 .and_then(|offset| rva.checked_add(offset))
                 .ok_or(PrepareError::Patch("import terminator RVA overflow"))?;
-            write_u32(&mut bytes, at, terminator)?;
-            write_u32(&mut bytes, at + 4, IMPORT_DESCRIPTOR_SIZE)?;
+            write_u32(bytes, at, terminator)?;
+            write_u32(bytes, at + 4, IMPORT_DESCRIPTOR_SIZE)?;
         }
     }
-    if let Some(at) = layout::data_directory_offset(&bytes, dir::BOUND_IMPORT) {
-        write(&mut bytes, at, &[0; layout::DATA_DIRECTORY_SIZE])?;
+    if let Some(at) = layout::data_directory_offset(bytes, dir::BOUND_IMPORT) {
+        write(bytes, at, &[0; layout::DATA_DIRECTORY_SIZE])?;
     }
 
     if let Some(tls) = &info.tls
@@ -90,11 +111,7 @@ pub fn prepare(original: &[u8]) -> Result<PreparedImage, PrepareError> {
         let at = info
             .rva_to_file_offset(tls.directory_rva)
             .ok_or(PrepareError::Patch("TLS directory is not file-backed"))?;
-        write_u64(
-            &mut bytes,
-            at as usize + layout::TLS64_ADDRESS_OF_CALLBACKS,
-            0,
-        )?;
+        write_u64(bytes, at as usize + layout::TLS64_ADDRESS_OF_CALLBACKS, 0)?;
         // A base relocation that writes into the field would turn the 0
         // into (part of) `delta` whenever the loader maps the copy away from
         // its preferred base (Wine always does for DYNAMIC_BASE images), and
@@ -106,10 +123,10 @@ pub fn prepare(original: &[u8]) -> Result<PreparedImage, PrepareError> {
             .directory_rva
             .checked_add(layout::TLS64_ADDRESS_OF_CALLBACKS as u32)
             .ok_or(PrepareError::Patch("TLS callback field RVA overflow"))?;
-        for reloc in relocations(&bytes, &info) {
+        for reloc in relocations(bytes, info) {
             if reloc.overlaps(field_rva, 8) {
                 for slot in 0..reloc.slots {
-                    write_u16(&mut bytes, reloc.entry + 2 * slot, 0)?; // ABSOLUTE
+                    write_u16(bytes, reloc.entry + 2 * slot, 0)?; // ABSOLUTE
                 }
             }
         }
@@ -118,7 +135,7 @@ pub fn prepare(original: &[u8]) -> Result<PreparedImage, PrepareError> {
         // section by its raw size. A damaged section table can make the two
         // disagree, and then the write above lands somewhere else while the
         // callbacks stay armed. The copy must never run them on its own.
-        if ImageInfo::parse(&bytes)?
+        if ImageInfo::parse(bytes)?
             .tls
             .is_some_and(|tls| tls.callbacks_va != 0)
         {
@@ -128,11 +145,7 @@ pub fn prepare(original: &[u8]) -> Result<PreparedImage, PrepareError> {
         }
     }
 
-    Ok(PreparedImage {
-        info,
-        bytes,
-        original_hash: blake3::hash(original),
-    })
+    Ok(())
 }
 
 /// Size of an IMAGE_IMPORT_DESCRIPTOR in the PE file.
