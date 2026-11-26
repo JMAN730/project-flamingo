@@ -1021,12 +1021,12 @@ fn the_24_bit_multiplies_lower_both_halves() {
     }
 }
 
-/// `v_sad_u8`, `v_sad_hi_u8`, `v_sad_u16` and `v_sad_u32` lower. An LDS
-/// store keeps the result live.
+/// `v_sad_u8`, `v_sad_hi_u8`, `v_sad_u16`, `v_sad_u32` and `v_msad_u8` lower.
+/// An LDS store keeps the result live.
 #[test]
 fn sums_of_absolute_differences_lower() {
     // VOP3 `op v0, v1, v2, v3`.
-    for op in [0x15Au32, 0x15B, 0x15C, 0x15D] {
+    for op in [0x15Au32, 0x15B, 0x15C, 0x15D, 0x171] {
         let words = [
             0x7E02_0285, // v_mov_b32 v1, 5
             0x7E04_0287, // v_mov_b32 v2, 7

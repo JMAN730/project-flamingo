@@ -123,21 +123,114 @@ struct BoundDsv {
     desc: Option<D3D12_DEPTH_STENCIL_VIEW_DESC>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-struct FreshTableKey {
+/// Root slots (bytes) as a set that lives on the stack: a draw collects them
+/// without the heap, and they come out in order.
+#[derive(Default)]
+struct Slots([u64; 4]);
+
+impl Slots {
+    fn insert(&mut self, slot: u8) {
+        self.0[usize::from(slot / 64)] |= 1 << (slot % 64);
+    }
+
+    fn contains(&self, slot: u8) -> bool {
+        (self.0[usize::from(slot / 64)] >> (slot % 64)) & 1 != 0
+    }
+
+    fn iter(&self) -> impl Iterator<Item = u8> {
+        let words = self.0;
+        (0..4u8).flat_map(move |w| {
+            let mut bits = words[usize::from(w)];
+            std::iter::from_fn(move || {
+                (bits != 0).then(|| {
+                    let bit = bits.trailing_zeros() as u8;
+                    bits &= bits - 1;
+                    w * 64 + bit
+                })
+            })
+        })
+    }
+}
+
+/// A hash that is mixed already, used as it is.
+#[derive(Default)]
+struct Plain(u64);
+
+impl std::hash::Hasher for Plain {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = self.0 << 8 | u64::from(b);
+        }
+    }
+    fn write_u64(&mut self, x: u64) {
+        self.0 = x;
+    }
+}
+
+#[inline]
+fn mix_hash(h: u64, x: u64) -> u64 {
+    (h.rotate_left(5) ^ x).wrapping_mul(0x517c_c1b7_2722_0a95)
+}
+
+/// A quick hash of a descriptor table's heap, copy generation, slot records,
+/// liveness flags, and structured alias/stride overrides. Hits still verify
+/// every exact `[u32; 3]` record word and override, so a collision costs a
+/// copy, never wrong descriptors.
+#[allow(clippy::too_many_arguments)]
+fn table_hash(
     heap: usize,
     copy_gen: u64,
-    slots: u32,
-    records_hash: u64,
+    raws: &[[u32; 3]],
+    dead: &[bool],
+    start_slot: u32,
+    step_dwords: u32,
+    aliases: &[StructuredBinding],
+    strides: &[&(victory_shader::emit::StructuredBinding, u32)],
+) -> u64 {
+    let mut h = mix_hash(heap as u64, copy_gen);
+    h = mix_hash(h, raws.len() as u64);
+    for (&[a, b, c], &is_dead) in raws.iter().zip(dead) {
+        h = mix_hash(h, u64::from(a) | (u64::from(b) << 32));
+        h = mix_hash(h, u64::from(c) | (u64::from(is_dead) << 32));
+    }
+    for alias in aliases {
+        h = mix_hash(
+            h,
+            u64::from(alias.entry - start_slot) | (u64::from(alias.stride) << 32),
+        );
+    }
+    for &(binding, stride) in strides {
+        let rel = binding.offset_dwords / step_dwords - start_slot;
+        h = mix_hash(h, u64::from(rel) | (u64::from(binding.uav) << 32));
+        h = mix_hash(h, u64::from(*stride));
+    }
+    h ^ (h >> 32)
+}
+
+/// The words of entry `k` of `table` (32-byte view slots or 16-byte sampler
+/// slots, stepped by `step_bytes`).
+#[cfg(test)]
+fn record(table: u64, k: u32) -> [u32; 3] {
+    // SAFETY: a descriptor slot in title memory.
+    unsafe { ((table + u64::from(k) * 32) as *const [u32; 3]).read_unaligned() }
 }
 
 struct FreshTableEntry {
-    table: u64,
-    start_slot: u32,
+    heap: usize,
+    copy_gen: u64,
+    slots: u32,
+    records_at: usize,
     first: u32,
     /// Sorted offsets `k - start_slot` that held a tagged stale (released) view
     /// compiled as null, so unchanged stale slots reuse the rebuilt range.
     dead_slots: Vec<u32>,
+    /// Relative `(entry - start_slot, stride)` overrides compiled into `first`.
+    aliases: Vec<(u32, u32)>,
+    /// Relative `(slot - start_slot, uav, stride)` overrides compiled into `first`.
+    strides: Vec<(u32, bool, u32)>,
 }
 
 /// Fast-path and incremental-sync cache for the texture half of
@@ -194,13 +287,19 @@ pub(crate) struct State {
     /// [`descriptor::heap_bind_id`] for each of [`Self::host_heaps`] when
     /// last bound; catches a new heap reused at the same title address.
     host_heap_ids: [u64; 2],
-    /// Tables made afresh in this list, keyed by title heap, `list.copy_gen()`,
-    /// slot count, and hashed descriptor records. Partitioning by `copy_gen`
-    /// preserves `Fill -> Copy -> Fill` ordering for CBV snapshots across
-    /// intervening deferred buffer copies, and hits are verified by re-reading
-    /// the range and checking view liveness so no per-table record vector is
-    /// allocated.
-    fresh_tables: std::collections::HashMap<FreshTableKey, FreshTableEntry>,
+    /// Tables made afresh in this list, keyed by quick hash ([`table_hash`])
+    /// and verified by exact `[u32; 3]` record words stored in
+    /// [`Self::fresh_records`], `heap`, `copy_gen`, liveness, and overrides.
+    /// Partitioning by `copy_gen` preserves `Fill -> Copy -> Fill` ordering
+    /// for CBV snapshots across intervening deferred buffer copies.
+    fresh_tables:
+        std::collections::HashMap<u64, FreshTableEntry, std::hash::BuildHasherDefault<Plain>>,
+    /// The record words of [`FreshTableEntry`] tables, one after the other.
+    fresh_records: Vec<[u32; 3]>,
+    /// What [`State::tables_with_strides`] made for the stage being bound:
+    /// root slot, byte offset of its fresh table. Kept to reuse its storage
+    /// across draws.
+    made: Vec<(u8, u32)>,
     /// The dynamic slots the list holds: title heap, first, count; given
     /// back when the list is reset or released.
     dynamic: Vec<(usize, u32, u32)>,
@@ -284,9 +383,7 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
         shadow.refresh(list, address, len);
         return Some(gpu);
     }
-    let (gpu, to) = list.scratch(len)?;
-    list.defer_fill(to, address as *const u8, len as usize);
-    Some(gpu)
+    list.fill_scratch(address as *const u8, len)
 }
 
 macro_rules! once {
@@ -320,6 +417,8 @@ impl State {
     pub(crate) fn take_dynamic(&mut self) -> Vec<(usize, u32, u32)> {
         // A following segment must acquire its own slots before recording a bind.
         self.fresh_tables.clear();
+        self.fresh_records.clear();
+        self.made.clear();
         self.root_view_slots.clear();
         std::mem::take(&mut self.dynamic)
     }
@@ -804,10 +903,8 @@ impl State {
             // SAFETY: an open list and a live pipeline.
             unsafe { l.SetPipelineState(&p.pso) };
             self.host_pipeline = p.pso.as_raw() as usize;
-            list.used_pipeline(&p.name);
             // The title may release the pipeline before it submits the list.
-            list.keep(&p.pso);
-            list.keep(&p.root);
+            list.bind_pipeline(p);
         }
         let pixel_hash = (!compute)
             .then(|| {
@@ -826,7 +923,7 @@ impl State {
                     pixel_hash.and_then(|ps| fullscreen_structured_alias(&stage.shader.hash, ps))
                 })
                 .flatten();
-            let made = self.tables_with_strides(
+            self.tables_with_strides(
                 list,
                 &t.used,
                 compute,
@@ -883,11 +980,13 @@ impl State {
                         values[u.index as usize..][..3].copy_from_slice(&binding);
                         continue;
                     }
-                    let fresh = made
+                    let fresh = self
+                        .made
                         .iter()
-                        .find(|m| m.0 == u.slot && u.root == RootType::Table);
+                        .find(|m| m.0 == u.slot && u.root == RootType::Table)
+                        .copied();
                     values[u.index as usize] = match fresh {
-                        Some(&(_, offset)) => offset,
+                        Some((_, offset)) => offset,
                         None => self.user_value(compute, u.slot, u.root, u.dword),
                     };
                 }
@@ -1232,6 +1331,10 @@ impl State {
             }
             h.finish()
         };
+        if crate::descriptor::host::take_short_reads() {
+            // A texture filled short during a remap: re-run bindless upload pass.
+            self.bindless_cache = None;
+        }
         let cur_tex_gen = host.tex_gen();
         let cur_state_gen = list.state_gen();
         if let Some(cache) = &self.bindless_cache
@@ -1339,7 +1442,9 @@ impl State {
                 }
                 if let Some(t) = crate::resource::host_resource(held.get()) {
                     if crate::texture::title_written(t) {
+                        crate::texture::PICKING.set(Some(u64::MAX));
                         crate::texture::upload_from(list, held.get(), t, *first);
+                        crate::texture::PICKING.set(None);
                     }
                     crate::list::ensure_bindless_state(list, held.get(), SHADER_RESOURCE);
                 }
@@ -1570,7 +1675,8 @@ impl State {
         compute: bool,
         aliases: &[StructuredBinding],
     ) -> Vec<(u8, u32)> {
-        self.tables_with_strides(list, used, compute, aliases, &[])
+        self.tables_with_strides(list, used, compute, aliases, &[]);
+        self.made.clone()
     }
 
     fn tables_with_strides(
@@ -1580,23 +1686,32 @@ impl State {
         compute: bool,
         aliases: &[StructuredBinding],
         structured_strides: &[(victory_shader::emit::StructuredBinding, u32)],
-    ) -> Vec<(u8, u32)> {
+    ) {
         let read_only_depth = self.read_only_depth(compute);
         let tables = |u: &&UsedResource| u.root == RootType::Table;
-        let mut fresh: Vec<u8> = used
+        // Taken out so `self` stays free to borrow; restored at the end.
+        let mut made = std::mem::take(&mut self.made);
+        made.clear();
+        let mut fresh = Slots::default();
+        for u in used
             .iter()
             .filter(tables)
             .filter(|u| matches!(u.kind, ResourceType::Cbv | ResourceType::Srv))
-            .map(|u| u.slot)
-            .chain(aliases.iter().map(|a| a.slot))
-            .chain(structured_strides.iter().map(|(binding, _)| binding.slot))
-            .collect();
+        {
+            fresh.insert(u.slot);
+        }
+        for a in aliases {
+            fresh.insert(a.slot);
+        }
+        for (binding, _) in structured_strides {
+            fresh.insert(binding.slot);
+        }
         // Tables reaching past a host heap smaller than the title's (the
         // host's limit, 1,000,000 views on NVIDIA, 2,048 samplers anywhere)
         // are made afresh too: the title's slots there have no host slot of
         // their own.
         for u in used.iter().filter(tables) {
-            if fresh.contains(&u.slot) {
+            if fresh.contains(u.slot) {
                 continue;
             }
             let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
@@ -1610,18 +1725,15 @@ impl State {
                 continue;
             };
             if index >= host.count() {
-                fresh.push(u.slot);
+                fresh.insert(u.slot);
             }
         }
-        fresh.sort_unstable();
-        fresh.dedup();
         for u in used.iter().filter(tables) {
-            if !fresh.contains(&u.slot) {
+            if !fresh.contains(u.slot) {
                 self.table_entry(list, u, compute);
             }
         }
-        let mut made = Vec::new();
-        for slot in fresh {
+        for slot in fresh.iter() {
             let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
                 continue;
             };
@@ -1706,8 +1818,9 @@ impl State {
             // Read the descriptor headers in `start_slot..=max_slot` once into
             // reusable scratch buffers, batch-check liveness with at most one
             // shared read lock (and zero `View` clones), then hash and verify
-            // cache hits from those same buffers without re-locking `VIEWS`.
+            // cache hits against saved `[u32; 3]` words in `self.fresh_records`.
             let heap_ptr = std::ptr::from_ref(heap) as usize;
+            let copy_gen = list.copy_gen();
             self.table_raws.clear();
             self.table_raws.reserve(n as usize);
             for k in start_slot..=max_slot {
@@ -1718,92 +1831,94 @@ impl State {
                     .push(unsafe { (at as *const [u32; 3]).read_unaligned() });
             }
             crate::descriptor::check_dead_slots(&self.table_raws, &mut self.table_dead);
-            let records_hash = {
-                use std::hash::{Hash, Hasher};
-                let mut h = std::collections::hash_map::DefaultHasher::new();
-                for (raw, &dead) in self.table_raws.iter().zip(&self.table_dead) {
-                    raw.hash(&mut h);
-                    dead.hash(&mut h);
-                }
-                for alias in &table_aliases {
-                    (alias.entry - start_slot, alias.stride).hash(&mut h);
-                }
-                for (binding, stride) in &table_strides {
-                    (
-                        binding.offset_dwords / step_dwords - start_slot,
-                        binding.uav,
-                        stride,
-                    )
-                        .hash(&mut h);
-                }
-                h.finish()
-            };
-            let key = FreshTableKey {
-                heap: heap_ptr,
-                copy_gen: list.copy_gen(),
-                slots: n,
-                records_hash,
-            };
+            let key = table_hash(
+                heap_ptr,
+                copy_gen,
+                &self.table_raws,
+                &self.table_dead,
+                start_slot,
+                step_dwords,
+                &table_aliases,
+                &table_strides,
+            );
             let offset_for = |first: u32| {
                 first
                     .checked_sub(start_slot)
                     .and_then(|base| base.checked_mul(step_bytes as u32))
             };
-            if let Some(entry) = self.fresh_tables.get(&key) {
-                let (prev_table, prev_start, first) = (entry.table, entry.start_slot, entry.first);
-                let mut reuse_ok = true;
+            let same = self.fresh_tables.get(&key).filter(|entry| {
+                if entry.heap != heap_ptr
+                    || entry.copy_gen != copy_gen
+                    || entry.slots != n
+                    || self.fresh_records[entry.records_at..entry.records_at + n as usize]
+                        != self.table_raws[..]
+                {
+                    return false;
+                }
+                if entry.aliases.len() != table_aliases.len()
+                    || !entry
+                        .aliases
+                        .iter()
+                        .zip(&table_aliases)
+                        .all(|(&(rel, stride), a)| {
+                            rel == a.entry - start_slot && stride == a.stride
+                        })
+                {
+                    return false;
+                }
+                if entry.strides.len() != table_strides.len()
+                    || !entry.strides.iter().zip(&table_strides).all(
+                        |(&(rel, uav, stride), (b, s))| {
+                            rel == b.offset_dwords / step_dwords - start_slot
+                                && uav == b.uav
+                                && stride == *s
+                        },
+                    )
+                {
+                    return false;
+                }
+                // Compare view liveness against what was compiled into `first`:
+                // a newly released view misses and rebuilds a null slot, while
+                // an unchanged stale slot already compiled as null reuses it.
                 let mut dead_cursor = 0usize;
-                for i in 0..n {
-                    let idx = i as usize;
-                    if prev_table != table || prev_start != start_slot {
-                        let prev_at = prev_table + u64::from(prev_start + i) * step_bytes;
-                        // SAFETY: `prev_table` + `prev_start + i` was verified
-                        // in-bounds of the same live `heap` when recorded.
-                        let prev_raw = unsafe { (prev_at as *const [u32; 3]).read_unaligned() };
-                        if self.table_raws[idx] != prev_raw {
-                            reuse_ok = false;
-                            break;
-                        }
-                    }
-                    // Compare view liveness against what was compiled into `first`:
-                    // a newly released view misses and rebuilds a null slot, while
-                    // an unchanged stale slot already compiled as null reuses it.
+                for (idx, &is_dead) in self.table_dead.iter().enumerate() {
+                    let i = idx as u32;
                     let was_dead = if entry.dead_slots.get(dead_cursor) == Some(&i) {
                         dead_cursor += 1;
                         true
                     } else {
                         false
                     };
-                    if self.table_dead[idx] != was_dead {
-                        reuse_ok = false;
-                        break;
+                    if is_dead != was_dead {
+                        return false;
                     }
                 }
-                if reuse_ok {
-                    let Some(byte_offset) = offset_for(first) else {
-                        self.table_failed = true;
-                        continue;
-                    };
-                    for alias in &table_aliases {
-                        if !entries.iter().any(|u| {
-                            u.kind != ResourceType::Cbv
-                                && u.table_offset_dwords / step_dwords == alias.entry
-                        }) {
-                            let _ = host.refresh_slot(first + (alias.entry - start_slot), list);
-                        }
-                    }
-                    for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
-                        let dyn_index = first + (u.table_offset_dwords / step_dwords - start_slot);
-                        if !host.refresh_slot(dyn_index, list) {
-                            let handle = table + u64::from(u.table_offset_dwords) * 4;
-                            if let Some(view) = crate::descriptor::view(handle) {
-                                self.depth_sampled |= readable(list, u, &view, read_only_depth);
-                            }
-                        }
-                    }
-                    made.push((slot, byte_offset));
+                dead_cursor == entry.dead_slots.len()
+            });
+            if let Some(&FreshTableEntry { first, .. }) = same {
+                let Some(byte_offset) = offset_for(first) else {
+                    self.table_failed = true;
                     continue;
+                };
+                for alias in &table_aliases {
+                    if !entries.iter().any(|u| {
+                        u.kind != ResourceType::Cbv
+                            && u.table_offset_dwords / step_dwords == alias.entry
+                    }) {
+                        let _ = host.refresh_slot(first + (alias.entry - start_slot), list);
+                    }
                 }
+                for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
+                    let dyn_index = first + (u.table_offset_dwords / step_dwords - start_slot);
+                    if !host.refresh_slot(dyn_index, list) {
+                        let handle = table + u64::from(u.table_offset_dwords) * 4;
+                        if let Some(view) = crate::descriptor::view(handle) {
+                            self.depth_sampled |= readable(list, u, &view, read_only_depth);
+                        }
+                    }
+                }
+                made.push((slot, byte_offset));
+                continue;
             }
             let Some(first) = host.dynamic(n) else {
                 // Without its fresh table the shader would read the title's
@@ -1852,11 +1967,11 @@ impl State {
                 }
                 match view {
                     Some(View::Constant(address, size)) if address != 0 => {
-                        let Some((gpu, to)) = list.scratch(u64::from(size)) else {
+                        let Some(gpu) = list.fill_scratch(address as *const u8, u64::from(size))
+                        else {
                             complete = false;
                             break;
                         };
-                        list.defer_fill(to, address as *const u8, size as usize);
                         host.constant_at(index, gpu, size);
                     }
                     Some(view) => {
@@ -1905,19 +2020,33 @@ impl State {
                     }
                 }
             }
+            let records_at = self.fresh_records.len();
+            self.fresh_records.extend_from_slice(&self.table_raws);
+            let saved_aliases = table_aliases
+                .iter()
+                .map(|a| (a.entry - start_slot, a.stride))
+                .collect();
+            let saved_strides = table_strides
+                .iter()
+                .map(|(b, s)| (b.offset_dwords / step_dwords - start_slot, b.uav, *s))
+                .collect();
             self.fresh_tables.insert(
                 key,
                 FreshTableEntry {
-                    table,
-                    start_slot,
+                    heap: heap_ptr,
+                    copy_gen,
+                    slots: n,
+                    records_at,
                     first,
                     dead_slots,
+                    aliases: saved_aliases,
+                    strides: saved_strides,
                 },
             );
             self.dynamic.push((heap_ptr, first, n));
             made.push((slot, byte_offset));
         }
-        made
+        self.made = made;
     }
 
     /// The first draws, at debug level: what they bind and read
@@ -2738,18 +2867,18 @@ mod tests {
     fn bounded_root_slots_belong_to_the_recording_that_allocated_them() {
         let mut state = super::State::default();
         let heap = 1;
+        state.fresh_records.push([0; 3]);
         state.fresh_tables.insert(
-            super::FreshTableKey {
+            11,
+            super::FreshTableEntry {
                 heap,
                 copy_gen: 0,
                 slots: 1,
-                records_hash: 11,
-            },
-            super::FreshTableEntry {
-                table: 10,
-                start_slot: 0,
+                records_at: 0,
                 first: 4,
                 dead_slots: Vec::new(),
+                aliases: Vec::new(),
+                strides: Vec::new(),
             },
         );
         state
@@ -2768,8 +2897,71 @@ mod tests {
             [(heap, 4, 1), (heap, 5, 1), (heap, 6, 1)]
         );
         assert!(state.fresh_tables.is_empty());
+        assert!(state.fresh_records.is_empty());
         assert!(state.root_view_slots.is_empty());
         assert!(state.take_dynamic().is_empty());
+    }
+
+    #[test]
+    fn slots_bitset_iterates_in_ascending_order_across_all_words() {
+        let mut slots = super::Slots::default();
+        for s in [255u8, 64, 0, 129, 63, 64, 192] {
+            slots.insert(s);
+        }
+        assert!(slots.contains(0));
+        assert!(slots.contains(63));
+        assert!(slots.contains(64));
+        assert!(slots.contains(129));
+        assert!(slots.contains(192));
+        assert!(slots.contains(255));
+        assert!(!slots.contains(1));
+        assert!(!slots.contains(128));
+        assert_eq!(
+            slots.iter().collect::<Vec<_>>(),
+            vec![0, 63, 64, 129, 192, 255]
+        );
+    }
+
+    #[test]
+    fn table_hash_and_record_compare_detect_record_and_override_changes() {
+        #[repr(C, align(32))]
+        struct RawTable([[u32; 8]; 2]);
+
+        let mut raw = RawTable([[0; 8]; 2]);
+        raw.0[0][0..3].copy_from_slice(&[0x1111_2222, 0x3333_4444, 0x5555_6666]);
+        raw.0[1][0..3].copy_from_slice(&[0x7777_8888, 0x9999_aaaa, 0xbbbb_cccc]);
+        let table = std::ptr::from_ref(&raw) as u64;
+
+        let r0 = super::record(table, 0);
+        let r1 = super::record(table, 1);
+        assert_eq!(r0, [0x1111_2222, 0x3333_4444, 0x5555_6666]);
+        assert_eq!(r1, [0x7777_8888, 0x9999_aaaa, 0xbbbb_cccc]);
+
+        let raws = [r0, r1];
+        let alive = [false, false];
+        let dead = [false, true];
+        let alias = [super::StructuredBinding {
+            slot: 1,
+            entry: 1,
+            stride: 64,
+        }];
+        let h_plain = super::table_hash(0x1000, 0, &raws, &alive, 0, 8, &[], &[]);
+        let h_dead = super::table_hash(0x1000, 0, &raws, &dead, 0, 8, &[], &[]);
+        let h_alias = super::table_hash(0x1000, 0, &raws, &alive, 0, 8, &alias, &[]);
+        let h_gen = super::table_hash(0x1000, 1, &raws, &alive, 0, 8, &[], &[]);
+        assert_ne!(h_plain, h_dead);
+        assert_ne!(h_plain, h_alias);
+        assert_ne!(h_plain, h_gen);
+
+        // Mutating an entry word changes both the exact record and the quick hash.
+        raw.0[1][2] ^= 1;
+        let table = std::ptr::from_ref(&raw) as u64;
+        let raws_mut = [super::record(table, 0), super::record(table, 1)];
+        assert_ne!(raws_mut[1], r1);
+        assert_ne!(
+            super::table_hash(0x1000, 0, &raws_mut, &alive, 0, 8, &[], &[]),
+            h_plain
+        );
     }
 
     #[test]
@@ -3122,18 +3314,18 @@ mod depth_tests {
         state.host_roots = [0x11, 0x22];
         state.host_heaps = [0x33, 0x44];
         state.host_heap_ids = [0x55, 0x66];
+        state.fresh_records.push([0; 3]);
         state.fresh_tables.insert(
-            FreshTableKey {
+            0xbeef,
+            FreshTableEntry {
                 heap: 0xdead,
                 copy_gen: 0,
                 slots: 1,
-                records_hash: 0xbeef,
-            },
-            FreshTableEntry {
-                table: 0,
-                start_slot: 0,
+                records_at: 0,
                 first: 1,
                 dead_slots: Vec::new(),
+                aliases: Vec::new(),
+                strides: Vec::new(),
             },
         );
         state

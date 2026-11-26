@@ -1467,10 +1467,19 @@ struct Deferred {
     /// descriptor heaps): the title may release its objects before it
     /// submits the list.
     kept: Vec<windows::core::IUnknown>,
+    /// The host pipelines [`HostList::bind_pipeline`] kept (by address), so a
+    /// pipeline the list binds again is not kept or queried again.
+    bound: std::collections::HashSet<usize>,
     /// Buffer ranges refreshed since the last title copy (host copy,
-    /// address, bytes), and upload fills made since (destination, source,
-    /// bytes): doing them again would find the same bytes.
+    /// address, bytes): refreshing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
+    /// Upload memory filled from title memory since the last title write
+    /// (source, bytes): its host address, which a second fill would find
+    /// holding the same bytes.
+    filled: std::collections::HashMap<(usize, usize), u64>,
+    /// Buffer ranges declared written by shaders since the last title copy
+    /// (host copy, address, bytes): declaring them again would change nothing.
+    gpu_written: std::collections::HashSet<(usize, usize, usize)>,
     /// Most detailed mip this list has copied for each texture.
     textures: std::collections::HashMap<usize, u32>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
@@ -1733,39 +1742,7 @@ impl Host {
         }
         batch.flush();
         drop(watch_guard);
-        let mut non_rebar_writes = Vec::new();
-        let mut rebar_entries: Vec<RebarWriteEntry> = Vec::new();
-        for (shadow, address, len) in batch.gpu_writes {
-            if shadow.is_rebar() {
-                let (from, to) = shadow.inside(address, len);
-                match rebar_entries
-                    .iter_mut()
-                    .find(|p| std::sync::Arc::ptr_eq(&p.shadow, &shadow))
-                {
-                    Some(entry) => {
-                        if from < to {
-                            entry.declared_spans.push((from, to));
-                        }
-                    }
-                    None => {
-                        let declared_spans = if from < to {
-                            vec![(from, to)]
-                        } else {
-                            Vec::new()
-                        };
-                        rebar_entries.push(RebarWriteEntry {
-                            shadow,
-                            declared_spans,
-                            piece_runs: Vec::new(),
-                            compare_out_base: None,
-                            compare_pieces: 0,
-                        });
-                    }
-                }
-            } else {
-                non_rebar_writes.push((shadow, address, len));
-            }
-        }
+        let (mut rebar_entries, non_rebar_writes) = collect_declared_writes(batch.gpu_writes);
         for entry in &mut rebar_entries {
             entry.declared_spans = merge_ranges(std::mem::take(&mut entry.declared_spans));
             entry.piece_runs = spans_to_piece_runs(&entry.declared_spans);
@@ -3026,11 +3003,34 @@ impl HostList {
     }
 
     /// Notes a pipeline the list binds.
+    #[cfg(test)]
     pub(crate) fn used_pipeline(&self, name: &str) {
         self.mark_work();
         let mut pipelines = self.pipelines.lock().unwrap_or_else(|e| e.into_inner());
         if !pipelines.contains(name) {
             pipelines.insert(name.to_owned());
+        }
+    }
+
+    /// Notes a pipeline the list binds and keeps it and its root signature
+    /// until the list is reset, the first time only: the list keeps the
+    /// first, so its address names the same pipeline from then on.
+    pub(crate) fn bind_pipeline(&self, p: &crate::pipeline::host::HostPipeline) {
+        self.mark_work();
+        let first = {
+            let mut deferred = self.deferred();
+            let first = deferred.bound.insert(p.pso.as_raw() as usize);
+            if first {
+                deferred.kept.push(p.pso.clone().into());
+                deferred.kept.push(p.root.clone().into());
+            }
+            first
+        };
+        if first {
+            let mut pipelines = self.pipelines.lock().unwrap_or_else(|e| e.into_inner());
+            if !pipelines.contains(p.name.as_str()) {
+                pipelines.insert(p.name.clone());
+            }
         }
     }
 
@@ -3052,6 +3052,8 @@ impl HostList {
             .copies
             .push(Step::Copy(dst as usize, src as usize, len));
         deferred.refreshed.clear();
+        deferred.filled.clear();
+        deferred.gpu_written.clear();
         deferred.copy_gen += 1;
     }
 
@@ -3076,6 +3078,20 @@ impl HostList {
             .push(Step::Fill(dst as usize, src as usize, len));
     }
 
+    /// The host GPU address of `len` bytes of upload memory holding the title
+    /// memory at `src` as of the list's submission: one copy for every ask
+    /// until a title copy or deferred run intervenes.
+    pub(crate) fn fill_scratch(&self, src: *const u8, len: u64) -> Option<u64> {
+        let key = (src as usize, len as usize);
+        if let Some(&gpu) = self.deferred().filled.get(&key) {
+            return Some(gpu);
+        }
+        let (gpu, to) = self.scratch(len)?;
+        self.defer_fill(to, src, len as usize);
+        self.deferred().filled.insert(key, gpu);
+        Some(gpu)
+    }
+
     /// Brings `[address, address + len)` of a buffer's host copy up to date
     /// when the list is submitted (once per range until a title copy
     /// intervenes), keeping the copy alive until the list is reset.
@@ -3096,7 +3112,8 @@ impl HostList {
     }
 
     /// Shaders of the list write `[address, address + len)` of a buffer's
-    /// host copy: copied back into title memory once the list has run.
+    /// host copy: copied back into title memory once the list has run
+    /// (deduplicated per exact range until a title copy or run intervenes).
     pub(crate) fn defer_gpu_write(
         &self,
         shadow: &std::sync::Arc<crate::shadow::Shadow>,
@@ -3104,9 +3121,13 @@ impl HostList {
         len: usize,
     ) {
         self.mark_work();
-        self.deferred()
-            .copies
-            .push(Step::GpuWrite(shadow.clone(), address, len));
+        let mut deferred = self.deferred();
+        let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
+        if deferred.gpu_written.insert(key) {
+            deferred
+                .copies
+                .push(Step::GpuWrite(shadow.clone(), address, len));
+        }
     }
 
     /// Stores `what` (`bytes` of it) at `dst` once the list has run.
@@ -3142,8 +3163,7 @@ impl HostList {
 
     /// A mapped upload buffer of `size` bytes, alive until the list is
     /// reset.
-    ///
-    /// shortcut: one buffer per copy; pool them once uploads are frequent.
+    #[cfg(test)]
     pub(crate) fn upload(&self, host: &Host, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         let (buffer, data) = host.upload_buffer(size)?;
         self.mark_work();
@@ -3162,9 +3182,28 @@ impl HostList {
         Some((buffer, data))
     }
 
+    /// `size` bytes of mapped upload memory, 512-byte aligned for a placed
+    /// footprint, alive until the list is reset: the buffer, the offset in
+    /// it and the CPU pointer.
+    pub(crate) fn upload_scratch(&self, size: u64) -> Option<(ID3D12Resource, u64, *mut u8)> {
+        self.scratch_in(size, 512, |buffer, at, _, data| (buffer.clone(), at, data))
+    }
+
     /// `len` bytes of upload memory (256-byte aligned) until the list is
     /// reset: the host GPU address and the CPU pointer.
     pub(crate) fn scratch(&self, len: u64) -> Option<(u64, *mut u8)> {
+        self.scratch_in(len, 256, |_, _, gpu, data| (gpu, data))
+    }
+
+    /// `len` bytes of upload memory at a multiple of `align` until the list
+    /// is reset, handed to `f` with the buffer, the offset in it, the host GPU
+    /// address and the CPU pointer.
+    fn scratch_in<R>(
+        &self,
+        len: u64,
+        align: u64,
+        f: impl FnOnce(&ID3D12Resource, u64, u64, *mut u8) -> R,
+    ) -> Option<R> {
         let host = host()?;
         let len = len.max(1).next_multiple_of(256);
         if len > SCRATCH_CHUNK {
@@ -3172,12 +3211,13 @@ impl HostList {
             name(&buffer, || format!("list scratch {len:#x}"));
             // SAFETY: a live buffer.
             let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+            let made = f(&buffer, 0, gpu, data);
             self.mark_work();
             self.deferred().uploads.push(buffer);
-            return Some((gpu, data));
+            return Some(made);
         }
         let mut s = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
-        if s.used + len > SCRATCH_CHUNK && s.current < s.chunks.len() {
+        while s.current < s.chunks.len() && s.used.next_multiple_of(align) + len > SCRATCH_CHUNK {
             (s.current, s.used) = (s.current + 1, 0);
         }
         if s.current == s.chunks.len() {
@@ -3188,12 +3228,13 @@ impl HostList {
             s.chunks.push((buffer, data as usize, gpu));
             s.used = 0;
         }
-        let (_, data, gpu) = s.chunks[s.current];
-        let at = s.used;
-        s.used += len;
+        let (ref buffer, data, gpu) = s.chunks[s.current];
+        let at = s.used.next_multiple_of(align);
+        let made = f(buffer, at, gpu + at, (data + at as usize) as *mut u8);
+        s.used = at + len;
         drop(s);
         self.mark_work();
-        Some((gpu + at, (data + at as usize) as *mut u8))
+        Some(made)
     }
 
     /// The host address of the list's indirect-work budget, zeroed at each
@@ -3359,6 +3400,8 @@ impl HostList {
         let mut deferred = self.deferred();
         deferred.copies.push(Step::Run(Box::new(work)));
         deferred.refreshed.clear();
+        deferred.filled.clear();
+        deferred.gpu_written.clear();
         deferred.copy_gen += 1;
     }
 
@@ -3792,7 +3835,7 @@ pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
 
 /// Calls `f` with the pieces of `[start, start + len)` cut at multiples of
 /// `step`.
-fn for_pieces(start: usize, len: usize, step: usize, mut f: impl FnMut(usize, usize)) {
+pub(crate) fn for_pieces(start: usize, len: usize, step: usize, mut f: impl FnMut(usize, usize)) {
     let end = start + len;
     let mut at = start;
     while at < end {
@@ -4302,6 +4345,43 @@ struct RebarWriteEntry {
     /// for this entry; `None` falls back to reading back all `declared_spans`.
     compare_out_base: Option<usize>,
     compare_pieces: usize,
+}
+
+type DeclaredWrite = (std::sync::Arc<crate::shadow::Shadow>, usize, usize);
+
+/// Groups unique declared GPU writes into O(R) per-shadow ReBAR entries and
+/// non-ReBAR writes in recording order.
+fn collect_declared_writes(
+    writes: Vec<DeclaredWrite>,
+) -> (Vec<RebarWriteEntry>, Vec<DeclaredWrite>) {
+    let mut rebar_entries: Vec<RebarWriteEntry> = Vec::new();
+    let mut by_shadow: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    let mut seen_rebar: std::collections::HashSet<(usize, usize, usize)> =
+        std::collections::HashSet::new();
+    let mut non_rebar_writes = Vec::new();
+    for (shadow, address, len) in writes {
+        if shadow.is_rebar() {
+            let ptr = std::sync::Arc::as_ptr(&shadow) as usize;
+            let (from, to) = shadow.inside(address, len);
+            let idx = *by_shadow.entry(ptr).or_insert_with(|| {
+                let i = rebar_entries.len();
+                rebar_entries.push(RebarWriteEntry {
+                    shadow,
+                    declared_spans: Vec::new(),
+                    piece_runs: Vec::new(),
+                    compare_out_base: None,
+                    compare_pieces: 0,
+                });
+                i
+            });
+            if from < to && seen_rebar.insert((ptr, from, to)) {
+                rebar_entries[idx].declared_spans.push((from, to));
+            }
+        } else {
+            non_rebar_writes.push((shadow, address, len));
+        }
+    }
+    (rebar_entries, non_rebar_writes)
 }
 
 /// Optional pre-submission rehash and post-submission hash-compare command
@@ -5176,6 +5256,17 @@ impl Meter {
                     } else {
                         "all of title memory"
                     }
+                );
+            }
+            let [through, left, filled, short] = [0, 1, 2, 3]
+                .map(|i| crate::texture::UNLOCKED[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            if through + left + filled > 0.0 {
+                tracing::info!(
+                    "texture refreshes during active remaps, per frame: \
+                     {through:.1} read through the kernel, {left:.1} left for the next refresh \
+                     (a page was not there), {filled:.1} first fillings from the pages there \
+                     (VICTORY_TEXTURE_FILL=0: left empty), {short:.1} of them with less than was \
+                     mapped (looked at again)"
                 );
             }
             #[cfg(feature = "diagnostics")]
@@ -6664,6 +6755,154 @@ mod tests {
 
         list.close();
         host.execute(&[&list]);
+        assert_eq!(host.d3d12_errors(), errors_before);
+    }
+
+    #[test]
+    fn upload_scratch_aligns_placements_and_falls_back_when_oversized() {
+        let _retire = isolated_retire_scope();
+        let Some(host) = host() else {
+            return;
+        };
+        let list = host.new_list().expect("host list");
+        let errors_before = host.d3d12_errors();
+
+        // First 256-byte scratch leaves `used = 256`, which is not 512-byte aligned.
+        let (gpu0, _) = list.scratch(256).expect("initial scratch");
+        assert_eq!(gpu0 % 256, 0);
+
+        let (buf1, at1, ptr1) = list
+            .upload_scratch(128)
+            .expect("aligned sub-allocated upload");
+        assert_eq!(
+            at1, 512,
+            "texture placement offset must round up to 512 bytes"
+        );
+        assert_eq!(at1 % 512, 0);
+        assert!(!ptr1.is_null());
+        assert_eq!(
+            list.deferred().uploads.len(),
+            0,
+            "sub-allocated staging must not allocate a dedicated upload buffer"
+        );
+        // SAFETY: `buf1` is a live resource and `ptr1` points to 256+ writable bytes.
+        unsafe {
+            assert_eq!(buf1.GetGPUVirtualAddress() + at1, gpu0 + at1);
+            ptr1.write_bytes(0x5a, 128);
+        }
+
+        // Oversized copy falls back to a dedicated upload buffer at offset 0.
+        let (buf_big, at_big, ptr_big) = list
+            .upload_scratch(SCRATCH_CHUNK + 512)
+            .expect("oversized fallback upload");
+        assert_eq!(at_big, 0);
+        assert!(!ptr_big.is_null());
+        assert_ne!(buf_big.as_raw(), buf1.as_raw());
+        assert_eq!(list.deferred().uploads.len(), 1);
+        // SAFETY: `ptr_big` is mapped for at least `SCRATCH_CHUNK + 512` bytes.
+        unsafe { ptr_big.write_bytes(0x3c, 16) };
+
+        list.close();
+        host.execute(&[&list]);
+        assert_eq!(host.d3d12_errors(), errors_before);
+    }
+
+    #[test]
+    fn fill_scratch_deduplicates_until_copy_or_defer_run() {
+        let _retire = isolated_retire_scope();
+        let Some(host) = host() else {
+            return;
+        };
+        let list = host.new_list().expect("host list");
+        let errors_before = host.d3d12_errors();
+        let mut src = [0x11u8; 64];
+        let mut dst = [0u8; 64];
+
+        let gpu1 = list.fill_scratch(src.as_ptr(), 64).expect("first fill");
+        let gpu2 = list.fill_scratch(src.as_ptr(), 64).expect("dedup fill");
+        assert_eq!(gpu1, gpu2);
+        assert_eq!(
+            list.deferred()
+                .copies
+                .iter()
+                .filter(|s| matches!(s, Step::Fill(..)))
+                .count(),
+            1
+        );
+
+        // Intervening title copy invalidates `filled` cache.
+        list.defer_copy(dst.as_mut_ptr(), src.as_ptr(), 4);
+        let gpu3 = list.fill_scratch(src.as_ptr(), 64).expect("post-copy fill");
+        assert_ne!(gpu3, gpu1);
+
+        // Intervening deferred run also invalidates `filled` cache.
+        list.defer(|| {});
+        src[0] = 0x22;
+        let gpu4 = list.fill_scratch(src.as_ptr(), 64).expect("post-run fill");
+        assert_ne!(gpu4, gpu3);
+
+        list.close();
+        host.execute(&[&list]);
+        assert_eq!(host.d3d12_errors(), errors_before);
+    }
+
+    #[test]
+    fn defer_gpu_write_deduplicates_and_clears_on_copy() {
+        let _retire = isolated_retire_scope();
+        let Some(host) = host() else {
+            return;
+        };
+        let list = host.new_list().expect("host list");
+        let errors_before = host.d3d12_errors();
+        let mut backing = vec![0u8; 4096];
+        let start = backing.as_mut_ptr() as u64;
+        let addr = start as usize;
+        crate::shadow::register(addr, start, backing.len() as u64);
+        let shadow = crate::shadow::find(start, backing.len() as u64).expect("registered shadow");
+
+        list.defer_gpu_write(&shadow, addr, 256);
+        list.defer_gpu_write(&shadow, addr, 256);
+        list.defer_gpu_write(&shadow, addr + 256, 256);
+
+        let gpu_write_count = list
+            .deferred()
+            .copies
+            .iter()
+            .filter(|s| matches!(s, Step::GpuWrite(..)))
+            .count();
+        assert_eq!(gpu_write_count, 2);
+
+        let (rebar, non_rebar) = collect_declared_writes(vec![
+            (shadow.clone(), addr, 256),
+            (shadow.clone(), addr, 256),
+            (shadow.clone(), addr + 256, 256),
+        ]);
+        if shadow.is_rebar() {
+            assert_eq!(rebar.len(), 1);
+            assert_eq!(rebar[0].declared_spans.len(), 2);
+            assert!(non_rebar.is_empty());
+        } else {
+            assert!(rebar.is_empty());
+            assert_eq!(non_rebar.len(), 3);
+        }
+
+        let mut dst = [0u8; 16];
+        list.defer_copy(dst.as_mut_ptr(), backing.as_ptr(), 16);
+        list.defer_gpu_write(&shadow, addr, 256);
+        let gpu_write_count_after = list
+            .deferred()
+            .copies
+            .iter()
+            .filter(|s| matches!(s, Step::GpuWrite(..)))
+            .count();
+        assert_eq!(gpu_write_count_after, 3);
+
+        list.close();
+        list.reset();
+        drop(rebar);
+        drop(non_rebar);
+        drop(shadow);
+        crate::shadow::unregister(addr, start);
         assert_eq!(host.d3d12_errors(), errors_before);
     }
 

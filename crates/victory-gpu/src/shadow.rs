@@ -1017,7 +1017,7 @@ static BUFFERS: RwLock<BTreeMap<(u64, usize), Entry>> = RwLock::new(BTreeMap::ne
 
 /// A title buffer exists at `start` (`len` bytes).
 pub(crate) fn register(resource: usize, start: u64, len: u64) {
-    BUFFERS.write().unwrap_or_else(|e| e.into_inner()).insert(
+    let before = BUFFERS.write().unwrap_or_else(|e| e.into_inner()).insert(
         (start, resource),
         Entry {
             // A size from the title's description: one past the address
@@ -1026,6 +1026,12 @@ pub(crate) fn register(resource: usize, start: u64, len: u64) {
             shadow: None,
         },
     );
+    // A buffer made again at the same place and address: its old copy may
+    // still be named by lists and descriptors, as one the title released.
+    if let Some(shadow) = before.and_then(|e| e.shadow) {
+        let born = shadow.born_seq;
+        crate::host::retire_born(shadow, born);
+    }
 }
 
 /// The title released it; lists that still hold its copy keep it alive,
@@ -2290,5 +2296,45 @@ mod tests {
             assert_eq!(guard.total_bytes, budget);
             assert!(guard.entries.contains_key(&(win(1), WINDOW)));
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn reregistering_a_title_buffer_retires_its_old_shadow_by_epoch() {
+        let Some(h) = host() else {
+            return;
+        };
+        const LEN: u64 = 2 << 20;
+        let resource = 0xdead_beef_0004usize;
+        let start = 0x79f0_0000_0000u64;
+
+        register(resource, start, LEN);
+        let first = find(start, 1).expect("shadow created for registered buffer");
+        assert_eq!(first.left(start + 0x10_0000), LEN - 0x10_0000);
+        let weak = Arc::downgrade(&first);
+        let born = first.born_seq;
+        drop(first);
+
+        let list = h.new_list().expect("host list");
+        list.mark_work();
+        assert!(list.has_epoch());
+
+        // Re-register at the exact same address and resource while `list` holds an epoch.
+        register(resource, start, LEN);
+        assert_eq!(
+            weak.strong_count(),
+            1,
+            "replaced Shadow (born_seq={born}) must be retired, not dropped while an active list epoch may name it"
+        );
+
+        list.close();
+        list.reset();
+        assert_eq!(
+            weak.strong_count(),
+            0,
+            "retired Shadow must drop once its blocking epoch finishes"
+        );
+
+        unregister(resource, start);
     }
 }
