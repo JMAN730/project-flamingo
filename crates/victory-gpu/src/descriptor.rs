@@ -275,6 +275,10 @@ const SHADER_VISIBLE: u32 = 1;
 
 /// Shader-visible heaps by address range, for mirroring descriptor writes:
 /// start, end, heap.
+///
+/// Read by every lookup, sync, and release, written only when a heap is made
+/// or dropped. Readers do not block each other while concurrent recording
+/// threads resolve descriptor handles or sync heaps.
 #[cfg(windows)]
 static SHADER_HEAPS: std::sync::RwLock<Vec<(u64, u64, usize)>> = std::sync::RwLock::new(Vec::new());
 

@@ -4069,6 +4069,8 @@ pub(crate) fn register(resource: usize, start: u64, len: u64) {
             shadow: None,
         },
     );
+    // A buffer made again at the same place and address: its old copy may
+    // still be named by lists and descriptors, as one the title released.
     if let Some(shadow) = before.and_then(|e| e.shadow) {
         if crate::lazy_back::active() {
             crate::lazy_back::materialize_shadow(Arc::as_ptr(&shadow) as usize);
@@ -5906,6 +5908,48 @@ mod tests {
             assert_eq!(guard.total_bytes, budget);
             assert!(guard.entries.contains_key(&(win(1), WINDOW)));
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn reregistering_a_title_buffer_retires_its_old_shadow_by_epoch() {
+        let _rebar = lock_rebar_gpu_test();
+        let _retire = crate::host::isolated_retire_scope();
+        let Some(h) = host() else {
+            return;
+        };
+        const LEN: u64 = 2 << 20;
+        let resource = 0xdead_beef_0004usize;
+        let start = 0x79f0_0000_0000u64;
+
+        register(resource, start, LEN);
+        let first = find(start, 1).expect("shadow created for registered buffer");
+        assert_eq!(first.left(start + 0x10_0000), LEN - 0x10_0000);
+        let weak = Arc::downgrade(&first);
+        let born = first.born_seq;
+        drop(first);
+
+        let list = h.new_list().expect("host list");
+        list.mark_work();
+        assert!(list.has_epoch());
+
+        // Re-register at the exact same address and resource while `list` holds an epoch.
+        register(resource, start, LEN);
+        assert_eq!(
+            weak.strong_count(),
+            1,
+            "replaced Shadow (born_seq={born}) must be retired, not dropped while an active list epoch may name it"
+        );
+
+        list.close();
+        list.reset();
+        assert_eq!(
+            weak.strong_count(),
+            0,
+            "retired Shadow must drop once its blocking epoch finishes"
+        );
+
+        unregister(resource, start);
     }
 
     #[test]

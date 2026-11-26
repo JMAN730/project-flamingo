@@ -4526,6 +4526,17 @@ enum Held<G> {
 pub(crate) static REMAPS: [std::sync::atomic::AtomicU64; 3] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
+/// Monotonic counter bumped whenever a title-memory mapping change starts or
+/// finishes (`title_memory_remapping`, `Remapping::drop`,
+/// `title_memory_remapped`, `title_memory_alias_rebound`), so unlocked texture
+/// reads can detect concurrent mapping churn.
+static REMAP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Current monotonic mapping-change sequence number.
+pub(crate) fn remap_seq() -> u64 {
+    REMAP_SEQ.load(Ordering::Acquire)
+}
+
 /// What the runtime holds while it changes what title memory shows
 /// ([`title_memory_remapping`]).
 pub struct Remapping {
@@ -4535,6 +4546,7 @@ pub struct Remapping {
 
 impl Drop for Remapping {
     fn drop(&mut self) {
+        REMAP_SEQ.fetch_add(1, Ordering::SeqCst);
         REMAPS[2].fetch_add(
             self.since.elapsed().as_micros() as u64,
             std::sync::atomic::Ordering::Relaxed,
@@ -4569,6 +4581,7 @@ pub fn title_memory_remapping(at: usize, len: usize) -> Remapping {
     } else {
         Held::All(MAPPING.write().unwrap_or_else(|e| e.into_inner()))
     };
+    REMAP_SEQ.fetch_add(1, Ordering::SeqCst);
     REMAPS[0].fetch_add(1, Relaxed);
     REMAPS[1].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
     Remapping {
@@ -4618,7 +4631,6 @@ pub fn title_memory_reading_now(at: usize, len: usize) -> Option<Reading> {
 /// Returns when the change of a mapping overlapping `[at, at + len)` that is
 /// under way, if one is, is over (or has been going on for 2 ms): pages it
 /// took away for its moment are back. Another may have begun.
-#[allow(dead_code)]
 pub(crate) fn change_over(at: usize, len: usize) {
     if !by_range() {
         if !matches!(MAPPING.try_read(), Err(std::sync::TryLockError::WouldBlock)) {
@@ -4661,6 +4673,7 @@ pub(crate) fn change_over(at: usize, len: usize) {
 /// unmapped).
 pub fn title_memory_remapped(at: usize, len: usize) {
     use windows_sys::Win32::System::Memory::PAGE_READWRITE;
+    REMAP_SEQ.fetch_add(1, Ordering::SeqCst);
     crate::lazy_back::discard_range(at, len);
     crate::texback::remapped(at, len);
     // The views the runtime told us of there are no longer what it shows.
@@ -4779,6 +4792,7 @@ pub fn title_memory_alias_rebound(at: usize, len: usize) {
         return;
     }
     crate::lazy_back::materialize_range(at, len);
+    REMAP_SEQ.fetch_add(1, Ordering::SeqCst);
     wrote(at, len);
     let lazy = crate::lazy_back::active();
     let rest = rest();

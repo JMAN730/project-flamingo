@@ -171,7 +171,7 @@ impl Batch {
                     }
                     Step::GpuWrite(shadow, ..) => Touch::Write(Arc::as_ptr(shadow) as usize),
                     Step::Copy(..) | Step::Run(_) => Touch::Title,
-                    Step::Fill(..) | Step::Host(_) | Step::HostRead(..) | Step::Texture(_) => {
+                    Step::Fill(..) | Step::Host(_) | Step::HostRead(..) | Step::Texture(..) => {
                         Touch::Nothing
                     }
                 };

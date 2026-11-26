@@ -1346,7 +1346,7 @@ enum Step {
     GpuWrite(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
     /// Brings a texture's staging buffer up to date: once per submission,
     /// whichever lists sample it, until a `Copy` or `Run` intervenes.
-    Texture(std::sync::Arc<crate::texture::Staging>),
+    Texture(std::sync::Arc<crate::texture::Staging>, u64),
 }
 
 /// A texture-to-buffer readback copied from a mapped readback buffer into
@@ -1380,10 +1380,19 @@ struct Deferred {
     /// descriptor heaps): the title may release its objects before it
     /// submits the list.
     kept: Vec<windows::core::IUnknown>,
+    /// The host pipelines [`HostList::bind_pipeline`] kept (by address), so a
+    /// pipeline the list binds again is not kept or queried again.
+    bound: std::collections::HashSet<usize>,
     /// Buffer ranges refreshed since the last title copy (host copy,
-    /// address, bytes), and upload fills made since (destination, source,
-    /// bytes): doing them again would find the same bytes.
+    /// address, bytes): refreshing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
+    /// Upload memory filled from title memory since the last title write
+    /// (source, bytes): its host address, which a second fill would find
+    /// holding the same bytes.
+    filled: std::collections::HashMap<(usize, usize), u64>,
+    /// Buffer ranges declared written by shaders since the last title copy
+    /// (host copy, address, bytes): declaring them again would change nothing.
+    gpu_written: std::collections::HashSet<(usize, usize, usize)>,
     /// Most detailed mip this list has copied for each texture.
     textures: std::collections::HashMap<usize, u32>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
@@ -1711,57 +1720,8 @@ impl Host {
                 last_notes(runs)
             ));
         }
-
-        let mut back: Vec<relay::Declared> = Vec::new();
-        let mut non_rebar_writes = Vec::new();
-        let mut rebar_entries: Vec<RebarWriteEntry> = Vec::new();
-        for (shadow, address, len) in batch.gpu_writes {
-            let end = address.saturating_add(len);
-            if address < end {
-                match back
-                    .iter_mut()
-                    .find(|(s, _)| std::sync::Arc::ptr_eq(s, &shadow))
-                {
-                    Some((_, ranges)) => {
-                        if !ranges.contains(&(address, end)) {
-                            ranges.push((address, end));
-                        }
-                    }
-                    None => back.push((shadow.clone(), vec![(address, end)])),
-                }
-            }
-            if !late {
-                if shadow.is_rebar() {
-                    let (from, to) = shadow.inside(address, len);
-                    match rebar_entries
-                        .iter_mut()
-                        .find(|p| std::sync::Arc::ptr_eq(&p.shadow, &shadow))
-                    {
-                        Some(entry) => {
-                            if from < to {
-                                entry.declared_spans.push((from, to));
-                            }
-                        }
-                        None => {
-                            let declared_spans = if from < to {
-                                vec![(from, to)]
-                            } else {
-                                Vec::new()
-                            };
-                            rebar_entries.push(RebarWriteEntry {
-                                shadow,
-                                declared_spans,
-                                piece_runs: Vec::new(),
-                                compare_out_base: None,
-                                compare_pieces: 0,
-                            });
-                        }
-                    }
-                } else if !shadow.carded() {
-                    non_rebar_writes.push((shadow, address, len));
-                }
-            }
-        }
+        let (back, mut rebar_entries, non_rebar_writes) =
+            collect_declared_writes(batch.gpu_writes, late);
         let card_declared: Vec<relay::Declared> = if crate::shadow::cards() {
             back.iter()
                 .filter(|(s, _)| s.carded())
@@ -1777,7 +1737,6 @@ impl Host {
             settled += settling.elapsed();
         }
         let card = self.card_before(card_declared, flown);
-
         for entry in &mut rebar_entries {
             entry.declared_spans = merge_ranges(std::mem::take(&mut entry.declared_spans));
             entry.piece_runs = spans_to_piece_runs(&entry.declared_spans);
@@ -2101,7 +2060,7 @@ fn collect_ask_once_ranges(runs: &[&HostList]) -> Vec<(usize, usize)> {
                 Step::Refresh(_, address, len) if *len > 0 => {
                     watch_ranges.push((*address, address.saturating_add(*len)));
                 }
-                Step::Texture(staging) => {
+                Step::Texture(staging, _) => {
                     let (start, end) = staging.memory_range();
                     if start < end {
                         watch_ranges.push((start, end));
@@ -3263,11 +3222,34 @@ impl HostList {
     }
 
     /// Notes a pipeline the list binds.
+    #[cfg(test)]
     pub(crate) fn used_pipeline(&self, name: &str) {
         self.mark_work();
         let mut pipelines = self.pipelines.lock().unwrap_or_else(|e| e.into_inner());
         if !pipelines.contains(name) {
             pipelines.insert(name.to_owned());
+        }
+    }
+
+    /// Notes a pipeline the list binds and keeps it and its root signature
+    /// until the list is reset, the first time only: the list keeps the
+    /// first, so its address names the same pipeline from then on.
+    pub(crate) fn bind_pipeline(&self, p: &crate::pipeline::host::HostPipeline) {
+        self.mark_work();
+        let first = {
+            let mut deferred = self.deferred();
+            let first = deferred.bound.insert(p.pso.as_raw() as usize);
+            if first {
+                deferred.kept.push(p.pso.clone().into());
+                deferred.kept.push(p.root.clone().into());
+            }
+            first
+        };
+        if first {
+            let mut pipelines = self.pipelines.lock().unwrap_or_else(|e| e.into_inner());
+            if !pipelines.contains(p.name.as_str()) {
+                pipelines.insert(p.name.clone());
+            }
         }
     }
 
@@ -3289,6 +3271,8 @@ impl HostList {
             .copies
             .push(Step::Copy(dst as usize, src as usize, len));
         deferred.refreshed.clear();
+        deferred.filled.clear();
+        deferred.gpu_written.clear();
         deferred.copy_gen += 1;
     }
 
@@ -3311,6 +3295,20 @@ impl HostList {
         self.deferred()
             .copies
             .push(Step::Fill(dst as usize, src as usize, len));
+    }
+
+    /// The host GPU address of `len` bytes of upload memory holding the title
+    /// memory at `src` as of the list's submission: one copy for every ask
+    /// until a title copy or deferred run intervenes.
+    pub(crate) fn fill_scratch(&self, src: *const u8, len: u64) -> Option<u64> {
+        let key = (src as usize, len as usize);
+        if let Some(&gpu) = self.deferred().filled.get(&key) {
+            return Some(gpu);
+        }
+        let (gpu, to) = self.scratch(len)?;
+        self.defer_fill(to, src, len as usize);
+        self.deferred().filled.insert(key, gpu);
+        Some(gpu)
     }
 
     /// Brings `[address, address + len)` of a buffer's host copy up to date
@@ -3413,7 +3411,8 @@ impl HostList {
     }
 
     /// Shaders of the list write `[address, address + len)` of a buffer's
-    /// host copy: copied back into title memory once the list has run.
+    /// host copy: copied back into title memory once the list has run
+    /// (deduplicated per exact range until a title copy or run intervenes).
     pub(crate) fn defer_gpu_write(
         &self,
         shadow: &std::sync::Arc<crate::shadow::Shadow>,
@@ -3421,9 +3420,13 @@ impl HostList {
         len: usize,
     ) {
         self.mark_work();
-        self.deferred()
-            .copies
-            .push(Step::GpuWrite(shadow.clone(), address, len));
+        let mut deferred = self.deferred();
+        let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
+        if deferred.gpu_written.insert(key) {
+            deferred
+                .copies
+                .push(Step::GpuWrite(shadow.clone(), address, len));
+        }
     }
 
     /// Stores `what` (`bytes` of it) at `dst` once the list has run.
@@ -3510,8 +3513,7 @@ impl HostList {
 
     /// A mapped upload buffer of `size` bytes, alive until the list is
     /// reset.
-    ///
-    /// shortcut: one buffer per copy; pool them once uploads are frequent.
+    #[cfg(test)]
     pub(crate) fn upload(&self, host: &Host, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         let (buffer, data) = host.upload_buffer(size)?;
         self.mark_work();
@@ -3530,9 +3532,28 @@ impl HostList {
         Some((buffer, data))
     }
 
+    /// `size` bytes of mapped upload memory, 512-byte aligned for a placed
+    /// footprint, alive until the list is reset: the buffer, the offset in
+    /// it and the CPU pointer.
+    pub(crate) fn upload_scratch(&self, size: u64) -> Option<(ID3D12Resource, u64, *mut u8)> {
+        self.scratch_in(size, 512, |buffer, at, _, data| (buffer.clone(), at, data))
+    }
+
     /// `len` bytes of upload memory (256-byte aligned) until the list is
     /// reset: the host GPU address and the CPU pointer.
     pub(crate) fn scratch(&self, len: u64) -> Option<(u64, *mut u8)> {
+        self.scratch_in(len, 256, |_, _, gpu, data| (gpu, data))
+    }
+
+    /// `len` bytes of upload memory at a multiple of `align` until the list
+    /// is reset, handed to `f` with the buffer, the offset in it, the host GPU
+    /// address and the CPU pointer.
+    fn scratch_in<R>(
+        &self,
+        len: u64,
+        align: u64,
+        f: impl FnOnce(&ID3D12Resource, u64, u64, *mut u8) -> R,
+    ) -> Option<R> {
         let host = host()?;
         let len = len.max(1).next_multiple_of(256);
         if len > SCRATCH_CHUNK {
@@ -3540,12 +3561,13 @@ impl HostList {
             name(&buffer, || format!("list scratch {len:#x}"));
             // SAFETY: a live buffer.
             let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+            let made = f(&buffer, 0, gpu, data);
             self.mark_work();
             self.deferred().uploads.push(buffer);
-            return Some((gpu, data));
+            return Some(made);
         }
         let mut s = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
-        if s.used + len > SCRATCH_CHUNK && s.current < s.chunks.len() {
+        while s.current < s.chunks.len() && s.used.next_multiple_of(align) + len > SCRATCH_CHUNK {
             (s.current, s.used) = (s.current + 1, 0);
         }
         if s.current == s.chunks.len() {
@@ -3556,12 +3578,13 @@ impl HostList {
             s.chunks.push((buffer, data as usize, gpu));
             s.used = 0;
         }
-        let (_, data, gpu) = s.chunks[s.current];
-        let at = s.used;
-        s.used += len;
+        let (ref buffer, data, gpu) = s.chunks[s.current];
+        let at = s.used.next_multiple_of(align);
+        let made = f(buffer, at, gpu + at, (data + at as usize) as *mut u8);
+        s.used = at + len;
         drop(s);
         self.mark_work();
-        Some((gpu + at, (data + at as usize) as *mut u8))
+        Some(made)
     }
 
     /// The host address of the list's indirect-work budget, zeroed at each
@@ -4007,6 +4030,8 @@ impl HostList {
         let mut deferred = self.deferred();
         deferred.copies.push(Step::Run(Box::new(work)));
         deferred.refreshed.clear();
+        deferred.filled.clear();
+        deferred.gpu_written.clear();
         deferred.copy_gen += 1;
     }
 
@@ -4031,10 +4056,37 @@ impl HostList {
     }
 
     /// Brings a texture's staging buffer up to date when the list is
-    /// submitted, keeping it alive until the list is reset.
-    pub(crate) fn defer_texture(&self, staging: std::sync::Arc<crate::texture::Staging>) {
+    /// submitted, keeping it alive until the list is reset and carrying the
+    /// mapped-byte baseline observed at recording time (`expected`).
+    pub(crate) fn defer_texture(
+        &self,
+        staging: std::sync::Arc<crate::texture::Staging>,
+        expected: u64,
+    ) {
         self.mark_work();
-        self.deferred().copies.push(Step::Texture(staging));
+        self.deferred()
+            .copies
+            .push(Step::Texture(staging, expected));
+    }
+
+    /// Raises the recorded mapped-byte baseline on any already-queued texture
+    /// upload for `resource` covering `first` on this list.
+    pub(crate) fn raise_texture_expected(&self, resource: usize, first: u32, expected: u64) {
+        if expected == 0 {
+            return;
+        }
+        let mut deferred = self.deferred();
+        for step in deferred.copies.iter_mut().rev() {
+            if let Step::Texture(staging, prev) = step
+                && staging.resource() == resource
+                && staging.first() <= first
+            {
+                if expected > *prev {
+                    *prev = expected;
+                }
+                break;
+            }
+        }
     }
 
     /// Runs the list's submission-time steps; refreshes go into `batch`
@@ -4138,9 +4190,9 @@ impl HostList {
                     batch.gpu_write(host, submitted, shadow, *address, *len);
                     continue;
                 }
-                Step::Texture(staging) => {
-                    if batch.texture_due(staging) {
-                        staging.refresh();
+                Step::Texture(staging, expected) => {
+                    if batch.texture_due(staging, *expected) {
+                        staging.refresh(*expected);
                     }
                     continue;
                 }
@@ -4164,8 +4216,9 @@ struct Batch {
     refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
     gpu_writes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
     declared_writes: std::collections::HashSet<(usize, usize, usize)>,
-    /// Staging buffers (by address) refreshed since the last title write.
-    textures: std::collections::HashSet<usize>,
+    /// Staging buffers (by address) refreshed since the last title write,
+    /// mapped to the highest mapped-byte baseline refreshed so far.
+    textures: std::collections::HashMap<usize, u64>,
     /// Deferred `Step::Fill` copies batched for parallel execution (`host_prep`).
     fills: Vec<(usize, usize, usize)>,
     /// Shadows already refreshed ahead of their first `Step::GpuWrite` (`host_prep`).
@@ -4222,11 +4275,22 @@ impl Batch {
         }
     }
 
-    /// Whether `staging` is still to be refreshed in this submission (and
-    /// notes it refreshed).
-    fn texture_due<T>(&mut self, staging: &std::sync::Arc<T>) -> bool {
-        self.textures
-            .insert(std::sync::Arc::as_ptr(staging) as *const () as usize)
+    /// Whether `staging` is still to be refreshed in this submission (or needs
+    /// a higher mapped-byte baseline than an earlier list in the same
+    /// submission), recording the highest baseline refreshed.
+    fn texture_due<T>(&mut self, staging: &std::sync::Arc<T>, expected: u64) -> bool {
+        let key = std::sync::Arc::as_ptr(staging) as *const () as usize;
+        match self.textures.entry(key) {
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(expected);
+                true
+            }
+            std::collections::hash_map::Entry::Occupied(mut e) if expected > *e.get() => {
+                e.insert(expected);
+                true
+            }
+            std::collections::hash_map::Entry::Occupied(_) => false,
+        }
     }
 
     /// Before a step that writes title memory: pending fills and refreshes are
@@ -4924,7 +4988,7 @@ pub(crate) fn write_mapped_raw(dst: *mut u8, src: *const u8, len: usize) {
 
 /// Calls `f` with the pieces of `[start, start + len)` cut at multiples of
 /// `step`.
-fn for_pieces(start: usize, len: usize, step: usize, mut f: impl FnMut(usize, usize)) {
+pub(crate) fn for_pieces(start: usize, len: usize, step: usize, mut f: impl FnMut(usize, usize)) {
     let end = start + len;
     let mut at = start;
     while at < end {
@@ -5501,6 +5565,67 @@ struct RebarWriteEntry {
     /// for this entry; `None` falls back to reading back all `declared_spans`.
     compare_out_base: Option<usize>,
     compare_pieces: usize,
+}
+
+type DeclaredWrite = (std::sync::Arc<crate::shadow::Shadow>, usize, usize);
+
+/// Groups unique declared GPU writes in O(R) into per-shadow `back` ranges
+/// (for card/async readback), plus ReBAR entries and non-ReBAR/non-carded
+/// writes when `!late`.
+fn collect_declared_writes(
+    writes: Vec<DeclaredWrite>,
+    late: bool,
+) -> (
+    Vec<relay::Declared>,
+    Vec<RebarWriteEntry>,
+    Vec<DeclaredWrite>,
+) {
+    let mut back: Vec<relay::Declared> = Vec::new();
+    let mut back_by_shadow: std::collections::HashMap<usize, usize> =
+        std::collections::HashMap::new();
+    let mut seen_back: std::collections::HashSet<(usize, usize, usize)> =
+        std::collections::HashSet::new();
+    let mut rebar_entries: Vec<RebarWriteEntry> = Vec::new();
+    let mut by_shadow: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    let mut seen_rebar: std::collections::HashSet<(usize, usize, usize)> =
+        std::collections::HashSet::new();
+    let mut non_rebar_writes = Vec::new();
+    for (shadow, address, len) in writes {
+        let ptr = std::sync::Arc::as_ptr(&shadow) as usize;
+        let end = address.saturating_add(len);
+        if address < end {
+            let idx = *back_by_shadow.entry(ptr).or_insert_with(|| {
+                let i = back.len();
+                back.push((shadow.clone(), Vec::new()));
+                i
+            });
+            if seen_back.insert((ptr, address, end)) {
+                back[idx].1.push((address, end));
+            }
+        }
+        if !late {
+            if shadow.is_rebar() {
+                let (from, to) = shadow.inside(address, len);
+                let idx = *by_shadow.entry(ptr).or_insert_with(|| {
+                    let i = rebar_entries.len();
+                    rebar_entries.push(RebarWriteEntry {
+                        shadow,
+                        declared_spans: Vec::new(),
+                        piece_runs: Vec::new(),
+                        compare_out_base: None,
+                        compare_pieces: 0,
+                    });
+                    i
+                });
+                if from < to && seen_rebar.insert((ptr, from, to)) {
+                    rebar_entries[idx].declared_spans.push((from, to));
+                }
+            } else if !shadow.carded() {
+                non_rebar_writes.push((shadow, address, len));
+            }
+        }
+    }
+    (back, rebar_entries, non_rebar_writes)
 }
 
 /// Optional pre-submission rehash and post-submission hash-compare command
@@ -6418,6 +6543,18 @@ impl Meter {
                     } else {
                         "all of title memory"
                     }
+                );
+            }
+            let [through, left, filled, short] = [0, 1, 2, 3].map(|i| {
+                crate::texture::UNLOCKED[i].swap(0, Ordering::Relaxed) as f64 / logged_frames
+            });
+            if through + left + filled > 0.0 {
+                tracing::info!(
+                    "texture refreshes during active remaps, per frame: \
+                     {through:.1} read through the kernel, {left:.1} left for the next refresh \
+                     (a page was not there), {filled:.1} first fillings from the pages there \
+                     (VICTORY_TEXTURE_FILL=0: left empty), {short:.1} of them with less than was \
+                     mapped (looked at again)"
                 );
             }
             crate::watch::asks_say(logged_frames);
