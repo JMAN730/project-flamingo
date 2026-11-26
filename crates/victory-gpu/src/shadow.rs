@@ -788,10 +788,22 @@ fn window_card_for(size: u64) -> Option<ID3D12Resource> {
 pub(crate) type CardDirty = (Arc<Shadow>, Vec<(usize, usize)>);
 
 pub(crate) fn card_dirty(sent_as: u64) -> Vec<CardDirty> {
-    let mut out = Vec::new();
     let mut carded = CARDED.lock().unwrap_or_else(|e| e.into_inner());
     let fetched = RELAY_FETCHED.load(Ordering::Acquire);
     let use_relay = relay();
+    card_dirty_with(&mut carded, sent_as, fetched, use_relay)
+}
+
+/// Core implementation of [`card_dirty`] parameterized over `carded`, `fetched`,
+/// and `use_relay` so tests can exercise the production draining and pruning
+/// paths in isolation without mutating process-wide `CARDED` or `RELAY_FETCHED`.
+pub(crate) fn card_dirty_with(
+    carded: &mut Vec<std::sync::Weak<Shadow>>,
+    sent_as: u64,
+    fetched: u64,
+    use_relay: bool,
+) -> Vec<CardDirty> {
+    let mut out = Vec::new();
     carded.retain(|weak| {
         let Some(shadow) = weak.upgrade() else {
             return false;
@@ -3488,7 +3500,10 @@ impl Shadow {
                     for s in &mut segs {
                         s.mirror = m_ptr + (s.src - start);
                     }
-                    let mut ok = run_copy_segs_status(&segs);
+                    let res = run_copy_segs_status(&segs);
+                    let mut ok = res.ok;
+                    let mut touched: Vec<CopySeg> =
+                        res.touched.into_iter().map(|(_, s)| s).collect();
                     drop(mirror);
                     if ok.iter().any(|&v| !v) {
                         let failed_indices: Vec<usize> = ok
@@ -3511,21 +3526,26 @@ impl Shadow {
                                         s
                                     })
                                     .collect();
-                                let retry_ok = run_copy_segs_status(&retry_segs);
-                                for (idx, passed) in failed_indices.into_iter().zip(retry_ok) {
+                                let retry_res = run_copy_segs_status(&retry_segs);
+                                touched.extend(retry_res.touched.into_iter().map(|(_, s)| s));
+                                for (idx, passed) in failed_indices.into_iter().zip(retry_res.ok) {
                                     ok[idx] = passed;
                                 }
                             }
                         }
                     }
-                    let (succeeded, failed, bytes) = partition_copy_segs(&segs, &ok);
-                    rebar.mark_dirty_segs(start, &succeeded);
+                    let (_succeeded, failed, bytes) = partition_copy_segs(&segs, &ok);
+                    // Invalidate ReBAR hashes for every chunk that wrote VRAM,
+                    // including successful chunks of a partially failed segment.
+                    rebar.mark_dirty_segs(start, &touched);
                     self.commit_copied_epochs(epochs, &failed);
                     return bytes;
                 }
             }
         }
-        let mut ok = run_copy_segs_status(&segs);
+        let res = run_copy_segs_status(&segs);
+        let mut ok = res.ok;
+        let mut touched: Vec<CopySeg> = res.touched.into_iter().map(|(_, s)| s).collect();
         if ok.iter().any(|&v| !v) {
             let failed_indices: Vec<usize> = ok
                 .iter()
@@ -3534,27 +3554,28 @@ impl Shadow {
                 .collect();
             let retry_segs: Vec<CopySeg> = failed_indices.iter().map(|&i| segs[i]).collect();
             materialize_copy_segs(&retry_segs);
-            let retry_ok = run_copy_segs_status(&retry_segs);
-            for (idx, passed) in failed_indices.into_iter().zip(retry_ok) {
+            let retry_res = run_copy_segs_status(&retry_segs);
+            touched.extend(retry_res.touched.into_iter().map(|(_, s)| s));
+            for (idx, passed) in failed_indices.into_iter().zip(retry_res.ok) {
                 ok[idx] = passed;
             }
         }
         let (succeeded, failed, bytes) = partition_copy_segs(&segs, &ok);
-        self.finish_copy_segs(start, &succeeded);
+        self.finish_copy_segs(start, &succeeded, &touched);
         self.commit_copied_epochs(epochs, &failed);
         bytes
     }
 
     /// Post-copy metadata invalidation for non-mirrored `segs`, acquiring each
-    /// per-shadow lock at most once.
-    fn finish_copy_segs(&self, start: usize, segs: &[CopySeg]) {
-        if segs.is_empty() {
-            return;
-        }
+    /// per-shadow lock at most once. `touched_rebar` includes any chunk that may
+    /// have written VRAM even when another chunk of the same segment failed.
+    fn finish_copy_segs(&self, start: usize, succeeded: &[CopySeg], touched_rebar: &[CopySeg]) {
         if let Some(rebar) = &self.rebar {
-            rebar.mark_dirty_segs(start, segs);
+            rebar.mark_dirty_segs(start, touched_rebar);
         }
-        self.card_changed_segs(start, segs);
+        if !succeeded.is_empty() {
+            self.card_changed_segs(start, succeeded);
+        }
     }
 
     #[cfg(test)]
@@ -3613,6 +3634,16 @@ impl Shadow {
     }
 
     #[cfg(test)]
+    pub(crate) fn seed_card_dirty_for_test(&self, ranges: Vec<(usize, usize)>) {
+        if let Some(card) = &self.card {
+            card.dirty
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .extend(ranges);
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn seed_card_sent_for_test(&self, sent_as: u64, ranges: Vec<(usize, usize)>) {
         if let Some(card) = &self.card {
             card.sent
@@ -3627,17 +3658,6 @@ impl Shadow {
         self.card.as_ref().map_or(0, |c| {
             c.sent.read().unwrap_or_else(|e| e.into_inner()).len()
         })
-    }
-
-    #[cfg(test)]
-    pub(crate) fn prune_card_sent_for_test(&self, fetched: u64) -> usize {
-        if let Some(card) = &self.card {
-            let mut sent = card.sent.write().unwrap_or_else(|e| e.into_inner());
-            sent.prune(fetched);
-            sent.len()
-        } else {
-            0
-        }
     }
 
     #[cfg(test)]
@@ -4001,53 +4021,95 @@ fn run_copy_jobs(jobs: Vec<Job>) {
     });
 }
 
-fn run_copy_segs_status(segs: &[CopySeg]) -> Vec<bool> {
-    let mut status = vec![true; segs.len()];
+struct CopySegsResult {
+    /// Per-input-segment full-success flag (`true` iff every chunk of `segs[i]` succeeded).
+    ok: Vec<bool>,
+    /// `(input_seg_index, chunk)` for every chunk that wrote destination bytes
+    /// (every successful chunk, plus any attempted non-mirrored chunk that
+    /// failed because `copy_mapped_raw_checked` may have written a partial
+    /// prefix directly into `seg.dst`).
+    touched: Vec<(usize, CopySeg)>,
+}
+
+fn run_copy_segs_status(segs: &[CopySeg]) -> CopySegsResult {
+    let mut ok = vec![true; segs.len()];
+    let mut touched = Vec::new();
     let total: usize = segs.iter().map(|s| s.len).sum();
     if total == 0 {
-        return status;
+        return CopySegsResult { ok, touched };
     }
     if !wide_copy() || total < WIDE_COPY_MIN {
         for (i, &seg) in segs.iter().enumerate() {
-            if !execute_copy_seg_checked(seg) {
-                status[i] = false;
+            if execute_copy_seg_checked(seg) {
+                if seg.len > 0 {
+                    touched.push((i, seg));
+                }
+            } else {
+                ok[i] = false;
+                if seg.len > 0 && seg.mirror == 0 {
+                    touched.push((i, seg));
+                }
             }
         }
-        return status;
+        return CopySegsResult { ok, touched };
     }
     let chunk_bytes = (total / 4).clamp(256 << 10, WIDE_COPY_CHUNK);
     let buckets = chunk_copy_segs_indexed(segs, chunk_bytes);
     if buckets.len() < 2 {
         for (i, &seg) in segs.iter().enumerate() {
-            if !execute_copy_seg_checked(seg) {
-                status[i] = false;
+            if execute_copy_seg_checked(seg) {
+                if seg.len > 0 {
+                    touched.push((i, seg));
+                }
+            } else {
+                ok[i] = false;
+                if seg.len > 0 && seg.mirror == 0 {
+                    touched.push((i, seg));
+                }
             }
         }
-        return status;
+        return CopySegsResult { ok, touched };
     }
     let seg_ok: Arc<Vec<std::sync::atomic::AtomicBool>> = Arc::new(
         (0..segs.len())
             .map(|_| std::sync::atomic::AtomicBool::new(true))
             .collect(),
     );
+    let touched_chunks: Arc<Mutex<Vec<(usize, CopySeg)>>> = Arc::new(Mutex::new(Vec::new()));
     let jobs: Vec<Job> = buckets
         .into_iter()
         .map(|bucket| {
             let seg_ok = seg_ok.clone();
+            let touched_chunks = touched_chunks.clone();
             Box::new(move || {
+                let mut local_touched = Vec::new();
                 for (idx, seg) in bucket {
-                    if !execute_copy_seg_checked(seg) {
+                    if execute_copy_seg_checked(seg) {
+                        if seg.len > 0 {
+                            local_touched.push((idx, seg));
+                        }
+                    } else {
                         seg_ok[idx].store(false, Ordering::Release);
+                        if seg.len > 0 && seg.mirror == 0 {
+                            local_touched.push((idx, seg));
+                        }
                     }
+                }
+                if !local_touched.is_empty() {
+                    touched_chunks
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .extend(local_touched);
                 }
             }) as Job
         })
         .collect();
     run_copy_jobs(jobs);
-    for (slot, flag) in status.iter_mut().zip(seg_ok.iter()) {
+    for (slot, flag) in ok.iter_mut().zip(seg_ok.iter()) {
         *slot = flag.load(Ordering::Acquire);
     }
-    status
+    let touched = std::mem::take(&mut *touched_chunks.lock().unwrap_or_else(|e| e.into_inner()));
+    CopySegsResult { ok, touched }
 }
 
 /// Copies `len` bytes from title memory `src` into writable host memory `dst`,
@@ -4069,7 +4131,7 @@ pub(crate) fn copy_mapped_wide_checked(dst: *mut u8, src: *const u8, len: usize)
         mirror: 0,
         len,
     }];
-    if run_copy_segs_status(&seg)[0] {
+    if run_copy_segs_status(&seg).ok[0] {
         return true;
     }
     crate::host::copy_mapped_checked(dst, src, len, false)
@@ -4197,7 +4259,9 @@ pub(crate) fn refresh_batch(items: Vec<(Arc<Shadow>, usize, usize)>, parallel_pl
     }
 
     if !all_segs.is_empty() {
-        let mut ok = run_copy_segs_status(&all_segs);
+        let res = run_copy_segs_status(&all_segs);
+        let mut ok = res.ok;
+        let mut touched = res.touched;
         if ok.iter().any(|&v| !v) {
             let failed_indices: Vec<usize> = ok
                 .iter()
@@ -4206,16 +4270,31 @@ pub(crate) fn refresh_batch(items: Vec<(Arc<Shadow>, usize, usize)>, parallel_pl
                 .collect();
             let retry_segs: Vec<CopySeg> = failed_indices.iter().map(|&i| all_segs[i]).collect();
             materialize_copy_segs(&retry_segs);
-            let retry_ok = run_copy_segs_status(&retry_segs);
-            for (idx, passed) in failed_indices.into_iter().zip(retry_ok) {
+            let retry_res = run_copy_segs_status(&retry_segs);
+            touched.extend(
+                retry_res
+                    .touched
+                    .into_iter()
+                    .map(|(retry_i, seg)| (failed_indices[retry_i], seg)),
+            );
+            for (idx, passed) in failed_indices.into_iter().zip(retry_res.ok) {
                 ok[idx] = passed;
             }
         }
-        for &(idx, seg_lo, seg_hi) in &non_mirrored {
+        let mut touched_by_shadow: Vec<Vec<CopySeg>> = vec![Vec::new(); non_mirrored.len()];
+        for (seg_idx, seg) in touched {
+            let owner = non_mirrored.partition_point(|&(_, _, hi)| hi <= seg_idx);
+            if let Some(slot) = touched_by_shadow.get_mut(owner) {
+                slot.push(seg);
+            }
+        }
+        for (&(idx, seg_lo, seg_hi), shadow_touched) in
+            non_mirrored.iter().zip(touched_by_shadow.iter())
+        {
             let (shadow, _, _, plan) = &planned[idx];
             let (succeeded, failed, bytes) =
                 partition_copy_segs(&all_segs[seg_lo..seg_hi], &ok[seg_lo..seg_hi]);
-            shadow.finish_copy_segs(shadow.start as usize, &succeeded);
+            shadow.finish_copy_segs(shadow.start as usize, &succeeded, shadow_touched);
             shadow.commit_copied_epochs(&plan.epochs, &failed);
             item_copied[idx] = bytes;
             total_copied += bytes;
@@ -6918,13 +6997,187 @@ mod tests {
 
     #[test]
     fn materialize_rebar_spans_ignores_inverted_span_without_underflow() {
-        let backing = vec![0x11u8; PAGE];
-        let Some(shadow) = Shadow::new_rebar_for_test(backing.as_ptr() as u64, PAGE as u64, 0x11)
-        else {
+        use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
+            PAGE_READWRITE, UnmapViewOfFile,
+        };
+
+        let Some(_h) = host() else {
             return;
         };
-        // Inverted span `(8, 4)` must return 0 without panicking in overflow-checked builds.
-        assert_eq!(shadow.relay_merge_rebar(&[(8, 4)], &[&[]]), 0);
+        // SAFETY: anonymous 1-page section so `lazy_back` can actually arm a block
+        // and `materialize_rebar_spans` executes its active span-filtering path.
+        let section: HANDLE = unsafe {
+            CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                PAGE as u32,
+                std::ptr::null(),
+            )
+        };
+        assert!(!section.is_null());
+        // SAFETY: map 1 page.
+        let view = unsafe { MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, PAGE) };
+        assert!(!view.Value.is_null());
+        let ptr = view.Value.cast::<u8>();
+        let va0 = ptr as usize;
+        let block = va0 / PAGE;
+        crate::lazy_back::clear_hot_for_test_pub(block);
+        crate::inplace::title_memory_section(section as usize, PAGE as u64, true);
+        crate::inplace::title_memory_view(va0, PAGE, section as usize, 0);
+        // SAFETY: seed memory.
+        unsafe { std::ptr::write_bytes(ptr, 0x11, PAGE) };
+
+        if let Some(shadow) = Shadow::new_rebar_for_test(va0 as u64, PAGE as u64, 0x11) {
+            assert!(
+                crate::lazy_back::try_defer_page_for_test(&shadow, 0, PAGE, 0),
+                "must arm a lazy block so `lazy_back::active()` is true"
+            );
+            assert!(
+                crate::lazy_back::active(),
+                "lazy_back must be active so materialize_rebar_spans runs its filter/map path"
+            );
+            // Inverted span `(8, 4)` must return 0 without panicking in overflow-checked builds.
+            assert_eq!(shadow.relay_merge_rebar(&[(8, 4)], &[&[]]), 0);
+            assert!(
+                crate::lazy_back::has_block(block),
+                "inverted span must be ignored without materializing unrelated block"
+            );
+            assert!(crate::lazy_back::materialize_range(va0, PAGE));
+            assert!(!crate::lazy_back::has_block(block));
+            drop(shadow);
+        }
+
+        crate::lazy_back::clear_hot_for_test_pub(block);
+        crate::watch::title_memory_remapped(va0, PAGE);
+        // SAFETY: cleanup.
+        unsafe {
+            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: view.Value });
+            CloseHandle(section);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn wide_rebar_copy_partial_failure_with_failed_retry_invalidates_written_hashes() {
+        use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
+            PAGE_READWRITE, UnmapViewOfFile,
+        };
+
+        let _rebar = lock_rebar_gpu_test();
+        let _retire = crate::host::isolated_retire_scope();
+        let Some(h) = host() else {
+            return;
+        };
+        if !wide_copy() {
+            return;
+        }
+        let len = WIDE_COPY_MIN;
+        let pages = len / PAGE;
+        assert!(pages >= 16);
+        // SAFETY: anonymous section of `WIDE_COPY_MIN` bytes (16 pages -> 4 parallel chunks).
+        let section: HANDLE = unsafe {
+            CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                len as u32,
+                std::ptr::null(),
+            )
+        };
+        assert!(!section.is_null());
+        // SAFETY: map all 16 pages.
+        let view = unsafe { MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, len) };
+        assert!(!view.Value.is_null());
+        let ptr = view.Value.cast::<u8>();
+        let va0 = ptr as usize;
+        let last_va = va0 + (pages - 1) * PAGE;
+        let last_block = last_va / PAGE;
+        crate::lazy_back::clear_hot_for_test_pub(last_block);
+        crate::inplace::title_memory_section(section as usize, len as u64, true);
+        crate::inplace::title_memory_view(va0, len, section as usize, 0);
+        // SAFETY: `ptr` is mapped RW for `len` bytes.
+        unsafe { std::ptr::write_bytes(ptr, 0x11, len) };
+
+        if let Some(shadow) = Shadow::new_rebar_for_test(va0 as u64, len as u64, 0x11) {
+            // Initialize cached ReBAR hashes and clear dirty bits so `pre_runs` starts empty.
+            let initial = shadow
+                .prepare_rebar_hashes(|n| h.default_buffer(n))
+                .expect("initial rebar hashes");
+            assert_eq!(initial.pre_runs, vec![(0, pages as u32)]);
+            let clean = shadow
+                .prepare_rebar_hashes(|n| h.default_buffer(n))
+                .expect("clean rebar hashes");
+            assert!(clean.pre_runs.is_empty());
+
+            // Write new bytes to chunks 0..3 (pages 0..12) while deferring the last page
+            // (page 15, inside chunk 3) via `lazy_back`.
+            // SAFETY: pages `0..12` are writable mapped title memory.
+            unsafe { std::ptr::write_bytes(ptr, 0x22, (pages - 4) * PAGE) };
+            assert!(crate::lazy_back::try_defer_page_for_test(
+                &shadow,
+                (pages - 1) * PAGE,
+                PAGE,
+                0
+            ));
+            assert!(crate::lazy_back::has_block(last_block));
+
+            // Fail BOTH pre-pass-1 materialization AND pre-retry materialization so chunk 3
+            // fails on both attempts while chunks 0..2 succeed and write `0x22` into VRAM.
+            crate::lazy_back::set_fail_next_fetches_for_test(2);
+            let epochs: Vec<(usize, u64)> = (0..pages).map(|p| (va0 / PAGE + p, 42)).collect();
+            let copied = shadow.copy_runs_with_epochs(&[(va0, va0 + len)], &epochs);
+            crate::lazy_back::set_fail_next_fetches_for_test(0);
+
+            assert_eq!(
+                copied, 0,
+                "failed segment must not be counted as fully copied"
+            );
+            // VRAM bytes for chunks 0..2 were already modified to `0x22`.
+            let vram_p0 = shadow.read_test_bytes(va0 as u64, 64);
+            assert_eq!(vram_p0, vec![0x22u8; 64]);
+
+            // Cached ReBAR hashes MUST be invalidated for all chunks that wrote VRAM
+            // even though the overall segment failed on both initial pass and retry.
+            let after = shadow
+                .prepare_rebar_hashes(|n| h.default_buffer(n))
+                .expect("rebar hashes after partial wide copy failure");
+            assert!(
+                after
+                    .pre_runs
+                    .iter()
+                    .any(|&(first, count)| first == 0 && count >= (pages - 4) as u32),
+                "written chunks (pages 0..{}) must be marked dirty in ReBAR hashes, got {:?}",
+                pages - 4,
+                after.pre_runs
+            );
+
+            // Epochs for the failed segment must NOT have been committed.
+            let committed = shadow.copied.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(
+                committed.iter().all(|&ep| ep == 0),
+                "epochs of a failed segment must stay uncommitted"
+            );
+            drop(committed);
+
+            assert!(crate::lazy_back::materialize_range(last_va, PAGE));
+            assert!(!crate::lazy_back::has_block(last_block));
+            drop(shadow);
+        }
+
+        crate::lazy_back::clear_hot_for_test_pub(last_block);
+        crate::watch::title_memory_remapped(va0, len);
+        // SAFETY: cleanup.
+        unsafe {
+            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: view.Value });
+            CloseHandle(section);
+        }
     }
 
     #[test]

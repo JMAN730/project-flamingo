@@ -25,6 +25,8 @@ use crate::present_compositor::PresentCompositor;
 mod prep;
 #[path = "host_relay.rs"]
 mod relay;
+#[cfg(test)]
+pub(crate) use relay::relay_no_card_fetch_watermark;
 pub(crate) use relay::*;
 
 #[cfg(all(test, feature = "diagnostics"))]
@@ -1914,6 +1916,12 @@ impl Host {
                 unsafe {
                     let signalled = {
                         let _lazy_order = crate::lazy_back::direct_submit_guard();
+                        #[cfg(test)]
+                        if let Some(hook) =
+                            AFTER_DIRECT_SUBMIT_GUARD_HOOK.with(|h| h.borrow_mut().take())
+                        {
+                            hook();
+                        }
                         self.queue.ExecuteCommandLists(group);
                         let res = self.queue.Signal(&self.fence, *submitted);
                         if res.is_ok() {
@@ -4822,6 +4830,21 @@ fn install_fast_copy_handler() {
     });
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static AFTER_DIRECT_SUBMIT_GUARD_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+    static AFTER_VIRTUAL_QUERY_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+    static AFTER_READ_PIECES_FAIL_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_after_direct_submit_guard_hook(hook: Option<Box<dyn FnOnce()>>) {
+    AFTER_DIRECT_SUBMIT_GUARD_HOOK.with(|h| *h.borrow_mut() = hook);
+}
+
 fn range_has_lazy_block(at: usize, len: usize) -> bool {
     crate::lazy_back::has_block_in_range(at, len)
 }
@@ -4850,6 +4873,10 @@ fn read_sparse_checked(src: *const u8, dst: *mut u8, len: usize) -> bool {
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
         // SAFETY: the query inspects an address and fills the local structure.
         let size = unsafe { VirtualQuery(at.cast(), &mut info, size_of_val(&info)) };
+        #[cfg(test)]
+        if let Some(hook) = AFTER_VIRTUAL_QUERY_HOOK.with(|h| h.borrow_mut().take()) {
+            hook();
+        }
         let n = (info.BaseAddress as usize)
             .saturating_add(info.RegionSize)
             .saturating_sub(at as usize)
@@ -4908,6 +4935,10 @@ fn read_pieces_checked(src: *const u8, dst: *mut u8, len: usize) -> bool {
         let to = dst.wrapping_add(at - src as usize);
         let gen64 = crate::lazy_back::remove_generation();
         if !read(at as *const u8, to, n) {
+            #[cfg(test)]
+            if let Some(hook) = AFTER_READ_PIECES_FAIL_HOOK.with(|h| h.borrow_mut().take()) {
+                hook();
+            }
             if range_has_lazy_block(at, n) {
                 ok = false;
                 return;

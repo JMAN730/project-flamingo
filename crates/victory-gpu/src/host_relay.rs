@@ -597,6 +597,25 @@ pub(crate) fn fallback_fetched_mark(inflight: bool, after: u64, landed: Option<u
     }
 }
 
+/// Computes the `relay_fetched` watermark when a relay landing has no eager
+/// card pieces left to DMA (including when every changed card page was
+/// deferred by `lazy_back`). Deferred pages never pin this watermark.
+pub(crate) fn relay_no_card_fetch_watermark(
+    inflight: bool,
+    has_copy_queue: bool,
+    max_sent_as: Option<u64>,
+    completed_order: u64,
+    queue_order: u64,
+) -> Option<u64> {
+    if inflight {
+        max_sent_as
+    } else if has_copy_queue {
+        Some(completed_order)
+    } else {
+        Some(queue_order)
+    }
+}
+
 /// The landed mark of [`CARD_FETCH`]'s tickets after ticket `k` landed.
 pub(crate) fn inflight_raise(landed: u32, k: u32) -> u32 {
     let next = k.wrapping_add(1);
@@ -2574,17 +2593,20 @@ impl Host {
 
         let completed_order = plans.iter().map(|p| p.order_after).max().unwrap_or(0);
         if !card_done_inflight && !has_card {
-            if inflight_fetch() {
-                if let Some(last) = plans.iter().map(|p| p.sent_as).max() {
-                    crate::shadow::relay_fetched(last);
-                }
+            let max_sent_as = plans.iter().map(|p| p.sent_as).max();
+            let queue_order = if !inflight_fetch() && self.copy_queue.is_none() {
+                *QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner())
             } else {
-                let after = if self.copy_queue.is_some() {
-                    completed_order
-                } else {
-                    *QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner())
-                };
-                crate::shadow::relay_fetched(after);
+                0
+            };
+            if let Some(mark) = relay_no_card_fetch_watermark(
+                inflight_fetch(),
+                self.copy_queue.is_some(),
+                max_sent_as,
+                completed_order,
+                queue_order,
+            ) {
+                crate::shadow::relay_fetched(mark);
             }
         }
         if !has_card && !has_rebar {

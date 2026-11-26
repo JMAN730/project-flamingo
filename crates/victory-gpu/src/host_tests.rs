@@ -3178,4 +3178,129 @@ mod relay_tests {
         drop(shadow);
         let _ = side;
     }
+
+    #[test]
+    fn read_sparse_and_pieces_checked_retry_when_lazy_block_materializes_mid_query() {
+        use crate::watch::PAGE;
+        use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
+            PAGE_READWRITE, UnmapViewOfFile,
+        };
+
+        let Some(h) = host() else {
+            return;
+        };
+        let errors_before = h.d3d12_errors();
+        // SAFETY: anonymous 1-page section so `lazy_back` can defer and merge via own view.
+        let section: HANDLE = unsafe {
+            CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                PAGE as u32,
+                std::ptr::null(),
+            )
+        };
+        assert!(!section.is_null());
+        // SAFETY: map 1 page.
+        let view = unsafe { MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, PAGE) };
+        assert!(!view.Value.is_null());
+        let ptr = view.Value.cast::<u8>();
+        let va = ptr as usize;
+        let block = va / PAGE;
+        crate::lazy_back::clear_hot_for_test_pub(block);
+        crate::inplace::title_memory_section(section as usize, PAGE as u64, true);
+        crate::inplace::title_memory_view(va, PAGE, section as usize, 0);
+        // SAFETY: `ptr` is mapped RW for `PAGE` bytes.
+        unsafe { std::ptr::write_bytes(ptr, 0x11, PAGE) };
+
+        let mut side = vec![0x11u8; PAGE];
+        let gpu_write = |shadow: &crate::shadow::Shadow, fill: u8| {
+            let (up, up_ptr) = h.upload_buffer(PAGE as u64).expect("upload");
+            // SAFETY: `up_ptr` covers `PAGE` mapped upload bytes.
+            unsafe {
+                std::ptr::write_bytes(up_ptr, 0x11, PAGE);
+                std::ptr::write_bytes(up_ptr, fill, 64);
+            }
+            let list = h.new_list().expect("list");
+            // SAFETY: live upload and shadow GPU buffers.
+            unsafe {
+                list.list
+                    .CopyBufferRegion(&shadow.buffer, 0, &up, 0, PAGE as u64);
+            }
+            list.close();
+            h.execute(&[&list]);
+            list.reset();
+        };
+
+        if let Some(shadow) = crate::shadow::Shadow::new_card_sized_for_test(
+            side.as_mut_ptr(),
+            va as u64,
+            PAGE as u64,
+        ) {
+            // 1. Force materialization strictly between `VirtualQuery` (seeing `PAGE_NOACCESS`)
+            //    and `range_has_lazy_block` in `read_sparse_checked`. Without the
+            //    `remove_generation()` check, `read_sparse_checked` would zero-fill `dst`.
+            gpu_write(&shadow, 0xA5);
+            assert!(crate::lazy_back::try_defer_page_for_test(
+                &shadow, 0, PAGE, 0
+            ));
+            assert!(crate::lazy_back::has_block(block));
+
+            AFTER_VIRTUAL_QUERY_HOOK.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    assert!(crate::lazy_back::materialize_range(va, PAGE));
+                }));
+            });
+            let mut dst = vec![0xEEu8; PAGE];
+            let ok = read_sparse_checked(ptr, dst.as_mut_ptr(), PAGE);
+            AFTER_VIRTUAL_QUERY_HOOK.with(|hook| *hook.borrow_mut() = None);
+            assert!(ok, "read_sparse_checked must retry and succeed");
+            assert_eq!(
+                &dst[..64],
+                &[0xA5; 64],
+                "read_sparse_checked must return materialized GPU bytes instead of zero-filling"
+            );
+            assert!(!crate::lazy_back::has_block(block));
+
+            // 2. Force materialization strictly between the failing `read` and
+            //    `range_has_lazy_block` in `read_pieces_checked`.
+            crate::lazy_back::clear_hot_for_test_pub(block);
+            gpu_write(&shadow, 0x5B);
+            assert!(crate::lazy_back::try_defer_page_for_test(
+                &shadow, 0, PAGE, 0
+            ));
+            assert!(crate::lazy_back::has_block(block));
+
+            AFTER_READ_PIECES_FAIL_HOOK.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    assert!(crate::lazy_back::materialize_range(va, PAGE));
+                }));
+            });
+            dst.fill(0xEE);
+            let ok = read_pieces_checked(ptr, dst.as_mut_ptr(), PAGE);
+            AFTER_READ_PIECES_FAIL_HOOK.with(|hook| *hook.borrow_mut() = None);
+            assert!(ok, "read_pieces_checked must retry and succeed");
+            assert_eq!(
+                &dst[..64],
+                &[0x5B; 64],
+                "read_pieces_checked must return materialized GPU bytes instead of zero-filling"
+            );
+            assert!(!crate::lazy_back::has_block(block));
+
+            drop(shadow);
+        }
+
+        crate::lazy_back::clear_hot_for_test_pub(block);
+        crate::watch::title_memory_remapped(va, PAGE);
+        // SAFETY: cleanup.
+        unsafe {
+            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: view.Value });
+            CloseHandle(section);
+        }
+        h.log_messages();
+        assert_eq!(h.d3d12_errors(), errors_before);
+    }
 }

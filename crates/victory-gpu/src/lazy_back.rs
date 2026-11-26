@@ -80,9 +80,17 @@ pub(crate) fn remove_generation() -> u64 {
 }
 
 /// Whether any lazy blocks are currently armed or a thread is mid-arm inside `LAZY_STATE`.
+/// Reads `ARMING_COUNT` strictly BEFORE `LAZY_COUNT` (`SeqCst`) so an armer that
+/// publishes `LAZY_COUNT` and then decrements `ARMING_COUNT` cannot cause both
+/// reads to observe zero after passing `inplace::generation()`.
 #[inline]
 pub(crate) fn active_or_arming() -> bool {
-    LAZY_COUNT.load(Ordering::SeqCst) > 0 || ARMING_COUNT.load(Ordering::SeqCst) > 0
+    let arming = ARMING_COUNT.load(Ordering::SeqCst);
+    #[cfg(test)]
+    if let Some(hook) = BETWEEN_ACTIVE_OR_ARMING_LOADS_HOOK.with(|h| h.borrow_mut().take()) {
+        hook();
+    }
+    arming > 0 || LAZY_COUNT.load(Ordering::SeqCst) > 0
 }
 
 #[inline]
@@ -146,6 +154,10 @@ struct LazyEntry {
     #[cfg_attr(not(test), allow(dead_code))]
     cpu_clean_after: Option<u64>,
     materializing: bool,
+    /// Set if restoring `PAGE_READWRITE` via `VirtualProtect` failed on this
+    /// entry so fault waiters observe `MaterializeOutcome::Failed` instead of
+    /// assuming the page is readable.
+    restore_failed: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -276,6 +288,19 @@ impl MaterializeBatchScope {
     }
 }
 
+#[cfg(test)]
+static FAIL_RESTORE_PROTECT_VA: AtomicUsize = AtomicUsize::new(0);
+
+fn restore_page_readwrite(va: usize) -> bool {
+    #[cfg(test)]
+    if FAIL_RESTORE_PROTECT_VA.load(Ordering::SeqCst) == va {
+        return false;
+    }
+    let mut old = 0u32;
+    // SAFETY: `va` was armed by us with `PAGE_NOACCESS`; restoring `PAGE_READWRITE`.
+    unsafe { VirtualProtect(va as *const _, PAGE, PAGE_READWRITE, &mut old) != 0 }
+}
+
 impl Drop for MaterializeBatchScope {
     fn drop(&mut self) {
         IN_MATERIALIZE.with(|v| {
@@ -290,28 +315,52 @@ impl Drop for MaterializeBatchScope {
             // Unwind safety: restore access on every armed VA BEFORE removing
             // entries and waking `LAZY_CV` waiters so no waiter can resume its
             // faulting instruction against `PAGE_NOACCESS` with a missing entry.
-            let armed_vas: Vec<usize> = {
+            // If `VirtualProtect` fails for any VA of an entry, retain that entry
+            // with `restore_failed = true` so waiters observe failure instead of
+            // treating the fault as handled.
+            let block_vas: Vec<(usize, Vec<usize>)> = {
                 let table = LAZY_STATE.lock().unwrap_or_else(|e| e.into_inner());
-                let mut vas = Vec::new();
-                for &block in &self.blocks {
-                    if let Some(entry) = table.pages.get(&block) {
-                        vas.extend_from_slice(&entry.armed_vas);
+                self.blocks
+                    .iter()
+                    .filter_map(|&block| {
+                        table
+                            .pages
+                            .get(&block)
+                            .map(|entry| (block, entry.armed_vas.clone()))
+                    })
+                    .collect()
+            };
+            let mut restored_blocks = Vec::with_capacity(block_vas.len());
+            let mut failed_blocks = Vec::new();
+            for (block, vas) in block_vas {
+                let mut all_restored = true;
+                for va in vas {
+                    if !restore_page_readwrite(va) {
+                        all_restored = false;
                     }
                 }
-                vas
-            };
-            for va in armed_vas {
-                let mut old = 0u32;
-                // SAFETY: restoring title view protection on unwind while entry
-                // stays marked `materializing` and blocks fault waiters.
-                unsafe { VirtualProtect(va as *const _, PAGE, PAGE_READWRITE, &mut old) };
+                if all_restored {
+                    restored_blocks.push(block);
+                } else {
+                    tracing::error!(
+                        primary = format_args!("{:#x}", block * PAGE),
+                        "lazy copy-back unwind VirtualProtect restoration failed; retaining entry"
+                    );
+                    failed_blocks.push(block);
+                }
             }
-            let mut removed = Vec::with_capacity(self.blocks.len());
+            let mut removed = Vec::with_capacity(restored_blocks.len());
             {
                 let mut table = LAZY_STATE.lock().unwrap_or_else(|e| e.into_inner());
-                for &block in &self.blocks {
+                for block in restored_blocks {
                     if let Some(entry) = remove_entry_locked_no_notify(&mut table, block, true) {
                         removed.push(entry);
+                    }
+                }
+                for block in failed_blocks {
+                    if let Some(entry) = table.pages.get_mut(&block) {
+                        entry.materializing = false;
+                        entry.restore_failed = true;
                     }
                 }
                 LAZY_COUNT.store(table.pages.len(), Ordering::Release);
@@ -444,17 +493,6 @@ impl LazyFetcher {
         }
     }
 
-    #[cfg(test)]
-    fn fetch(
-        &mut self,
-        shadow: &Shadow,
-        offset: usize,
-        len: usize,
-    ) -> windows::core::Result<Vec<u8>> {
-        let (buf, _, _) = self.fetch_batch(&[(shadow, offset, len)], true)?;
-        Ok(buf)
-    }
-
     fn fetch_batch(
         &mut self,
         items: &[(&Shadow, usize, usize)],
@@ -520,6 +558,10 @@ impl LazyFetcher {
             STATS.dma_batches.fetch_add(1, Ordering::Relaxed);
             self.queue.Signal(&self.fence, self.sent)?;
             self.wait_for_fence(self.sent)?;
+            #[cfg(test)]
+            if FAIL_AFTER_SUBMIT_FOR_TEST.with(|f| f.replace(false)) {
+                return Err(windows::core::Error::from_hresult(E_FAIL));
+            }
             self.in_flight = false;
             let mut out = vec![0u8; total_bytes];
             if total_bytes > 0 {
@@ -543,23 +585,64 @@ pub(crate) struct DirectSubmitGuard(
     #[allow(dead_code)] Option<std::sync::MutexGuard<'static, Option<LazyFetcher>>>,
 );
 
-/// Serializes a DIRECT-queue submission (`ExecuteCommandLists + Signal +
-/// note_signalled`) against in-flight `COPY`-queue lazy fetches so no DIRECT
-/// writer can race with an unordered COPY read on the same shadow buffer.
-/// Lock-free no-op when `lazy_back` has never been activated.
-pub(crate) fn direct_submit_guard() -> DirectSubmitGuard {
-    if !ever_active() {
+/// Whether DIRECT submissions must serialize against `FETCHER`.
+/// Always `false` in production when `VICTORY_LAZY_BACK` is unset (zero
+/// overhead, since `try_defer_page` cannot arm any block). When lazy readback
+/// can activate (`enabled()` in production, or in tests where
+/// `try_defer_page_for_test` can arm without the env var), this is `true` from
+/// startup so the first-activation transition cannot race with an in-progress
+/// DIRECT submission.
+#[inline]
+fn direct_submit_serialization_enabled() -> bool {
+    #[cfg(test)]
+    {
+        true
+    }
+    #[cfg(not(test))]
+    {
+        enabled()
+    }
+}
+
+#[inline]
+fn direct_submit_guard_if(serialize: bool) -> DirectSubmitGuard {
+    if !serialize {
         return DirectSubmitGuard(None);
     }
     DirectSubmitGuard(Some(FETCHER.lock().unwrap_or_else(|e| e.into_inner())))
 }
 
+/// Serializes a DIRECT-queue submission (`ExecuteCommandLists + Signal +
+/// note_signalled`) against in-flight `COPY`-queue lazy fetches so no DIRECT
+/// writer can race with an unordered COPY read on the same shadow buffer,
+/// including across the very first lazy activation.
+/// Lock-free no-op in production when `VICTORY_LAZY_BACK` is not enabled.
+pub(crate) fn direct_submit_guard() -> DirectSubmitGuard {
+    direct_submit_guard_if(direct_submit_serialization_enabled())
+}
+
 #[cfg(test)]
 std::thread_local! {
     static THREAD_DMA_BATCHES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-    static FAIL_NEXT_FETCH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FAIL_NEXT_FETCHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static FAIL_AFTER_SUBMIT_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static BEFORE_FETCH_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+    static BETWEEN_ACTIVE_OR_ARMING_LOADS_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
     static EVER_ACTIVE_OBSERVER: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
         const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_fail_next_fetches_for_test(count: usize) {
+    FAIL_NEXT_FETCHES.with(|f| f.set(count));
+}
+
+#[cfg(test)]
+pub(crate) fn clear_hot_for_test_pub(block: usize) {
+    let mut table = LAZY_STATE.lock().unwrap_or_else(|e| e.into_inner());
+    table.hot.remove(&block);
 }
 
 #[cfg(test)]
@@ -567,22 +650,11 @@ fn thread_dma_batches() -> u64 {
     THREAD_DMA_BATCHES.with(|c| c.get())
 }
 
-fn fetch_gpu_batch(items: &[(&Shadow, usize, usize)]) -> windows::core::Result<BatchFetch> {
-    if items.is_empty() {
-        return Ok((Vec::new(), Vec::new(), 0));
-    }
-    #[cfg(test)]
-    if FAIL_NEXT_FETCH.with(|f| f.replace(false)) {
-        return Err(windows::core::Error::from_hresult(E_FAIL));
-    }
-    // Acquire `FETCHER` BEFORE snapshotting `wait_direct` so DIRECT submissions
-    // serialized via `direct_submit_guard()` are strictly ordered either before
-    // this check (setting `wait_direct = true` + `last_signalled`) or after our
-    // COPY read finishes on the GPU and releases `FETCHER`.
-    let mut guard = FETCHER.lock().unwrap_or_else(|e| e.into_inner());
-    let wait_direct = items
-        .iter()
-        .any(|&(shadow, _, _)| shadow.has_inflight_gpu_write());
+fn run_fetcher_batch(
+    guard: &mut Option<LazyFetcher>,
+    items: &[(&Shadow, usize, usize)],
+    wait_direct: bool,
+) -> windows::core::Result<BatchFetch> {
     if guard.is_none() {
         *guard = Some(LazyFetcher::new()?);
     }
@@ -601,16 +673,38 @@ fn fetch_gpu_batch(items: &[(&Shadow, usize, usize)]) -> windows::core::Result<B
     result
 }
 
+fn fetch_gpu_batch(items: &[(&Shadow, usize, usize)]) -> windows::core::Result<BatchFetch> {
+    if items.is_empty() {
+        return Ok((Vec::new(), Vec::new(), 0));
+    }
+    #[cfg(test)]
+    if FAIL_NEXT_FETCHES.with(|f| {
+        let rem = f.get();
+        if rem > 0 {
+            f.set(rem - 1);
+            true
+        } else {
+            false
+        }
+    }) {
+        return Err(windows::core::Error::from_hresult(E_FAIL));
+    }
+    // Acquire `FETCHER` BEFORE snapshotting `wait_direct` so DIRECT submissions
+    // serialized via `direct_submit_guard()` are strictly ordered either before
+    // this check (setting `wait_direct = true` + `last_signalled`) or after our
+    // COPY read finishes on the GPU and releases `FETCHER`.
+    let mut guard = FETCHER.lock().unwrap_or_else(|e| e.into_inner());
+    let wait_direct = items
+        .iter()
+        .any(|&(shadow, _, _)| shadow.has_inflight_gpu_write());
+    run_fetcher_batch(&mut guard, items, wait_direct)
+}
+
 #[cfg(test)]
 fn fetch_gpu_bytes(shadow: &Shadow, offset: usize, len: usize) -> windows::core::Result<Vec<u8>> {
     let mut guard = FETCHER.lock().unwrap_or_else(|e| e.into_inner());
-    if guard.is_none() {
-        *guard = Some(LazyFetcher::new()?);
-    }
-    guard
-        .as_mut()
-        .ok_or_else(|| windows::core::Error::from_hresult(E_FAIL))?
-        .fetch(shadow, offset, len)
+    let (buf, _, _) = run_fetcher_batch(&mut guard, &[(shadow, offset, len)], true)?;
+    Ok(buf)
 }
 
 fn remove_entry_locked_no_notify(
@@ -726,7 +820,10 @@ fn try_defer_page_inner(
             }
         }
         if let Some(existing) = table.pages.get_mut(&primary_block) {
-            if existing.materializing || !Arc::ptr_eq(&existing.shadow, shadow) {
+            if existing.materializing
+                || existing.restore_failed
+                || !Arc::ptr_eq(&existing.shadow, shadow)
+            {
                 return false;
             }
             existing.fetched_after = existing.fetched_after.max(fetched_after);
@@ -782,7 +879,10 @@ fn try_defer_page_inner(
             return false;
         }
         if let Some(existing) = table.pages.get_mut(&primary_block) {
-            if existing.materializing || !Arc::ptr_eq(&existing.shadow, shadow) {
+            if existing.materializing
+                || existing.restore_failed
+                || !Arc::ptr_eq(&existing.shadow, shadow)
+            {
                 return false;
             }
             existing.fetched_after = existing.fetched_after.max(fetched_after);
@@ -861,9 +961,10 @@ fn try_defer_page_inner(
                 is_view,
                 cpu_clean_after: if is_view { cpu_clean_after } else { None },
                 materializing: false,
+                restore_failed: false,
             },
         );
-        LAZY_COUNT.store(table.pages.len(), Ordering::Release);
+        LAZY_COUNT.store(table.pages.len(), Ordering::SeqCst);
         STATS.deferred_new.fetch_add(1, Ordering::Relaxed);
         STATS.skipped_bytes.fetch_add(len as u64, Ordering::Relaxed);
         true
@@ -1052,22 +1153,29 @@ fn materialize_claimed_batch(claimed: Vec<ClaimedBlock>, reason: MaterializeReas
     }
     let scope_blocks: Vec<usize> = claimed.iter().map(|c| c.primary_block).collect();
     let mut scope = MaterializeBatchScope::enter(scope_blocks);
+    #[cfg(test)]
+    if let Some(hook) = BEFORE_FETCH_HOOK.with(|h| h.borrow_mut().take()) {
+        hook();
+    }
     let fetch_items: Vec<(&Shadow, usize, usize)> = claimed
         .iter()
         .map(|c| (&*c.shadow, c.offset, c.len))
         .collect();
     let fetched = fetch_gpu_batch(&fetch_items);
 
-    let restore_prot = |vas: &[usize]| {
+    let restore_prot = |vas: &[usize]| -> bool {
+        let mut all_ok = true;
         for &va in vas {
-            let mut old = 0u32;
-            // SAFETY: `va` was armed by us with `PAGE_NOACCESS`; restoring `PAGE_READWRITE`.
-            unsafe { VirtualProtect(va as *const _, PAGE, PAGE_READWRITE, &mut old) };
+            if !restore_page_readwrite(va) {
+                all_ok = false;
+            }
         }
+        all_ok
     };
 
     let mut succeeded: Vec<usize> = Vec::with_capacity(claimed.len());
     let mut failed: Vec<usize> = Vec::new();
+    let mut restore_failed: Vec<usize> = Vec::new();
 
     match fetched {
         Ok((buf, slices, live_fetched_after)) => {
@@ -1105,16 +1213,24 @@ fn materialize_claimed_batch(claimed: Vec<ClaimedBlock>, reason: MaterializeReas
                 };
 
                 if merged_via_own {
-                    restore_prot(&item.restore_vas);
-                    if reason == (MaterializeReason::CpuFault { is_write: true }) {
-                        for &va in &item.restore_vas {
-                            crate::watch::wrote(va, PAGE);
+                    if restore_prot(&item.restore_vas) {
+                        if reason == (MaterializeReason::CpuFault { is_write: true }) {
+                            for &va in &item.restore_vas {
+                                crate::watch::wrote(va, PAGE);
+                            }
                         }
+                        STATS
+                            .materialized_bytes
+                            .fetch_add(item.len as u64, Ordering::Relaxed);
+                        succeeded.push(item.primary_block);
+                    } else {
+                        tracing::error!(
+                            primary = format_args!("{:#x}", item.primary_block * PAGE),
+                            "lazy copy-back VirtualProtect restoration failed; retaining entry"
+                        );
+                        restore_failed.push(item.primary_block);
+                        failed.push(item.primary_block);
                     }
-                    STATS
-                        .materialized_bytes
-                        .fetch_add(item.len as u64, Ordering::Relaxed);
-                    succeeded.push(item.primary_block);
                 } else if !crate::inplace::has_view_at(item.own_va) {
                     // View was already unmapped; drop tracking without reopening stale RAM.
                     succeeded.push(item.primary_block);
@@ -1153,6 +1269,11 @@ fn materialize_claimed_batch(claimed: Vec<ClaimedBlock>, reason: MaterializeReas
                 entry.materializing = false;
             }
         }
+        for &block in &restore_failed {
+            if let Some(entry) = table.pages.get_mut(&block) {
+                entry.restore_failed = true;
+            }
+        }
         LAZY_COUNT.store(table.pages.len(), Ordering::Release);
         LAZY_CV.notify_all();
     }
@@ -1180,6 +1301,9 @@ fn materialize_primary(primary_block: usize, reason: MaterializeReason) -> Mater
                 Some(entry) if entry.materializing => {
                     waited = true;
                     table = LAZY_CV.wait(table).unwrap_or_else(|e| e.into_inner());
+                }
+                Some(entry) if entry.restore_failed => {
+                    return MaterializeOutcome::Failed;
                 }
                 Some(entry) => {
                     entry.materializing = true;
@@ -1303,14 +1427,15 @@ fn materialize_ranges_inner(ranges: &[(usize, usize)], check_active: bool) -> bo
                     if current_thread_materializing(primary_block) {
                         continue;
                     }
-                    if table
-                        .pages
-                        .get(&primary_block)
-                        .is_some_and(|e| e.materializing)
-                    {
-                        wait_only = true;
-                    } else {
-                        to_claim.insert(primary_block);
+                    if let Some(entry) = table.pages.get(&primary_block) {
+                        if entry.restore_failed {
+                            return false;
+                        }
+                        if entry.materializing {
+                            wait_only = true;
+                        } else {
+                            to_claim.insert(primary_block);
+                        }
                     }
                 }
             }
@@ -1382,10 +1507,15 @@ pub(crate) fn materialize_shadow(shadow_ptr: usize) -> bool {
                     if current_thread_materializing(b) {
                         continue;
                     }
-                    if table.pages.get(&b).is_some_and(|e| e.materializing) {
-                        wait_only = true;
-                    } else {
-                        to_claim.push(b);
+                    if let Some(entry) = table.pages.get(&b) {
+                        if entry.restore_failed {
+                            return false;
+                        }
+                        if entry.materializing {
+                            wait_only = true;
+                        } else {
+                            to_claim.push(b);
+                        }
                     }
                 }
             }
@@ -1463,6 +1593,7 @@ pub(crate) fn discard_range(at: usize, len: usize) {
                 if va_block == primary
                     && let Some(entry) = table.pages.get_mut(&primary)
                     && !entry.materializing
+                    && !entry.restore_failed
                 {
                     let surviving: Vec<usize> = entry
                         .armed_vas
@@ -2879,8 +3010,9 @@ mod tests {
         };
 
         // Seed a nonempty `Card::sent` history on this isolated fixture (without
-        // touching the process-wide `RELAY_FETCHED` watermark) and defer page 0
-        // at an ancient `fetched_after = 1`.
+        // touching the process-wide `RELAY_FETCHED` watermark or `CARDED`) and
+        // defer page 0 at an ancient `fetched_after = 1`.
+        let global_fetched_before = crate::shadow::relay_fetched_value();
         shadow.seed_card_sent_for_test(10, vec![(0, 64)]);
         shadow.seed_card_sent_for_test(20, vec![(64, 128)]);
         assert_eq!(shadow.card_sent_len_for_test(), 2);
@@ -2889,10 +3021,40 @@ mod tests {
         assert!(try_defer_page_inner(&shadow, 0, len, 1));
         assert!(has_block(va / PAGE));
 
-        // Pruning `Card::sent` on this shadow removes entries `<= fetched` even
-        // while the cold page remains deferred at `fetched_after = 1`.
-        assert_eq!(shadow.prune_card_sent_for_test(15), 1);
-        assert_eq!(shadow.prune_card_sent_for_test(25), 0);
+        // 1. Production watermark computation when every changed card page is
+        //    deferred (`has_card == false`) advances past `fetched_after = 1`
+        //    rather than pinning the watermark to the deferred page.
+        let wm15 = crate::host::relay_no_card_fetch_watermark(true, true, Some(15), 15, 0)
+            .expect("inflight watermark");
+        assert_eq!(wm15, 15);
+        assert_eq!(
+            crate::host::relay_no_card_fetch_watermark(false, true, Some(15), 15, 0),
+            Some(15)
+        );
+        let wm25 = crate::host::relay_no_card_fetch_watermark(true, true, Some(25), 25, 0)
+            .expect("inflight watermark 25");
+        assert_eq!(wm25, 25);
+
+        // 2. Production `card_dirty` empty-dirty fast path (`card_dirty_with`)
+        //    prunes `sent_as <= 15` on this isolated fixture while page 0 stays
+        //    deferred at `fetched_after = 1`.
+        let mut isolated_carded = vec![Arc::downgrade(&shadow)];
+        let drained_fast = crate::shadow::card_dirty_with(&mut isolated_carded, 30, wm15, true);
+        assert!(drained_fast.is_empty());
+        assert_eq!(shadow.card_sent_len_for_test(), 1);
+
+        // 3. Production `card_dirty` non-empty-dirty slow path prunes `sent_as <= 25`
+        //    and records the newly drained dirty range under `sent_as = 30`.
+        shadow.seed_card_dirty_for_test(vec![(128, 192)]);
+        let drained_slow = crate::shadow::card_dirty_with(&mut isolated_carded, 30, wm25, true);
+        assert_eq!(drained_slow.len(), 1);
+        assert_eq!(drained_slow[0].1, vec![(128, 192)]);
+        assert_eq!(shadow.card_sent_len_for_test(), 1);
+        assert_eq!(
+            crate::shadow::relay_fetched_value(),
+            global_fetched_before,
+            "isolated watermark/pruning test must not mutate process-wide RELAY_FETCHED"
+        );
 
         // Materializing the cold page fetches live GPU bytes cleanly.
         assert!(materialize_range(va, len));
@@ -3322,7 +3484,7 @@ mod tests {
 
         // Inject a DMA failure: `handle_fault` must return `false`, keep the
         // entry tracked, and leave the page at `PAGE_NOACCESS` (never exposing stale RAM).
-        FAIL_NEXT_FETCH.with(|f| f.set(true));
+        set_fail_next_fetches_for_test(1);
         assert!(
             !handle_fault(va, false),
             "failed materialization must NOT report fault as handled"
@@ -3470,6 +3632,483 @@ mod tests {
             free_watch_pages(dst_ptr);
             free_watch_pages(src_ptr);
         }
+        h.log_messages();
+        assert_eq!(h.d3d12_errors(), errors_before);
+    }
+
+    #[test]
+    fn lazy_unwind_failed_virtual_protect_makes_failure_visible_to_waiters() {
+        let Some(h) = crate::host::host() else {
+            return;
+        };
+        let errors_before = h.d3d12_errors();
+        let ptr = alloc_watch_pages(1);
+        // SAFETY: `ptr` owns `PAGE` bytes.
+        unsafe { ptr::write_bytes(ptr, 0x11, PAGE) };
+        let va = ptr as usize;
+        let block = va / PAGE;
+        clear_hot_for_test(block);
+
+        let Some((shadow, _side)) = make_card_shadow_at(va as u64, 1, 0x11) else {
+            // SAFETY: cleanup.
+            unsafe { free_watch_pages(ptr) };
+            return;
+        };
+        gpu_write_shadow(&shadow, 0, &[0x6B; 32]);
+        assert!(try_defer_page_inner(&shadow, 0, PAGE, 0));
+        assert!(has_block(block));
+        assert!(!is_readable_now(va));
+
+        struct ResetFailVa;
+        impl Drop for ResetFailVa {
+            fn drop(&mut self) {
+                FAIL_RESTORE_PROTECT_VA.store(0, Ordering::SeqCst);
+            }
+        }
+        let _reset_fail = ResetFailVa;
+        FAIL_RESTORE_PROTECT_VA.store(va, Ordering::SeqCst);
+
+        let entered = Arc::new((Mutex::new(false), Condvar::new()));
+        let release_panic = Arc::new((Mutex::new(false), Condvar::new()));
+        let entered_t1 = entered.clone();
+        let release_t1 = release_panic.clone();
+
+        // Thread 1 claims the block (`materializing = true`), waits for Thread 2
+        // to block on `LAZY_CV`, and then panics so `MaterializeBatchScope::drop`
+        // attempts `VirtualProtect` restoration (which fails for `va`).
+        let t1 = std::thread::spawn(move || {
+            BEFORE_FETCH_HOOK.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    {
+                        let mut g = entered_t1.0.lock().unwrap();
+                        *g = true;
+                        entered_t1.1.notify_all();
+                    }
+                    let mut r = release_t1.0.lock().unwrap();
+                    while !*r {
+                        r = release_t1.1.wait(r).unwrap();
+                    }
+                    panic!("simulated unwind during materialization");
+                }));
+            });
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = handle_fault(va, false);
+            }));
+        });
+
+        {
+            let mut g = entered.0.lock().unwrap();
+            while !*g {
+                g = entered.1.wait(g).unwrap();
+            }
+        }
+
+        // Thread 2 enters `handle_fault` while Thread 1 holds `materializing = true`
+        // and blocks on `LAZY_CV`.
+        let waiter_started = Arc::new(AtomicBool::new(false));
+        let waiter_started_t2 = waiter_started.clone();
+        let t2 = std::thread::spawn(move || {
+            waiter_started_t2.store(true, Ordering::SeqCst);
+            handle_fault(va, false)
+        });
+        while !waiter_started.load(Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+
+        {
+            let mut r = release_panic.0.lock().unwrap();
+            *r = true;
+            release_panic.1.notify_all();
+        }
+        t1.join().expect("t1 joined");
+        let waiter_handled = t2.join().expect("t2 joined");
+
+        assert!(
+            !waiter_handled,
+            "waiter must observe failure when unwind VirtualProtect restoration fails"
+        );
+        assert!(
+            has_block(block),
+            "entry must remain tracked when unwind VirtualProtect restoration fails"
+        );
+        assert!(
+            !is_readable_now(va),
+            "page remains PAGE_NOACCESS after failed VirtualProtect restoration"
+        );
+        assert!(
+            !handle_fault(va, false),
+            "subsequent fault on restore-failed entry must continue reporting failure"
+        );
+        assert!(
+            !materialize_range(va, PAGE),
+            "materialize_range on restore-failed entry must report failure"
+        );
+
+        // Clean up the intentionally broken entry and restore RW before freeing.
+        drop(_reset_fail);
+        discard_range(va, PAGE);
+        assert!(!has_block(block));
+        let mut old = 0u32;
+        // SAFETY: restoring RW on our test allocation for cleanup.
+        unsafe { VirtualProtect(va as *const _, PAGE, PAGE_READWRITE, &mut old) };
+        clear_hot_for_test(block);
+        drop(shadow);
+        // SAFETY: cleanup.
+        unsafe { free_watch_pages(ptr) };
+        h.log_messages();
+        assert_eq!(h.d3d12_errors(), errors_before);
+    }
+
+    #[test]
+    fn lazy_fetch_gpu_bytes_and_batch_detach_inflight_fetcher_on_error() {
+        let Some(h) = crate::host::host() else {
+            return;
+        };
+        let errors_before = h.d3d12_errors();
+        let ptr = alloc_watch_pages(1);
+        // SAFETY: `ptr` owns `PAGE` bytes.
+        unsafe { ptr::write_bytes(ptr, 0x11, PAGE) };
+        let va = ptr as usize;
+        clear_hot_for_test(va / PAGE);
+
+        let Some((shadow, _side)) = make_card_shadow_at(va as u64, 1, 0x11) else {
+            // SAFETY: cleanup.
+            unsafe { free_watch_pages(ptr) };
+            return;
+        };
+        gpu_write_shadow(&shadow, 0, &[0x4D; 32]);
+
+        // 1. Seed `FETCHER` and record its COM fence pointer.
+        let initial = fetch_gpu_bytes(&shadow, 0, PAGE).expect("initial fetch_gpu_bytes");
+        assert_eq!(&initial[..32], &[0x4D; 32]);
+        let fence_before = {
+            let guard = FETCHER.lock().unwrap_or_else(|e| e.into_inner());
+            guard.as_ref().expect("fetcher initialized").fence.as_raw() as usize
+        };
+
+        // 2. Simulate an unconfirmed post-submit error in `fetch_gpu_bytes`:
+        //    the in-flight fetcher must be detached (`None`), never reused.
+        FAIL_AFTER_SUBMIT_FOR_TEST.with(|f| f.set(true));
+        let err = fetch_gpu_bytes(&shadow, 0, PAGE);
+        FAIL_AFTER_SUBMIT_FOR_TEST.with(|f| f.set(false));
+        assert!(err.is_err(), "injected post-submit error must fail");
+        {
+            let guard = FETCHER.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(
+                guard.is_none(),
+                "fetch_gpu_bytes must detach in-flight fetcher on post-submit error"
+            );
+        }
+
+        // Next `fetch_gpu_bytes` must create a fresh fetcher and succeed cleanly.
+        let recovered = fetch_gpu_bytes(&shadow, 0, PAGE).expect("recovered fetch_gpu_bytes");
+        assert_eq!(&recovered[..32], &[0x4D; 32]);
+        let fence_after = {
+            let guard = FETCHER.lock().unwrap_or_else(|e| e.into_inner());
+            let f = guard.as_ref().expect("fresh fetcher created");
+            assert_eq!(f.sent, 1, "fresh fetcher must start at sent = 1");
+            f.fence.as_raw() as usize
+        };
+        assert_ne!(
+            fence_after, fence_before,
+            "fresh fetcher must replace the detached in-flight fetcher"
+        );
+
+        // 3. Verify `fetch_gpu_batch` applies the exact same detach-on-error cleanup.
+        FAIL_AFTER_SUBMIT_FOR_TEST.with(|f| f.set(true));
+        let batch_err = fetch_gpu_batch(&[(&shadow, 0, PAGE)]);
+        FAIL_AFTER_SUBMIT_FOR_TEST.with(|f| f.set(false));
+        assert!(batch_err.is_err());
+        {
+            let guard = FETCHER.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(
+                guard.is_none(),
+                "fetch_gpu_batch must detach in-flight fetcher on post-submit error"
+            );
+        }
+        let (batch_buf, _, _) =
+            fetch_gpu_batch(&[(&shadow, 0, PAGE)]).expect("recovered fetch_gpu_batch");
+        assert_eq!(&batch_buf[..32], &[0x4D; 32]);
+
+        clear_hot_for_test(va / PAGE);
+        drop(shadow);
+        // SAFETY: cleanup.
+        unsafe { free_watch_pages(ptr) };
+        h.log_messages();
+        assert_eq!(h.d3d12_errors(), errors_before);
+    }
+
+    #[test]
+    fn lazy_direct_submit_guard_serializes_across_first_activation_transition() {
+        let Some(h) = crate::host::host() else {
+            return;
+        };
+        let errors_before = h.d3d12_errors();
+
+        // When serialization is disabled (production with VICTORY_LAZY_BACK unset),
+        // `direct_submit_guard_if(false)` stays a lock-free no-op.
+        assert!(direct_submit_guard_if(false).0.is_none());
+
+        let ptr = alloc_watch_pages(1);
+        // SAFETY: `ptr` owns `PAGE` bytes.
+        unsafe { ptr::write_bytes(ptr, 0x11, PAGE) };
+        let va = ptr as usize;
+        let block = va / PAGE;
+        clear_hot_for_test(block);
+
+        let Some((shadow, _side)) = make_card_shadow_at(va as u64, 1, 0x11) else {
+            // SAFETY: cleanup.
+            unsafe { free_watch_pages(ptr) };
+            return;
+        };
+
+        // Reset `EVER_ACTIVE` to simulate pre-first-activation state, restoring it on drop.
+        struct RestoreEverActive(bool);
+        impl Drop for RestoreEverActive {
+            fn drop(&mut self) {
+                EVER_ACTIVE.store(self.0, Ordering::SeqCst);
+            }
+        }
+        let _restore_ever = RestoreEverActive(EVER_ACTIVE.swap(false, Ordering::SeqCst));
+        assert!(!ever_active());
+
+        // Prepare a DIRECT-queue command list that writes `[0xFA; 64]` to `shadow`
+        // and declare the pending GPU write on `shadow` just like production submissions.
+        shadow.writing(va, 64, |_, _| None);
+        let (up, up_ptr) = h.upload_buffer(64).expect("upload buffer");
+        // SAFETY: `up_ptr` is mapped for 64 bytes.
+        unsafe { ptr::write_bytes(up_ptr, 0xFA, 64) };
+        let list = h.new_list().expect("list");
+        // SAFETY: live upload and shadow buffers.
+        unsafe {
+            list.list.CopyBufferRegion(&shadow.buffer, 0, &up, 0, 64);
+        }
+        list.close();
+
+        let entered_direct = Arc::new((Mutex::new(false), Condvar::new()));
+        let release_direct = Arc::new((Mutex::new(false), Condvar::new()));
+        let entered_t1 = entered_direct.clone();
+        let release_t1 = release_direct.clone();
+
+        // Thread 1 starts a DIRECT submission while `ever_active() == false` and
+        // pauses strictly AFTER acquiring `direct_submit_guard()` and BEFORE
+        // `ExecuteCommandLists` / `Signal`.
+        let t1 = std::thread::spawn(move || {
+            crate::host::set_after_direct_submit_guard_hook(Some(Box::new(move || {
+                {
+                    let mut e = entered_t1.0.lock().unwrap();
+                    *e = true;
+                    entered_t1.1.notify_all();
+                }
+                let mut r = release_t1.0.lock().unwrap();
+                while !*r {
+                    r = release_t1.1.wait(r).unwrap();
+                }
+            })));
+            h.execute(&[&list]);
+            list.reset();
+        });
+
+        {
+            let mut e = entered_direct.0.lock().unwrap();
+            while !*e {
+                e = entered_direct.1.wait(e).unwrap();
+            }
+        }
+
+        // While Thread 1 is paused mid-DIRECT-submission, arm the VERY FIRST lazy
+        // page (transitioning `EVER_ACTIVE`: false -> true) and kick off a COPY
+        // materialization on Thread 2.
+        assert!(!ever_active());
+        assert!(try_defer_page_inner(&shadow, 0, PAGE, 0));
+        assert!(ever_active(), "first lazy arm must flip EVER_ACTIVE");
+        assert!(has_block(block));
+
+        let copy_started = Arc::new(AtomicBool::new(false));
+        let copy_finished = Arc::new(AtomicBool::new(false));
+        let started_t2 = copy_started.clone();
+        let finished_t2 = copy_finished.clone();
+        let t2 = std::thread::spawn(move || {
+            started_t2.store(true, Ordering::SeqCst);
+            let ok = materialize_range(va, PAGE);
+            finished_t2.store(true, Ordering::SeqCst);
+            ok
+        });
+        while !copy_started.load(Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        assert!(
+            !copy_finished.load(Ordering::SeqCst),
+            "COPY fetch must block behind DIRECT submission even across first-activation transition"
+        );
+
+        // Release Thread 1 so its DIRECT write executes, signals, and drops its guard.
+        {
+            let mut r = release_direct.0.lock().unwrap();
+            *r = true;
+            release_direct.1.notify_all();
+        }
+        t1.join().expect("t1 joined");
+        shadow.copy_back_done(&[(va, va + 64)]);
+        assert!(t2.join().expect("t2 joined"));
+        assert!(!has_block(block));
+
+        // Thread 2's COPY read must have executed after Thread 1's DIRECT write.
+        // SAFETY: page is materialized and readable.
+        let got = unsafe { std::slice::from_raw_parts(ptr, 64) };
+        assert_eq!(
+            got, &[0xFA; 64],
+            "COPY fetch serialized after first-activation DIRECT write must read `[0xFA; 64]`"
+        );
+
+        drop(_restore_ever);
+        clear_hot_for_test(block);
+        drop(shadow);
+        // SAFETY: cleanup.
+        unsafe { free_watch_pages(ptr) };
+        h.log_messages();
+        assert_eq!(h.d3d12_errors(), errors_before);
+    }
+
+    #[test]
+    fn lazy_active_or_arming_reads_arming_before_lazy_across_completion_interleaving() {
+        assert_eq!(LAZY_COUNT.load(Ordering::SeqCst), 0);
+        assert_eq!(ARMING_COUNT.load(Ordering::SeqCst), 0);
+        assert!(!active_or_arming());
+
+        struct RestoreLazyCount;
+        impl Drop for RestoreLazyCount {
+            fn drop(&mut self) {
+                LAZY_COUNT.store(0, Ordering::SeqCst);
+                BETWEEN_ACTIVE_OR_ARMING_LOADS_HOOK.with(|h| *h.borrow_mut() = None);
+            }
+        }
+        let _restore = RestoreLazyCount;
+
+        // Simulate an armer mid-arm (`ARMING_COUNT == 1`, `LAZY_COUNT == 0`).
+        // Between the two atomic loads inside `active_or_arming()`, complete the arm
+        // (`LAZY_COUNT: 0 -> 1`, then `ARMING_COUNT: 1 -> 0`).
+        // Reading `ARMING_COUNT` first observes `1` and returns `true`; reading
+        // `LAZY_COUNT` first would observe `0`, run the hook, then observe `ARMING_COUNT == 0`
+        // and falsely return `false`.
+        let arming = ArmingGuard::enter();
+        let mut arming_opt = Some(arming);
+        BETWEEN_ACTIVE_OR_ARMING_LOADS_HOOK.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move || {
+                LAZY_COUNT.store(1, Ordering::SeqCst);
+                drop(arming_opt.take());
+            }));
+        });
+        assert!(
+            active_or_arming(),
+            "active_or_arming must observe true across (ARMING=1,LAZY=0)->(ARMING=0,LAZY=1)"
+        );
+        // After completion (`ARMING_COUNT == 0`, `LAZY_COUNT == 1`), second check also returns true.
+        assert_eq!(ARMING_COUNT.load(Ordering::SeqCst), 0);
+        assert!(active_or_arming());
+        drop(_restore);
+        assert!(!active_or_arming());
+    }
+
+    #[test]
+    fn lazy_mapping_65th_section_view_materializes_armed_block() {
+        let Some(h) = crate::host::host() else {
+            return;
+        };
+        let errors_before = h.d3d12_errors();
+        let cap = crate::watch::MANY_VIEWS;
+        // SAFETY: anonymous 1-page section mapped across `MANY_VIEWS + 1` (65) views.
+        let section: HANDLE = unsafe {
+            CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                ptr::null(),
+                PAGE_READWRITE,
+                0,
+                PAGE as u32,
+                ptr::null(),
+            )
+        };
+        assert!(!section.is_null());
+        crate::inplace::title_memory_section(section as usize, PAGE as u64, true);
+
+        let mut views = Vec::with_capacity(cap + 1);
+        for _ in 0..cap {
+            // SAFETY: mapping one of `MANY_VIEWS` views of offset 0.
+            let view = unsafe { MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, PAGE) };
+            assert!(!view.Value.is_null());
+            let va = view.Value as usize;
+            clear_hot_for_test(va / PAGE);
+            crate::inplace::title_memory_view(va, PAGE, section as usize, 0);
+            views.push(view);
+        }
+
+        let va0 = views[0].Value as usize;
+        let block0 = va0 / PAGE;
+        // SAFETY: seed physical section page via view 0.
+        unsafe { ptr::write_bytes(va0 as *mut u8, 0x11, PAGE) };
+
+        if let Some((shadow, _side)) = make_card_shadow_at(va0 as u64, 1, 0x11) {
+            gpu_write_shadow(&shadow, 0, &[0x65; 32]);
+            assert!(
+                try_defer_page_inner(&shadow, 0, PAGE, 0),
+                "arming a page with exactly MANY_VIEWS ({cap}) views must succeed"
+            );
+            assert!(has_block(block0));
+            for v in &views {
+                assert!(
+                    !is_readable_now(v.Value as usize),
+                    "every armed view must be PAGE_NOACCESS before the 65th view maps"
+                );
+            }
+
+            // Map the 65th (`MANY_VIEWS + 1`) view: capped `views_of_section`
+            // omits it, so `watch::views_mapped` must use the uncapped lookup
+            // (`views_of_section_all`) to materialize the armed block.
+            // SAFETY: mapping the 65th view of the same section page.
+            let view65 = unsafe { MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, PAGE) };
+            assert!(!view65.Value.is_null());
+            let va65 = view65.Value as usize;
+            clear_hot_for_test(va65 / PAGE);
+            views.push(view65);
+            crate::inplace::title_memory_view(va65, PAGE, section as usize, 0);
+
+            assert!(
+                crate::inplace::views_of_section(section as usize, 0, PAGE).is_empty(),
+                "capped views_of_section must still omit pages with > MANY_VIEWS views"
+            );
+            assert!(
+                !crate::inplace::views_of_section_all(section as usize, 0, PAGE).is_empty(),
+                "uncapped views_of_section_all must include pages with > MANY_VIEWS views"
+            );
+            assert!(
+                !has_block(block0),
+                "mapping the 65th view must materialize the deferred block"
+            );
+            for v in &views {
+                assert!(
+                    is_readable_now(v.Value as usize),
+                    "all 65 views must be readable after materialization"
+                );
+            }
+            // SAFETY: 65th view is readable and holds merged GPU bytes.
+            let got65 = unsafe { std::slice::from_raw_parts(va65 as *const u8, 32) };
+            assert_eq!(got65, &[0x65; 32]);
+            drop(shadow);
+        }
+
+        for v in views {
+            let va = v.Value as usize;
+            clear_hot_for_test(va / PAGE);
+            crate::watch::title_memory_remapped(va, PAGE);
+            // SAFETY: unmapping test view.
+            unsafe {
+                UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: v.Value });
+            }
+        }
+        // SAFETY: closing anonymous section handle.
+        unsafe { CloseHandle(section) };
         h.log_messages();
         assert_eq!(h.d3d12_errors(), errors_before);
     }

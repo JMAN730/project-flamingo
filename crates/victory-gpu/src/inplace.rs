@@ -672,10 +672,12 @@ pub(crate) fn pages_of(page: usize) -> Vec<usize> {
         .unwrap_or_default()
 }
 
-/// The title views that show any of the physical bytes `[offset, offset +
-/// len)` of `section`, as `(address, bytes)` ranges in address order; not
-/// those of a page shown in very many views (`MANY_VIEWS`).
-pub(crate) fn views_of_section(section: usize, offset: u64, len: usize) -> Vec<(usize, usize)> {
+fn views_of_section_inner(
+    section: usize,
+    offset: u64,
+    len: usize,
+    max_views: Option<usize>,
+) -> Vec<(usize, usize)> {
     if len == 0 {
         return Vec::new();
     }
@@ -685,7 +687,7 @@ pub(crate) fn views_of_section(section: usize, offset: u64, len: usize) -> Vec<(
     let mut at = offset - offset % K64 as u64;
     while at < end {
         if let Some(shown) = v.pages.get(&(section, at))
-            && shown.len() <= crate::watch::MANY_VIEWS
+            && max_views.is_none_or(|cap| shown.len() <= cap)
         {
             pages.extend(shown.iter().copied());
         }
@@ -704,6 +706,20 @@ pub(crate) fn views_of_section(section: usize, offset: u64, len: usize) -> Vec<(
         }
     }
     runs
+}
+
+/// The title views that show any of the physical bytes `[offset, offset +
+/// len)` of `section`, as `(address, bytes)` ranges in address order; not
+/// those of a page shown in very many views (`MANY_VIEWS`).
+pub(crate) fn views_of_section(section: usize, offset: u64, len: usize) -> Vec<(usize, usize)> {
+    views_of_section_inner(section, offset, len, Some(crate::watch::MANY_VIEWS))
+}
+
+/// Uncapped variant of [`views_of_section`] used by `lazy_back` in
+/// [`crate::watch::views_mapped`] so mapping a `(MANY_VIEWS + 1)`-th alias of a
+/// deferred section page still materializes every armed view.
+pub(crate) fn views_of_section_all(section: usize, offset: u64, len: usize) -> Vec<(usize, usize)> {
+    views_of_section_inner(section, offset, len, None)
 }
 
 /// Whether what shaders wrote goes back into title view memory through a
@@ -794,6 +810,7 @@ fn own_view_ptr(
     at: usize,
     len: usize,
     blocking: bool,
+    allow_many_views: bool,
 ) -> Option<(
     usize,
     Vec<usize>,
@@ -821,7 +838,7 @@ fn own_view_ptr(
             .pages
             .get(&(section, offset - offset % K64 as u64))?
             .clone();
-        if shown.len() > crate::watch::MANY_VIEWS {
+        if !allow_many_views && shown.len() > crate::watch::MANY_VIEWS {
             return None;
         }
         let section_bytes = v.sections.iter().find(|s| s.0 == section)?.1;
@@ -892,7 +909,7 @@ fn own_view_ptr(
 /// Whether `[at, at + len)` has a live, committed host-only `PAGE_READWRITE`
 /// own view of its backing section (non-blocking).
 pub(crate) fn has_own_view_for(at: usize, len: usize) -> bool {
-    own_view_ptr(at, len, false).is_some()
+    own_view_ptr(at, len, false, false).is_some()
 }
 
 /// Reads title physical bytes at `[at, at + dst.len())` through our own
@@ -901,20 +918,22 @@ pub(crate) fn has_own_view_for(at: usize, len: usize) -> bool {
 /// of a mapped section view or a mapping change is in progress.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn read_own(at: usize, dst: &mut [u8]) -> bool {
-    read_own_inner(at, dst, false)
+    read_own_inner(at, dst, false, false)
 }
 
 /// Blocking variant of [`read_own`] for `lazy_back` materialization, waiting
-/// for any unrelated mapping change instead of failing transiently.
+/// for any unrelated mapping change instead of failing transiently and
+/// permitting pages that just crossed `MANY_VIEWS` when a new alias was mapped.
 pub(crate) fn read_own_blocking(at: usize, dst: &mut [u8]) -> bool {
-    read_own_inner(at, dst, true)
+    read_own_inner(at, dst, true, true)
 }
 
-fn read_own_inner(at: usize, dst: &mut [u8], blocking: bool) -> bool {
+fn read_own_inner(at: usize, dst: &mut [u8], blocking: bool, allow_many_views: bool) -> bool {
     if dst.is_empty() {
         return true;
     }
-    let Some((src, _shown, _own, _still)) = own_view_ptr(at, dst.len(), blocking) else {
+    let Some((src, _shown, _own, _still)) = own_view_ptr(at, dst.len(), blocking, allow_many_views)
+    else {
         return false;
     };
     // SAFETY: committed bytes inside our own `PAGE_READWRITE` section view
@@ -931,16 +950,22 @@ fn read_own_inner(at: usize, dst: &mut [u8], blocking: bool) -> bool {
 /// nothing written: not view memory, a page of very many views, the
 /// runtime changing mappings at this moment, or the host refusing.
 pub(crate) fn write_own(at: usize, bytes: &[u8]) -> Option<Vec<usize>> {
-    write_own_inner(at, bytes, false)
+    write_own_inner(at, bytes, false, false)
 }
 
-/// Blocking variant of [`write_own`] for `lazy_back` materialization.
+/// Blocking variant of [`write_own`] for `lazy_back` materialization,
+/// permitting pages that just crossed `MANY_VIEWS` when a new alias was mapped.
 pub(crate) fn write_own_blocking(at: usize, bytes: &[u8]) -> Option<Vec<usize>> {
-    write_own_inner(at, bytes, true)
+    write_own_inner(at, bytes, true, true)
 }
 
-fn write_own_inner(at: usize, bytes: &[u8], blocking: bool) -> Option<Vec<usize>> {
-    let (dst, shown, _own, _still) = own_view_ptr(at, bytes.len(), blocking)?;
+fn write_own_inner(
+    at: usize,
+    bytes: &[u8],
+    blocking: bool,
+    allow_many_views: bool,
+) -> Option<Vec<usize>> {
+    let (dst, shown, _own, _still) = own_view_ptr(at, bytes.len(), blocking, allow_many_views)?;
     // SAFETY: committed bytes inside our own view (`_own` keeps it mapped until
     // after the copy even if evicted, and `_still` keeps the title view live);
     // the source is the caller's slice.
@@ -2399,8 +2424,9 @@ mod tests {
         assert!(write_own(title_view + 64, &payload).is_some());
 
         // Simulate an active caller holding `Arc<Own>` across eviction.
-        let (ptr, _shown, active_own, still) = own_view_ptr(title_view + 64, payload.len(), false)
-            .expect("own_view_ptr should succeed");
+        let (ptr, _shown, active_own, still) =
+            own_view_ptr(title_view + 64, payload.len(), false, false)
+                .expect("own_view_ptr should succeed");
         let own_base = active_own.base;
         drop(still);
 

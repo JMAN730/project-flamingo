@@ -4490,14 +4490,19 @@ pub(crate) fn views_mapped(section: usize, offset: u64, len: usize) {
     if !guard && !lazy {
         return;
     }
-    let ranges = crate::inplace::views_of_section(section, offset, len);
-    if ranges.is_empty() {
-        return;
-    }
     if lazy {
-        let _ = crate::lazy_back::materialize_ranges_unconditional(&ranges);
+        // Use the uncapped lookup so mapping a `(MANY_VIEWS + 1)`-th view of a
+        // deferred page still materializes all armed views.
+        let lazy_ranges = crate::inplace::views_of_section_all(section, offset, len);
+        if !lazy_ranges.is_empty() {
+            let _ = crate::lazy_back::materialize_ranges_unconditional(&lazy_ranges);
+        }
     }
     if !guard {
+        return;
+    }
+    let ranges = crate::inplace::views_of_section(section, offset, len);
+    if ranges.is_empty() {
         return;
     }
     let mut mask = ShardMask::EMPTY;
