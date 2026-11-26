@@ -21,6 +21,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use windows::Win32::Graphics::Direct3D12::*;
+use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8_UNORM;
 
 use crate::host::{HostList, host};
 use crate::object::This;
@@ -96,6 +97,8 @@ pub(crate) struct Staging {
     /// Top levels of the title's texture the host copy lacks.
     skipped: u32,
     memory: *const u8,
+    /// Whether unchanged view guards can defer hashing this texture.
+    guard_view: bool,
     /// Title resource this staging buffer is of: host SRVs are narrowed to
     /// its resident mip window ([`note_resident`]).
     resource: This,
@@ -221,6 +224,32 @@ thread_local! {
     /// Texture memory read for hashing and detiling: one per submitting
     /// thread, as large as the largest texture it read.
     static SCRATCH: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Calls `f` with `size` bytes of this thread's scratch buffer (their contents
+/// are whatever the last texture left). Moves the buffer out of the
+/// thread-local `RefCell` during `f` so same-thread VEH re-entrancy can never
+/// panic with `RefCell already borrowed`. Keeps the initialized length so
+/// alternating large and small textures do not re-zero the tail.
+fn with_scratch<R>(size: usize, f: impl FnOnce(&mut [u8]) -> R) -> R {
+    let mut read = SCRATCH.with(|slot| {
+        slot.try_borrow_mut()
+            .map(|mut b| std::mem::take(&mut *b))
+            .unwrap_or_default()
+    });
+    if size > read.len() {
+        read.reserve_exact(size - read.len());
+        read.resize(size, 0);
+    }
+    let out = f(&mut read[..size]);
+    SCRATCH.with(|slot| {
+        if let Ok(mut saved) = slot.try_borrow_mut()
+            && read.capacity() > saved.capacity()
+        {
+            *saved = read;
+        }
+    });
+    out
 }
 
 /// Textures the host GPU wrote by a copy or resolve: their contents are on
@@ -659,7 +688,9 @@ impl Staging {
         let start = self.memory as usize;
         let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
         let last = &mut *last;
-        if let Some((now, written)) = crate::watch::writes(start, start + size, false) {
+        if self.guard_view
+            && let Some((now, written)) = crate::watch::writes(start, start + size, false)
+        {
             if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
                 return 0;
             }
@@ -699,8 +730,7 @@ impl Staging {
         // Read through the kernel, as above: the title may unmap the pages
         // (evicting a texture a big table lists) while we read them, and a
         // direct read would fault. The copy is reused, not kept per texture.
-        SCRATCH.with_borrow_mut(|tiled| {
-            tiled.resize(size, 0);
+        with_scratch(size, |tiled| {
             crate::host::copy_mapped(tiled.as_mut_ptr(), self.memory, size, false);
             self.changed(last, tiled, self.first)
         })
@@ -778,15 +808,9 @@ impl Staging {
     }
 }
 
-/// Reads a texture for the duration of its detile. Keep the initialized
-/// length so alternating large and small textures do not re-zero the tail.
+/// Reads a texture for the duration of its detile.
 fn with_tiled_copy(memory: *const u8, size: usize, detile: impl FnOnce(&[u8])) {
-    SCRATCH.with_borrow_mut(|read| {
-        if size > read.len() {
-            read.reserve_exact(size - read.len());
-            read.resize(size, 0);
-        }
-        let tiled = &mut read[..size];
+    with_scratch(size, |tiled| {
         crate::host::copy_mapped(tiled.as_mut_ptr(), memory, size, false);
         detile(tiled);
     });
@@ -965,6 +989,15 @@ fn create_staging(
     let host = host()?;
     // SAFETY: a live resource.
     let d = unsafe { texture.GetDesc() };
+    // Software-decoded movie planes are linear R8 textures. The decoder can
+    // write through another view of the same pages, bypassing the guards on
+    // the sampled view. Check their content on every submission so cycling
+    // through the movie's textures does not replay old frames.
+    let guard_view = !(d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
+        && d.Format == DXGI_FORMAT_R8_UNORM
+        && d.MipLevels == 1
+        && d.DepthOrArraySize == 1
+        && layout.desc.swizzle == victory_formats::texture::Swizzle::LINEAR);
     let first = first_mip(&layout, u32::from(d.MipLevels), requested);
     let tiled_bytes = layout.bytes_from(first) as usize;
     let count = if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
@@ -1007,6 +1040,7 @@ fn create_staging(
         mips: u32::from(d.MipLevels),
         skipped: crate::resource::dropped_mips(resource),
         memory,
+        guard_view,
         resource,
         last: Mutex::default(),
         born_seq: crate::host::birth_seq(),
@@ -2003,5 +2037,19 @@ mod resident_tests {
         assert_eq!(resident(resource), None);
         // Leave no cross-test residue in the process-wide sets.
         forget(resource as usize);
+    }
+
+    #[test]
+    fn with_scratch_is_reentrant_safe() {
+        let outer = super::with_scratch(64, |outer_buf| {
+            outer_buf.fill(0xaa);
+            let inner = super::with_scratch(256, |inner_buf| {
+                inner_buf.fill(0x55);
+                inner_buf.len()
+            });
+            assert!(outer_buf.iter().all(|&b| b == 0xaa));
+            (outer_buf.len(), inner)
+        });
+        assert_eq!(outer, (64, 256));
     }
 }
