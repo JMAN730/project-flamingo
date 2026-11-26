@@ -786,11 +786,85 @@ fn with_tiled_copy(memory: *const u8, size: usize, detile: impl FnOnce(&[u8])) {
 /// Whether `[at, at + len)` is committed memory (streamed textures may be
 /// unmapped until their pages arrive).
 pub(crate) fn committed(at: *const u8, len: usize) -> bool {
+    if len == 0 {
+        return true;
+    }
+    // A range past the top of the address space is never all committed.
+    if (at as usize).checked_add(len).is_none() {
+        return false;
+    }
     committed_prefix(at, len) == len
 }
 
+/// Whether residency probes (`committed`, `committed_prefix`) fall back to
+/// `VirtualQuery` instead of batched `K32QueryWorkingSetEx`
+/// (`VICTORY_COMMITTED_QUERY=1` restores legacy `VirtualQuery`).
+fn by_query() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_COMMITTED_QUERY").is_some_and(|v| v == "1"))
+}
+
 fn committed_prefix(at: *const u8, len: usize) -> usize {
-    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    if len == 0 {
+        return 0;
+    }
+    if by_query() {
+        return committed_prefix_by_query(at, len);
+    }
+    readable_prefix(at as usize, len)
+}
+
+/// Contiguous readable prefix length of `[start, start.saturating_add(len))`
+/// using batched 256-page `K32QueryWorkingSetEx` syscalls (with
+/// [`crate::host::read_into_probe`] fallback for pages not yet in the working
+/// set), avoiding `VirtualQuery`'s full-region page-table walks.
+fn readable_prefix(start: usize, len: usize) -> usize {
+    use windows_sys::Win32::System::ProcessStatus::{
+        K32QueryWorkingSetEx, PSAPI_WORKING_SET_EX_INFORMATION,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    const KERNEL_PAGE: usize = 4096;
+    let end = start.saturating_add(len);
+    if start >= end {
+        return 0;
+    }
+    let first = start / KERNEL_PAGE;
+    let last = (end - 1) / KERNEL_PAGE;
+    // SAFETY: plain data filled by `K32QueryWorkingSetEx`.
+    let mut info: [PSAPI_WORKING_SET_EX_INFORMATION; 256] = unsafe { std::mem::zeroed() };
+    let mut page = first;
+    while page <= last {
+        let n = (last - page + 1).min(info.len());
+        for (i, entry) in info[..n].iter_mut().enumerate() {
+            entry.VirtualAddress = ((page + i) * KERNEL_PAGE) as *mut _;
+        }
+        // SAFETY: `n` entries of the given size; our own process.
+        let asked = unsafe {
+            K32QueryWorkingSetEx(
+                GetCurrentProcess(),
+                info.as_mut_ptr().cast(),
+                (n * size_of::<PSAPI_WORKING_SET_EX_INFORMATION>()) as u32,
+            )
+        } != 0;
+        for (i, entry) in info[..n].iter().enumerate() {
+            // Bit 0 of the answer: the page is in the working set.
+            // SAFETY: plain data filled by the query.
+            let valid = asked && unsafe { entry.VirtualAttributes.Flags } & 1 != 0;
+            let page_addr = (page + i) * KERNEL_PAGE;
+            let mut byte = [0u8];
+            if !(valid || crate::host::read_into_probe(page_addr as *const u8, &mut byte)) {
+                return page_addr.saturating_sub(start);
+            }
+        }
+        page += n;
+    }
+    end - start
+}
+
+fn committed_prefix_by_query(at: *const u8, len: usize) -> usize {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery,
+    };
     let mut p = at as usize;
     // A range past the top of the address space (a title address and size
     // taken as they come) is cut at the top, so it is never all committed.
@@ -800,7 +874,8 @@ fn committed_prefix(at: *const u8, len: usize) -> usize {
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
         // SAFETY: a valid out pointer of the right size.
         let n = unsafe { VirtualQuery(p as *const _, &mut info, size_of_val(&info)) };
-        if n == 0 || info.State != MEM_COMMIT {
+        if n == 0 || info.State != MEM_COMMIT || (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0
+        {
             break;
         }
         p = (info.BaseAddress as usize).saturating_add(info.RegionSize);
@@ -968,6 +1043,76 @@ mod tests {
         assert!(committed(data.as_ptr(), data.len()));
         assert!(!committed(data.as_ptr(), usize::MAX));
         assert!(!committed(usize::MAX as *const u8, 2));
+    }
+
+    #[test]
+    fn batched_query_working_set_prefix_spans_multiple_batches_and_stops_at_holes() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc,
+            VirtualFree, VirtualProtect,
+        };
+        const MEM_TOP_DOWN: u32 = 0x10_0000;
+        const KERNEL_PAGE: usize = 4096;
+        // > 256 pages so `readable_prefix` crosses multiple 256-entry
+        // `K32QueryWorkingSetEx` batches (300 pages = 1.2 MiB).
+        const TOTAL_PAGES: usize = 300;
+        const COMMIT_PAGES: usize = 270;
+        const TOTAL_BYTES: usize = TOTAL_PAGES * KERNEL_PAGE;
+        const COMMIT_BYTES: usize = COMMIT_PAGES * KERNEL_PAGE;
+
+        // SAFETY: isolated reservation freed at the end of the test.
+        let base = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                TOTAL_BYTES,
+                MEM_RESERVE | MEM_TOP_DOWN,
+                PAGE_NOACCESS,
+            )
+            .cast::<u8>()
+        };
+        assert!(!base.is_null());
+        // SAFETY: commit the first 270 pages; leave pages 270..300 reserved.
+        let mapped = unsafe { VirtualAlloc(base.cast(), COMMIT_BYTES, MEM_COMMIT, PAGE_READWRITE) };
+        assert_eq!(mapped, base.cast());
+
+        // Touch only the first half so the second half exercises the
+        // `read_into_probe` fallback for committed pages not yet in working set.
+        // SAFETY: pages 0..135 are committed and writable.
+        unsafe { base.write_bytes(0x5A, 135 * KERNEL_PAGE) };
+
+        assert_eq!(readable_prefix(base as usize, TOTAL_BYTES), COMMIT_BYTES);
+        assert_eq!(
+            readable_prefix(base as usize + 123, TOTAL_BYTES - 123),
+            COMMIT_BYTES - 123
+        );
+        assert!(committed(base, COMMIT_BYTES));
+        assert!(!committed(base, TOTAL_BYTES));
+        // Unmapped start returns 0 immediately.
+        assert_eq!(
+            readable_prefix(base as usize + COMMIT_BYTES, 16 * KERNEL_PAGE),
+            0
+        );
+
+        // `PAGE_NOACCESS` mid-range stops `readable_prefix` before the protected page.
+        let mut old = 0u32;
+        // SAFETY: page 260 is committed within our reservation.
+        let protected = unsafe {
+            VirtualProtect(
+                base.add(260 * KERNEL_PAGE).cast(),
+                KERNEL_PAGE,
+                PAGE_NOACCESS,
+                &mut old,
+            )
+        };
+        assert_ne!(protected, 0);
+        assert_eq!(
+            readable_prefix(base as usize, TOTAL_BYTES),
+            260 * KERNEL_PAGE
+        );
+        assert!(!committed(base, COMMIT_BYTES));
+
+        // SAFETY: release our reservation.
+        assert_ne!(unsafe { VirtualFree(base.cast(), 0, MEM_RELEASE) }, 0);
     }
 
     #[test]
