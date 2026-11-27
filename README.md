@@ -73,6 +73,15 @@ shader model 6.6 (and mesh shaders for the world), Rust (pinned in
 [docs/linux-proton.md](docs/linux-proton.md) for which crates build and test
 natively today, cross-building `victory.exe` and running it under Proton.
 
+Windows 10's own Direct3D 12 stops at shader model 6.5, so there
+`victory.exe` needs the runtime of Microsoft's Agility SDK. Take
+`D3D12Core.dll` from the NuGet package `Microsoft.Direct3D.D3D12` 1.620.2
+(`build\native\bin\x64`) and put it in a `D3D12` folder beside the
+executable before building, for example `target\release\D3D12\D3D12Core.dll`:
+a build that finds it there makes `victory.exe` load it. Keep the folder
+beside `victory.exe` wherever you copy it. A build made without the DLL uses
+the system's runtime, which is enough on Windows 11.
+
 Under Wine or Proton, builds without embedded helper shaders also need DXC's
 `dxcompiler.dll` (with its `dxil.dll`): Wine's `d3dcompiler_47` cannot compile
 the indirect-argument clamp. The Nix shell sets `VICTORY_BUILD_DXC` to embed
@@ -90,6 +99,14 @@ The title also needs several GiB of available Windows commit at startup.
 Check **Committed** under **Task Manager → Performance → Memory**. If
 `crashes.log` reports Windows error 1455, close other applications or increase
 the Windows paging file size, then retry.
+
+On a slow host (a few frames a second or less), set
+`VICTORY_TIME_SCALE=auto` (or `auto:<fps>`, 10 by default): the title's
+clock then slows while frames come slower than that, so what the title does
+by the clock (streaming in and creating objects) keeps pace with what it
+does per frame (freeing them). Without it the title can run out of a fixed
+pool of objects while loading and stop at a breakpoint. It is off by
+default.
 
 Keep the game folder on an SSD if you can. From a hard drive the first
 screen stays black, at 30 fps and about 3 draws/frame, for a minute and a
@@ -220,16 +237,25 @@ The on/off switches below (`...=1`) are off when unset or set to `0`.
 | `VICTORY_D3D12_GBV_EAGER=1` | with the two above, compile the active GPU validation shader variant at pipeline creation rather than first bind |
 | `VICTORY_D3D12_GBV_EAGER=guarded` | as above, explicitly selecting guarded GPU validation (fails host initialization if guarded mode cannot be verified; diagnostics only) |
 | `VICTORY_D3D12_DRED=1` | on a GPU failure, the allocation hit and the commands in flight |
+| `VICTORY_BREADCRUMBS=1` | without the above: on a GPU failure, the commands of the last submissions that had begun but not finished (two immediate writes per command; light enough not to hide timing-sensitive faults) |
+| `VICTORY_CHECK_DESCRIPTORS=1` | at each draw and dispatch, the descriptor kind at every heap entry a translated shader reads (table entries, and heap indices in root constants or read from a buffer) compared with what the shader declares; mismatches logged, and draws with a buffer read as a texture, another texture dimension or another view class dropped; slots a submission in flight reads rewritten with another kind logged |
+| `VICTORY_TIME_SCALE=0.25` | the title's clock (`QueryPerformanceCounter`, `GetTickCount`) at a quarter of real time |
+| `VICTORY_SHADER_TRACE_DYNAMIC=1` | logs how each translated shader computes the heap indices it adds at run time (`dynamic heap indices`) |
 | `VICTORY_LOG=victory_gpu::draw=debug` | with frames listed for capture: one line per draw and dispatch of those frames with its targets (named as in the `VICTORY_DUMP_TARGETS` files) and, if it was dropped, why |
 | `VICTORY_SKIP_PIPELINES=<hash>,...` | omit draws and dispatches, including indirect ones, whose pipeline contains a listed 16-digit shader hash |
 | `VICTORY_SKIP_HOST_PSOS=<name>,...` | omit a host pipeline whose 32-digit library name matches exactly; get names and worker thread IDs with `VICTORY_TRACE_PIPELINES=1` |
 | `VICTORY_SKIP_WAVE64=mesh,compute` | omit draws and dispatches whose pipeline has a program of a listed stage written for 64-lane waves (on hosts with 32-lane waves, such as NVIDIA's, these can hang the GPU) |
+| `VICTORY_NO_BARYCENTRICS=1` | pixel shaders that need barycentrics run the way they do on a host without them (translated without `SV_Barycentrics` and `GetAttributeAtVertex`, behind a geometry shader that gives them the values at each vertex and the weights), to compare the two on a host that has them |
 | `VICTORY_GPU_TIMING=1` | with the above, each list of a submission run and timed on its own; slow lists logged with their slowest commands |
 | `VICTORY_WAIT_TIMEOUT_MS=<ms>` | override the 2000 ms fail-open timeout for mid-list GPU memory waits |
 | `VICTORY_D3D12_WARP=1` | host device on the software adapter (slow; cannot reset the driver) |
 | `VICTORY_ADAPTER=<name>` | select a D3D12 adapter by case-insensitive substring (default: the first GPU, in high-performance order, with shader model 6.6, resource binding tier 3 and mesh shaders; the log says what is missing when none has all three) |
 | `VICTORY_SHADER_LOOP_LIMIT=<n>` | translated shader loops stop after `n` iterations per lane instead of 2^20 (own shader cache entries); if a lower `n` makes world frames much faster, loops hitting the limit are what makes them slow |
 | `VICTORY_SHADER_OPT=<bits>` | which clean-up passes run over each translated shader (own shader cache entries): `0` none, 1 dead code, 2 constants and identities, 4 reuse of values, 8 branch facts, 16 loads within a block; unset runs all. Every pass is exact, so a fault that goes away with `0` is in a pass |
+| `VICTORY_SHADER_NO_LAST_CHANCE=1` | works in release builds too (own shader cache entries): the translator's last-chance retry (leftover registers, in `emit` and `resource::track`) is off; programs that need it are refused |
+| `VICTORY_SHADER_NO_SECOND_PASS=1` | works in release builds too (own shader cache entries): no second try at refused programs (SCC of a lane mask as wave-any, lane reads from spills) |
+| `VICTORY_SHADER_NO_BUFFER_TABLE=1` | works in release builds too (own shader cache entries): buffer loads whose element stride only the view knows (a descriptor picked at run time, such as each lane's own in a waterfall loop) are refused instead of read through the host's buffer view table |
+| `VICTORY_NO_ACCC=1` | works in release builds too: `ACCC` containers have no programs |
 | `VICTORY_ALIAS_COPY=0` | views the title places in the memory of a texture the host writes are filled from title memory again instead of copied from that texture on the host |
 | `VICTORY_AUDIO_CAPTURE=<file.wav>` | records what the title plays (our process only) |
 | `VICTORY_XMA_DUMP=<dir>` | saves the first 32 XMA voices' context and input |
