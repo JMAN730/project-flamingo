@@ -438,14 +438,14 @@ pub(crate) fn expand(
 
     // Refresh title buffers at submission time.
     let args_len = u64::from(stride) * u64::from(max.max(1));
-    args.refresh_as(
+    args.refresh_in_place(
         list,
         arguments,
         args_len,
         D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
     );
     if let Some((c, at)) = counter {
-        c.refresh_as(list, at, 4, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        c.refresh_in_place(list, at, 4, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     }
     for w in &work {
         w.shadow.refresh_as(

@@ -601,6 +601,19 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             crate::resource::host_resource(dst),
             crate::resource::host_resource(src),
         ) {
+            let host_dst = crate::resource::host_copy(dst);
+            let host_src = crate::resource::host_copy(src);
+            if let (Some(hd), Some(hs)) = (host_dst.as_ref(), host_src.as_ref())
+                && hd.mip_drop != hs.mip_drop
+            {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| {
+                    tracing::warn!(
+                        "copy_resource between textures with different mip_drop skipped"
+                    );
+                });
+                return;
+            }
             if crate::texture::title_written(from) {
                 crate::texture::upload(&list, src, from);
             }
@@ -777,7 +790,28 @@ extern "system" fn copy_texture_region(
         let Some(to) = crate::resource::host_resource(dst.resource) else {
             return;
         };
+        let mut to_sub = dst.footprint.offset as u32;
+        if dst.kind != FOOTPRINT
+            && let Some(host_dst) = crate::resource::host_copy(dst.resource)
+        {
+            let Some(host_sub) = host_dst.host_subresource(to_sub) else {
+                return;
+            };
+            to_sub = host_sub;
+        }
+        let mut from_sub = src.footprint.offset as u32;
+        if src.kind != FOOTPRINT
+            && let Some(host_src) = crate::resource::host_copy(src.resource)
+        {
+            let Some(host_sub) = host_src.host_subresource(from_sub) else {
+                return;
+            };
+            from_sub = host_sub;
+        }
         let mut from = src;
+        if src.kind != FOOTPRINT {
+            from.footprint.offset = u64::from(from_sub);
+        }
         let _upload; // keeps the source alive while this call records it
         #[cfg(feature = "diagnostics")]
         let mut read = None;
@@ -816,6 +850,9 @@ extern "system" fn copy_texture_region(
         crate::texture::host_written(dst.resource);
         list.mark_work();
         let mut to_location = dst;
+        if dst.kind != FOOTPRINT {
+            to_location.footprint.offset = u64::from(to_sub);
+        }
         to_location.resource = to.as_raw().cast_const().cast();
         #[cfg(feature = "diagnostics")]
         {
@@ -886,6 +923,22 @@ extern "system" fn resolve(
             crate::resource::host_resource(src),
         )
     {
+        let dst_sub = if let Some(hd) = crate::resource::host_copy(dst) {
+            let Some(mapped) = hd.host_subresource(dst_sub) else {
+                return;
+            };
+            mapped
+        } else {
+            dst_sub
+        };
+        let src_sub = if let Some(hs) = crate::resource::host_copy(src) {
+            let Some(mapped) = hs.host_subresource(src_sub) else {
+                return;
+            };
+            mapped
+        } else {
+            src_sub
+        };
         use windows::Win32::Foundation::RECT;
         use windows::Win32::Graphics::Direct3D12::{
             D3D12_RESOLVE_MODE_AVERAGE, D3D12_RESOURCE_DESC, ID3D12GraphicsCommandList1,
@@ -1241,9 +1294,136 @@ extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, _flags: u32) {
     }
 }
 
-/// `BeginQuery`/`EndQuery(heap, type, index)`: queries are answered when
-/// resolved.
-extern "system" fn query_mark(_: This, _heap: This, _kind: u32, _index: u32) {}
+/// `D3D12_QUERY_TYPE_OCCLUSION` and `_BINARY_OCCLUSION`.
+const OCCLUSION: u32 = 0;
+const BINARY_OCCLUSION: u32 = 1;
+
+/// `BeginQuery(heap, type, index)`: an occlusion query runs on the host
+/// GPU, in the host query heap behind the title's; other kinds are answered
+/// when resolved.
+extern "system" fn begin_query(this: This, heap: This, kind: u32, index: u32) {
+    #[cfg(windows)]
+    if matches!(kind, OCCLUSION | BINARY_OCCLUSION)
+        && let Some(host_heap) = crate::query::occlusion_heap(heap)
+        && let Some(list) = host_list(this)
+    {
+        list.keep(&host_heap);
+        // SAFETY: an open list; the index is the title's, inside its heap
+        // (which the host heap matches in size).
+        unsafe {
+            list.list.BeginQuery(
+                &host_heap,
+                windows::Win32::Graphics::Direct3D12::D3D12_QUERY_TYPE(kind as i32),
+                index,
+            )
+        };
+        crate::query::begun(heap, index, std::sync::Arc::as_ptr(&list) as usize);
+        mark_work(this);
+    }
+    #[cfg(not(windows))]
+    let _ = (this, heap, kind, index);
+}
+
+/// `EndQuery(heap, type, index)`: ends a host occlusion query begun in the
+/// same host list (a list split between the two drops the query, whose
+/// last result stays).
+extern "system" fn end_query(this: This, heap: This, kind: u32, index: u32) {
+    #[cfg(windows)]
+    if matches!(kind, OCCLUSION | BINARY_OCCLUSION)
+        && let Some(host_heap) = crate::query::occlusion_heap(heap)
+        && let Some(list) = host_list(this)
+    {
+        let here = std::sync::Arc::as_ptr(&list) as usize;
+        if crate::query::take_begun(heap, index) == Some(here) {
+            // SAFETY: an open list; the query was begun in it.
+            unsafe {
+                list.list.EndQuery(
+                    &host_heap,
+                    windows::Win32::Graphics::Direct3D12::D3D12_QUERY_TYPE(kind as i32),
+                    index,
+                )
+            };
+            crate::query::set_ended(heap, index);
+            mark_work(this);
+        } else {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                tracing::info!("an occlusion query ended in another host list than it began: its last result stays");
+            });
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = (this, heap, kind, index);
+}
+
+/// Resolves the host occlusion queries `first..first + count` of `heap`
+/// into the title's `buffer` at `offset`, at the end of the list: each run
+/// of queries ever ended on the host is resolved into readback memory and
+/// copied to title memory once the list has run. A query never ended on
+/// the host leaves its 8 bytes as they were (its last result). False if
+/// `heap` has no host occlusion heap.
+#[cfg(windows)]
+fn resolve_occlusion(
+    this: This,
+    heap: This,
+    kind: u32,
+    first: u32,
+    count: u32,
+    buffer: This,
+    offset: u64,
+) -> bool {
+    let Some(host_heap) = crate::query::occlusion_heap(heap) else {
+        return false;
+    };
+    let (Some(list), Some(host)) = (host_list(this), crate::host::host()) else {
+        return true;
+    };
+    let mut i = 0;
+    while i < count {
+        if !crate::query::ended(heap, first + i) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < count && crate::query::ended(heap, first + i) {
+            i += 1;
+        }
+        let n = i - start;
+        let bytes = u64::from(n) * 8;
+        let Some(target) = buffer_range(buffer, offset + u64::from(start) * 8, bytes) else {
+            return true;
+        };
+        let Some((staging, data)) = list.readback(host, bytes) else {
+            return true;
+        };
+        list.keep(&host_heap);
+        // SAFETY: an open list; queries ended on the host; the readback
+        // buffer holds `bytes`.
+        unsafe {
+            list.list.ResolveQueryData(
+                &host_heap,
+                windows::Win32::Graphics::Direct3D12::D3D12_QUERY_TYPE(kind as i32),
+                first + start,
+                n,
+                &staging,
+                0,
+            )
+        };
+        let len = bytes as usize;
+        list.defer_readback(target, data, len, len, 1, len, len);
+        #[cfg(feature = "diagnostics")]
+        {
+            static RESOLVED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let total = RESOLVED.fetch_add(u64::from(n), std::sync::atomic::Ordering::Relaxed)
+                + u64::from(n);
+            if total.ilog2() != (total - u64::from(n)).max(1).ilog2() || total == u64::from(n) {
+                tracing::info!(n, total, "occlusion queries resolved on the host");
+            }
+        }
+    }
+    mark_work(this);
+    true
+}
 
 /// `ResolveQueryData(heap, type, first, count, buffer, offset)`: writes
 /// each query's result into the buffer once the list has run. Timestamps
@@ -1254,20 +1434,38 @@ extern "system" fn query_mark(_: This, _heap: This, _kind: u32, _index: u32) {}
 /// not measured ones (time spans come out as the submission's length).
 extern "system" fn resolve_queries(
     this: This,
-    _heap: This,
+    heap: This,
     kind: u32,
-    _first: u32,
+    first: u32,
     count: u32,
     buffer: This,
     offset: u64,
 ) {
-    const OCCLUSION: u32 = 0;
-    const BINARY: u32 = 1;
+    #[cfg(not(windows))]
+    let _ = (heap, first);
+    const BINARY: u32 = BINARY_OCCLUSION;
     const TIMESTAMP: u32 = 2;
     const PIPELINE_STATISTICS: u32 = 3;
+    #[cfg(windows)]
+    if matches!(kind, OCCLUSION | BINARY_OCCLUSION)
+        && resolve_occlusion(this, heap, kind, first, count, buffer, offset)
+    {
+        return;
+    }
     let Some((data, size)) = crate::resource::buffer_bytes(buffer) else {
         return;
     };
+    #[cfg(feature = "diagnostics")]
+    {
+        static SEEN: [std::sync::atomic::AtomicU64; 5] =
+            [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+        let n = SEEN[kind.min(4) as usize]
+            .fetch_add(u64::from(count), std::sync::atomic::Ordering::Relaxed)
+            + u64::from(count);
+        if n > 0 && n.ilog2() != (n - u64::from(count)).max(1).ilog2() || n == u64::from(count) {
+            tracing::info!(kind, count, total = n, "query results resolved (made up)");
+        }
+    }
     let (what, bytes) = match kind {
         OCCLUSION => (Written::Value(1 << 20), 8),
         BINARY => (Written::Value(1), 8),
@@ -1917,8 +2115,8 @@ const METHODS: [(usize, *const ()); 53] = [
 ];
 /// The rest of [`METHODS`], kept apart only to stay readable.
 const MORE_METHODS: [(usize, *const ()); 9] = [
-    (28, query_mark as *const ()),             // 0xe0 BeginQuery
-    (29, query_mark as *const ()),             // 0xe8 EndQuery
+    (28, begin_query as *const ()),            // 0xe0 BeginQuery
+    (29, end_query as *const ()),              // 0xe8 EndQuery
     (30, resolve_queries as *const ()),        // 0xf0
     (78, dispatch_x as *const ()),             // 0x270
     (98, state::dispatch_mesh_x as *const ()), // 0x310

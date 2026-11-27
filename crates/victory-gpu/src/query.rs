@@ -1,5 +1,6 @@
-//! Query heaps. Nothing runs on a GPU yet, so no query ever produces a
-//! result; the heap only remembers its description.
+//! Query heaps. Occlusion heaps get a host query heap of the same size, so
+//! the title's occlusion queries run on the host GPU (see `list.rs`); other
+//! kinds only remember their description.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use crate::object::{self, E_INVALIDARG, HRESULT, Iid, Object, QUERY_HEAP, Table, This, guid};
@@ -29,6 +30,120 @@ pub(crate) struct Desc {
 struct Heap {
     object: Object,
     desc: Desc,
+    /// The host occlusion heap (made on first use) and, per query, whether
+    /// one was ended on the host since it was made.
+    #[cfg(windows)]
+    host: std::sync::OnceLock<Option<HostQueries>>,
+}
+
+#[cfg(windows)]
+struct HostQueries {
+    heap: windows::Win32::Graphics::Direct3D12::ID3D12QueryHeap,
+    ended: std::sync::Mutex<Vec<bool>>,
+}
+
+/// `D3D12_QUERY_HEAP_TYPE_OCCLUSION`.
+const OCCLUSION_HEAP: u32 = 0;
+
+#[cfg(windows)]
+fn heap(this: This) -> Option<&'static Heap> {
+    // SAFETY: the title passes one of our query heaps, alive while it uses it.
+    unsafe { this.cast::<Heap>().as_ref() }
+}
+
+#[cfg(windows)]
+fn host_queries(this: This) -> Option<&'static HostQueries> {
+    let heap = heap(this)?;
+    if heap.desc.kind != OCCLUSION_HEAP || heap.desc.count == 0 {
+        return None;
+    }
+    heap.host
+        .get_or_init(|| {
+            use windows::Win32::Graphics::Direct3D12::*;
+            let device = &crate::host::host()?.device;
+            let mut made: Option<ID3D12QueryHeap> = None;
+            // SAFETY: plain object creation.
+            let result = unsafe {
+                device.CreateQueryHeap(
+                    &D3D12_QUERY_HEAP_DESC {
+                        Type: D3D12_QUERY_HEAP_TYPE_OCCLUSION,
+                        Count: heap.desc.count,
+                        NodeMask: 0,
+                    },
+                    &mut made,
+                )
+            };
+            if let Err(e) = result {
+                tracing::warn!(error = %e, count = heap.desc.count, "no host occlusion query heap");
+                return None;
+            }
+            Some(HostQueries {
+                heap: made?,
+                ended: std::sync::Mutex::new(vec![false; heap.desc.count as usize]),
+            })
+        })
+        .as_ref()
+}
+
+/// The host occlusion heap behind the title's query heap `this`, if it is an
+/// occlusion heap and the host GPU made one.
+#[cfg(windows)]
+pub(crate) fn occlusion_heap(
+    this: This,
+) -> Option<windows::Win32::Graphics::Direct3D12::ID3D12QueryHeap> {
+    host_queries(this).map(|q| q.heap.clone())
+}
+
+/// Notes that query `index` of `this` was ended on the host: its result
+/// can be resolved from then on.
+#[cfg(windows)]
+pub(crate) fn set_ended(this: This, index: u32) {
+    if let Some(q) = host_queries(this)
+        && let Some(e) = q
+            .ended
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_mut(index as usize)
+    {
+        *e = true;
+    }
+}
+
+/// Whether query `index` of `this` was ever ended on the host.
+#[cfg(windows)]
+pub(crate) fn ended(this: This, index: u32) -> bool {
+    host_queries(this).is_some_and(|q| {
+        q.ended
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(index as usize)
+            .copied()
+            .unwrap_or(false)
+    })
+}
+
+/// Queries begun on the host and not yet ended: by (heap, index), the host
+/// list they were begun in (an end must be recorded in the same list).
+#[cfg(windows)]
+static OPEN: std::sync::Mutex<Option<std::collections::HashMap<(usize, u32), usize>>> =
+    std::sync::Mutex::new(None);
+
+/// Notes query `index` of `this` begun in host list `list`.
+#[cfg(windows)]
+pub(crate) fn begun(this: This, index: u32, list: usize) {
+    OPEN.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_with(Default::default)
+        .insert((this as usize, index), list);
+}
+
+/// The host list query `index` of `this` was begun in, forgetting it.
+#[cfg(windows)]
+pub(crate) fn take_begun(this: This, index: u32) -> Option<usize> {
+    OPEN.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_mut()?
+        .remove(&(this as usize, index))
 }
 
 /// Device method.
@@ -46,6 +161,8 @@ pub(crate) extern "system" fn create(
     let heap = Box::new(Heap {
         object: Object::new(&FUNCTIONS),
         desc,
+        #[cfg(windows)]
+        host: std::sync::OnceLock::new(),
     });
     object::hand_out(QUERY_HEAP, heap, iid, &HEAP_IIDS, out)
 }

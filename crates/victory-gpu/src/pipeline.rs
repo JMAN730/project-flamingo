@@ -10,7 +10,9 @@
 //! use (decision 0003).
 //!
 //! Host pipelines cover vertex-plus-pixel (including a geometry stage that
-//! expands rectangle lists), mesh-plus-pixel, and compute. shortcut:
+//! expands rectangle lists, and on a host without barycentrics one that
+//! gives a pixel shader that needs them the values at each vertex and the
+//! weights), mesh-plus-pixel, and compute. shortcut:
 //! tessellation stages and the plain graphics description keep their
 //! containers only. The 32-byte packet after the header stays zero: titles
 //! only copy it inline, which our null command-list limits keep from running.
@@ -65,6 +67,9 @@ pub(crate) struct Shader {
     container: Vec<u8>,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
+    /// A mesh shader as hosts without mesh shaders run it.
+    #[cfg(windows)]
+    mesh_fallback: OnceLock<Option<MeshFallback>>,
     /// Whether its native program runs in 64-lane console waves
     /// (diagnostics: `VICTORY_SKIP_WAVE64`).
     #[cfg(all(windows, feature = "diagnostics"))]
@@ -94,6 +99,8 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 container: bytes.to_vec(),
                 #[cfg(windows)]
                 translated: OnceLock::new(),
+                #[cfg(windows)]
+                mesh_fallback: OnceLock::new(),
                 #[cfg(all(windows, feature = "diagnostics"))]
                 wave64: OnceLock::new(),
             })
@@ -127,6 +134,7 @@ impl Shader {
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
                 root_uavs: Vec::new(),
+                structured_srvs: Vec::new(),
             },
             used,
         }));
@@ -135,6 +143,7 @@ impl Shader {
             hash: String::new(),
             container: Vec::new(),
             translated,
+            mesh_fallback: OnceLock::new(),
             #[cfg(feature = "diagnostics")]
             wave64: OnceLock::new(),
         })
@@ -161,6 +170,7 @@ impl Shader {
                 host,
                 used: native.used,
             })),
+            mesh_fallback: OnceLock::new(),
             #[cfg(feature = "diagnostics")]
             wave64: OnceLock::from(native.wave64),
         })
@@ -172,6 +182,13 @@ impl Shader {
         self.translated
             .get_or_init(|| {
                 let done = translate(&self.container);
+                #[cfg(feature = "diagnostics")]
+                {
+                    let chains = victory_shader::emit::take_dynamic_chains();
+                    if !chains.is_empty() {
+                        tracing::info!(hash = %self.hash, ?chains, "dynamic heap indices");
+                    }
+                }
                 match &done {
                     Ok(t) => tracing::info!(
                         stage = self.stage,
@@ -191,15 +208,102 @@ impl Shader {
             })
             .as_ref()
     }
+
+    /// A mesh shader's translation for a host without mesh shaders, made on
+    /// first use; one that does not translate is logged once.
+    // shortcut: not kept on disk as `translated` is, so each run translates
+    // the mesh shaders it draws with again.
+    pub(crate) fn mesh_fallback(&self) -> Option<&MeshFallback> {
+        self.mesh_fallback
+            .get_or_init(|| {
+                let done = victory_shader::emit::translate_mesh_fallback(&self.container)
+                    .map_err(|e| e.to_string())
+                    .and_then(|f| {
+                        Ok(MeshFallback {
+                            compute: Translated {
+                                host: f.compute,
+                                used: used_resources(&self.container)?,
+                            },
+                            vertex: f.vertex,
+                            buffer: f.buffer,
+                        })
+                    });
+                match &done {
+                    Ok(f) => tracing::info!(
+                        hash = %self.hash,
+                        group_dwords = f.buffer.group_dwords(),
+                        "mesh shader translated for a host without mesh shaders"
+                    ),
+                    Err(e) => tracing::warn!(
+                        hash = %self.hash,
+                        error = %e,
+                        "mesh shader does not translate for a host without mesh shaders; \
+                         its pipelines' draws are dropped"
+                    ),
+                }
+                done.ok()
+            })
+            .as_ref()
+    }
+}
+
+#[cfg(all(test, windows, feature = "diagnostics"))]
+impl Shader {
+    /// A shader that is already translated (no container), for tests that
+    /// draw with translations made elsewhere.
+    pub(crate) fn translated_as(
+        stage: &'static str,
+        host: victory_shader::emit::HostShader,
+        fallback: Option<victory_shader::emit::MeshFallback>,
+    ) -> Arc<Shader> {
+        let translated = Translated {
+            host,
+            used: Vec::new(),
+        };
+        let fallback = fallback.map(|f| MeshFallback {
+            compute: Translated {
+                host: f.compute,
+                used: Vec::new(),
+            },
+            vertex: f.vertex,
+            buffer: f.buffer,
+        });
+        Arc::new(Shader {
+            stage,
+            hash: "test".into(),
+            container: Vec::new(),
+            translated: OnceLock::from(Some(translated)),
+            mesh_fallback: OnceLock::from(fallback),
+            wave64: OnceLock::new(),
+        })
+    }
+}
+
+/// A mesh shader as a host without mesh shaders runs it
+/// (`victory_shader::emit::MeshFallback`).
+#[cfg(windows)]
+pub(crate) struct MeshFallback {
+    /// The program as a compute shader, with the console resources it reads.
+    pub(crate) compute: Translated,
+    /// The vertex shader that reads the buffer back.
+    pub(crate) vertex: victory_shader::emit::HostShader,
+    pub(crate) buffer: victory_shader::emit::MeshBuffer,
 }
 
 #[cfg(windows)]
 fn translate(container: &[u8]) -> Result<Translated, String> {
-    use victory_shader::{Container, FourCC, HwStage};
     let host = crate::shader_cache::host_shader(container)?;
+    let used = used_resources(container)?;
+    Ok(Translated { host, used })
+}
+
+/// The console resources a container's program reads.
+#[cfg(windows)]
+fn used_resources(container: &[u8]) -> Result<Vec<victory_shader::UsedResource>, String> {
+    use victory_shader::{Container, FourCC, HwStage, accc::ACCC};
     let c = Container::parse(container).map_err(|e| e.to_string())?;
-    let used = match c.part(FourCC::DXIL) {
-        Some(part) => victory_shader::native_programs(part.data)
+    let used = match c.part(FourCC::DXIL).or(c.part(ACCC)) {
+        Some(_) => victory_shader::container_programs(&c)
             .map_err(|e| e.to_string())?
             .into_iter()
             .find(|p| {
@@ -212,7 +316,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
             .unwrap_or_default(),
         None => Vec::new(),
     };
-    Ok(Translated { host, used })
+    Ok(used)
 }
 
 #[repr(C)]
@@ -327,11 +431,7 @@ impl Shader {
         *self.wave64.get_or_init(|| {
             victory_shader::Container::parse(&self.container)
                 .ok()
-                .and_then(|c| {
-                    c.part(victory_shader::FourCC::DXIL)
-                        .map(|p| p.data.to_vec())
-                })
-                .and_then(|d| victory_shader::native::native_programs(&d).ok())
+                .and_then(|c| victory_shader::container_programs(&c).ok())
                 .is_some_and(|ps| ps.iter().any(|p| p.wave64))
         })
     }
@@ -484,6 +584,8 @@ pub(crate) extern "system" fn create_compute(
     let Some(desc) = (unsafe { desc.as_ref() }) else {
         return E_INVALIDARG;
     };
+    // SAFETY: a live description; no extensions.
+    unsafe { note_without_dxil(desc, 0, std::ptr::null()) };
     hand_out(
         copy("compute", &desc.stage).into_iter().collect(),
         #[cfg(windows)]
@@ -500,12 +602,77 @@ pub(crate) extern "system" fn create_compute(
 pub(crate) extern "system" fn create_compute_x(
     this: This,
     desc: *const ComputeHead,
-    _extensions: u32,
-    _extended: *const u8,
+    extensions: u32,
+    extended: *const u8,
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
+    // SAFETY: as in `create_compute`; the extensions are only read.
+    unsafe { note_without_dxil(desc, extensions, extended) };
     create_compute(this, desc, iid, out)
+}
+
+/// Logs, once per container, a compute container whose parts hold no DXIL (one this host cannot translate):
+/// its part tags and sizes and the first words of the extension records,
+/// to see where such a program's machine code travels.
+///
+/// # Safety
+/// `desc` is null or the title's description; `extended` is null or points
+/// at `extensions` records.
+unsafe fn note_without_dxil(desc: *const ComputeHead, extensions: u32, extended: *const u8) {
+    use victory_shader::{Container, FourCC};
+    // SAFETY: as the caller promises.
+    let Some(desc) = (unsafe { desc.as_ref() }) else {
+        return;
+    };
+    if desc.stage.code.is_null() || desc.stage.size == 0 {
+        return;
+    }
+    // SAFETY: the title passes `size` bytes of shader code.
+    let bytes = unsafe { std::slice::from_raw_parts(desc.stage.code, desc.stage.size) };
+    let parts = match Container::parse(bytes) {
+        Ok(c)
+            if c.part(FourCC::DXIL)
+                .or(c.part(victory_shader::accc::ACCC))
+                .is_some() =>
+        {
+            return;
+        }
+        Ok(c) => c
+            .parts
+            .iter()
+            .map(|p| format!("{}:{}", p.fourcc, p.data.len()))
+            .collect::<Vec<_>>()
+            .join(" "),
+        Err(e) => format!("not a container ({e})"),
+    };
+    static SEEN: Mutex<Vec<[u8; 32]>> = Mutex::new(Vec::new());
+    let full = *blake3::hash(bytes).as_bytes();
+    {
+        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        if seen.contains(&full) {
+            return;
+        }
+        seen.push(full);
+    }
+    let words: Vec<String> = if extended.is_null() || extensions == 0 {
+        Vec::new()
+    } else {
+        // SAFETY: the title passes its extension records there; only their
+        // first 8 bytes each (no record is smaller than a pointer) are read.
+        (0..(extensions as usize * 2).min(16))
+            .map(|i| unsafe { extended.cast::<u32>().add(i).read_unaligned() })
+            .map(|w| format!("{w:#x}"))
+            .collect()
+    };
+    tracing::info!(
+        hash = %blake3::Hash::from(full).to_hex()[..16],
+        size = bytes.len(),
+        parts,
+        extensions,
+        ext_words = ?words,
+        "compute container without DXIL"
+    );
 }
 
 /// A pipeline described as a stream: its size and the subobjects, each a

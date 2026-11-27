@@ -23,6 +23,7 @@ use windows::Win32::Graphics::Direct3D12::*;
 use crate::host::{HostList, host};
 
 const SOURCE: &str = include_str!("../shaders/argument_clamp.hlsl");
+const MESH_SOURCE: &str = include_str!("../shaders/mesh_draws.hlsl");
 
 struct Clamp {
     root: ID3D12RootSignature,
@@ -37,7 +38,7 @@ unsafe impl Sync for Clamp {}
 fn clamp() -> Option<&'static Clamp> {
     static CLAMP: std::sync::OnceLock<Option<Clamp>> = std::sync::OnceLock::new();
     CLAMP
-        .get_or_init(|| match make() {
+        .get_or_init(|| match make("argument clamp", SOURCE) {
             Ok(c) => Some(c),
             Err(e) => {
                 tracing::warn!(error = %e, "no argument clamp: indirect execution dropped");
@@ -47,10 +48,11 @@ fn clamp() -> Option<&'static Clamp> {
         .as_ref()
 }
 
-fn make() -> windows::core::Result<Clamp> {
+/// A compute pass of ours from HLSL `source`, named `name` in messages.
+fn make(name: &str, source: &str) -> windows::core::Result<Clamp> {
     let device = &host().ok_or_else(windows::core::Error::empty)?.device;
     // Wine's d3dcompiler_47 refuses it; `compile_compute` then uses DXC.
-    let bytes = crate::hlsl::compile_compute("argument clamp", SOURCE)?;
+    let bytes = crate::hlsl::compile_compute(name, source)?;
     let bytes = &bytes[..];
     // SAFETY: plain object creation; the root signature is inside the shader.
     unsafe {
@@ -121,6 +123,60 @@ pub(crate) fn bound(
     true
 }
 
+fn mesh_pass() -> Option<&'static Clamp> {
+    static PASS: std::sync::OnceLock<Option<Clamp>> = std::sync::OnceLock::new();
+    PASS.get_or_init(|| match make("mesh draw arguments", MESH_SOURCE) {
+        Ok(c) => Some(c),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "no mesh draw arguments: indirect mesh dispatches dropped on this host"
+            );
+            None
+        }
+    })
+    .as_ref()
+}
+
+/// Bytes of a draw's and of a dispatch's arguments.
+pub(crate) const DRAW_BYTES: u32 = 16;
+pub(crate) const DISPATCH_BYTES: u32 = 12;
+
+/// Records, in `list`, the pass that makes the arguments of an indirect
+/// mesh dispatch on a host without mesh shaders: from the first clamped
+/// record at host address `args` (in unordered-access state, as
+/// [`clamp_uav`] leaves it) it writes, at host address `made`, `parts`
+/// draws [`DRAW_BYTES`] apart and after them `parts` dispatches
+/// [`DISPATCH_BYTES`] apart. Part k covers the record's thread groups from
+/// `k * capacity`, at most `capacity` of them: its dispatch runs that many
+/// groups and its draw has `vertices` per instance and one instance per
+/// group. Replaces the list's compute root signature and pipeline. False if
+/// the pass is not available.
+pub(crate) fn mesh_draws(
+    list: &HostList,
+    args: u64,
+    made: u64,
+    (parts, capacity, vertices): (u32, u32, u32),
+) -> bool {
+    let Some(c) = mesh_pass() else {
+        return false;
+    };
+    let l = &list.list;
+    let constants = [parts, capacity, vertices, 0];
+    // SAFETY: an open list; our root signature, pipeline and live buffers
+    // the caller's list holds, both in unordered-access state.
+    unsafe {
+        l.SetComputeRootSignature(&c.root);
+        l.SetPipelineState(&c.pso);
+        l.SetComputeRoot32BitConstants(0, 4, constants.as_ptr().cast(), 0);
+        l.SetComputeRootUnorderedAccessView(1, args);
+        l.SetComputeRootUnorderedAccessView(2, made);
+        l.Dispatch(1, 1, 1);
+        l.ResourceBarrier(&[uav_barrier()]);
+    }
+    true
+}
+
 pub(crate) fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
     D3D12_RESOURCE_BARRIER {
         Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
@@ -142,5 +198,54 @@ mod tests {
             return; // no host GPU here
         }
         assert!(super::clamp().is_some());
+    }
+
+    /// The arguments of an indirect mesh dispatch without mesh shaders: the
+    /// first record's thread groups are split over the parts, each with its
+    /// draw and its dispatch, and the title's records stay as they are.
+    #[test]
+    fn mesh_draw_arguments_split_the_first_record() {
+        let Some(host) = super::host() else {
+            return; // no host GPU here
+        };
+        // (first record, what each of 3 parts of 1000 groups runs).
+        let cases: [([u32; 3], [u32; 3]); 4] = [
+            ([2500, 1, 1], [1000, 1000, 500]),
+            ([1000, 1, 1], [1000, 0, 0]),
+            ([5000, 1, 1], [1000, 1000, 1000]),
+            ([700, 0, 1], [0, 0, 0]),
+        ];
+        for (first, want) in cases {
+            let list = host.new_list().expect("host command list");
+            let (args, args_at) = host.shared_buffer(256).expect("records");
+            let (made, made_at) = host.shared_buffer(256).expect("made arguments");
+            let records: [[u32; 3]; 3] = [first, [7, 1, 1], [9, 1, 1]];
+            // SAFETY: freshly mapped host buffers of 256 bytes; live buffers.
+            let (args_gpu, made_gpu) = unsafe {
+                std::ptr::copy_nonoverlapping(
+                    records.as_ptr().cast::<u8>(),
+                    args_at,
+                    size_of_val(&records),
+                );
+                std::ptr::write_bytes(made_at, 0xaa, 256);
+                (args.GetGPUVirtualAddress(), made.GetGPUVirtualAddress())
+            };
+            // Three parts of 1000 groups, 768 vertices each.
+            assert!(super::mesh_draws(&list, args_gpu, made_gpu, (3, 1000, 768)));
+            list.close();
+            host.execute(&[&list]);
+            // SAFETY: execution finished; the buffers are mapped and readable.
+            let (after, draws, dispatches) = unsafe {
+                (
+                    args_at.cast::<[[u32; 3]; 3]>().read_unaligned(),
+                    made_at.cast::<[[u32; 4]; 3]>().read_unaligned(),
+                    made_at.add(48).cast::<[[u32; 3]; 3]>().read_unaligned(),
+                )
+            };
+            assert_eq!(after, records, "{first:?}: the title's records");
+            assert_eq!(draws, want.map(|n| [768, n, 0, 0]), "{first:?}: draws");
+            let empty_or = |n: u32| if n == 0 { [0; 3] } else { [n, 1, 1] };
+            assert_eq!(dispatches, want.map(empty_or), "{first:?}: dispatches");
+        }
     }
 }

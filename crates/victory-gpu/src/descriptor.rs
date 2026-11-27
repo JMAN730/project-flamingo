@@ -11,7 +11,15 @@ use crate::object::{self, DESCRIPTOR_HEAP, E_INVALIDARG, HRESULT, Iid, Object, T
 use crate::resource::{Memory, PAGEABLE_IIDS};
 
 #[cfg(windows)]
+// Outside diagnostics builds only the notes are made (and do nothing).
+#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+pub(crate) mod check;
+#[cfg(windows)]
 pub(crate) mod host;
+#[cfg(windows)]
+pub(crate) mod table;
+#[cfg(windows)]
+pub use host::adjust_mips;
 
 /// The first index of `n` (non-zero) consecutive free slots in `taken`,
 /// searching from `cursor` on and then from the start. A run may cross the
@@ -191,7 +199,9 @@ impl Heap {
         let start = self.start as usize;
         let end = start.saturating_add(mirrored_count as usize * step as usize);
         let mut last_watch = self.sync_watch.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((now, pages)) = crate::watch::writes(start, end, false) {
+        // Guarded: a heap in mapped view memory is not write-watched, and
+        // without guards every bind would compare every slot.
+        if let Some((now, pages)) = crate::watch::writes(start, end, true) {
             let prev = *last_watch;
             let mut mirrored = 0;
             for (page, written_at) in pages {

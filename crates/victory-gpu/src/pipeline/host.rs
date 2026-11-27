@@ -8,7 +8,7 @@
 use std::ffi::{CStr, CString};
 use std::sync::Arc;
 
-use victory_shader::emit::{ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
+use victory_shader::emit::{MESH_BUFFER_SPACE, ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -327,10 +327,20 @@ pub(crate) struct Stage {
     pub(crate) root_srvs: Vec<(u8, u32)>,
     /// Root UAVs, each a one-view table.
     pub(crate) root_uavs: Vec<(u8, u32)>,
+    /// A mesh stage run as a compute shader, on a host without mesh
+    /// shaders: its translation is the one made for that.
+    pub(crate) fallback: bool,
 }
 
 impl Stage {
     pub(crate) fn translated(&self) -> &Translated {
+        if self.fallback {
+            return &self
+                .shader
+                .mesh_fallback()
+                .expect("host pipelines are made from translated shaders")
+                .compute;
+        }
         self.shader
             .translated()
             .expect("host pipelines are made from translated shaders")
@@ -366,10 +376,75 @@ impl Shader {
                 used: native.used,
             })
             .into(),
+            mesh_fallback: std::sync::OnceLock::new(),
             #[cfg(feature = "diagnostics")]
             wave64: native.wave64.into(),
         }))
     }
+}
+
+impl Shader {
+    /// A pixel shader that needs barycentrics, translated for a host without
+    /// them (`victory_shader::emit::translate_without_barycentrics`). Kept
+    /// with the pipeline that uses it, as a mesh shader's variant is; the
+    /// translation itself comes from the shader cache, under a key of its
+    /// own.
+    // shortcut: made from the title's container, so a pixel shader that is
+    // also specialised for the strides of bound structured views (whose
+    // variant has no container) gets no such translation.
+    fn without_barycentrics(self: &Arc<Self>) -> Result<Arc<Self>, String> {
+        if self.container.is_empty() {
+            return Err("a pixel shader specialised for bound views".into());
+        }
+        let host = crate::shader_cache::host_shader_without_barycentrics(&self.container)?;
+        let used = self
+            .translated()
+            .ok_or("the pixel shader does not translate")?
+            .used
+            .clone();
+        Ok(Arc::new(Self {
+            stage: self.stage,
+            hash: self.hash.clone(),
+            container: Vec::new(),
+            translated: Some(Translated { host, used }).into(),
+            mesh_fallback: std::sync::OnceLock::new(),
+            #[cfg(feature = "diagnostics")]
+            wave64: std::sync::OnceLock::new(),
+        }))
+    }
+}
+
+/// The pixel stage and the geometry stage that run pixel shader `ps`, which
+/// needs barycentrics, on a host without them, behind the vertex stage `vs`
+/// (translated DXIL), for primitives of the title's topology type
+/// `topology`: `ps` translated to read the values at each vertex and the
+/// weights from inputs that the geometry stage
+/// (`victory_shader::emit::barycentric_gs`) adds. Triangles only (lists
+/// and strips, and the console's quads, which the host draws as triangle
+/// lists); otherwise the reason there is none.
+fn barycentric_fallback(
+    vs: &[u8],
+    ps: &Arc<Shader>,
+    topology: i32,
+) -> Result<(Arc<Shader>, Vec<u8>), String> {
+    match topology {
+        3 | QUADS => {}
+        RECTANGLES => {
+            return Err("rectangle lists have a geometry stage of their own".into());
+        }
+        0 => return Err("a pipeline that names no topology".into()),
+        _ => return Err("points, lines and patches have no barycentrics here".into()),
+    }
+    let variant = ps.without_barycentrics()?;
+    let host = &variant
+        .translated()
+        .ok_or("the pixel shader does not translate")?
+        .host;
+    if host.needs_barycentrics() {
+        return Err("the pixel shader still needs the host's barycentrics".into());
+    }
+    let gs = victory_shader::emit::barycentric_gs(vs, &host.dxil).map_err(|e| e.to_string())?;
+    Ok((variant, gs))
 }
 
 /// Gets the host PSO for the strides of the views bound to this draw or dispatch.
@@ -382,6 +457,28 @@ pub(crate) fn bound_pipeline(
     }
     let _ = super::host_pipeline(this);
     super::make::ready_with_strides(&super::pipeline(this).host, view_stride)
+}
+
+/// The compute half of a mesh pipeline on a host without mesh shaders
+/// (`victory_shader::emit::MeshFallback`): it runs the mesh program, which
+/// stores its vertices and primitives in a buffer, and the pipeline's own
+/// state then draws them with the vertex shader that reads the buffer back.
+pub(crate) struct MeshFallbackPipeline {
+    pub(crate) pso: ID3D12PipelineState,
+    pub(crate) root: ID3D12RootSignature,
+    /// The mesh stage, bound on `root` from the title's graphics arguments.
+    pub(crate) stage: Stage,
+    /// The buffer's root parameters: the root UAV of `root`, and the root
+    /// SRV of the pipeline's graphics root signature.
+    pub(crate) uav: u32,
+    pub(crate) srv: u32,
+    /// The root constant of `root` that tells the program the number of its
+    /// first thread group: a dispatch of more groups than the buffer holds
+    /// runs in parts, and each part's groups count from 0 on the host.
+    pub(crate) first_group: u32,
+    /// Bytes of one thread group's record, and the vertices drawn for it.
+    pub(crate) group_bytes: u64,
+    pub(crate) vertices: u32,
 }
 
 pub(crate) struct HostPipeline {
@@ -401,6 +498,164 @@ pub(crate) struct HostPipeline {
     pub(crate) inputs: Vec<Input>,
     /// Its shaders, for reports of slow submissions.
     pub(crate) name: String,
+    /// On a host without mesh shaders, a mesh pipeline's compute half: the
+    /// compute pass that runs before it.
+    pub(crate) fallback: Option<MeshFallbackPipeline>,
+}
+
+/// Adds what the translation `t` of `shader` binds to the root parameters,
+/// the ranges its table parameters point at and the static samplers, for
+/// the stages `visibility` names. `fallback`: a mesh stage run as a compute
+/// shader. `None` if a range could not be kept.
+// Boxed: the table parameters point at the ranges, which must not move as
+// the list grows.
+#[allow(clippy::vec_box)]
+fn stage_bindings(
+    (shader, t, fallback): (&Arc<Shader>, &victory_shader::emit::HostShader, bool),
+    visibility: D3D12_SHADER_VISIBILITY,
+    params: &mut Vec<D3D12_ROOT_PARAMETER1>,
+    ranges: &mut Vec<Box<D3D12_DESCRIPTOR_RANGE1>>,
+    samplers: &mut Vec<D3D12_STATIC_SAMPLER_DESC>,
+) -> Option<Stage> {
+    let mut stage = Stage {
+        shader: shader.clone(),
+        user_data: None,
+        root_cbvs: Vec::new(),
+        root_srvs: Vec::new(),
+        root_uavs: Vec::new(),
+        fallback,
+    };
+    let dwords = t.user_data_dwords();
+    if dwords > 0 {
+        stage.user_data = Some((params.len() as u32, dwords));
+        params.push(D3D12_ROOT_PARAMETER1 {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+            Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                Constants: D3D12_ROOT_CONSTANTS {
+                    ShaderRegister: 0,
+                    RegisterSpace: USER_DATA_SPACE,
+                    Num32BitValues: dwords,
+                },
+            },
+            ShaderVisibility: visibility,
+        });
+    }
+    for (slots, kind, out) in [
+        (
+            &t.root_cbvs,
+            D3D12_ROOT_PARAMETER_TYPE_CBV,
+            &mut stage.root_cbvs,
+        ),
+        (
+            &t.root_srvs,
+            D3D12_ROOT_PARAMETER_TYPE_SRV,
+            &mut stage.root_srvs,
+        ),
+    ] {
+        for &slot in slots {
+            if kind == D3D12_ROOT_PARAMETER_TYPE_SRV && bounded_root_srvs() {
+                // A one-view table: the view's size bounds the reads,
+                // which a root descriptor leaves unbounded.
+                ranges.push(Box::new(D3D12_DESCRIPTOR_RANGE1 {
+                    RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+                    NumDescriptors: 1,
+                    BaseShaderRegister: u32::from(slot),
+                    RegisterSpace: ROOT_CBV_SPACE,
+                    Flags: D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE
+                        | D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE,
+                    OffsetInDescriptorsFromTableStart: 0,
+                }));
+                let range: *const D3D12_DESCRIPTOR_RANGE1 = &**ranges.last()?;
+                out.push((slot, params.len() as u32));
+                params.push(D3D12_ROOT_PARAMETER1 {
+                    ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+                    Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                        DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE1 {
+                            NumDescriptorRanges: 1,
+                            pDescriptorRanges: range,
+                        },
+                    },
+                    ShaderVisibility: visibility,
+                });
+                continue;
+            }
+            out.push((slot, params.len() as u32));
+            params.push(D3D12_ROOT_PARAMETER1 {
+                ParameterType: kind,
+                Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                    Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                        ShaderRegister: u32::from(slot),
+                        RegisterSpace: ROOT_CBV_SPACE,
+                        Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
+                    },
+                },
+                ShaderVisibility: visibility,
+            });
+        }
+    }
+    for &slot in &t.root_uavs {
+        // A one-view table, as a bounded root SRV: the view's size
+        // bounds what the shader writes, which a root descriptor
+        // leaves unbounded.
+        ranges.push(Box::new(D3D12_DESCRIPTOR_RANGE1 {
+            RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_UAV,
+            NumDescriptors: 1,
+            BaseShaderRegister: u32::from(slot),
+            RegisterSpace: ROOT_CBV_SPACE,
+            Flags: D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE
+                | D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE,
+            OffsetInDescriptorsFromTableStart: 0,
+        }));
+        let range: *const D3D12_DESCRIPTOR_RANGE1 = &**ranges.last()?;
+        stage.root_uavs.push((slot, params.len() as u32));
+        params.push(D3D12_ROOT_PARAMETER1 {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+            Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE1 {
+                    NumDescriptorRanges: 1,
+                    pDescriptorRanges: range,
+                },
+            },
+            ShaderVisibility: visibility,
+        });
+    }
+    for (n, s) in t.static_samplers.iter().enumerate() {
+        samplers.push(D3D12_STATIC_SAMPLER_DESC {
+            Filter: D3D12_FILTER(s.filter as i32),
+            AddressU: D3D12_TEXTURE_ADDRESS_MODE(s.address[0] as i32),
+            AddressV: D3D12_TEXTURE_ADDRESS_MODE(s.address[1] as i32),
+            AddressW: D3D12_TEXTURE_ADDRESS_MODE(s.address[2] as i32),
+            MipLODBias: s.mip_lod_bias,
+            MaxAnisotropy: s.max_anisotropy,
+            ComparisonFunc: D3D12_COMPARISON_FUNC(s.comparison as i32),
+            BorderColor: D3D12_STATIC_BORDER_COLOR(s.border as i32),
+            MinLOD: s.min_lod,
+            MaxLOD: s.max_lod,
+            ShaderRegister: n as u32,
+            RegisterSpace: SAMPLER_SPACE,
+            ShaderVisibility: visibility,
+        });
+    }
+    Some(stage)
+}
+
+/// The root parameter of the buffer a mesh program's compute half fills
+/// and its draw reads (a root UAV, then a root SRV).
+fn mesh_buffer_parameter(
+    kind: D3D12_ROOT_PARAMETER_TYPE,
+    visibility: D3D12_SHADER_VISIBILITY,
+) -> D3D12_ROOT_PARAMETER1 {
+    D3D12_ROOT_PARAMETER1 {
+        ParameterType: kind,
+        Anonymous: D3D12_ROOT_PARAMETER1_0 {
+            Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                ShaderRegister: 0,
+                RegisterSpace: MESH_BUFFER_SPACE,
+                Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
+            },
+        },
+        ShaderVisibility: visibility,
+    }
 }
 
 /// Logs a pipeline that gets no host pipeline, once per reason.
@@ -439,16 +694,21 @@ impl HostPipeline {
         }
         let mesh = find("mesh");
         let pipeline_mesh;
-        let stages = if let Some(cs) = compute {
+        let barycentric_ps;
+        let mut stages = if let Some(cs) = compute {
             vec![(cs, D3D12_SHADER_VISIBILITY_ALL)]
         } else {
             let pixel = find("pixel");
             let first = match (mesh, find("vertex")) {
                 (Some(ms), _) => {
                     if !host()?.mesh_shaders() {
-                        return refuse(
-                            "the host GPU has no mesh shaders (or no shader model 6.6)",
+                        // The mesh program as a compute pass and a draw that
+                        // reads what it stored.
+                        return Self::without_mesh_shaders(
                             shaders,
+                            (ms, pixel),
+                            g,
+                            structured_strides,
                         );
                     }
                     let pixel_dxil = match pixel {
@@ -475,6 +735,33 @@ impl HostPipeline {
             s.translated()?;
         }
         let host = host()?;
+        // A pixel shader that needs barycentrics on a host without them:
+        // its translation without them, behind a geometry stage that gives
+        // it the values at each vertex and the weights. Where that cannot be
+        // made, the host refuses the pipeline as before.
+        // shortcut: not for mesh pipelines on a host with mesh shaders (no
+        // geometry stage there); such hosts have barycentrics so far.
+        let mut barycentric_gs = None;
+        if mesh.is_none()
+            && let Some(g) = g
+            && let Some(&(ps, _)) = stages.get(1)
+            && ps.translated()?.host.needs_barycentrics()
+            && !host.barycentrics()
+        {
+            let vs = &stages[0].0.translated()?.host.dxil;
+            match barycentric_fallback(vs, ps, g.topology.0) {
+                Ok((variant, gs)) => {
+                    barycentric_ps = variant;
+                    stages[1].0 = &barycentric_ps;
+                    barycentric_gs = Some(gs);
+                }
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    ?shaders,
+                    "no barycentric geometry stage for a host without barycentrics"
+                ),
+            }
+        }
 
         // The root signature the translated shaders' bindings define.
         let mut params: Vec<D3D12_ROOT_PARAMETER1> = Vec::new();
@@ -487,125 +774,13 @@ impl HostPipeline {
         for &(shader, visibility) in &stages {
             let t = &shader.translated()?.host;
             heaps |= t.indexes_heaps();
-            let mut stage = Stage {
-                shader: shader.clone(),
-                user_data: None,
-                root_cbvs: Vec::new(),
-                root_srvs: Vec::new(),
-                root_uavs: Vec::new(),
-            };
-            let dwords = t.user_data_dwords();
-            if dwords > 0 {
-                stage.user_data = Some((params.len() as u32, dwords));
-                params.push(D3D12_ROOT_PARAMETER1 {
-                    ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
-                    Anonymous: D3D12_ROOT_PARAMETER1_0 {
-                        Constants: D3D12_ROOT_CONSTANTS {
-                            ShaderRegister: 0,
-                            RegisterSpace: USER_DATA_SPACE,
-                            Num32BitValues: dwords,
-                        },
-                    },
-                    ShaderVisibility: visibility,
-                });
-            }
-            for (slots, kind, out) in [
-                (
-                    &t.root_cbvs,
-                    D3D12_ROOT_PARAMETER_TYPE_CBV,
-                    &mut stage.root_cbvs,
-                ),
-                (
-                    &t.root_srvs,
-                    D3D12_ROOT_PARAMETER_TYPE_SRV,
-                    &mut stage.root_srvs,
-                ),
-            ] {
-                for &slot in slots {
-                    if kind == D3D12_ROOT_PARAMETER_TYPE_SRV && bounded_root_srvs() {
-                        // A one-view table: the view's size bounds the reads,
-                        // which a root descriptor leaves unbounded.
-                        ranges.push(Box::new(D3D12_DESCRIPTOR_RANGE1 {
-                            RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
-                            NumDescriptors: 1,
-                            BaseShaderRegister: u32::from(slot),
-                            RegisterSpace: ROOT_CBV_SPACE,
-                            Flags: D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE
-                                | D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE,
-                            OffsetInDescriptorsFromTableStart: 0,
-                        }));
-                        let range: *const D3D12_DESCRIPTOR_RANGE1 = &**ranges.last()?;
-                        out.push((slot, params.len() as u32));
-                        params.push(D3D12_ROOT_PARAMETER1 {
-                            ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
-                            Anonymous: D3D12_ROOT_PARAMETER1_0 {
-                                DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE1 {
-                                    NumDescriptorRanges: 1,
-                                    pDescriptorRanges: range,
-                                },
-                            },
-                            ShaderVisibility: visibility,
-                        });
-                        continue;
-                    }
-                    out.push((slot, params.len() as u32));
-                    params.push(D3D12_ROOT_PARAMETER1 {
-                        ParameterType: kind,
-                        Anonymous: D3D12_ROOT_PARAMETER1_0 {
-                            Descriptor: D3D12_ROOT_DESCRIPTOR1 {
-                                ShaderRegister: u32::from(slot),
-                                RegisterSpace: ROOT_CBV_SPACE,
-                                Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
-                            },
-                        },
-                        ShaderVisibility: visibility,
-                    });
-                }
-            }
-            for &slot in &t.root_uavs {
-                // A one-view table, as a bounded root SRV: the view's size
-                // bounds what the shader writes, which a root descriptor
-                // leaves unbounded.
-                ranges.push(Box::new(D3D12_DESCRIPTOR_RANGE1 {
-                    RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_UAV,
-                    NumDescriptors: 1,
-                    BaseShaderRegister: u32::from(slot),
-                    RegisterSpace: ROOT_CBV_SPACE,
-                    Flags: D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE
-                        | D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE,
-                    OffsetInDescriptorsFromTableStart: 0,
-                }));
-                let range: *const D3D12_DESCRIPTOR_RANGE1 = &**ranges.last()?;
-                stage.root_uavs.push((slot, params.len() as u32));
-                params.push(D3D12_ROOT_PARAMETER1 {
-                    ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
-                    Anonymous: D3D12_ROOT_PARAMETER1_0 {
-                        DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE1 {
-                            NumDescriptorRanges: 1,
-                            pDescriptorRanges: range,
-                        },
-                    },
-                    ShaderVisibility: visibility,
-                });
-            }
-            for (n, s) in t.static_samplers.iter().enumerate() {
-                samplers.push(D3D12_STATIC_SAMPLER_DESC {
-                    Filter: D3D12_FILTER(s.filter as i32),
-                    AddressU: D3D12_TEXTURE_ADDRESS_MODE(s.address[0] as i32),
-                    AddressV: D3D12_TEXTURE_ADDRESS_MODE(s.address[1] as i32),
-                    AddressW: D3D12_TEXTURE_ADDRESS_MODE(s.address[2] as i32),
-                    MipLODBias: s.mip_lod_bias,
-                    MaxAnisotropy: s.max_anisotropy,
-                    ComparisonFunc: D3D12_COMPARISON_FUNC(s.comparison as i32),
-                    BorderColor: D3D12_STATIC_BORDER_COLOR(s.border as i32),
-                    MinLOD: s.min_lod,
-                    MaxLOD: s.max_lod,
-                    ShaderRegister: n as u32,
-                    RegisterSpace: SAMPLER_SPACE,
-                    ShaderVisibility: visibility,
-                });
-            }
-            bound.push(stage);
+            bound.push(stage_bindings(
+                (shader, t, false),
+                visibility,
+                &mut params,
+                &mut ranges,
+                &mut samplers,
+            )?);
         }
         let (root, root_blob) =
             match root_signature(&host.device, &params, &samplers, compute.is_some(), heaps) {
@@ -642,7 +817,16 @@ impl HostPipeline {
             let pso = match made {
                 Ok(pso) => pso,
                 Err(e) => {
-                    tracing::warn!(error = %e, ?shaders, "host pipeline refused");
+                    let declared = stages
+                        .first()
+                        .and_then(|(s, _)| s.translated())
+                        .map(|t| t.host.declared());
+                    tracing::warn!(
+                        error = %e,
+                        ?shaders,
+                        declared = declared.as_deref().unwrap_or("?"),
+                        "host pipeline refused"
+                    );
                     host.log_messages();
                     return None;
                 }
@@ -660,6 +844,7 @@ impl HostPipeline {
                 rects: false,
                 slots: 0,
                 inputs: Vec::new(),
+                fallback: None,
             });
         }
         let Some(g) = g else {
@@ -698,6 +883,7 @@ impl HostPipeline {
                 rects: false,
                 slots: 0,
                 inputs: Vec::new(),
+                fallback: None,
             });
         }
 
@@ -719,14 +905,13 @@ impl HostPipeline {
             pRootSignature: unsafe { std::mem::transmute_copy(&root) },
             VS: code(0),
             PS: code(1),
-            GS: rect_gs
-                .as_ref()
-                .map_or(D3D12_SHADER_BYTECODE::default(), |gs| {
-                    D3D12_SHADER_BYTECODE {
-                        pShaderBytecode: gs.as_ptr().cast(),
-                        BytecodeLength: gs.len(),
-                    }
-                }),
+            GS: rect_gs.as_ref().or(barycentric_gs.as_ref()).map_or(
+                D3D12_SHADER_BYTECODE::default(),
+                |gs| D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: gs.as_ptr().cast(),
+                    BytecodeLength: gs.len(),
+                },
+            ),
             BlendState: host_blend(&g.blend, &g.targets),
             SampleMask: g.sample_mask,
             RasterizerState: g.rasterizer,
@@ -748,9 +933,15 @@ impl HostPipeline {
             SampleDesc: g.samples,
             ..Default::default()
         };
-        // A pipeline with the geometry stage has a name of its own in the
+        // A pipeline with a geometry stage has a name of its own in the
         // library; the others keep theirs.
         let name = |gs: Option<&[u8]>| match gs {
+            Some(gs) if barycentric_gs.is_some() => super::library::name(
+                "graphics barycentrics",
+                &root_blob,
+                &[&code_bytes(&code(0)), &code_bytes(&code(1)), gs],
+                &state,
+            ),
             Some(gs) => super::library::name(
                 "graphics rectangles",
                 &root_blob,
@@ -773,7 +964,10 @@ impl HostPipeline {
                 || unsafe { host.device.CreateGraphicsPipelineState(desc) },
             )
         };
-        let mut made = make(&desc, &name(rect_gs.as_deref()));
+        let mut made = make(
+            &desc,
+            &name(rect_gs.as_deref().or(barycentric_gs.as_deref())),
+        );
         if made.is_err() && rect_gs.is_some() {
             // The host refused the geometry stage: once more without it.
             tracing::warn!(
@@ -815,6 +1009,7 @@ impl HostPipeline {
         tracing::info!(
             ?shaders,
             rectangle_geometry = rect_gs.is_some(),
+            barycentric_geometry = barycentric_gs.is_some(),
             "host pipeline"
         );
         crate::host::name(&pso, || format!("{shaders:?}"));
@@ -838,6 +1033,231 @@ impl HostPipeline {
             rects: rect_gs.is_some(),
             slots: g.slots(),
             inputs: g.elements(),
+            fallback: None,
+        })
+    }
+
+    /// A mesh pipeline for a host without mesh shaders: a compute pipeline
+    /// that runs the mesh program `ms` into a buffer, and a graphics pipeline
+    /// (the title's state, a vertex shader that reads the buffer back, the
+    /// title's pixel shader) that draws from it.
+    pub(crate) fn without_mesh_shaders(
+        shaders: &[Arc<Shader>],
+        (ms, ps): (&Arc<Shader>, Option<&Arc<Shader>>),
+        g: Option<&GraphicsState>,
+        structured_strides: &[(victory_shader::emit::StructuredBinding, u32)],
+    ) -> Option<HostPipeline> {
+        let Some(f) = ms.mesh_fallback() else {
+            return refuse(
+                "the host GPU has no mesh shaders and the mesh program does not run without them",
+                shaders,
+            );
+        };
+        let mut pixel = match ps {
+            Some(ps) => Some((ps, &ps.translated()?.host)),
+            None => None,
+        };
+        let Some(g) = g else {
+            return refuse("graphics state not kept (plain description)", shaders);
+        };
+        let host = host()?;
+        // As in `new`: a pixel shader that needs barycentrics on a host
+        // without them, behind a geometry stage. The draw is a triangle list.
+        let barycentric_ps;
+        let mut barycentric_gs = None;
+        if let Some((ps, t)) = pixel
+            && t.needs_barycentrics()
+            && !host.barycentrics()
+        {
+            match barycentric_fallback(&f.vertex.dxil, ps, 3) {
+                Ok((variant, gs)) => {
+                    barycentric_ps = variant;
+                    pixel = Some((&barycentric_ps, &barycentric_ps.translated()?.host));
+                    barycentric_gs = Some(gs);
+                }
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    ?shaders,
+                    "no barycentric geometry stage for a host without barycentrics"
+                ),
+            }
+        }
+        let bytecode = |dxil: &[u8]| D3D12_SHADER_BYTECODE {
+            pShaderBytecode: dxil.as_ptr().cast(),
+            BytecodeLength: dxil.len(),
+        };
+        let refused = |what: &str, e: windows::core::Error| {
+            tracing::warn!(error = %e, ?shaders, "host mesh pipeline without mesh shaders: {what} refused");
+            // Tests have no log: say which part it was there too.
+            #[cfg(test)]
+            eprintln!("host mesh pipeline without mesh shaders: {what} refused: {e}");
+            host.log_messages();
+        };
+
+        // The compute half: the mesh stage's bindings, then the buffer.
+        let (mut params, mut samplers) = (Vec::new(), Vec::new());
+        // Ranges the table parameters point at, alive until both root
+        // signatures are made.
+        let mut ranges: Vec<Box<D3D12_DESCRIPTOR_RANGE1>> = Vec::new();
+        let stage = stage_bindings(
+            (ms, &f.compute.host, true),
+            D3D12_SHADER_VISIBILITY_ALL,
+            &mut params,
+            &mut ranges,
+            &mut samplers,
+        )?;
+        let uav = params.len() as u32;
+        params.push(mesh_buffer_parameter(
+            D3D12_ROOT_PARAMETER_TYPE_UAV,
+            D3D12_SHADER_VISIBILITY_ALL,
+        ));
+        let first_group = params.len() as u32;
+        params.push(D3D12_ROOT_PARAMETER1 {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+            Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                Constants: D3D12_ROOT_CONSTANTS {
+                    ShaderRegister: 0,
+                    RegisterSpace: MESH_BUFFER_SPACE,
+                    Num32BitValues: 1,
+                },
+            },
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+        });
+        let heaps = f.compute.host.indexes_heaps();
+        let (compute_root, blob) =
+            match root_signature(&host.device, &params, &samplers, true, heaps) {
+                Ok(root) => root,
+                Err(e) => {
+                    refused("the compute root signature", e);
+                    return None;
+                }
+            };
+        let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+            // SAFETY: a borrowed pointer the description never releases.
+            pRootSignature: unsafe { std::mem::transmute_copy(&compute_root) },
+            CS: bytecode(&f.compute.host.dxil),
+            ..Default::default()
+        };
+        let name = super::library::name("mesh as compute", &blob, &[&f.compute.host.dxil], "");
+        let made = super::library::pipeline(
+            &name,
+            // SAFETY: the description points at live data.
+            |library, name| unsafe { library.LoadComputePipeline(name, &desc) },
+            // SAFETY: as above.
+            || unsafe { host.device.CreateComputePipelineState(&desc) },
+        );
+        let compute_pso = match made {
+            Ok(pso) => pso,
+            Err(e) => {
+                refused("the compute pipeline", e);
+                return None;
+            }
+        };
+
+        // The draw: the pixel stage's bindings, then the buffer for the
+        // vertex shader.
+        let (mut params, mut samplers) = (Vec::new(), Vec::new());
+        let mut bound = Vec::new();
+        let mut heaps = false;
+        if let Some((ps, t)) = pixel {
+            heaps = t.indexes_heaps();
+            bound.push(stage_bindings(
+                (ps, t, false),
+                D3D12_SHADER_VISIBILITY_PIXEL,
+                &mut params,
+                &mut ranges,
+                &mut samplers,
+            )?);
+        }
+        let srv = params.len() as u32;
+        params.push(mesh_buffer_parameter(
+            D3D12_ROOT_PARAMETER_TYPE_SRV,
+            D3D12_SHADER_VISIBILITY_VERTEX,
+        ));
+        let (root, blob) = match root_signature(&host.device, &params, &samplers, false, heaps) {
+            Ok(root) => root,
+            Err(e) => {
+                refused("the draw's root signature", e);
+                return None;
+            }
+        };
+        let ps_code = pixel.map_or(D3D12_SHADER_BYTECODE::default(), |(_, t)| bytecode(&t.dxil));
+        let desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+            // SAFETY: a borrowed pointer the description never releases.
+            pRootSignature: unsafe { std::mem::transmute_copy(&root) },
+            VS: bytecode(&f.vertex.dxil),
+            PS: ps_code,
+            GS: barycentric_gs
+                .as_deref()
+                .map_or(D3D12_SHADER_BYTECODE::default(), bytecode),
+            BlendState: g.blend,
+            SampleMask: g.sample_mask,
+            RasterizerState: g.rasterizer,
+            DepthStencilState: g.depth,
+            // The translation makes triangle mesh shaders only.
+            PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+            NumRenderTargets: g.targets.NumRenderTargets,
+            RTVFormats: g.targets.RTFormats,
+            DSVFormat: g.depth_format,
+            SampleDesc: g.samples,
+            ..Default::default()
+        };
+        let name = match &barycentric_gs {
+            Some(gs) => super::library::name(
+                "mesh as draw barycentrics",
+                &blob,
+                &[&f.vertex.dxil, &code_bytes(&ps_code), gs],
+                &g.describe(),
+            ),
+            None => super::library::name(
+                "mesh as draw",
+                &blob,
+                &[&f.vertex.dxil, &code_bytes(&ps_code)],
+                &g.describe(),
+            ),
+        };
+        let made = super::library::pipeline(
+            &name,
+            // SAFETY: the description points at live data.
+            |library, name| unsafe { library.LoadGraphicsPipeline(name, &desc) },
+            // SAFETY: as above.
+            || unsafe { host.device.CreateGraphicsPipelineState(&desc) },
+        );
+        let pso = match made {
+            Ok(pso) => pso,
+            Err(e) => {
+                refused("the draw's pipeline", e);
+                return None;
+            }
+        };
+        tracing::info!(
+            ?shaders,
+            barycentric_geometry = barycentric_gs.is_some(),
+            "host mesh pipeline without mesh shaders"
+        );
+        crate::host::name(&compute_pso, || format!("{shaders:?} as compute"));
+        crate::host::name(&pso, || format!("{shaders:?} as draw"));
+        Some(HostPipeline {
+            compute: false,
+            mesh: true,
+            pso,
+            root,
+            stages: bound,
+            structured_strides: structured_strides.to_vec(),
+            name: format!("{shaders:?}"),
+            rects: false,
+            slots: 0,
+            inputs: Vec::new(),
+            fallback: Some(MeshFallbackPipeline {
+                pso: compute_pso,
+                root: compute_root,
+                stage,
+                uav,
+                srv,
+                first_group,
+                group_bytes: u64::from(f.buffer.group_dwords()) * 4,
+                vertices: f.buffer.draw_vertices(),
+            }),
         })
     }
 }
@@ -1089,6 +1509,33 @@ mod tests {
             t.DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
         }
         b
+    }
+
+    /// The barycentric geometry stage is for triangles only: rectangle
+    /// lists (which have a stage of their own), points, lines, patches and
+    /// a pipeline without a topology are refused with a reason; triangles
+    /// and quads get as far as the pixel shader's translation.
+    #[test]
+    fn barycentric_stages_are_for_triangles_only() {
+        let ps = Shader::for_test("pixel", victory_shader::HwStage::Ps, Vec::new());
+        for topology in [RECTANGLES, 0, 1, 2, 4] {
+            let refused = barycentric_fallback(&[], &ps, topology).err();
+            assert!(
+                refused
+                    .as_deref()
+                    .is_some_and(|e| !e.contains("specialised")),
+                "{topology}: {refused:?}"
+            );
+        }
+        for topology in [3, QUADS] {
+            // A test shader has no container to translate again.
+            let refused = barycentric_fallback(&[], &ps, topology).err();
+            assert_eq!(
+                refused.as_deref(),
+                Some("a pixel shader specialised for bound views"),
+                "{topology}"
+            );
+        }
     }
 
     #[test]

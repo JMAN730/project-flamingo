@@ -39,12 +39,658 @@ const RTV_RING: u32 = 1024;
 /// Maximum number of detached host lists kept for reuse after pending resets.
 const LIST_POOL_CAP: usize = 64;
 
+/// Work a submission's completion runs on the completion thread.
+type Job = Box<dyn FnOnce() + Send>;
+
+/// A submission between [`Host::begin`] and [`Host::complete`].
+struct Begun {
+    value: u64,
+    /// The submission as its host copies know it ([`Shadow::writing`]):
+    /// the first host fence value it signals.
+    ///
+    /// [`Shadow::writing`]: crate::shadow::Shadow::writing
+    sub: u64,
+    started: std::time::Instant,
+    prepared: std::time::Instant,
+    gpu_writes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    epoch: (*const Mutex<RetireState>, u64),
+}
+
+// SAFETY: the retire state pointer names a static or a test scope that
+// outlives the submission; the rest is Send.
+unsafe impl Send for Begun {}
+
+/// A submission whose GPU work is done and copied back, before the writes
+/// that tell the title so ([`Host::complete_gpu`], [`Host::complete_writes`]).
+struct Finishing(*const Mutex<RetireState>, u64, u64);
+
+// SAFETY: as for `Begun`.
+unsafe impl Send for Finishing {}
+
+/// `VICTORY_ASYNC_SUBMIT` (experimental). Where a submission's completion
+/// (GPU wait, copy-back, the writes that tell the title, what they release)
+/// runs:
+/// - 1 (and 3): on the title's side: left pending, run by the next queue
+///   call or submission, by a fence query once the GPU is done, or by a
+///   CPU fence wait that needs it; the GPU runs meanwhile and every
+///   submission is prepared on the thread that submits it, at that point;
+/// - 2: on the completion thread, the caller waiting for it (bisection);
+/// - 4: as 7, but what the done writes release (the queue's next work,
+///   other queues' work) left pending as in 1 (bisection);
+/// - 5: GPU wait and copy-back on the completion thread; the done writes
+///   and what they release left pending as in 1 (bisection);
+/// - 6: as 7, copy-back writing exactly the bytes the GPU changed;
+/// - 7: all of it on the completion thread, which then also prepares the
+///   queue's next submission and runs other queues' released work while
+///   the title's thread records (the title fails during loading this way).
+///
+/// Pending work the title's threads do not take runs on a fallback thread
+/// [`PENDING_FALLBACK`] after the GPU finished it (counted in the log).
+#[cfg(not(test))]
+fn async_mode() -> u8 {
+    static MODE: OnceLock<u8> = OnceLock::new();
+    *MODE.get_or_init(|| {
+        let mode = std::env::var("VICTORY_ASYNC_SUBMIT")
+            .ok()
+            .and_then(|v| v.trim().parse::<u8>().ok())
+            .filter(|m| (1..=7).contains(m))
+            .map(|m| if m == 3 { 1 } else { m })
+            .unwrap_or(1);
+        if matches!(mode, 1 | 4 | 5) {
+            PENDING_USED.store(true, Ordering::Relaxed);
+        }
+        tracing::info!(mode, "asynchronous host submission");
+        mode
+    })
+}
+
+thread_local! {
+    /// This is the completion thread.
+    static IN_COMPLETER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Copy-back's join gap for overlapped modes (see [`Shadow::copy_back`]).
+///
+/// [`Shadow::copy_back`]: crate::shadow::Shadow::copy_back
+#[cfg_attr(test, allow(dead_code))]
+const OVERLAPPED_GAP: usize = 64;
+
+/// Submission work left for the title's threads, and the host fence value
+/// its GPU work signals (0: none to wait for).
+static PENDING: Mutex<Option<(Job, u64)>> = Mutex::new(None);
+static PENDING_MOVED: std::sync::Condvar = std::sync::Condvar::new();
+static PENDING_USED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Pending work run by a title thread, and by the fallback thread.
+static PENDING_RUN: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+/// How long pending work whose GPU work is done waits for a title thread.
+#[cfg(not(test))]
+const PENDING_FALLBACK: std::time::Duration = std::time::Duration::from_millis(2);
+
+/// Unless `VICTORY_FAST_WAKE=1`: a submission's completion
+/// does not scan the GPU memory waits its copy-back may meet; the fence
+/// watcher's poll finds them, as before that scan was added.
+fn old_completion_scan() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        // Default: completions leave memory waits to the watcher (waking
+        // them on the completing thread made world entry hang the GPU in 4
+        // of 5 runs). `VICTORY_FAST_WAKE=1` wakes them at once.
+        let fast = crate::switch::on("VICTORY_FAST_WAKE");
+        if fast {
+            tracing::info!("VICTORY_FAST_WAKE: completions wake satisfied memory waits at once");
+        }
+        !fast
+    })
+}
+
+/// Whether the host fence reached `value`.
+fn gpu_reached(value: u64) -> bool {
+    // SAFETY: a plain query of our fence.
+    value == 0 || host().is_some_and(|h| unsafe { h.fence.GetCompletedValue() } >= value)
+}
+
+/// Runs the submission work left pending for the title's threads, if any,
+/// waiting for its GPU work (nothing unless `VICTORY_ASYNC_SUBMIT` leaves
+/// work pending).
+pub(crate) fn run_pending() {
+    if FLIGHT_USED.load(Ordering::Relaxed) {
+        // In flight: a queue call never waits for the GPU.
+        flight_done();
+        return;
+    }
+    take_pending(false);
+}
+
+/// [`run_pending`], only if its GPU work is done (a fence query: the title
+/// may poll).
+pub(crate) fn run_pending_if_done() {
+    if FLIGHT_USED.load(Ordering::Relaxed) {
+        flight_done();
+        return;
+    }
+    take_pending(true);
+}
+
+/// Before a CPU fence wait not met yet: [`run_pending`]; with submissions
+/// in flight, completes them in order (waiting for the GPU) until
+/// `reached` or none is left.
+pub(crate) fn run_pending_until(reached: &dyn Fn() -> bool) {
+    if !FLIGHT_USED.load(Ordering::Relaxed) {
+        run_pending();
+        return;
+    }
+    run_releases(std::time::Duration::ZERO);
+    while !reached() && flight_step(true, Releases::Here, reached) {}
+    run_releases(std::time::Duration::ZERO);
+}
+
+fn take_pending(only_done: bool) {
+    if !PENDING_USED.load(Ordering::Relaxed) {
+        return;
+    }
+    let job = {
+        let mut pending = PENDING.lock().unwrap_or_else(|e| e.into_inner());
+        match &*pending {
+            Some((_, value)) if only_done && !gpu_reached(*value) => None,
+            _ => pending.take(),
+        }
+    };
+    if let Some((job, _)) = job {
+        PENDING_MOVED.notify_all();
+        PENDING_RUN[0].fetch_add(1, Ordering::Relaxed);
+        job();
+    }
+}
+
+/// Leaves `job` (whose GPU work signals `value`) for the title's threads
+/// ([`run_pending`]); one already left is run first, here.
+#[cfg(not(test))]
+fn pend(job: Job, value: u64) {
+    static FALLBACK: OnceLock<()> = OnceLock::new();
+    FALLBACK.get_or_init(|| {
+        let spawned = std::thread::Builder::new()
+            .name("victory gpu pending".into())
+            .spawn(pending_fallback);
+        if let Err(e) = spawned {
+            tracing::warn!(error = %e, "no fallback thread for pending submission work");
+        }
+    });
+    let mut pending = PENDING.lock().unwrap_or_else(|e| e.into_inner());
+    while let Some((old, _)) = pending.take() {
+        drop(pending);
+        PENDING_RUN[1].fetch_add(1, Ordering::Relaxed);
+        old();
+        pending = PENDING.lock().unwrap_or_else(|e| e.into_inner());
+    }
+    *pending = Some((job, value));
+    PENDING_MOVED.notify_all();
+}
+
+/// Runs pending work no title thread took within [`PENDING_FALLBACK`] of
+/// its GPU work finishing (a title thread may be waiting for what it
+/// releases without asking us, such as a memory value).
+#[cfg(not(test))]
+fn pending_fallback() {
+    const POLL: std::time::Duration = std::time::Duration::from_millis(1);
+    let mut pending = PENDING.lock().unwrap_or_else(|e| e.into_inner());
+    loop {
+        while pending.is_none() {
+            pending = PENDING_MOVED
+                .wait(pending)
+                .unwrap_or_else(|e| e.into_inner());
+        }
+        // Until its GPU work is done, then the grace period.
+        let mut done_at = None;
+        while let Some((_, value)) = &*pending {
+            let now = std::time::Instant::now();
+            if done_at.is_none() && gpu_reached(*value) {
+                done_at = Some(now);
+            }
+            if done_at.is_some_and(|at| now - at >= PENDING_FALLBACK) {
+                let job = pending.take();
+                drop(pending);
+                let n = PENDING_RUN[1].fetch_add(1, Ordering::Relaxed) + 1;
+                if n == 1 || n.is_multiple_of(256) {
+                    tracing::info!(
+                        by_title = PENDING_RUN[0].load(Ordering::Relaxed),
+                        by_fallback = n,
+                        "pending submission work run by the fallback thread"
+                    );
+                }
+                if let Some((job, _)) = job {
+                    job();
+                }
+                pending = PENDING.lock().unwrap_or_else(|e| e.into_inner());
+                break;
+            }
+            let wait = match done_at {
+                Some(at) => PENDING_FALLBACK.saturating_sub(now - at).min(POLL),
+                None => POLL,
+            };
+            let before = pending.as_ref().map(|(_, v)| *v);
+            pending = PENDING_MOVED
+                .wait_timeout(pending, wait)
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+            if pending.as_ref().map(|(_, v)| *v) != before {
+                // Taken (or replaced): start over.
+                break;
+            }
+        }
+    }
+}
+
+/// `VICTORY_IN_FLIGHT=<n>` (2 to 16, experimental): up to `n` host
+/// submissions in flight on the one in-order host queue; 1 (the default,
+/// and tests) keeps one at a time.
+///
+/// Design:
+/// - A submission is prepared and handed to the host queue on the thread
+///   that runs the title's ExecuteCommandLists, at that point, as always
+///   ([`Host::execute_in_flight`]); it does not wait for the one before to
+///   complete, only for the number in flight to drop below `n`. Its
+///   completion (fence wait, copy-back, readbacks, done writes, epoch
+///   release) is queued ([`FLIGHT`]) and runs strictly in submission
+///   order ([`FLIGHT_ORDER`]): on a title thread at its next queue call,
+///   fence query or CPU fence wait once the GPU is done, when a later
+///   submission needs it, or on a fallback thread once the GPU is done.
+///   What a completion releases (lists back to the pool, queues it woke)
+///   runs on title threads, or on the fallback thread after
+///   [`PENDING_FALLBACK`] (as with `VICTORY_ASYNC_SUBMIT=1`).
+/// - Snapshots are per submission ([`Shadow::writing`] takes the
+///   submission), and copy-back hands bytes a later submission also
+///   declared on to its snapshot ([`Shadow::copy_back`]), so each copy-back
+///   compares with what title memory holds of the GPU's earlier work.
+/// - A refresh never copies title memory over ranges a submission not yet
+///   copied back declared (`Shadow::update` skips every pending range): the
+///   host copy holds that submission's GPU output, which the later GPU work
+///   on the same in-order queue reads.
+/// - What a submission writes into title memory at completion (shader
+///   ranges, readbacks, done writes: its [`Landing`]) is stale in title
+///   memory until then. A later submission whose preparation reads or
+///   writes such title memory on the CPU (title copies, upload fills,
+///   texture refreshes, refreshes through another host copy of the same
+///   memory, work that may touch any memory), or reuses a host list still
+///   in flight, first completes the submissions it depends on ("drained").
+///   Done writes a refresh covers are put into the host copy instead
+///   ([`Shadow::patch_flying`]).
+/// - Queues: a submission returns its host fence value to the queue's
+///   timeline, which goes on with further submissions and waits but holds
+///   fence signals and other CPU-visible work until it has completed. A
+///   GPU memory wait on a value a submission in flight will write is met
+///   at once (see `timeline::in_flight_meets` for why that is sound).
+/// - Epochs (one per submission), list pins and recycling, per-list upload,
+///   scratch, readback and rect buffers are per submission already. The
+///   shared mesh buffer and descriptor heaps are GPU-ordered by the queue.
+///
+/// [`Shadow::writing`]: crate::shadow::Shadow::writing
+/// [`Shadow::copy_back`]: crate::shadow::Shadow::copy_back
+/// [`Shadow::patch_flying`]: crate::shadow::Shadow::patch_flying
+#[cfg(not(test))]
+pub(crate) fn in_flight_limit() -> usize {
+    static LIMIT: OnceLock<usize> = OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        let limit = std::env::var("VICTORY_IN_FLIGHT")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&n| n >= 2)
+            .map_or(1, |n| n.min(16));
+        if limit > 1 {
+            FLIGHT_USED.store(true, Ordering::Relaxed);
+            tracing::info!(limit, "host submissions in flight");
+        }
+        limit
+    })
+}
+
+/// Tests keep one submission at a time.
+#[cfg(test)]
+pub(crate) fn in_flight_limit() -> usize {
+    1
+}
+
+/// The completion of a submission in flight, up to what it releases: run
+/// in submission order, it returns the rest ([`Flight`]).
+type Finish = Box<dyn FnOnce() -> Job + Send>;
+
+/// Makes a submission's [`Finish`] once it has begun.
+type MakeFinish = Box<dyn FnOnce(Begun) -> Finish>;
+
+/// A submission in flight ([`in_flight_limit`]): its host fence value and
+/// its completion.
+struct Flight {
+    value: u64,
+    finish: Finish,
+}
+
+/// Submissions in flight, in submission order.
+static FLIGHT: Mutex<std::collections::VecDeque<Flight>> =
+    Mutex::new(std::collections::VecDeque::new());
+/// Signalled when a submission joins or leaves [`FLIGHT`] or a release is
+/// queued.
+static FLIGHT_MOVED: std::sync::Condvar = std::sync::Condvar::new();
+/// Held while a completion runs, from taking it off [`FLIGHT`] to its end:
+/// completions run one at a time, in order. Taken under the submission
+/// lock (a submission completing earlier ones), never the other way round.
+static FLIGHT_ORDER: Mutex<()> = Mutex::new(());
+/// What completions run on the fallback thread release, for the title's
+/// threads (or the fallback after [`PENDING_FALLBACK`]).
+static RELEASES: Mutex<std::collections::VecDeque<(std::time::Instant, Job)>> =
+    Mutex::new(std::collections::VecDeque::new());
+static RELEASES_N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static FLIGHT_USED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Since the frame-rate line: submissions begun in flight, of them with
+/// others in flight, those others summed, waits at the limit, then drains
+/// by reason ([`Why`]).
+static FLIGHT_STATS: [std::sync::atomic::AtomicU64; 9] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 9];
+
+/// What a submission in flight writes into title memory at completion.
+#[derive(Default)]
+struct Landing {
+    value: u64,
+    /// Its host lists.
+    lists: Vec<usize>,
+    /// Ranges its shaders write: (host copy, start, end).
+    gpu_writes: Vec<(usize, usize, usize)>,
+    /// Readback destinations: (start, end).
+    readbacks: Vec<(usize, usize)>,
+    /// Done writes: (start, end).
+    done: Vec<(usize, usize)>,
+    /// What its GPU work changes in place in host copies: (host copy,
+    /// start, end).
+    in_place: Vec<(usize, usize, usize)>,
+    /// Its submission as its host copies know it ([`Begun::sub`]).
+    sub: u64,
+    /// The host copies of `in_place` and of the ranges its shaders write
+    /// (start, end), to look at and to let go of.
+    copies: Vec<std::sync::Arc<crate::shadow::Shadow>>,
+    shaders: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+}
+
+/// The first submission in flight whose shaders have left, in a host copy
+/// of a range they declared, a value at the wait's address that meets it
+/// (its host fence value). That GPU work wrote it, so the waiting queue's
+/// next GPU work, on the in-order host queue after it, may go on; what the
+/// title's CPU sees still waits for completion (as for done writes, see
+/// `timeline::in_flight_meets`). Only a value the submission changed
+/// (unlike its snapshot) counts: the copy may hold an older one there that
+/// the title has since replaced in title memory.
+pub(crate) fn shader_meets(wait: &crate::timeline::MemoryWait) -> Option<u64> {
+    if !FLIGHT_USED.load(Ordering::Relaxed) {
+        return None;
+    }
+    let (address, width) = (wait.address as usize, usize::from(wait.width));
+    let landings = LANDINGS.lock().unwrap_or_else(|e| e.into_inner());
+    landings.iter().find_map(|l| {
+        l.shaders
+            .iter()
+            .filter(|(_, a, e)| *a <= address && address + width <= *e)
+            .find_map(|(s, ..)| s.gpu_changed(address, width, l.sub))
+            .filter(|&v| wait.met_by(width, v) == Some(true))
+            .map(|_| l.value)
+    })
+}
+
+/// Landings of submissions in flight, in submission order. Leaf lock.
+static LANDINGS: Mutex<Vec<Landing>> = Mutex::new(Vec::new());
+
+/// What a submission's preparation touches that a landing may make stale.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Access {
+    /// Runs a host list.
+    List(usize),
+    /// Work that may read or write any title memory.
+    Anything,
+    /// Reads or writes title memory `[start, end)` on the CPU, for a host
+    /// copy (a refresh) or not.
+    Memory {
+        copy: Option<usize>,
+        start: usize,
+        end: usize,
+    },
+    /// Shaders of a host copy write `[start, end)`.
+    Declares {
+        copy: usize,
+        start: usize,
+        end: usize,
+    },
+}
+
+/// Why a submission waited for earlier ones to complete: a host list still
+/// in flight, work that may touch anything, another host copy of the memory
+/// a landing writes, title memory a landing writes.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Why {
+    List = 4,
+    Anything = 5,
+    Alias = 6,
+    Landing = 7,
+    /// A refresh of what its GPU work changes in place.
+    InPlace = 8,
+}
+
+/// The last landing `accesses` depend on (its host fence value) and why.
+/// Same-copy refreshes and declarations do not depend on a landing (the
+/// copy holds the GPU's bytes; [`Shadow::copy_back`] hands them on), nor
+/// do refreshes on done writes (patched into the copy).
+///
+/// [`Shadow::copy_back`]: crate::shadow::Shadow::copy_back
+fn depends(accesses: &[Access], landings: &[Landing]) -> Option<(u64, Why)> {
+    let hit = |a: usize, e: usize, s: usize, t: usize| a < t && s < e;
+    let mut found: Option<(u64, Why)> = None;
+    for landing in landings {
+        let why = accesses.iter().find_map(|access| match *access {
+            Access::List(list) => landing.lists.contains(&list).then_some(Why::List),
+            Access::Anything => Some(Why::Anything),
+            Access::Memory { copy, start, end } => {
+                if let Some(copy) = copy
+                    && landing
+                        .in_place
+                        .iter()
+                        .any(|&(c, s, t)| c == copy && hit(start, end, s, t))
+                {
+                    Some(Why::InPlace)
+                } else if landing
+                    .gpu_writes
+                    .iter()
+                    .any(|&(c, s, t)| hit(start, end, s, t) && copy != Some(c))
+                {
+                    Some(if copy.is_some() {
+                        Why::Alias
+                    } else {
+                        Why::Landing
+                    })
+                } else if landing
+                    .readbacks
+                    .iter()
+                    .chain(if copy.is_none() {
+                        &landing.done[..]
+                    } else {
+                        &[]
+                    })
+                    .any(|&(s, t)| hit(start, end, s, t))
+                {
+                    Some(Why::Landing)
+                } else {
+                    None
+                }
+            }
+            Access::Declares { copy, start, end } => landing
+                .gpu_writes
+                .iter()
+                .any(|&(c, s, t)| c != copy && hit(start, end, s, t))
+                .then_some(Why::Alias),
+        });
+        if let Some(why) = why {
+            found = Some((landing.value, why));
+        }
+    }
+    found
+}
+
+/// Whether to run completions on this thread, and what they release.
+#[derive(Clone, Copy, PartialEq)]
+enum Releases {
+    /// A title thread with no lock held: here, at once.
+    Here,
+    /// Under the submission lock or on the fallback thread: queued.
+    Queued,
+}
+
+/// Runs the next completion in flight unless `enough` (checked under the
+/// order lock) or nothing is in flight; `block`: waits for the GPU and for
+/// a completion another thread runs, else only takes one whose GPU work is
+/// done and that no other thread is running. Returns whether one ran.
+fn flight_step(block: bool, releases: Releases, enough: &dyn Fn() -> bool) -> bool {
+    let order = if block {
+        FLIGHT_ORDER.lock().unwrap_or_else(|e| e.into_inner())
+    } else {
+        match FLIGHT_ORDER.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return false,
+        }
+    };
+    if enough() {
+        return false;
+    }
+    let flight = {
+        let mut flying = FLIGHT.lock().unwrap_or_else(|e| e.into_inner());
+        match flying.front() {
+            None => return false,
+            Some(f) if !block && !gpu_reached(f.value) => return false,
+            Some(_) => flying.pop_front(),
+        }
+    };
+    FLIGHT_MOVED.notify_all();
+    let Some(flight) = flight else {
+        return false;
+    };
+    let release = (flight.finish)();
+    drop(order);
+    match releases {
+        Releases::Here => release(),
+        Releases::Queued => {
+            RELEASES
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push_back((std::time::Instant::now(), release));
+            RELEASES_N.fetch_add(1, Ordering::Release);
+            FLIGHT_MOVED.notify_all();
+        }
+    }
+    true
+}
+
+/// Runs the queued releases at least `age` old, in order.
+fn run_releases(age: std::time::Duration) {
+    while RELEASES_N.load(Ordering::Acquire) > 0 {
+        let job = {
+            let mut releases = RELEASES.lock().unwrap_or_else(|e| e.into_inner());
+            match releases.front() {
+                Some((at, _)) if at.elapsed() >= age => releases.pop_front(),
+                _ => None,
+            }
+        };
+        let Some((_, job)) = job else {
+            return;
+        };
+        RELEASES_N.fetch_sub(1, Ordering::AcqRel);
+        job();
+    }
+}
+
+/// On a title thread with no lock held: completes what the GPU finished,
+/// and runs what completions released.
+fn flight_done() {
+    while flight_step(false, Releases::Here, &|| false) {}
+    run_releases(std::time::Duration::ZERO);
+}
+
+/// Completes submissions in flight up to host fence value `value` (under
+/// the submission lock: what they release is queued).
+fn flight_through(value: u64) {
+    let done = || crate::timeline::completed_value() >= value;
+    while !done() {
+        if !flight_step(true, Releases::Queued, &done) && !done() {
+            // Taken by another thread, which has not finished it yet.
+            std::thread::yield_now();
+        }
+    }
+}
+
+/// Runs completions in flight whose GPU work is done that no title thread
+/// took, and what completions released that no title thread ran within
+/// [`PENDING_FALLBACK`] (a title thread may be waiting for a memory value
+/// without asking us).
+#[cfg(not(test))]
+fn flight_fallback() {
+    // Our own event: completions on title threads wait on the host's.
+    // SAFETY: a plain event.
+    let event = unsafe { CreateEventW(None, false, false, None) }.ok();
+    let mut asked = 0;
+    loop {
+        let front = {
+            let mut flying = FLIGHT.lock().unwrap_or_else(|e| e.into_inner());
+            while flying.is_empty() && RELEASES_N.load(Ordering::Acquire) == 0 {
+                flying = FLIGHT_MOVED.wait(flying).unwrap_or_else(|e| e.into_inner());
+            }
+            let front = flying.front().map(|f| f.value);
+            if front.is_none() {
+                // Only releases: until they are old enough.
+                drop(
+                    FLIGHT_MOVED
+                        .wait_timeout(flying, std::time::Duration::from_millis(1))
+                        .unwrap_or_else(|e| e.into_inner()),
+                );
+            }
+            front
+        };
+        if let Some(value) = front
+            && !gpu_reached(value)
+        {
+            match (host(), event) {
+                (Some(h), Some(ev)) => {
+                    // SAFETY: our fence and event.
+                    unsafe {
+                        if asked != value && h.fence.SetEventOnCompletion(value, ev).is_ok() {
+                            asked = value;
+                        }
+                        WaitForSingleObject(ev, 2);
+                    }
+                }
+                _ => std::thread::sleep(std::time::Duration::from_millis(1)),
+            }
+        }
+        let mut ran = false;
+        while flight_step(false, Releases::Queued, &|| false) {
+            ran = true;
+        }
+        if !ran && front.is_some_and(gpu_reached) {
+            // A title thread is completing it.
+            let flying = FLIGHT.lock().unwrap_or_else(|e| e.into_inner());
+            drop(
+                FLIGHT_MOVED
+                    .wait_timeout(flying, std::time::Duration::from_millis(1))
+                    .unwrap_or_else(|e| e.into_inner()),
+            );
+        }
+        run_releases(PENDING_FALLBACK);
+    }
+}
+
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
     queue: ID3D12CommandQueue,
-    fence: ID3D12Fence,
+    pub(crate) fence: ID3D12Fence,
     /// The last value signalled on `fence`, behind the submission lock.
     submitted: Mutex<u64>,
+    /// A submission is between `begin` and `complete`.
+    busy: Mutex<bool>,
+    idle: std::sync::Condvar,
     event: HANDLE,
     rtvs: ID3D12DescriptorHeap,
     rtv_size: u32,
@@ -63,6 +709,8 @@ pub(crate) struct Host {
     present_retry: Mutex<Retry>,
     /// Detached host lists whose submissions finished, ready to reuse.
     free_lists: Mutex<Vec<HostList>>,
+    /// GPU-writable memory for mesh programs run without mesh shaders.
+    mesh_scratch: Mutex<MeshScratch>,
     #[cfg(test)]
     reused_lists: std::sync::atomic::AtomicU64,
     #[cfg(test)]
@@ -373,11 +1021,24 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
             None => {}
         }
     }
+    #[cfg(feature = "diagnostics")]
+    if crumbs_on() {
+        text.push_str(&crumb_report());
+    }
     tracing::error!("{text}");
     match ON_FAILURE.get() {
         Some(report) => report(&text),
         None => std::process::abort(),
     }
+}
+
+/// The host fence value of the last submission sent to the queue (read
+/// without the submission lock, which is held while one is prepared).
+static SUBMITTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The host fence value of the last submission sent to the queue.
+pub(crate) fn submitted_value() -> u64 {
+    SUBMITTED.load(Ordering::Relaxed)
 }
 
 /// The host GPU, created on first use; `None` without one (a run then
@@ -518,6 +1179,8 @@ fn create() -> windows::core::Result<Host> {
             queue,
             fence,
             submitted: Mutex::new(0),
+            busy: Mutex::new(false),
+            idle: std::sync::Condvar::new(),
             event,
             rtvs,
             rtv_size,
@@ -529,6 +1192,7 @@ fn create() -> windows::core::Result<Host> {
             presenter: Mutex::new(None),
             present_retry: Mutex::new(Retry::new()),
             free_lists: Mutex::default(),
+            mesh_scratch: Mutex::default(),
             #[cfg(test)]
             reused_lists: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
@@ -698,6 +1362,10 @@ pub(crate) struct HostList {
     /// and at the end, and where they are read back.
     #[cfg(feature = "diagnostics")]
     stamps: OnceLock<Option<(ID3D12QueryHeap, ID3D12Resource)>>,
+    /// With `VICTORY_BREADCRUMBS`: this recording's pair of words in the
+    /// breadcrumb buffer ([`Crumbs`]), `u32::MAX` before its first note.
+    #[cfg(feature = "diagnostics")]
+    crumb: std::sync::atomic::AtomicU32,
 }
 
 impl Drop for HostList {
@@ -762,6 +1430,155 @@ pub(crate) fn dred_on() -> bool {
     *ON.get_or_init(|| cfg!(feature = "diagnostics") && crate::switch::on("VICTORY_D3D12_DRED"))
 }
 
+/// Whether our own breadcrumbs are on (`VICTORY_BREADCRUMBS`, diagnostics
+/// builds, without device-removed data): each noted command of a list is
+/// preceded by two immediate writes into system memory, read when the
+/// device is removed to name the commands that had begun but not finished.
+/// Lighter than device-removed data, which slows the GPU enough to hide
+/// some faults.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn crumbs_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| !dred_on() && crate::switch::on("VICTORY_BREADCRUMBS"))
+}
+
+/// Recordings with breadcrumb words at once (reused round-robin).
+#[cfg(feature = "diagnostics")]
+const CRUMB_LISTS: u32 = 4096;
+
+/// The breadcrumb buffer: per recording, the noted command done before
+/// and the one begun up to.
+#[cfg(feature = "diagnostics")]
+struct Crumbs {
+    _buffer: ID3D12Resource,
+    gpu: u64,
+    cpu: usize,
+    next: std::sync::atomic::AtomicU32,
+}
+
+#[cfg(feature = "diagnostics")]
+fn crumbs() -> Option<&'static Crumbs> {
+    static CRUMBS: OnceLock<Option<Crumbs>> = OnceLock::new();
+    CRUMBS
+        .get_or_init(|| {
+            let device = &host()?.device;
+            let props = D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_CUSTOM,
+                CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
+                MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
+                ..Default::default()
+            };
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: u64::from(CRUMB_LISTS) * 8,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                ..Default::default()
+            };
+            let mut buffer: Option<ID3D12Resource> = None;
+            // SAFETY: plain object creation; the mapping stays valid while
+            // the buffer lives (for the process).
+            unsafe {
+                device
+                    .CreateCommittedResource(
+                        &props,
+                        D3D12_HEAP_FLAG_NONE,
+                        &desc,
+                        D3D12_RESOURCE_STATE_COMMON,
+                        None,
+                        &mut buffer,
+                    )
+                    .ok()?;
+                let buffer = buffer?;
+                let mut cpu = std::ptr::null_mut();
+                buffer.Map(0, None, Some(&mut cpu)).ok()?;
+                std::ptr::write_bytes(cpu.cast::<u8>(), 0, CRUMB_LISTS as usize * 8);
+                tracing::warn!("VICTORY_BREADCRUMBS: noted commands leave breadcrumbs");
+                Some(Crumbs {
+                    gpu: buffer.GetGPUVirtualAddress(),
+                    cpu: cpu as usize,
+                    _buffer: buffer,
+                    next: std::sync::atomic::AtomicU32::new(0),
+                })
+            }
+        })
+        .as_ref()
+}
+
+/// The recordings of the last submissions, with breadcrumbs: host fence
+/// value, then per list its breadcrumb words and noted commands (moved out
+/// of the list when it is submitted).
+#[cfg(feature = "diagnostics")]
+type CrumbRun = (u64, Vec<(u32, Vec<Note>)>);
+
+#[cfg(feature = "diagnostics")]
+static CRUMB_RUNS: Mutex<std::collections::VecDeque<CrumbRun>> =
+    Mutex::new(std::collections::VecDeque::new());
+
+/// Keeps the noted commands of the lists of submission `sub` for the
+/// breadcrumb report.
+#[cfg(feature = "diagnostics")]
+fn keep_crumbs(sub: u64, runs: &[&HostList]) {
+    let lists = runs
+        .iter()
+        .map(|r| {
+            let notes = std::mem::take(&mut *r.notes.lock().unwrap_or_else(|e| e.into_inner()));
+            (r.crumb.load(Ordering::Relaxed), notes)
+        })
+        .collect();
+    let mut kept = CRUMB_RUNS.lock().unwrap_or_else(|e| e.into_inner());
+    kept.push_back((sub, lists));
+    while kept.len() > 12 {
+        kept.pop_front();
+    }
+}
+
+/// For each list of the last submissions that did not finish: the noted
+/// commands that had begun but not finished when the device was removed.
+#[cfg(feature = "diagnostics")]
+fn crumb_report() -> String {
+    let Some(crumbs) = crumbs() else {
+        return "; no breadcrumbs".into();
+    };
+    let mut text = String::new();
+    let kept = CRUMB_RUNS.lock().unwrap_or_else(|e| e.into_inner());
+    for (sub, lists) in kept.iter() {
+        text.push_str(&format!("; submission {sub}"));
+        for (i, (slot, notes)) in lists.iter().enumerate() {
+            let slot = *slot;
+            if slot == u32::MAX {
+                text.push_str(&format!("; list {i}: no noted commands"));
+                continue;
+            }
+            // SAFETY: the mapped breadcrumb words of this recording, written by the GPU.
+            let (done, begun) = unsafe {
+                let at = (crumbs.cpu as *const u32).add(slot as usize * 2);
+                (at.read_volatile(), at.add(1).read_volatile())
+            };
+            let n = notes.len() as u32;
+            if done >= n {
+                text.push_str(&format!("; list {i}: {n} noted commands done"));
+                continue;
+            }
+            text.push_str(&format!(
+                "; list {i}: done before {done}, begun up to {begun} of {n} noted commands:"
+            ));
+            let last = begun.max(done + 1).min(n).min(done + 6);
+            for k in done..last {
+                let note: String = notes[k as usize].0.chars().take(600).collect();
+                text.push_str(&format!(" [{k}] {note}"));
+            }
+        }
+    }
+    text
+}
+
 /// Whether each list of a submission runs and is timed on its own, slow
 /// ones logged with their commands (`VICTORY_GPU_TIMING`, diagnostics
 /// builds; the commands are noted with `VICTORY_D3D12_DRED` on).
@@ -795,6 +1612,25 @@ struct Scratch {
 unsafe impl Send for Scratch {}
 
 const SCRATCH_CHUNK: u64 = 4 << 20;
+
+/// The buffer for mesh programs run without mesh shaders
+/// (`State::dispatch_mesh`), and its size: what their compute half stores
+/// and their draw reads back. Every such dispatch of every list uses it
+/// from the start: the host has one queue, which runs lists one after the
+/// other and a list's commands in order, so one dispatch's draw has read it
+/// before the next one's compute pass writes it.
+#[derive(Default)]
+struct MeshScratch {
+    buffer: Option<(ID3D12Resource, u64)>,
+}
+
+/// The least the mesh buffer holds.
+pub(crate) const MESH_BUFFER_MIN: u64 = 16 << 20;
+/// The most the mesh buffer is grown to. A dispatch of more thread groups
+/// than it holds runs in parts (`State::dispatch_mesh`), so this trades
+/// memory against passes; an indirect dispatch, whose group count only the
+/// GPU has, records the parts of the most groups it can have.
+pub(crate) const MESH_BUFFER_MOST: u64 = 64 << 20;
 
 /// Per-list GPU-writable buffers for indirect rectangle expansion
 /// (`crate::rectangles`): one vertex scratch buffer (reused per draw after
@@ -839,6 +1675,10 @@ enum Step {
     /// Brings a texture's staging buffer up to date: once per submission,
     /// whichever lists sample it, until a `Copy` or `Run` intervenes.
     Texture(std::sync::Arc<crate::texture::Staging>),
+    /// The list's GPU work changes a range (address, bytes) of a host copy
+    /// in place (only with submissions in flight:
+    /// [`crate::shadow::Shadow::refresh_in_place`]).
+    InPlace(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
 }
 
 /// A texture-to-buffer readback copied from a mapped readback buffer into
@@ -885,6 +1725,54 @@ struct Deferred {
 }
 
 impl Deferred {
+    /// What the steps touch that a submission in flight may make stale
+    /// ([`depends`]).
+    fn accesses(&self, out: &mut Vec<Access>) {
+        let copy = |s: &std::sync::Arc<crate::shadow::Shadow>| std::sync::Arc::as_ptr(s) as usize;
+        for step in &self.copies {
+            match step {
+                &Step::Copy(dst, src, len) => {
+                    out.push(Access::Memory {
+                        copy: None,
+                        start: src,
+                        end: src + len,
+                    });
+                    out.push(Access::Memory {
+                        copy: None,
+                        start: dst,
+                        end: dst + len,
+                    });
+                }
+                &Step::Fill(_, src, len) => out.push(Access::Memory {
+                    copy: None,
+                    start: src,
+                    end: src + len,
+                }),
+                Step::Refresh(shadow, address, len) => out.push(Access::Memory {
+                    copy: Some(copy(shadow)),
+                    start: *address,
+                    end: address + len,
+                }),
+                Step::GpuWrite(shadow, address, len) => out.push(Access::Declares {
+                    copy: copy(shadow),
+                    start: *address,
+                    end: address + len,
+                }),
+                Step::Texture(staging) => {
+                    let (start, end) = staging.title_range();
+                    out.push(Access::Memory {
+                        copy: None,
+                        start,
+                        end,
+                    });
+                }
+                Step::Run(_) => out.push(Access::Anything),
+                // Its refresh is a step of its own.
+                Step::Host(_) | Step::InPlace(..) => {}
+            }
+        }
+    }
+
     /// Whether a fill of upload memory at `dst` from title memory at `src`
     /// (`len` bytes) is not yet among the steps since the last title copy
     /// (and notes it). Kept with the refreshed ranges: both are forgotten
@@ -925,8 +1813,41 @@ impl Host {
             let mesh = ok
                 && options.MeshShaderTier != D3D12_MESH_SHADER_TIER_NOT_SUPPORTED
                 && model.HighestShaderModel.0 >= D3D_SHADER_MODEL_6_6.0;
-            tracing::info!(mesh, "host mesh shader support");
-            mesh
+            // Diagnostics builds: run mesh programs the way hosts without
+            // mesh shaders do, on a host that has them (to compare the two).
+            let unused =
+                cfg!(feature = "diagnostics") && crate::switch::on("VICTORY_NO_MESH_SHADERS");
+            tracing::info!(mesh, unused, "host mesh shader support");
+            mesh && !unused
+        })
+    }
+
+    /// Whether the host gives pixel shaders barycentrics (`SV_Barycentrics`
+    /// and `GetAttributeAtVertex`, `D3D12_FEATURE_DATA_D3D12_OPTIONS3
+    /// .BarycentricsSupported`); logged once. Without them, pixel shaders
+    /// that need them run behind the geometry shader of
+    /// `victory_shader::emit::barycentric_gs`.
+    pub(crate) fn barycentrics(&self) -> bool {
+        static BARYCENTRICS: OnceLock<bool> = OnceLock::new();
+        *BARYCENTRICS.get_or_init(|| {
+            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS3::default();
+            // SAFETY: the query writes its own structure of the given size.
+            let ok = unsafe {
+                self.device
+                    .CheckFeatureSupport(
+                        D3D12_FEATURE_D3D12_OPTIONS3,
+                        (&raw mut options).cast(),
+                        size_of_val(&options) as u32,
+                    )
+                    .is_ok()
+            };
+            let barycentrics = ok && options.BarycentricsSupported.as_bool();
+            // Diagnostics builds: run them the way hosts without
+            // barycentrics do, on a host that has them (to compare the two).
+            let unused =
+                cfg!(feature = "diagnostics") && crate::switch::on("VICTORY_NO_BARYCENTRICS");
+            tracing::info!(barycentrics, unused, "host barycentric support");
+            barycentrics && !unused
         })
     }
 
@@ -947,6 +1868,12 @@ impl Host {
                     )
                     .is_ok()
             };
+            // `VICTORY_WAVE64_SPLIT=1`: on 32-lane hosts, wave64 programs run
+            // as two 32-lane halves. shortcut: experimental; off, they are
+            // refused as before (the title read -1 from GPU-written data
+            // with it on).
+            let split = std::env::var_os("VICTORY_WAVE64_SPLIT").is_some_and(|v| v != "0");
+            victory_shader::emit::set_host_wave64(!split || ok && options.WaveLaneCountMax >= 64);
             let wave32 = ok
                 && wave32_supported(
                     options.WaveOps.as_bool(),
@@ -1054,15 +1981,265 @@ impl Host {
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
                 stamps: OnceLock::new(),
+                #[cfg(feature = "diagnostics")]
+                crumb: std::sync::atomic::AtomicU32::new(u32::MAX),
             })
         }
     }
 
     /// Runs closed lists and waits for them.
     pub(crate) fn execute(&self, runs: &[&HostList]) {
+        if in_flight_limit() > 1 {
+            self.execute_flying(runs);
+            return;
+        }
+        let begun = self.begin(runs);
+        let woken = self.complete(begun, runs, None);
+        woken.run();
+    }
+
+    /// [`Host::execute`] with submissions in flight ([`in_flight_limit`]):
+    /// in line behind them, so completions stay in submission order.
+    fn execute_flying(&self, runs: &[&HostList]) {
+        let me = std::ptr::from_ref(self) as usize;
+        let lists: Vec<usize> = runs
+            .iter()
+            .map(|l| std::ptr::from_ref(*l) as usize)
+            .collect();
+        let make: MakeFinish = Box::new(move |begun| {
+            Box::new(move || {
+                // SAFETY: the host and the caller's lists outlive this: the
+                // caller waits below until it has run.
+                let (host, refs) = unsafe {
+                    let refs: Vec<&HostList> =
+                        lists.iter().map(|&l| &*(l as *const HostList)).collect();
+                    (&*(me as *const Host), refs)
+                };
+                let woken = host.complete(begun, &refs, None);
+                Box::new(move || woken.run()) as Job
+            })
+        });
+        let value = self.submit(runs, Some(make)).0;
+        let done = || crate::timeline::completed_value() >= value;
+        while !done() {
+            if !flight_step(true, Releases::Here, &done) && !done() {
+                std::thread::yield_now();
+            }
+        }
+        run_releases(std::time::Duration::ZERO);
+    }
+
+    /// Runs closed lists with up to [`in_flight_limit`] submissions in
+    /// flight: prepares and submits them now, on this thread, and leaves
+    /// their completion queued ([`FLIGHT`]); returns the host fence value
+    /// it signals (the queue holds what the title's CPU would see until it
+    /// has completed). `done` runs once the lists are no longer used.
+    #[cfg_attr(test, allow(dead_code))]
+    pub(crate) fn execute_in_flight(
+        &'static self,
+        runs: Vec<std::sync::Arc<HostList>>,
+        done: Box<dyn FnOnce() + Send>,
+    ) -> u64 {
+        let keep = runs.clone();
+        let make: MakeFinish = Box::new(move |begun| {
+            Box::new(move || {
+                let refs: Vec<&HostList> = keep.iter().map(|l| &**l).collect();
+                let woken = self.complete(begun, &refs, None);
+                drop(refs);
+                Box::new(move || {
+                    drop(keep);
+                    done();
+                    woken.run();
+                }) as Job
+            })
+        });
+        let refs: Vec<&HostList> = runs.iter().map(|l| &**l).collect();
+        let value = self.submit(&refs, Some(make)).0;
+        drop(refs);
+        drop(runs);
+        // What earlier completions released while this one prepared, and
+        // queues whose memory waits this one's done writes meet.
+        run_releases(std::time::Duration::ZERO);
+        #[cfg(feature = "diagnostics")]
+        let scan =
+            crate::timeline::wait_stats::scanning(crate::timeline::wait_stats::Scan::AfterSubmit);
+        let woken = crate::fence::written(0, 0);
+        #[cfg(feature = "diagnostics")]
+        drop(scan);
+        woken.run();
+        value
+    }
+
+    /// Runs closed lists without waiting for them: the GPU wait, copy-back
+    /// and the writes that tell the title its work is done happen on a
+    /// worker thread, so the title's thread goes on with its next frame
+    /// while the GPU runs this one. The next submission still waits for
+    /// this one to finish before it prepares (snapshots and the ranges
+    /// shaders write are per host copy, not per submission). `done` runs
+    /// on the worker once the lists are no longer used.
+    pub(crate) fn execute_async(
+        &'static self,
+        runs: Vec<std::sync::Arc<HostList>>,
+        done: Box<dyn FnOnce() + Send>,
+    ) {
+        let refs: Vec<&HostList> = runs.iter().map(|l| &**l).collect();
+        let begun = self.begin(&refs);
+        drop(refs);
+        #[cfg(not(test))]
+        let mode = async_mode();
+        #[cfg(test)]
+        let mode = 7;
+        let gap = match mode {
+            1 | 2 => None,
+            6 => Some(1),
+            _ => Some(OVERLAPPED_GAP),
+        };
+        let job: Job = match mode {
+            #[cfg(not(test))]
+            1 => {
+                let value = begun.value;
+                pend(
+                    Box::new(move || {
+                        let refs: Vec<&HostList> = runs.iter().map(|l| &**l).collect();
+                        let woken = self.complete(begun, &refs, gap);
+                        drop(refs);
+                        drop(runs);
+                        done();
+                        woken.run();
+                    }),
+                    value,
+                );
+                return;
+            }
+            #[cfg(not(test))]
+            4 => Box::new(move || {
+                let refs: Vec<&HostList> = runs.iter().map(|l| &**l).collect();
+                let woken = self.complete(begun, &refs, gap);
+                drop(refs);
+                drop(runs);
+                pend(
+                    Box::new(move || {
+                        done();
+                        woken.run();
+                    }),
+                    0,
+                );
+            }),
+            #[cfg(not(test))]
+            5 => Box::new(move || {
+                let refs: Vec<&HostList> = runs.iter().map(|l| &**l).collect();
+                let finishing = self.complete_gpu(begun, &refs, gap);
+                drop(refs);
+                pend(
+                    Box::new(move || {
+                        let refs: Vec<&HostList> = runs.iter().map(|l| &**l).collect();
+                        let woken = self.complete_writes(finishing, &refs);
+                        drop(refs);
+                        drop(runs);
+                        done();
+                        woken.run();
+                    }),
+                    0,
+                );
+            }),
+            _ => Box::new(move || {
+                let refs: Vec<&HostList> = runs.iter().map(|l| &**l).collect();
+                let woken = self.complete(begun, &refs, gap);
+                drop(refs);
+                drop(runs);
+                done();
+                woken.run();
+            }),
+        };
+        if mode == 2 {
+            // The caller waits for the completion thread (which runs it in
+            // place: what a completion releases can submit).
+            if IN_COMPLETER.get() {
+                job();
+                return;
+            }
+            let (tx, rx) = std::sync::mpsc::sync_channel::<()>(1);
+            let job: Job = Box::new(move || {
+                job();
+                let _ = tx.send(());
+            });
+            match self.completer().send(job) {
+                Ok(()) => {
+                    let _ = rx.recv();
+                }
+                Err(e) => (e.0)(),
+            }
+            return;
+        }
+        if let Err(e) = self.completer().send(job) {
+            // No worker: finish here.
+            (e.0)();
+        }
+    }
+
+    /// The thread that finishes asynchronous submissions, in order.
+    fn completer(&'static self) -> &'static std::sync::mpsc::Sender<Job> {
+        static TX: OnceLock<std::sync::mpsc::Sender<Job>> = OnceLock::new();
+        TX.get_or_init(|| {
+            let (tx, rx) = std::sync::mpsc::channel::<Job>();
+            let spawned = std::thread::Builder::new()
+                .name("victory gpu completion".into())
+                .spawn(move || {
+                    IN_COMPLETER.set(true);
+                    for job in rx {
+                        job();
+                    }
+                });
+            if let Err(e) = spawned {
+                tracing::warn!(error = %e, "no completion thread; submissions finish in place");
+            }
+            tx
+        })
+    }
+
+    /// Waits until no submission is in flight, then prepares and submits
+    /// `runs` and signals the fence; [`Host::complete`] finishes it.
+    fn begin(&self, runs: &[&HostList]) -> Begun {
+        match self.submit(runs, None) {
+            (_, Some(begun)) => begun,
+            (_, None) => unreachable!("only a submission in flight is queued"),
+        }
+    }
+
+    /// [`Host::begin`]; with `flight` (submissions in flight), it does not
+    /// wait for the one before to complete: it waits only below the limit
+    /// and for earlier submissions its preparation depends on ([`depends`]),
+    /// then queues its completion ([`FLIGHT`], made by `flight`) and
+    /// returns its host fence value alone.
+    fn submit(&self, runs: &[&HostList], flight: Option<MakeFinish>) -> (u64, Option<Begun>) {
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
+        if flight.is_some() {
+            // In flight: per submission (see `in_flight_limit`).
+        } else if PENDING_USED.load(Ordering::Relaxed) {
+            // The submission in flight may be finished by pending work.
+            loop {
+                run_pending();
+                let mut busy = self.busy.lock().unwrap_or_else(|e| e.into_inner());
+                if !*busy {
+                    *busy = true;
+                    break;
+                }
+                let wait = std::time::Duration::from_millis(1);
+                drop(self.idle.wait_timeout(busy, wait));
+            }
+        } else {
+            let mut busy = self.busy.lock().unwrap_or_else(|e| e.into_inner());
+            while *busy {
+                busy = self.idle.wait(busy).unwrap_or_else(|e| e.into_inner());
+            }
+            *busy = true;
+        }
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        let sub = *submitted + 1;
+        if flight.is_some() {
+            self.wait_in_line(runs);
+        }
         #[cfg(test)]
         let exec_scope = runs
             .iter()
@@ -1076,10 +2253,18 @@ impl Host {
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::Submissions, 1);
+        #[cfg(feature = "diagnostics")]
+        if crumbs_on() {
+            keep_crumbs(sub, runs);
+        }
         let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len());
         // Where each run's lists start in `lists`.
         let mut firsts = Vec::with_capacity(runs.len());
-        let mut batch = Batch::default();
+        let mut batch = Batch {
+            sub,
+            flight: flight.is_some(),
+            ..Batch::default()
+        };
         {
             #[cfg(test)]
             let _scope = enter_retire_scope(exec_scope.clone());
@@ -1109,30 +2294,19 @@ impl Host {
         let groups = [&lists[..]];
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
+            SUBMITTED.store(*submitted, Ordering::Relaxed);
             let started = std::time::Instant::now();
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
+                let calling = std::time::Instant::now();
                 self.queue.ExecuteCommandLists(group);
+                crate::timeline::HELD_US[4]
+                    .fetch_add(calling.elapsed().as_micros() as u64, Ordering::Relaxed);
                 match self.queue.Signal(&self.fence, *submitted) {
-                    Ok(()) => match self.fence.SetEventOnCompletion(*submitted, self.event) {
-                        Ok(()) => {
-                            let waited = WaitForSingleObject(self.event, INFINITE);
-                            if waited != WAIT_OBJECT_0 {
-                                tracing::warn!(
-                                    wait = waited.0,
-                                    "host fence event wait failed; polling fence"
-                                );
-                                self.poll_fence(*submitted);
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                error = %e,
-                                "host fence event registration failed; polling fence"
-                            );
-                            self.poll_fence(*submitted);
-                        }
-                    },
+                    // Diagnostics timing runs each list on its own: wait
+                    // for it here; otherwise `complete` waits.
+                    Ok(()) if groups.len() > 1 => self.wait_fence(*submitted),
+                    Ok(()) => {}
                     Err(e) => fail(format_args!(
                         "host GPU fence signal failed after a submission of {} lists ({e}){}{}",
                         runs.len(),
@@ -1162,6 +2336,174 @@ impl Host {
             let _ = (i, started);
         }
         let _ = &firsts;
+        let value = *submitted;
+        let in_place = std::mem::take(&mut batch.in_place);
+        let begun = Begun {
+            value,
+            sub,
+            started,
+            prepared,
+            gpu_writes: batch.gpu_writes,
+            epoch: (std::ptr::from_ref(exec_state), exec_epoch),
+        };
+        let Some(make) = flight else {
+            drop(submitted);
+            return (value, Some(begun));
+        };
+        // On the host queue now: later submissions see what it will write
+        // at completion, and its completion is queued, both before the
+        // submission lock is let go (the next submission checks them).
+        let mut landing = Landing {
+            value,
+            lists: runs
+                .iter()
+                .map(|l| std::ptr::from_ref(*l) as usize)
+                .collect(),
+            gpu_writes: begun
+                .gpu_writes
+                .iter()
+                .map(|(s, a, n)| (std::sync::Arc::as_ptr(s) as usize, *a, a + n))
+                .collect(),
+            shaders: begun
+                .gpu_writes
+                .iter()
+                .map(|(s, a, n)| (s.clone(), *a, a + n))
+                .collect(),
+            sub,
+            ..Landing::default()
+        };
+        for (shadow, address, len) in in_place {
+            shadow.in_place(sub, address, address + len);
+            landing.in_place.push((
+                std::sync::Arc::as_ptr(&shadow) as usize,
+                address,
+                address + len,
+            ));
+            landing.copies.push(shadow);
+        }
+        let mut known = Vec::new();
+        for list in runs {
+            let deferred = list.deferred();
+            for rb in &deferred.readbacks {
+                let end = match rb.dst_pitch == rb.src_pitch {
+                    true => rb.dst + rb.total,
+                    false => rb.dst + rb.lines.saturating_sub(1) * rb.dst_pitch + rb.row_bytes,
+                };
+                landing.readbacks.push((rb.dst, end));
+            }
+            for &(at, what, bytes) in &deferred.writes {
+                landing.done.push((at, at + bytes));
+                if let crate::queue::Written::Value(v) = what {
+                    known.push((at, bytes, v));
+                }
+            }
+        }
+        crate::timeline::fly_writes(value, known);
+        LANDINGS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(landing);
+        FLIGHT
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push_back(Flight {
+                value,
+                finish: make(begun),
+            });
+        FLIGHT_MOVED.notify_all();
+        drop(submitted);
+        #[cfg(not(test))]
+        {
+            static FALLBACK: OnceLock<()> = OnceLock::new();
+            FALLBACK.get_or_init(|| {
+                let spawned = std::thread::Builder::new()
+                    .name("victory gpu in flight".into())
+                    .spawn(flight_fallback);
+                if let Err(e) = spawned {
+                    tracing::warn!(error = %e, "no fallback thread for submissions in flight");
+                }
+            });
+        }
+        (value, None)
+    }
+
+    /// Before a submission in flight prepares (under the submission lock):
+    /// waits until fewer than [`in_flight_limit`] are in flight, and
+    /// completes the earlier ones its preparation depends on ([`depends`]).
+    /// What those completions release is queued for the caller.
+    fn wait_in_line(&self, runs: &[&HostList]) {
+        let limit = in_flight_limit();
+        let full = || FLIGHT.lock().unwrap_or_else(|e| e.into_inner()).len() >= limit;
+        if full() {
+            FLIGHT_STATS[3].fetch_add(1, Ordering::Relaxed);
+            while full() {
+                if !flight_step(true, Releases::Queued, &|| !full()) && full() {
+                    std::thread::yield_now();
+                }
+            }
+        }
+        let depth = FLIGHT.lock().unwrap_or_else(|e| e.into_inner()).len() as u64;
+        FLIGHT_STATS[0].fetch_add(1, Ordering::Relaxed);
+        if depth > 0 {
+            FLIGHT_STATS[1].fetch_add(1, Ordering::Relaxed);
+            FLIGHT_STATS[2].fetch_add(depth, Ordering::Relaxed);
+        }
+        // Landings stay until their completion has run (one may be running
+        // on another thread, off the queue already).
+        if LANDINGS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty()
+        {
+            return;
+        }
+        let mut accesses = Vec::new();
+        for list in runs {
+            accesses.push(Access::List(std::ptr::from_ref(*list) as usize));
+            list.deferred().accesses(&mut accesses);
+        }
+        let found = depends(
+            &accesses,
+            &LANDINGS.lock().unwrap_or_else(|e| e.into_inner()),
+        );
+        if let Some((value, why)) = found
+            && crate::timeline::completed_value() < value
+        {
+            FLIGHT_STATS[why as usize].fetch_add(1, Ordering::Relaxed);
+            flight_through(value);
+        }
+    }
+
+    /// Waits for a submission [`Host::begin`] made, copies back what its
+    /// shaders wrote and does the writes that tell the title it is done;
+    /// what those writes release runs from the returned [`crate::fence::Woken`].
+    /// `gap`: the submitting thread went on (see [`Shadow::copy_back`]),
+    /// so title memory is written with its blocks kept open.
+    ///
+    /// [`Shadow::copy_back`]: crate::shadow::Shadow::copy_back
+    fn complete(
+        &self,
+        begun: Begun,
+        runs: &[&HostList],
+        gap: Option<usize>,
+    ) -> crate::fence::Woken {
+        let finishing = self.complete_gpu(begun, runs, gap);
+        self.complete_writes(finishing, runs)
+    }
+
+    /// [`Host::complete`] up to the writes that tell the title: the GPU
+    /// wait, copy-back and readbacks.
+    fn complete_gpu(&self, begun: Begun, runs: &[&HostList], gap: Option<usize>) -> Finishing {
+        let overlapped = gap.is_some();
+        let Begun {
+            value,
+            sub,
+            started,
+            prepared,
+            gpu_writes,
+            epoch: (exec_state, exec_epoch),
+        } = begun;
+        self.wait_fence(value);
         let gpu = prepared.elapsed();
         SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
         SUBMISSION_US[1].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
@@ -1197,43 +2539,144 @@ impl Host {
         // submission, however many dispatches declared it (the world's
         // passes declare the same big ranges dozens of times).
         let copying = std::time::Instant::now();
-        for (shadow, address, len) in batch.gpu_writes {
-            let written = shadow.copy_back(address, len);
+        #[cfg(feature = "diagnostics")]
+        let mut copied: Vec<(usize, usize)> = gpu_writes.iter().map(|w| (w.1, w.2)).collect();
+        for (shadow, address, len) in gpu_writes {
+            let written = shadow.copy_back(address, len, gap, sub);
             COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
         }
         for list in runs {
             for rb in &list.deferred().readbacks {
                 let written = if rb.dst_pitch == rb.src_pitch {
-                    crate::watch::writing(rb.dst, rb.total);
-                    write_mapped(rb.dst as *mut u8, rb.src as *const u8, rb.total);
+                    readback(rb.dst, rb.src, rb.total, overlapped);
                     rb.total
                 } else {
                     let mut n = 0;
                     for line in 0..rb.lines {
                         let to = rb.dst + line * rb.dst_pitch;
                         let from = rb.src + line * rb.src_pitch;
-                        crate::watch::writing(to, rb.row_bytes);
-                        write_mapped(to as *mut u8, from as *const u8, rb.row_bytes);
+                        readback(to, from, rb.row_bytes, overlapped);
                         n += rb.row_bytes;
                     }
                     n
                 };
+                #[cfg(feature = "diagnostics")]
+                copied.push(if rb.dst_pitch == rb.src_pitch || rb.lines == 0 {
+                    (rb.dst, rb.total)
+                } else {
+                    (rb.dst, (rb.lines - 1) * rb.dst_pitch + rb.row_bytes)
+                });
                 COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
             }
         }
+        #[cfg(feature = "diagnostics")]
+        crate::timeline::wait_stats::copied_back(value, copied);
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
+        Finishing(exec_state, exec_epoch, value)
+    }
+
+    /// The rest of [`Host::complete`]: the writes that tell the title its
+    /// work is done, then the submission's end.
+    fn complete_writes(&self, finishing: Finishing, runs: &[&HostList]) -> crate::fence::Woken {
+        let Finishing(exec_state, exec_epoch, value) = finishing;
+        // SAFETY: the retire state outlives every submission (a static, or a
+        // test's scope that waits for its lists).
+        let exec_state: &Mutex<RetireState> = unsafe { &*exec_state };
         // Queues these writes release run their work once no lock is held:
         // it submits lists itself (this lock, the lists' `deferred`).
         let mut woken = crate::fence::Woken::default();
         for list in runs {
             for &(at, what, bytes) in &list.deferred().writes {
+                #[cfg(feature = "diagnostics")]
+                let _scan = crate::timeline::wait_stats::scanning(
+                    crate::timeline::wait_stats::Scan::DoneWrite {
+                        sub: value,
+                        at,
+                        bytes,
+                    },
+                );
                 woken.add(what.write(at as *mut u8, bytes));
             }
         }
+        if FLIGHT_USED.load(Ordering::Relaxed) {
+            // In flight: title memory holds what it writes now, and the
+            // queues that held CPU-visible work behind it may go on.
+            crate::timeline::land_writes(value);
+            let landed: Vec<Landing> = {
+                let mut landings = LANDINGS.lock().unwrap_or_else(|e| e.into_inner());
+                let (landed, flying) = std::mem::take(&mut *landings)
+                    .into_iter()
+                    .partition(|l| l.value == value);
+                *landings = flying;
+                landed
+            };
+            for landing in landed {
+                for shadow in &landing.copies {
+                    shadow.in_place_done(landing.sub);
+                }
+            }
+            woken.add(crate::fence::Woken::of(crate::timeline::completed(value)));
+        }
+        // GPU memory waits that what shaders wrote (copied back above)
+        // satisfies: woken now, not at the fence watcher's next 10 ms poll
+        // (a frame chains dozens of submissions through such waits).
+        // Default (no `VICTORY_FAST_WAKE`): left to the watcher, as before
+        // (bisection).
+        if !old_completion_scan() {
+            #[cfg(feature = "diagnostics")]
+            let scan = crate::timeline::wait_stats::scanning(
+                crate::timeline::wait_stats::Scan::Completion { sub: value },
+            );
+            woken.add(crate::fence::written(0, 0));
+            #[cfg(feature = "diagnostics")]
+            drop(scan);
+        }
         self.log_messages();
-        drop(submitted);
         release_epoch_in(exec_state, exec_epoch);
-        woken.run();
+        *self.busy.lock().unwrap_or_else(|e| e.into_inner()) = false;
+        self.idle.notify_all();
+        woken
+    }
+
+    /// Waits until the fence reaches `value`.
+    fn wait_fence(&self, value: u64) {
+        thread_local! {
+            /// With submissions in flight, completions and timed diagnostics
+            /// submissions may wait on different threads at once: one event
+            /// per thread, so no wait takes another's signal.
+            static EVENT: Option<HANDLE> =
+                // SAFETY: a plain event, kept for the thread's life.
+                unsafe { CreateEventW(None, false, false, None) }.ok();
+        }
+        let event = match FLIGHT_USED.load(Ordering::Relaxed) {
+            true => EVENT.with(|e| *e).unwrap_or(self.event),
+            false => self.event,
+        };
+        // SAFETY: our fence and event.
+        unsafe {
+            if self.fence.GetCompletedValue() >= value {
+                return;
+            }
+            match self.fence.SetEventOnCompletion(value, event) {
+                Ok(()) => {
+                    let waited = WaitForSingleObject(event, INFINITE);
+                    if waited != WAIT_OBJECT_0 {
+                        tracing::warn!(
+                            wait = waited.0,
+                            "host fence event wait failed; polling fence"
+                        );
+                        self.poll_fence(value);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "host fence event registration failed; polling fence"
+                    );
+                    self.poll_fence(value);
+                }
+            }
+        }
     }
 
     /// Fallback completion wait when registering or waiting on `self.event`
@@ -1270,6 +2713,11 @@ impl Host {
         // Without it the queries fail as unsupported, which reads like a
         // missing GPU feature.
         if !dred_on() {
+            #[cfg(feature = "diagnostics")]
+            if crumbs_on() {
+                let _ = runs;
+                return crumb_report();
+            }
             return "; a diagnostics build with VICTORY_D3D12_DRED=1 records where the GPU stopped"
                 .to_owned();
         }
@@ -1595,6 +3043,14 @@ impl HostList {
     }
 
     pub(crate) fn close(&self) {
+        // The last noted command's breadcrumb: done once it finishes.
+        #[cfg(feature = "diagnostics")]
+        if crumbs_on() {
+            let notes = self.notes.lock().unwrap_or_else(|e| e.into_inner());
+            if !notes.is_empty() {
+                self.crumb(notes.len() as u32);
+            }
+        }
         // Lists can execute together, in a different order, or more than once.
         // Buffers do not decay between lists in the same ExecuteCommandLists.
         // Restore a known entry state for the next recording.
@@ -1729,6 +3185,8 @@ impl HostList {
             .clear();
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        #[cfg(feature = "diagnostics")]
+        self.crumb.store(u32::MAX, Ordering::Relaxed);
         {
             let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
             (scratch.current, scratch.used) = (0, 0);
@@ -1952,11 +3410,50 @@ impl HostList {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .push((what, range));
+        } else if crumbs_on() {
+            let mut notes = self.notes.lock().unwrap_or_else(|e| e.into_inner());
+            self.crumb(notes.len() as u32);
+            notes.push((what(), range));
         }
+    }
+
+    /// Writes the breadcrumbs before noted command `at`: begun up to it
+    /// (when the front end of the GPU reaches it), done before it (once all
+    /// earlier work has finished).
+    #[cfg(feature = "diagnostics")]
+    fn crumb(&self, at: u32) {
+        let Some(crumbs) = crumbs() else { return };
+        let Ok(list) = self.list.cast::<ID3D12GraphicsCommandList2>() else {
+            return;
+        };
+        let mut slot = self.crumb.load(Ordering::Relaxed);
+        if slot == u32::MAX {
+            slot = crumbs.next.fetch_add(1, Ordering::Relaxed) % CRUMB_LISTS;
+            self.crumb.store(slot, Ordering::Relaxed);
+        }
+        let done = crumbs.gpu + u64::from(slot) * 8;
+        let params = [
+            D3D12_WRITEBUFFERIMMEDIATE_PARAMETER {
+                Dest: done + 4,
+                Value: at + 1,
+            },
+            D3D12_WRITEBUFFERIMMEDIATE_PARAMETER {
+                Dest: done,
+                Value: at,
+            },
+        ];
+        let modes = [
+            D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_IN,
+            D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT,
+        ];
+        // SAFETY: an open list; the destinations lie in our breadcrumb buffer.
+        unsafe { list.WriteBufferImmediate(2, params.as_ptr(), Some(modes.as_ptr())) };
     }
 
     /// Notes a pipeline the list binds.
     pub(crate) fn used_pipeline(&self, name: &str) {
+        #[cfg(feature = "diagnostics")]
+        crate::shadow::note_bound_pipeline(name);
         self.mark_work();
         let mut pipelines = self.pipelines.lock().unwrap_or_else(|e| e.into_inner());
         if !pipelines.contains(name) {
@@ -2033,6 +3530,20 @@ impl HostList {
                 .copies
                 .push(Step::Refresh(shadow.clone(), address, len));
         }
+    }
+
+    /// The list's GPU work changes `[address, address + len)` of a buffer's
+    /// host copy in place, not to be copied back (submissions in flight).
+    pub(crate) fn defer_in_place(
+        &self,
+        shadow: &std::sync::Arc<crate::shadow::Shadow>,
+        address: usize,
+        len: usize,
+    ) {
+        self.mark_work();
+        self.deferred()
+            .copies
+            .push(Step::InPlace(shadow.clone(), address, len));
     }
 
     /// Shaders of the list write `[address, address + len)` of a buffer's
@@ -2158,6 +3669,33 @@ impl HostList {
         }
         // SAFETY: a live buffer.
         Some(unsafe { buffer.GetGPUVirtualAddress() })
+    }
+
+    /// The GPU-writable buffer for mesh programs run without mesh shaders,
+    /// of at least `len` bytes where [`MESH_BUFFER_MOST`] allows (and of
+    /// [`MESH_BUFFER_MIN`]): the buffer, its host GPU address and its size.
+    /// The host shares one between its lists, and this list keeps it alive.
+    /// Its state is tracked as a shadow buffer's is ([`HostList::use_shadow`]):
+    /// common when a list starts and when it closes.
+    pub(crate) fn mesh_buffer(&self, len: u64) -> Option<(ID3D12Resource, u64, u64)> {
+        let want = len
+            .clamp(MESH_BUFFER_MIN, MESH_BUFFER_MOST)
+            .next_multiple_of(1 << 16);
+        let host = host()?;
+        let (buffer, have) = {
+            let mut s = host.mesh_scratch.lock().unwrap_or_else(|e| e.into_inner());
+            if s.buffer.as_ref().is_none_or(|(_, have)| *have < want) {
+                let buffer = host.default_buffer(want)?;
+                name(&buffer, || format!("mesh buffer {want:#x}"));
+                // Lists that recorded the smaller one keep it alive.
+                s.buffer = Some((buffer, want));
+            }
+            s.buffer.clone()?
+        };
+        self.keep(&buffer);
+        // SAFETY: a live buffer.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        Some((buffer, gpu, have))
     }
 
     /// The list's GPU-writable scratch buffer for expanded indirect
@@ -2367,6 +3905,12 @@ impl HostList {
                     batch.gpu_write(shadow, *address, *len);
                     continue;
                 }
+                Step::InPlace(shadow, address, len) => {
+                    if batch.flight {
+                        batch.in_place.push((shadow.clone(), *address, *len));
+                    }
+                    continue;
+                }
                 Step::Texture(staging) => {
                     if batch.texture_due(staging) {
                         staging.refresh();
@@ -2395,6 +3939,12 @@ struct Batch {
     declared_writes: std::collections::HashSet<(usize, usize, usize)>,
     /// Staging buffers (by address) refreshed since the last title write.
     textures: std::collections::HashSet<usize>,
+    /// The submission, for its snapshots ([`Begun::sub`]).
+    sub: u64,
+    /// Submissions are in flight: refreshes take their done writes.
+    flight: bool,
+    /// In flight: ranges the submission's GPU work changes in place.
+    in_place: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
 }
 
 impl Batch {
@@ -2414,7 +3964,7 @@ impl Batch {
             // Another declaration of this exact range is already pending until
             // the GPU submission finishes, so it needs no refresh boundary.
             self.flush();
-            shadow.writing(address, len);
+            shadow.writing(address, len, self.sub);
             self.gpu_writes.push((shadow.clone(), address, len));
         }
     }
@@ -2449,6 +3999,9 @@ impl Batch {
         for (shadow, from, to) in self.refreshes.drain(..) {
             let started = std::time::Instant::now();
             let copied = shadow.update(from, to - from);
+            if self.flight {
+                shadow.patch_flying(from, to);
+            }
             let us = started.elapsed().as_micros() as u64;
             #[cfg(feature = "diagnostics")]
             if let Some(bytes) = crate::shadow::skipped(to - from, copied) {
@@ -2642,6 +4195,20 @@ type NtWrite = unsafe extern "system" fn(
     written: *mut usize,
 ) -> i32;
 
+/// A readback's bytes into title memory after its submission. Overlapped
+/// (asynchronous submission), its blocks stay open until the write lands:
+/// a refresh on the title's thread could guard them again in between.
+fn readback(dst: usize, src: usize, len: usize, overlapped: bool) {
+    if overlapped {
+        crate::watch::kernel_will_write(dst, len);
+        write_mapped(dst as *mut u8, src as *const u8, len);
+        crate::watch::kernel_wrote(dst, len);
+    } else {
+        crate::watch::writing(dst, len);
+        write_mapped(dst as *mut u8, src as *const u8, len);
+    }
+}
+
 /// Copies host memory into title memory after a submission (what shaders
 /// wrote), leaving pages that are not mapped alone.
 ///
@@ -2649,6 +4216,11 @@ type NtWrite = unsafe extern "system" fn(
 /// the NT write directly, avoiding the region query and temporary changes
 /// to read-only page protections that WriteProcessMemory can perform.
 pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
+    #[cfg(feature = "diagnostics")]
+    // SAFETY: the caller's source holds `len` bytes.
+    crate::shadow::high_ones(dst as usize, unsafe {
+        std::slice::from_raw_parts(src, len)
+    });
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let Some(method) = copy_back_method() else {
         return;
@@ -2991,6 +4563,100 @@ pub struct HdrDisplayInfo {
     pub max_full_frame_luminance: f32,
 }
 
+/// Whether this process uses more than 85% of the video memory budget the
+/// OS gives it on the host adapter. Asked at most every 250 ms; false if
+/// the adapter cannot say.
+pub(crate) fn video_memory_tight() -> bool {
+    use std::sync::atomic::{AtomicBool, AtomicU64};
+    static ASKED_MS: AtomicU64 = AtomicU64::new(0);
+    static TIGHT: AtomicBool = AtomicBool::new(false);
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let now = START
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_millis() as u64
+        + 1;
+    let asked = ASKED_MS.load(Ordering::Relaxed);
+    if asked != 0 && now - asked < 250
+        || ASKED_MS
+            .compare_exchange(asked, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+    {
+        return TIGHT.load(Ordering::Relaxed);
+    }
+    let Some(host) = host() else { return false };
+    // SAFETY: plain DXGI factory and adapter queries.
+    let tight = unsafe {
+        CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+            .and_then(|f| f.EnumAdapterByLuid::<IDXGIAdapter3>(host.device.GetAdapterLuid()))
+            .and_then(|a| {
+                let mut info = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
+                a.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut info)
+                    .map(|()| info.Budget > 0 && info.CurrentUsage > info.Budget / 100 * 85)
+            })
+            .unwrap_or(false)
+    };
+    if tight && !TIGHT.load(Ordering::Relaxed) {
+        tracing::info!("video memory near its budget: new read-only textures go to system memory");
+    }
+    TIGHT.store(tight, Ordering::Relaxed);
+    tight
+}
+
+/// Bytes of video memory made since start (frees not counted): render
+/// targets and depth, other textures, GPU-only buffers.
+#[cfg(feature = "diagnostics")]
+pub(crate) static VRAM_MADE: [std::sync::atomic::AtomicU64; 3] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// Counts `resource` in [`VRAM_MADE`] slot `kind`.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn note_vram(kind: usize, resource: &ID3D12Resource) {
+    let Some(host) = host() else { return };
+    // SAFETY: plain queries on a live resource and device.
+    let bytes = unsafe {
+        let desc = resource.GetDesc();
+        host.device
+            .GetResourceAllocationInfo(0, &[desc])
+            .SizeInBytes
+    };
+    VRAM_MADE[kind].fetch_add(bytes, Ordering::Relaxed);
+}
+
+/// Logs the host adapter's video memory (local) and the system memory it
+/// maps (non-local): what this process uses of each against the budget the
+/// OS gives it.
+#[cfg(feature = "diagnostics")]
+fn log_video_memory() {
+    let Some(host) = host() else { return };
+    // SAFETY: plain DXGI factory and adapter queries.
+    unsafe {
+        let Ok(factory) = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0)) else {
+            return;
+        };
+        let Ok(adapter) = factory.EnumAdapterByLuid::<IDXGIAdapter3>(host.device.GetAdapterLuid())
+        else {
+            return;
+        };
+        let mb = |group| {
+            let mut info = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
+            adapter
+                .QueryVideoMemoryInfo(0, group, &mut info)
+                .map(|()| (info.CurrentUsage >> 20, info.Budget >> 20))
+                .unwrap_or_default()
+        };
+        let (local, local_budget) = mb(DXGI_MEMORY_SEGMENT_GROUP_LOCAL);
+        let (shared, shared_budget) = mb(DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL);
+        let [targets, textures, buffers] = VRAM_MADE
+            .each_ref()
+            .map(|n| n.load(Ordering::Relaxed) >> 20);
+        tracing::info!(
+            "video memory {local}/{local_budget} MB, shared {shared}/{shared_budget} MB; made \
+             since start: targets {targets} MB, textures {textures} MB, GPU buffers {buffers} MB"
+        );
+    }
+}
+
 /// Queries the host display outputs for an active HDR10 (`G2084_NONE_P2020`)
 /// desktop mode. Returns `None` when HDR is disabled or unsupported.
 pub fn display_hdr_info() -> Option<HdrDisplayInfo> {
@@ -3048,6 +4714,8 @@ struct Presenter {
     hwnd: HWND,
     meter: Meter,
     last_present_issue: Option<HRESULT>,
+    /// The two planes of the last present that had two, blended.
+    composed: Option<crate::planes::Composed>,
 }
 
 /// A successful DXGI status may still mean nothing was presented.
@@ -3122,6 +4790,8 @@ impl Meter {
     fn frame(&mut self, hwnd: HWND) {
         #[cfg(feature = "diagnostics")]
         tracing::debug!(target: "victory_gpu::frame", token = crate::frame::current(), "present");
+        #[cfg(feature = "diagnostics")]
+        crate::timeline::wait_stats::frame();
         self.frames += 1;
         #[cfg(feature = "diagnostics")]
         {
@@ -3147,12 +4817,55 @@ impl Meter {
         let [back_ms, back_mb] =
             [0, 1].map(|i| COPY_BACK[i].swap(0, Ordering::Relaxed) as f64 / [1e3, 1e6][i] / frames);
         let dropped = crate::draw::take_dropped() as f64 / frames;
+        let [fence, memory, pending, running, called] = crate::timeline::HELD_US
+            .each_ref()
+            .map(|n| n.swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames);
+        let flight = FLIGHT_STATS
+            .each_ref()
+            .map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames);
+        let [met_early, met_shaders] = crate::timeline::MET_IN_FLIGHT
+            .each_ref()
+            .map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames);
         let indirect = crate::list::take_indirect() as f64 / frames;
+        let [mesh_direct, mesh_indirect] =
+            crate::draw::take_mesh_without_mesh_shaders().map(|n| n as f64 / frames);
         // Over the same frames as the counts above.
         #[cfg(feature = "diagnostics")]
         let drops = crate::pipeline::take_drops();
         if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
             self.logged = std::time::Instant::now();
+            #[cfg(feature = "diagnostics")]
+            log_video_memory();
+            {
+                tracing::info!(
+                    "queues per frame (ms, summed over queues): held behind fences {fence:.1},                      behind memory waits {memory:.1}, behind finishing submissions {pending:.1};                      running work {running:.1}; in the driver's ExecuteCommandLists {called:.1}"
+                );
+            }
+            if in_flight_limit() > 1 {
+                let [
+                    began,
+                    behind,
+                    depth,
+                    full,
+                    list,
+                    anything,
+                    alias,
+                    landing,
+                    in_place,
+                ] = flight;
+                let average = if behind > 0.0 { depth / behind } else { 0.0 };
+                tracing::info!(
+                    "in flight per frame: {began:.1} submissions, {behind:.1} begun behind \
+                     others ({average:.1} in flight on average), {full:.1} waited at the limit \
+                     of {limit}; waited for earlier ones to complete: {list:.1} for a list \
+                     still in flight, {anything:.1} for work that may touch any memory, \
+                     {alias:.1} for another copy of memory they write, {landing:.1} for title \
+                     memory they write, {in_place:.1} for indirect arguments they change in \
+                     place; memory waits met by a submission in flight: {met_early:.1} by its \
+                     done writes, {met_shaders:.1} by what its shaders wrote",
+                    limit = in_flight_limit()
+                );
+            }
             tracing::info!(
                 "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
@@ -3161,9 +4874,19 @@ impl Meter {
                  {indirect:.0} indirect",
                 making = crate::pipeline::making()
             );
+            if mesh_direct + mesh_indirect > 0.0 {
+                tracing::info!(
+                    "mesh dispatches run as a compute pass and a draw (no mesh shaders on this \
+                     host): {mesh_direct:.1}/frame direct, {mesh_indirect:.1}/frame indirect"
+                );
+            }
             #[cfg(feature = "diagnostics")]
             {
                 crate::copystat::log(std::mem::take(&mut self.copy_stats_frames) as f64);
+                tracing::info!(
+                    conflicts = crate::shadow::CONFLICTS.swap(0, Ordering::Relaxed),
+                    "copy-back conflicts (dwords left to a newer CPU write) since the last line"
+                );
                 for (why, n) in drops.iter().take(40) {
                     tracing::info!(
                         "dropped {:.1}/frame without a host pipeline: {why}",
@@ -3211,17 +4934,30 @@ impl Meter {
 
 impl Host {
     /// Shows `texture`, which is in `state` (a host state) and stays in it,
-    /// as frame `frame` (saved if captures are on). `None` if nothing was
-    /// shown or the diagnostic probe has no reading. Otherwise diagnostics
-    /// builds report whether the sampled pixels were black.
-    pub(crate) fn present(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
+    /// as frame `frame` (saved if captures are on), with the second display
+    /// plane `overlay` (likewise with its state) blended over it if the
+    /// title presents one. `None` if nothing was shown or the diagnostic
+    /// probe has no reading. Otherwise diagnostics builds report whether
+    /// the sampled pixels were black.
+    pub(crate) fn present(
+        &self,
+        texture: &ID3D12Resource,
+        state: u32,
+        overlay: Option<(&ID3D12Resource, u32)>,
+        frame: u64,
+    ) -> Option<bool> {
         // SAFETY: a live resource.
         let desc = unsafe { texture.GetDesc() };
         let Some(format) = swap_format(desc.Format) else {
             tracing::warn!(format = desc.Format.0, "cannot present this format");
             return None;
         };
-        let (width, height) = (desc.Width as u32, desc.Height);
+        // Two planes are shown at the size of the larger one.
+        let (width, height) = match overlay {
+            // SAFETY: a live resource.
+            Some((o, _)) => crate::planes::size(&desc, &unsafe { o.GetDesc() }),
+            None => (desc.Width as u32, desc.Height),
+        };
         let mut presenter = self.presenter.lock().unwrap_or_else(|e| e.into_inner());
         let mut retry = self.present_retry.lock().unwrap_or_else(|e| e.into_inner());
         let now = std::time::Instant::now();
@@ -3311,38 +5047,73 @@ impl Host {
             };
             p.copy.reset();
             let list = &p.copy.list;
-            list.ResourceBarrier(&[
-                transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE),
-                transition(
-                    &back,
-                    D3D12_RESOURCE_STATE_PRESENT,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                ),
-            ]);
+            // The composed planes, already in the copy-source state.
+            let composed = overlay.and_then(|(o, o_state)| {
+                crate::planes::compose(
+                    &self.device,
+                    list,
+                    &mut p.composed,
+                    (texture, state),
+                    (o, D3D12_RESOURCE_STATES(o_state as i32)),
+                    format,
+                )
+            });
+            let source = composed.as_ref().unwrap_or(texture);
+            let to_present = transition(
+                &back,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_PRESENT,
+            );
+            let to_copy = transition(
+                &back,
+                D3D12_RESOURCE_STATE_PRESENT,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+            );
+            if composed.is_some() {
+                list.ResourceBarrier(&[to_copy]);
+            } else {
+                list.ResourceBarrier(&[
+                    transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE),
+                    to_copy,
+                ]);
+            }
             // Diagnostics: `VICTORY_SHOW_TARGET` shows one of the title's render targets instead.
             #[cfg(feature = "diagnostics")]
             let shown = crate::capture::show(list, &back);
             #[cfg(not(feature = "diagnostics"))]
             let shown = false;
             if !shown {
-                list.CopyResource(&back, texture);
+                if composed.is_none() && (width, height) != (desc.Width as u32, desc.Height) {
+                    // Two planes the pass could not compose: the first one,
+                    // at the top left of the larger back buffer.
+                    let at = |resource: &ID3D12Resource| D3D12_TEXTURE_COPY_LOCATION {
+                        pResource: std::mem::transmute_copy(resource),
+                        Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                            SubresourceIndex: 0,
+                        },
+                    };
+                    list.CopyTextureRegion(&at(&back), 0, 0, 0, &at(texture), None);
+                } else {
+                    list.CopyResource(&back, source);
+                }
             }
             #[cfg(feature = "diagnostics")]
             let capture = crate::capture::wanted(frame)
-                .then(|| crate::capture::read_back(&self.device, list, texture))
+                .then(|| crate::capture::read_back(&self.device, list, source))
                 .flatten();
             #[cfg(feature = "diagnostics")]
-            let probe = crate::capture::probe(&self.device, list, texture);
+            let probe = crate::capture::probe(&self.device, list, source);
             #[cfg(not(feature = "diagnostics"))]
             let _ = frame;
-            list.ResourceBarrier(&[
-                transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state),
-                transition(
-                    &back,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                    D3D12_RESOURCE_STATE_PRESENT,
-                ),
-            ]);
+            if composed.is_some() {
+                list.ResourceBarrier(&[to_present]);
+            } else {
+                list.ResourceBarrier(&[
+                    transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state),
+                    to_present,
+                ]);
+            }
             p.copy.close();
             self.execute(&[&p.copy]);
             #[cfg(feature = "diagnostics")]
@@ -3429,6 +5200,7 @@ impl Host {
                 hwnd,
                 meter: Meter::new(),
                 last_present_issue: None,
+                composed: None,
             };
             p.sync_color_space(display_hdr_info().is_some());
             Ok(p)
@@ -3590,6 +5362,10 @@ impl Host {
                 &mut buffer,
             )
         };
+        #[cfg(feature = "diagnostics")]
+        if let Some(b) = &buffer {
+            note_vram(2, b);
+        }
         match made {
             Ok(()) => buffer,
             Err(e) => {
@@ -4560,5 +6336,85 @@ mod present_retry {
         ] {
             assert!(!step.name().is_empty());
         }
+    }
+}
+
+#[cfg(test)]
+mod flight_tests {
+    use super::*;
+
+    fn landings() -> Vec<Landing> {
+        vec![
+            Landing {
+                value: 10,
+                lists: vec![1],
+                gpu_writes: vec![(0xc1, 100, 200)],
+                readbacks: vec![(300, 310)],
+                done: vec![(400, 408)],
+                in_place: vec![(0xc1, 500, 520)],
+                ..Landing::default()
+            },
+            Landing {
+                value: 11,
+                gpu_writes: vec![(0xc2, 1000, 2000)],
+                ..Landing::default()
+            },
+        ]
+    }
+
+    fn memory(copy: Option<usize>, start: usize, end: usize) -> Access {
+        Access::Memory { copy, start, end }
+    }
+
+    /// A submission prepares ahead of those in flight unless it touches,
+    /// on the CPU, what they write into title memory at completion.
+    #[test]
+    fn a_submission_waits_only_for_landings_its_preparation_reads() {
+        let l = landings();
+        let one = |a: Access| depends(&[a], &l);
+        // The same host copy holds the GPU's bytes: no wait.
+        assert_eq!(one(memory(Some(0xc1), 150, 160)), None);
+        assert_eq!(
+            one(Access::Declares {
+                copy: 0xc1,
+                start: 150,
+                end: 160
+            }),
+            None
+        );
+        // Done writes a refresh covers are patched into the copy.
+        assert_eq!(one(memory(Some(0xc1), 402, 403)), None);
+        // Another copy of the memory, or the CPU reading it.
+        assert_eq!(one(memory(Some(0xc3), 150, 160)), Some((10, Why::Alias)));
+        assert_eq!(
+            one(Access::Declares {
+                copy: 0xc2,
+                start: 150,
+                end: 160
+            }),
+            Some((10, Why::Alias))
+        );
+        assert_eq!(one(memory(None, 150, 151)), Some((10, Why::Landing)));
+        assert_eq!(one(memory(None, 402, 403)), Some((10, Why::Landing)));
+        assert_eq!(one(memory(Some(0xc1), 305, 306)), Some((10, Why::Landing)));
+        assert_eq!(one(memory(None, 1999, 2001)), Some((11, Why::Landing)));
+        // Indirect arguments its GPU work clamps in place: a refresh
+        // through the same copy waits (title memory there is not stale).
+        assert_eq!(one(memory(Some(0xc1), 510, 511)), Some((10, Why::InPlace)));
+        assert_eq!(one(memory(None, 510, 511)), None);
+        // Untouched memory, ranges that only meet at an edge.
+        assert_eq!(one(memory(None, 0, 100)), None);
+        assert_eq!(one(memory(None, 200, 300)), None);
+        // A list still in flight; work that may touch anything waits for
+        // the last one.
+        assert_eq!(one(Access::List(1)), Some((10, Why::List)));
+        assert_eq!(one(Access::List(2)), None);
+        assert_eq!(one(Access::Anything), Some((11, Why::Anything)));
+        // The last landing depended on.
+        assert_eq!(
+            depends(&[memory(None, 150, 151), memory(None, 1500, 1501)], &l),
+            Some((11, Why::Landing))
+        );
+        assert_eq!(depends(&[], &l), None);
     }
 }

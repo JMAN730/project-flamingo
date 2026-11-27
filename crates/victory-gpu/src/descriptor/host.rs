@@ -168,6 +168,12 @@ pub(crate) struct HostHeap {
     next: Mutex<(u32, Vec<bool>)>,
     /// Leaf-only tracker of live SRV/UAV textures across title slots.
     tex_tracker: Mutex<TexTracker>,
+    /// The buffer view table translated shaders may read ([`super::table`]),
+    /// made on first use.
+    pub(super) buffer_table: Mutex<Option<super::table::BufferTable>>,
+    /// Counts slots made from another record than before (or made null),
+    /// for the buffer view table to tell when it must look again.
+    pub(super) writes: std::sync::atomic::AtomicU64,
 }
 
 /// Host heaps' GPU ranges (start, bytes, bytes per slot, sampler), for
@@ -359,6 +365,8 @@ impl HostHeap {
             refreshes: Mutex::new(HashMap::new()),
             next: Mutex::new((0, vec![false; extra as usize])),
             tex_tracker: Mutex::new(TexTracker::new(sampler, count)),
+            buffer_table: Mutex::new(None),
+            writes: std::sync::atomic::AtomicU64::new(0),
         };
         // A slot never written is undefined: shaders reading one (a slot
         // the title wrote in a way we do not know, or a table entry no
@@ -373,6 +381,7 @@ impl HostHeap {
             ms = started.elapsed().as_millis(),
             "host descriptor heap made null"
         );
+        super::check::forget(h.cpu, (count + extra) as usize * h.step as usize);
         Some(h)
     }
 
@@ -442,6 +451,7 @@ fn null_sampler(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     };
     // SAFETY: a slot of a sampler heap of ours.
     unsafe { host.device.CreateSampler(&desc, at) };
+    super::check::note(at, super::check::Kind::SAMPLER);
 }
 
 impl HostHeap {
@@ -649,6 +659,7 @@ impl HostHeap {
             host.device
                 .CreateConstantBufferView(Some(&desc), self.cpu(index))
         };
+        super::check::note(self.cpu(index), super::check::Kind::cbv(false));
     }
 
     /// Makes slot `index` (a dynamic one) a raw buffer view of `len` bytes
@@ -679,6 +690,7 @@ impl HostHeap {
             host.device
                 .CreateShaderResourceView(buffer, Some(&desc), self.cpu(index))
         };
+        super::check::note(self.cpu(index), super::check::Kind::srv(Some(&desc), false));
         self.keep(index, Kept::Resource(buffer.clone()));
     }
 
@@ -708,6 +720,7 @@ impl HostHeap {
                 self.cpu(index),
             )
         };
+        super::check::note(self.cpu(index), super::check::Kind::uav(Some(&desc), false));
         self.keep(index, Kept::Resource(buffer.clone()));
     }
 
@@ -725,7 +738,24 @@ impl HostHeap {
                 self.cpu(index),
             )
         };
+        super::check::note(self.cpu(index), super::check::Kind::uav(Some(&desc), true));
         self.keep(index, Kept::Empty);
+    }
+
+    /// The kind of descriptor at slot `index`, marked read by a submission
+    /// of host fence value `read_by` or later (`VICTORY_CHECK_DESCRIPTORS`);
+    /// `None` past the heap's end.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn checked_kind(&self, index: u32, read_by: u64) -> Option<super::check::Kind> {
+        if index >= self.count.saturating_add(self.spare) {
+            return None;
+        }
+        let initial = if self.sampler {
+            super::check::Kind::SAMPLER
+        } else {
+            super::check::Kind::INITIAL_VIEW
+        };
+        Some(super::check::read(self.cpu(index), initial, read_by))
     }
 
     /// The shader-visible handle of slot `index`.
@@ -773,12 +803,16 @@ impl HostHeap {
             // title released): nothing to read.
             if made[index as usize] != 0 {
                 made[index as usize] = 0;
+                self.writes
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 self.make_null(index);
                 self.track_slot(index, None);
             }
             return None;
         };
         if made[index as usize] != key {
+            self.writes
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let later = !for_draw && view.is_buffer();
             made[index as usize] = if later { 0 } else { key };
             let kept = if later {
@@ -1283,6 +1317,12 @@ pub(crate) fn selected_buffer(view: &View) -> Option<BufferRead> {
 /// Re-expresses the exact byte start and length of a raw buffer SRV as
 /// structured elements of width `stride`, rejecting typed or already-structured
 /// views and fractional bounds.
+/// Whether `view` is a raw buffer view that [`HostHeap::make_structured_at`]
+/// can alias as `stride`-byte structured elements.
+pub(crate) fn raw_aliasable(view: &View, stride: u32) -> bool {
+    buffer_srv_parts(view).is_some_and(|(_, _, desc)| structured_alias(desc, stride).is_some())
+}
+
 fn structured_alias(
     mut desc: D3D12_SHADER_RESOURCE_VIEW_DESC,
     stride: u32,
@@ -1386,6 +1426,7 @@ fn buffer_srv_inner(
             host.device
                 .CreateShaderResourceView(&upload, Some(&desc), at)
         };
+        super::check::note(at, super::check::Kind::srv(Some(&desc), false));
         return Some(Kept::Unaligned(UnalignedCopy {
             resource: upload,
             dst: dst as usize,
@@ -1404,6 +1445,7 @@ fn buffer_srv_inner(
         host.device
             .CreateShaderResourceView(&shadow.buffer, Some(&desc), at)
     };
+    super::check::note(at, super::check::Kind::srv(Some(&desc), false));
     if track_shadow {
         Some(Kept::AliasedShadow {
             shadow,
@@ -1476,6 +1518,7 @@ fn buffer_uav(
             at,
         )
     };
+    super::check::note(at, super::check::Kind::uav(Some(&desc), false));
     Some(Kept::Resource(shadow.buffer.clone()))
 }
 
@@ -1805,6 +1848,99 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
     true
 }
 
+/// Adjusts the most detailed mip and mip count in a shader resource view
+pub fn adjust_mips(most_detailed: &mut u32, mip_levels: &mut u32, drop: u32, host_mips: u32) {
+    let dropped_from_view = drop.saturating_sub(*most_detailed);
+    *most_detailed = most_detailed.saturating_sub(drop);
+    if *mip_levels != u32::MAX {
+        let surviving_mips = mip_levels.saturating_sub(dropped_from_view);
+        let max_mips = host_mips.saturating_sub(*most_detailed);
+        *mip_levels = surviving_mips.min(max_mips).max(1);
+    }
+}
+
+/// Clamps shader resource view mips to the surviving host miplevel range
+/// when the underlying host texture had mips dropped for low VRAM budgets.
+fn adjust_srv_for_dropped_mips(
+    desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC,
+    drop: u32,
+    host_mips: u32,
+) {
+    match desc.ViewDimension {
+        D3D12_SRV_DIMENSION_TEXTURE1D => {
+            // SAFETY: matching union variant for ViewDimension.
+            let tex = unsafe { &mut desc.Anonymous.Texture1D };
+            adjust_mips(
+                &mut tex.MostDetailedMip,
+                &mut tex.MipLevels,
+                drop,
+                host_mips,
+            );
+        }
+        D3D12_SRV_DIMENSION_TEXTURE1DARRAY => {
+            // SAFETY: matching union variant for ViewDimension.
+            let tex = unsafe { &mut desc.Anonymous.Texture1DArray };
+            adjust_mips(
+                &mut tex.MostDetailedMip,
+                &mut tex.MipLevels,
+                drop,
+                host_mips,
+            );
+        }
+        D3D12_SRV_DIMENSION_TEXTURE2D => {
+            // SAFETY: matching union variant for ViewDimension.
+            let tex = unsafe { &mut desc.Anonymous.Texture2D };
+            adjust_mips(
+                &mut tex.MostDetailedMip,
+                &mut tex.MipLevels,
+                drop,
+                host_mips,
+            );
+        }
+        D3D12_SRV_DIMENSION_TEXTURE2DARRAY => {
+            // SAFETY: matching union variant for ViewDimension.
+            let tex = unsafe { &mut desc.Anonymous.Texture2DArray };
+            adjust_mips(
+                &mut tex.MostDetailedMip,
+                &mut tex.MipLevels,
+                drop,
+                host_mips,
+            );
+        }
+        D3D12_SRV_DIMENSION_TEXTURE3D => {
+            // SAFETY: matching union variant for ViewDimension.
+            let tex = unsafe { &mut desc.Anonymous.Texture3D };
+            adjust_mips(
+                &mut tex.MostDetailedMip,
+                &mut tex.MipLevels,
+                drop,
+                host_mips,
+            );
+        }
+        D3D12_SRV_DIMENSION_TEXTURECUBE => {
+            // SAFETY: matching union variant for ViewDimension.
+            let tex = unsafe { &mut desc.Anonymous.TextureCube };
+            adjust_mips(
+                &mut tex.MostDetailedMip,
+                &mut tex.MipLevels,
+                drop,
+                host_mips,
+            );
+        }
+        D3D12_SRV_DIMENSION_TEXTURECUBEARRAY => {
+            // SAFETY: matching union variant for ViewDimension.
+            let tex = unsafe { &mut desc.Anonymous.TextureCubeArray };
+            adjust_mips(
+                &mut tex.MostDetailedMip,
+                &mut tex.MipLevels,
+                drop,
+                host_mips,
+            );
+        }
+        _ => {}
+    }
+}
+
 /// Makes the host descriptor for `view` at `at`: the host resource it
 /// views, or `None` if it cannot.
 fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
@@ -1829,6 +1965,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             };
             // SAFETY: a slot of our heap; the range lies in the host copy.
             unsafe { device.CreateConstantBufferView(Some(&desc), at) };
+            super::check::note(at, super::check::Kind::cbv(false));
             Some(Kept::Resource(shadow.buffer.clone()))
         }
         View::Shader(resource, desc) => {
@@ -1853,6 +1990,18 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 if !fits(texture, desc.as_mut().map(|d| &mut d.Format), false) {
                     return None;
                 }
+                let drop = crate::resource::texture_memory(resource)
+                    .map(|(_, orig)| {
+                        // SAFETY: live texture.
+                        let host_mips = unsafe { texture.GetDesc() }.MipLevels;
+                        u32::from(orig.mip_levels).saturating_sub(u32::from(host_mips))
+                    })
+                    .unwrap_or(0);
+                if let (true, Some(d)) = (drop > 0, desc.as_mut()) {
+                    // SAFETY: live texture.
+                    let host_mips = unsafe { texture.GetDesc() }.MipLevels;
+                    adjust_srv_for_dropped_mips(d, drop, u32::from(host_mips));
+                }
                 // SAFETY: a live texture and a slot of our heap.
                 unsafe {
                     device.CreateShaderResourceView(
@@ -1861,6 +2010,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                         at,
                     )
                 };
+                super::check::note(at, super::check::Kind::srv(desc.as_ref(), false));
                 Some(Kept::Texture {
                     resource: texture.clone(),
                     title: resource as usize,
@@ -1912,6 +2062,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                     at,
                 )
             };
+            super::check::note(at, super::check::Kind::uav(desc.as_ref(), false));
             Some(Kept::Texture {
                 resource: texture.clone(),
                 title: resource as usize,
@@ -1927,12 +2078,14 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             };
             // SAFETY: a slot of our sampler heap.
             unsafe { device.CreateSampler(&desc, at) };
+            super::check::note(at, super::check::Kind::SAMPLER);
             Some(Kept::Empty)
         }
         View::ConsoleSampler(words) => {
             let desc = crate::sampler::console(words);
             // SAFETY: a slot of our sampler heap.
             unsafe { device.CreateSampler(&desc, at) };
+            super::check::note(at, super::check::Kind::SAMPLER);
             Some(Kept::Empty)
         }
         View::Placed(unordered, resource, desc) => {
@@ -1974,6 +2127,46 @@ pub(crate) fn placed_first_mip(view: &View) -> u32 {
         unsafe { desc.Anonymous.Texture2D.MostDetailedMip }
     } else {
         0
+    }
+}
+
+#[cfg(test)]
+mod srv_mips_tests {
+    use super::*;
+
+    /// Dropped mips correctly clamp straddled and fully pruned SRV windows.
+    #[test]
+    fn srv_mips_adjustment_handles_straddled_and_dropped_views() {
+        let mut most_detailed = 1;
+        let mut mip_levels = 3;
+        // 64x64 texture with 7 levels, drop 2 -> host has 5 levels (0..4 representing guest 2..6).
+        // Guest view requests levels 1..=3 (3 levels).
+        // Level 1 dropped, surviving are 2..=3 (2 levels).
+        // Host should receive MostDetailedMip: 0, MipLevels: 2 (representing guest 2..=3).
+        adjust_mips(&mut most_detailed, &mut mip_levels, 2, 5);
+        assert_eq!(most_detailed, 0);
+        assert_eq!(mip_levels, 2);
+
+        // Entirely dropped view (requesting levels 0..=1 with drop 2) clamps to at least 1.
+        let mut most_detailed = 0;
+        let mut mip_levels = 2;
+        adjust_mips(&mut most_detailed, &mut mip_levels, 2, 5);
+        assert_eq!(most_detailed, 0);
+        assert_eq!(mip_levels, 1);
+
+        // Surviving view (requesting levels 3..=4 with drop 2)
+        let mut most_detailed = 3;
+        let mut mip_levels = 2;
+        adjust_mips(&mut most_detailed, &mut mip_levels, 2, 5);
+        assert_eq!(most_detailed, 1);
+        assert_eq!(mip_levels, 2);
+
+        // Unbounded view (u32::MAX)
+        let mut most_detailed = 1;
+        let mut mip_levels = u32::MAX;
+        adjust_mips(&mut most_detailed, &mut mip_levels, 2, 5);
+        assert_eq!(most_detailed, 0);
+        assert_eq!(mip_levels, u32::MAX);
     }
 }
 
@@ -2021,6 +2214,7 @@ fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
         }
         View::Constant(..) => {
             let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC::default();
+            super::check::note(at, super::check::Kind::cbv(true));
             // SAFETY: a slot of our heap; a zero location makes a null view.
             return unsafe { host.device.CreateConstantBufferView(Some(&desc), at) };
         }
@@ -2044,6 +2238,7 @@ fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
             at,
         )
     };
+    super::check::note(at, super::check::Kind::uav(Some(&desc), true));
 }
 
 /// A null texture UAV of the title's view dimension (1D, 1D or 2D arrays,
@@ -2113,6 +2308,7 @@ fn null_buffer_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
         host.device
             .CreateShaderResourceView(None::<&ID3D12Resource>, Some(&desc), at)
     };
+    super::check::note(at, super::check::Kind::srv(Some(&desc), true));
 }
 
 /// A texture view that reads zeros with the dimension (and mip and array
@@ -2140,6 +2336,7 @@ fn null_like(words: &[u32; 10], at: D3D12_CPU_DESCRIPTOR_HANDLE) {
         host.device
             .CreateShaderResourceView(None::<&ID3D12Resource>, Some(&desc), at)
     };
+    super::check::note(at, super::check::Kind::srv(Some(&desc), true));
 }
 
 /// A view that reads zeros, for slots whose view the host cannot make.
@@ -2164,6 +2361,7 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
         host.device
             .CreateShaderResourceView(None::<&ID3D12Resource>, Some(&desc), at)
     };
+    super::check::note(at, super::check::Kind::srv(Some(&desc), true));
 }
 
 #[cfg(test)]

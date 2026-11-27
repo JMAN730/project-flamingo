@@ -85,17 +85,17 @@ pub(crate) struct HeapDesc {
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ResourceDesc {
-    dimension: u32,
-    alignment: u64,
-    width: u64,
-    height: u32,
-    depth_or_array_size: u16,
-    mip_levels: u16,
-    format: u32,
-    sample_count: u32,
-    sample_quality: u32,
-    layout: u32,
-    flags: u32,
+    pub(crate) dimension: u32,
+    pub(crate) alignment: u64,
+    pub(crate) width: u64,
+    pub(crate) height: u32,
+    pub(crate) depth_or_array_size: u16,
+    pub(crate) mip_levels: u16,
+    pub(crate) format: u32,
+    pub(crate) sample_count: u32,
+    pub(crate) sample_quality: u32,
+    pub(crate) layout: u32,
+    pub(crate) flags: u32,
 }
 
 #[repr(C)]
@@ -814,9 +814,14 @@ impl Resource {
                     .map_or(std::ptr::null(), |c| std::ptr::from_ref(c).cast::<c_void>());
                 let texture = host_texture(&self.desc, state, clear)?;
                 let state = crate::host::legal_state(&texture, crate::host::texture_state(state));
+                // SAFETY: a live texture.
+                let host_mips = unsafe { texture.GetDesc().MipLevels };
+                let drop = self.desc.mip_levels.saturating_sub(host_mips);
                 Some(std::sync::Arc::new(HostTexture {
                     texture,
                     state: state.into(),
+                    title_mips: self.desc.mip_levels,
+                    mip_drop: drop,
                 }))
             })
             .as_ref()
@@ -829,10 +834,41 @@ impl Resource {
 /// may release a resource whose commands it recorded but not yet submitted
 /// (console memory outlives the object; a host texture must outlive the
 /// lists that name it).
+/// Maps a guest subresource index to the corresponding host subresource index,
+/// or `None` if the subresource was dropped.
+pub fn map_subresource(guest_sub: u32, guest_mips: u32, drop: u32) -> Option<u32> {
+    if drop == 0 || guest_mips == 0 {
+        return Some(guest_sub);
+    }
+    let slice = guest_sub / guest_mips;
+    let guest_mip = guest_sub % guest_mips;
+    if guest_mip < drop {
+        return None;
+    }
+    let host_mips = guest_mips.saturating_sub(drop).max(1);
+    let host_mip = guest_mip - drop;
+    Some(slice * host_mips + host_mip)
+}
+
 #[cfg(windows)]
 pub(crate) struct HostTexture {
     pub(crate) texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
     pub(crate) state: std::sync::atomic::AtomicU32,
+    pub(crate) title_mips: u16,
+    pub(crate) mip_drop: u16,
+}
+
+#[cfg(windows)]
+impl HostTexture {
+    /// Maps a guest subresource index to the corresponding host subresource index,
+    /// or `None` if the subresource was dropped.
+    pub(crate) fn host_subresource(&self, guest_sub: u32) -> Option<u32> {
+        map_subresource(
+            guest_sub,
+            u32::from(self.title_mips),
+            u32::from(self.mip_drop),
+        )
+    }
 }
 
 /// Moves the host texture to `wanted` (a host texture state); the host
@@ -869,6 +905,133 @@ pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
 
 /// A host texture like the title's: same description, in GPU memory,
 /// without the console's layout and flags.
+static PRESSURE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+#[cfg(test)]
+pub(crate) fn pressure() -> u32 {
+    PRESSURE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(test)]
+pub(crate) fn set_pressure(val: u32) {
+    PRESSURE.store(val, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Computes the number of mips to drop for this texture under the current
+/// mip drop setting or host memory pressure. Pure sampled textures with sufficient
+/// mips and size are scaled down to reduce VRAM consumption on low-VRAM GPUs.
+pub(crate) fn compute_mip_drop(desc: &ResourceDesc) -> u32 {
+    let env_drop = crate::texture::texture_mip_drop();
+    let pressure = PRESSURE.load(std::sync::atomic::Ordering::Relaxed);
+    let drop = env_drop.max(pressure).min(3);
+    if drop == 0 {
+        return 0;
+    }
+    let min_size = crate::texture::texture_mip_drop_min_size();
+    compute_mip_drop_explicit(desc, drop, min_size)
+}
+
+pub(crate) fn compute_mip_drop_explicit(desc: &ResourceDesc, drop: u32, min_size: u64) -> u32 {
+    if drop == 0 {
+        return 0;
+    }
+    // Only drop for pure sampled textures: not buffers, not render targets,
+    // not depth buffers, not UAVs, not 3D textures, and not textures with MSAA.
+    const TARGET_DEPTH_UNORDERED: u32 = 0x7;
+    if desc.dimension == BUFFER
+        || desc.dimension == TEXTURE_3D
+        || desc.flags & TARGET_DEPTH_UNORDERED != 0
+        || desc.sample_count > 1
+    {
+        return 0;
+    }
+    // Exclude non-power-of-two (NPOT) textures: display artwork, loading screens,
+    // video frames, and UI presentation surfaces (e.g. 1920x1080, 1280x720, 2560x1440).
+    // These are 2D presentation assets whose titles copy only subresource 0;
+    // dropping them causes flat-colour loading screens while saving negligible VRAM (<10 MB).
+    // In contrast, 3D world streaming textures in RAGE are strictly power-of-two.
+    if !desc.width.is_power_of_two() || !desc.height.is_power_of_two() {
+        return 0;
+    }
+    // Size floor: drop only textures where both dimensions are at least `min_size`
+    // (default 1024). Small utility textures account for < 2.5% of VRAM but cause
+    // copy coordinate underflow and 1x1 degenerate collapses. Testers can configure
+    // this via VICTORY_TEXTURE_MIP_DROP_MIN_SIZE (e.g. 2048 for conservative mode).
+    if desc.width < min_size || u64::from(desc.height) < min_size {
+        return 0;
+    }
+    let mut k = drop;
+    while k > 0 {
+        // Require at least 2 mips to survive on the host.
+        if desc.mip_levels > (k as u16 + 1) && (desc.width >> k) > 0 && (desc.height >> k) > 0 {
+            return k;
+        }
+        k -= 1;
+    }
+    0
+}
+
+pub(crate) fn apply_mip_drop(desc: &ResourceDesc, drop: u32) -> ResourceDesc {
+    let mut d = *desc;
+    if drop > 0 {
+        d.width = (d.width >> drop).max(1);
+        d.height = (d.height >> drop).max(1);
+        if d.dimension == TEXTURE_3D {
+            d.depth_or_array_size = (d.depth_or_array_size >> drop).max(1);
+        }
+        d.mip_levels = d.mip_levels.saturating_sub(drop as u16).max(1);
+    }
+    d
+}
+
+#[cfg(windows)]
+pub(crate) const WIN_E_OUTOFMEMORY: windows::core::HRESULT = windows::core::HRESULT(E_OUTOFMEMORY);
+
+#[cfg(windows)]
+pub(crate) fn create_texture_with_auto_mip_drop<T, F>(
+    desc: &ResourceDesc,
+    mut create_fn: F,
+) -> Result<(T, u32), windows::core::Error>
+where
+    F: FnMut(&ResourceDesc, u32) -> Result<T, windows::core::Error>,
+{
+    let mut current_drop = compute_mip_drop(desc);
+    let min_size = crate::texture::texture_mip_drop_min_size();
+    loop {
+        let applied_desc = apply_mip_drop(desc, current_drop);
+        match create_fn(&applied_desc, current_drop) {
+            Ok(res) => return Ok((res, current_drop)),
+            Err(e) if e.code() == WIN_E_OUTOFMEMORY => {
+                let next_drop = (current_drop + 1).min(3);
+                let possible_drop = compute_mip_drop_explicit(desc, next_drop, min_size);
+                if possible_drop > current_drop {
+                    let prev =
+                        PRESSURE.fetch_max(possible_drop, std::sync::atomic::Ordering::Relaxed);
+                    if possible_drop > prev {
+                        tracing::warn!(
+                            dropped = possible_drop,
+                            width = desc.width,
+                            height = desc.height,
+                            "host memory pressure: dropping mips automatically after E_OUTOFMEMORY"
+                        );
+                    }
+                    current_drop = possible_drop;
+                    continue;
+                } else {
+                    tracing::error!(
+                        error = %e,
+                        desc = ?applied_desc,
+                        current_drop,
+                        "host memory exhausted: CreateCommittedResource failed with E_OUTOFMEMORY and texture cannot drop further mips"
+                    );
+                    return Err(e);
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 #[cfg(windows)]
 fn host_texture(
     desc: &ResourceDesc,
@@ -880,8 +1043,28 @@ fn host_texture(
     if desc.dimension == BUFFER {
         return None;
     }
+    // `VICTORY_NO_TEXTURES=1`: textures shaders only read get no host copy,
+    // so their views are null (they sample as zero). Render targets, depth
+    // and unordered-access textures keep theirs. For cards with less video
+    // memory than the world needs (about 8.6 GB of textures at its load).
+    // shortcut: a texture the title flags read-only but fills by a copy
+    // loses that content too.
+    static NO_TEXTURES: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if desc.flags & 7 == 0
+        && *NO_TEXTURES.get_or_init(|| {
+            let on = std::env::var_os("VICTORY_NO_TEXTURES").is_some_and(|v| v != "0");
+            if on {
+                tracing::info!("VICTORY_NO_TEXTURES: read-only textures get no host copy");
+            }
+            on
+        })
+    {
+        return None;
+    }
     let host = crate::host::host()?;
-    let mut d = *desc;
+    // `VICTORY_TEXTURE_MIP_DROP=n`: sampled-only textures lose their top `n`
+    // mips; `Resource::host` records how many the created texture lost.
+    let mut d = apply_mip_drop(desc, compute_mip_drop(desc));
     d.layout = 0;
     d.alignment = 0;
     d.flags &= PC_FLAGS;
@@ -923,9 +1106,25 @@ fn host_texture(
         };
         value
     });
-    let heap = D3D12_HEAP_PROPERTIES {
+    // Textures shaders only read go to system memory the GPU maps once video
+    // memory is near its budget: slower to sample, but a card with less
+    // video memory than the console's (the world keeps about 12 GB of
+    // targets and textures) keeps running instead of losing its device.
+    let read_only = d.flags & (RENDER_TARGET | DEPTH | UNORDERED) == 0;
+    let system = D3D12_HEAP_PROPERTIES {
+        Type: D3D12_HEAP_TYPE_CUSTOM,
+        CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE,
+        MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
+        ..Default::default()
+    };
+    let video = D3D12_HEAP_PROPERTIES {
         Type: D3D12_HEAP_TYPE_DEFAULT,
         ..Default::default()
+    };
+    let heap = if read_only && crate::host::video_memory_tight() {
+        system
+    } else {
+        video
     };
     let mut texture: Option<ID3D12Resource> = None;
     let create = |d: &ResourceDesc, texture: &mut Option<ID3D12Resource>| {
@@ -976,6 +1175,8 @@ fn host_texture(
         tracing::warn!(error = %e, desc = ?d, "no host texture");
     }
     if let Some(t) = &texture {
+        #[cfg(feature = "diagnostics")]
+        crate::host::note_vram(usize::from(d.flags & (RENDER_TARGET | DEPTH) == 0), t);
         crate::host::name(t, || {
             format!(
                 "texture {}x{} f{} flags {:#x}",
@@ -1673,6 +1874,126 @@ mod tests {
             S_OK
         );
         heap
+    }
+
+    #[test]
+    fn mip_drop_computation_respects_constraints() {
+        let sample_tex = texture(1024, 1024, 28, 10);
+        assert_eq!(sample_tex.flags, 0);
+
+        // When drop is 0:
+        assert_eq!(compute_mip_drop_explicit(&sample_tex, 0, 1024), 0);
+
+        // Render targets and depth buffers should never drop mips:
+        let mut rt_tex = sample_tex;
+        rt_tex.flags = 1; // RENDER_TARGET
+        assert_eq!(compute_mip_drop_explicit(&rt_tex, 1, 1024), 0);
+
+        let mut depth_tex = sample_tex;
+        depth_tex.flags = 2; // DEPTH
+        assert_eq!(compute_mip_drop_explicit(&depth_tex, 1, 1024), 0);
+
+        let mut uav_tex = sample_tex;
+        uav_tex.flags = 4; // UNORDERED
+        assert_eq!(compute_mip_drop_explicit(&uav_tex, 1, 1024), 0);
+
+        // Textures with 1 mip should never drop:
+        let mut single_mip = sample_tex;
+        single_mip.mip_levels = 1;
+        assert_eq!(compute_mip_drop_explicit(&single_mip, 1, 1024), 0);
+
+        // Buffer should never drop:
+        let buf = buffer(1024);
+        assert_eq!(compute_mip_drop_explicit(&buf, 1, 1024), 0);
+
+        // Non-power-of-two textures (loading artwork, UI e.g. 1920x1080, 1280x720) must never drop:
+        let loading_art = texture(1920, 1080, 28, 11);
+        assert_eq!(compute_mip_drop_explicit(&loading_art, 1, 1024), 0);
+        let ui_art = texture(1280, 720, 28, 10);
+        assert_eq!(compute_mip_drop_explicit(&ui_art, 1, 1024), 0);
+
+        // Standard POT 3D textures >= 1024 drop properly:
+        assert_eq!(compute_mip_drop_explicit(&sample_tex, 1, 1024), 1);
+        let large_tex = texture(2048, 2048, 28, 12);
+        assert_eq!(compute_mip_drop_explicit(&large_tex, 1, 1024), 1);
+        let non_square_pot = texture(2048, 1024, 28, 11);
+        assert_eq!(compute_mip_drop_explicit(&non_square_pot, 1, 1024), 1);
+
+        // Textures under min_size floor (e.g. 512x512) are preserved:
+        let small_tex = texture(512, 512, 28, 9);
+        assert_eq!(compute_mip_drop_explicit(&small_tex, 1, 1024), 0);
+
+        // Conservative min_size = 2048 preserves 1024 textures and drops >= 2048:
+        assert_eq!(compute_mip_drop_explicit(&sample_tex, 1, 2048), 0);
+        assert_eq!(compute_mip_drop_explicit(&non_square_pot, 1, 2048), 0);
+        assert_eq!(compute_mip_drop_explicit(&large_tex, 1, 2048), 1);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn auto_mip_drop_on_oom_escalates_pressure_and_drops_mips() {
+        set_pressure(0);
+        let large_tex = texture(2048, 2048, 28, 12);
+        assert_eq!(compute_mip_drop(&large_tex), 0);
+
+        // Simulated allocator: fails on drop 0 with E_OUTOFMEMORY, succeeds on drop 1.
+        let mut attempts = 0;
+        let res = create_texture_with_auto_mip_drop(&large_tex, |d, drop| {
+            attempts += 1;
+            if drop == 0 {
+                assert_eq!(d.width, 2048);
+                assert_eq!(d.height, 2048);
+                assert_eq!(d.mip_levels, 12);
+                Err(windows::core::Error::from_hresult(WIN_E_OUTOFMEMORY))
+            } else {
+                assert_eq!(drop, 1);
+                assert_eq!(d.width, 1024);
+                assert_eq!(d.height, 1024);
+                assert_eq!(d.mip_levels, 11);
+                Ok("texture_host_handle")
+            }
+        });
+        assert_eq!(res.unwrap(), ("texture_host_handle", 1));
+        assert_eq!(attempts, 2);
+        assert_eq!(pressure(), 1);
+
+        // Subsequent textures automatically start with drop = 1:
+        let another_tex = texture(1024, 1024, 28, 10);
+        assert_eq!(compute_mip_drop(&another_tex), 1);
+
+        // Simulated allocator: fails on drop 1, succeeds on drop 2:
+        let mut attempts2 = 0;
+        let res2 = create_texture_with_auto_mip_drop(&another_tex, |d, drop| {
+            attempts2 += 1;
+            if drop == 1 {
+                assert_eq!(d.width, 512);
+                assert_eq!(d.height, 512);
+                assert_eq!(d.mip_levels, 9);
+                Err(windows::core::Error::from_hresult(WIN_E_OUTOFMEMORY))
+            } else {
+                assert_eq!(drop, 2);
+                assert_eq!(d.width, 256);
+                assert_eq!(d.height, 256);
+                assert_eq!(d.mip_levels, 8);
+                Ok("texture_host_handle_2")
+            }
+        });
+        assert_eq!(res2.unwrap(), ("texture_host_handle_2", 2));
+        assert_eq!(attempts2, 2);
+        assert_eq!(pressure(), 2);
+
+        // A non-droppable resource (e.g. render target) fails without dropping mips:
+        let mut rt_tex = texture(1024, 1024, 28, 1);
+        rt_tex.flags = 1;
+        let mut rt_attempts = 0;
+        let rt_res = create_texture_with_auto_mip_drop(&rt_tex, |_d, _drop| {
+            rt_attempts += 1;
+            Err::<(), _>(windows::core::Error::from_hresult(WIN_E_OUTOFMEMORY))
+        });
+        assert!(rt_res.is_err());
+        assert_eq!(rt_attempts, 1);
+
+        set_pressure(0);
     }
 
     #[test]
@@ -2692,5 +3013,33 @@ void main() {
             assert_eq!(view_format(out), None, "flags {flags}");
             assert_eq!(slot::<Release>(out, 0x10)(out), 0);
         }
+    }
+
+    /// Subresource index remapping prunes dropped guest mips and correctly maps surviving mips.
+    #[test]
+    fn subresource_index_remapping_and_pruning() {
+        // 6 slices (e.g. Cubemap), 8 guest mips, drop 2 -> host has 6 mips
+        const GUEST_MIPS: u32 = 8;
+        const DROP: u32 = 2;
+
+        // Slice 0, guest mip 0 -> dropped
+        assert_eq!(map_subresource(0, GUEST_MIPS, DROP), None);
+        // Slice 0, guest mip 1 -> dropped
+        assert_eq!(map_subresource(1, GUEST_MIPS, DROP), None);
+        // Slice 0, guest mip 2 -> host slice 0, mip 0 = 0
+        assert_eq!(map_subresource(2, GUEST_MIPS, DROP), Some(0));
+        // Slice 0, guest mip 7 -> host slice 0, mip 5 = 5
+        assert_eq!(map_subresource(7, GUEST_MIPS, DROP), Some(5));
+
+        // Slice 1, guest mip 0 (subresource 8) -> dropped
+        assert_eq!(map_subresource(8, GUEST_MIPS, DROP), None);
+        // Slice 1, guest mip 2 (subresource 10) -> host slice 1, mip 0 = 6
+        assert_eq!(map_subresource(10, GUEST_MIPS, DROP), Some(6));
+
+        // Slice 3, guest mip 4 (subresource 3 * 8 + 4 = 28) -> host slice 3, mip 2 (3 * 6 + 2 = 20)
+        assert_eq!(map_subresource(28, GUEST_MIPS, DROP), Some(20));
+
+        // Zero drop -> pass through
+        assert_eq!(map_subresource(15, GUEST_MIPS, 0), Some(15));
     }
 }

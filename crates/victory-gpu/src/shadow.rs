@@ -16,7 +16,7 @@
 //! indexed heaps keep what their first use copied.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::{
@@ -39,12 +39,27 @@ pub(crate) struct Shadow {
     copied: Mutex<Vec<u64>>,
     /// Whether the memory is write-watched: unknown, yes, no.
     watched: AtomicU8,
-    /// Ranges shaders of a submission not yet copied back may be writing:
-    /// title memory there is older than the copy.
-    pending: Mutex<Vec<(usize, usize)>>,
-    /// The copy's bytes before the submission ran, from an offset on,
-    /// covering the ranges its shaders write: what the GPU wrote differs.
-    before: Mutex<Before>,
+    /// Ranges shaders of submissions not yet copied back may be writing,
+    /// with the submission that declared them: title memory there is older
+    /// than the copy.
+    pending: Mutex<Vec<(u64, usize, usize)>>,
+    /// Per submission not yet copied back (in submission order): the copy's
+    /// bytes before it ran, from an offset on, covering the ranges its
+    /// shaders write: what the GPU wrote differs.
+    ///
+    /// One submission at a time (the default) has one entry. With several
+    /// in flight (`VICTORY_IN_FLIGHT`), later submissions may declare
+    /// ranges an earlier one's shaders still write; then the bytes are
+    /// handed on in order ("rolling" snapshots, see [`Shadow::copy_back`]):
+    /// the earlier copy-back puts what it saw into title memory and into the
+    /// later snapshots, and leaves the copy itself alone (the later GPU work
+    /// may be writing it); the last one to cover the bytes brings the copy
+    /// in line with title memory, as one submission at a time does.
+    before: Mutex<Vec<(u64, Before)>>,
+    /// Ranges GPU work of submissions in flight changes in place without
+    /// declaring them, with the submission ([`Shadow::refresh_in_place`]).
+    /// Empty without `VICTORY_IN_FLIGHT`.
+    in_place: Mutex<Vec<(u64, usize, usize)>>,
 }
 
 #[derive(Default)]
@@ -86,6 +101,7 @@ impl UnchangedPages {
         false
     }
 
+    #[cfg(test)]
     fn clear(&mut self) {
         self.pages.clear();
     }
@@ -130,6 +146,32 @@ unsafe impl Send for Shadow {}
 unsafe impl Sync for Shadow {}
 
 impl Shadow {
+    /// The copy's bytes for `len` bytes of title memory at `address`, as
+    /// they are now (tests look at what a submission's shaders left there).
+    #[cfg(all(test, feature = "diagnostics"))]
+    pub(crate) fn host_bytes(&self, address: u64, len: usize) -> Vec<u8> {
+        assert!(address >= self.start && address + len as u64 <= self.start + self.len);
+        // SAFETY: within the copy's persistent mapping.
+        unsafe {
+            std::slice::from_raw_parts(self.data.add((address - self.start) as usize), len).to_vec()
+        }
+    }
+
+    /// Writes `bytes` into the copy at a title address, as the GPU would
+    /// (tests of copy-back).
+    #[cfg(test)]
+    fn gpu_wrote(&self, address: u64, bytes: &[u8]) {
+        assert!(address >= self.start && address + bytes.len() as u64 <= self.start + self.len);
+        // SAFETY: within the copy's persistent mapping.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                self.data.add((address - self.start) as usize),
+                bytes.len(),
+            );
+        }
+    }
+
     /// The host GPU address of a title address inside the buffer.
     pub(crate) fn gpu(&self, address: u64) -> u64 {
         self.gpu + (address - self.start)
@@ -176,6 +218,69 @@ impl Shadow {
         list.defer_refresh(self, address as usize, len as usize);
     }
 
+    /// [`Shadow::refresh_as`] of a range the list's GPU work changes in the
+    /// copy without declaring it (indirect arguments clamped in place: what
+    /// it writes must not go back to title memory). With submissions in
+    /// flight, the range is noted while the submission is: no refresh of a
+    /// later one copies title memory over it meanwhile (a later one that
+    /// asks for it first waits for this one), and no earlier copy-back
+    /// writes the copy there.
+    pub(crate) fn refresh_in_place(
+        self: &Arc<Self>,
+        list: &HostList,
+        address: u64,
+        len: u64,
+        access: D3D12_RESOURCE_STATES,
+    ) {
+        self.refresh_as(list, address, len, access);
+        if crate::host::in_flight_limit() > 1 {
+            let len = len.min(self.left(address));
+            list.defer_in_place(self, address as usize, len as usize);
+        }
+    }
+
+    /// A submission in flight (`sub`) changes `[start, end)` of the copy in
+    /// place ([`Shadow::refresh_in_place`]).
+    pub(crate) fn in_place(&self, sub: u64, start: usize, end: usize) {
+        self.in_place
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((sub, start, end));
+    }
+
+    /// The submission's GPU work is done with what it changes in place.
+    pub(crate) fn in_place_done(&self, sub: u64) {
+        self.in_place
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|r| r.0 != sub);
+    }
+
+    /// With submissions in flight: the value (`width` bytes, 4 or 8) the
+    /// GPU work of submission `sub` has left at title address `address` in
+    /// the copy, if it differs from that submission's snapshot there (so
+    /// that work, not an older one, wrote it). None if the submission did
+    /// not declare it or has not changed it (yet).
+    pub(crate) fn gpu_changed(&self, address: usize, width: usize, sub: u64) -> Option<u64> {
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        if address < start || address + width > end || !matches!(width, 4 | 8) {
+            return None;
+        }
+        let at = address - start;
+        let all = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        let (taken, before) = all.iter().find(|(s, _)| *s == sub)?.1.snapshot.as_ref()?;
+        if at < *taken || at + width > taken + before.len() {
+            return None;
+        }
+        let mut now = [0u8; 8];
+        for (i, b) in now[..width].iter_mut().enumerate() {
+            // SAFETY: inside the mapping (checked above); the GPU may be
+            // writing it, so read it as it is.
+            *b = unsafe { self.data.add(at + i).read_volatile() };
+        }
+        (now[..width] != before[at - taken..at - taken + width]).then(|| u64::from_le_bytes(now))
+    }
+
     fn new(buffer: ID3D12Resource, data: *mut u8, gpu: u64, start: u64, len: u64) -> Shadow {
         let pages = (start + len).div_ceil(PAGE as u64) - start / PAGE as u64;
         Shadow {
@@ -188,6 +293,7 @@ impl Shadow {
             watched: AtomicU8::new(0),
             pending: Mutex::default(),
             before: Mutex::default(),
+            in_place: Mutex::default(),
         }
     }
 
@@ -209,6 +315,8 @@ impl Shadow {
     /// a GPU-side dirty mask would save that if big ranges make it slow.
     pub(crate) fn gpu_writes(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
         let len = len.min(self.left(address));
+        #[cfg(feature = "diagnostics")]
+        note_writer(address, len);
         list.defer_gpu_write(self, address as usize, len as usize);
     }
 
@@ -218,17 +326,33 @@ impl Shadow {
     /// submission declares (the world declares overlapping views of its
     /// 174 MB heap dozens of times), in reused memory (fresh snapshots cost
     /// ~2.3 million page faults per world frame).
-    pub(crate) fn writing(&self, address: usize, len: usize) {
+    ///
+    /// `sub` names the submission (increasing in submission order); each
+    /// has its own snapshot. Bytes an earlier submission in flight still
+    /// writes are taken from the copy as it is now, and replaced by what
+    /// that submission's copy-back sees (see [`Shadow::copy_back`]).
+    pub(crate) fn writing(&self, address: usize, len: usize, sub: u64) {
         self.pending
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .push((address, address + len));
+            .push((sub, address, address + len));
         let (from, to) = self.inside(address, len);
         // SAFETY: inside the mapping.
         let host =
             |a: usize, b: usize| unsafe { std::slice::from_raw_parts(self.data.add(a), b - a) };
-        let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
-        let before = &mut before.snapshot;
+        let mut all = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        let at = match all.iter().position(|(s, _)| *s >= sub) {
+            Some(i) if all[i].0 == sub => i,
+            Some(i) => {
+                all.insert(i, (sub, Before::default()));
+                i
+            }
+            None => {
+                all.push((sub, Before::default()));
+                all.len() - 1
+            }
+        };
+        let before = &mut all[at].1.snapshot;
         let (start, end) = match &*before {
             Some((at, bytes)) => ((*at).min(from), (at + bytes.len()).max(to)),
             None => (from, to),
@@ -259,22 +383,75 @@ impl Shadow {
     /// putting back the copy's older bytes there broke the title's own
     /// records (a fence list read as -1, title+0x4e9b54a). Returns the bytes
     /// written.
-    pub(crate) fn copy_back(&self, address: usize, len: usize) -> usize {
-        let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
-        let Before {
-            snapshot,
-            unchanged,
-        } = &mut *before;
+    ///
+    /// `gap` (`Some`): the submitting thread is not waiting (asynchronous
+    /// submission), so the title's busiest thread writes these pages while
+    /// this runs. Then only the runs of bytes the GPU changed are written,
+    /// runs less than `gap` bytes apart joined (a whole piece read and
+    /// written back loses the title's writes in between), the blocks stay
+    /// open until the write lands (another thread's refresh guards them
+    /// again otherwise, and the write fails), and pages are taken as
+    /// current as of before they were read.
+    ///
+    /// `sub`: the submission (as given to [`Shadow::writing`]). Copy-backs
+    /// run in submission order. A piece a later submission in flight also
+    /// declared is handed on instead ([`Shadow::hand_on`]): its GPU work
+    /// may be writing the copy, so the copy is only read.
+    pub(crate) fn copy_back(
+        &self,
+        address: usize,
+        len: usize,
+        gap: Option<usize>,
+        sub: u64,
+    ) -> usize {
+        let overlapped = gap.is_some();
+        let gap = gap.unwrap_or(1).max(1);
+        let mut all = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        // Ranges later submissions declared or change in place (none with
+        // one at a time).
+        let mut later: Vec<(usize, usize)> = self
+            .pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|p| p.0 > sub)
+            .map(|p| (p.1, p.2))
+            .collect();
+        later.extend(
+            self.in_place
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .filter(|p| p.0 > sub)
+                .map(|p| (p.1, p.2)),
+        );
+        let mine = all.iter().position(|(s, _)| *s == sub);
         let mut written = 0;
         let (from, to) = self.inside(address, len);
         let start = self.start as usize;
-        if let Some((taken, before)) = &*snapshot
+        if let Some(i) = mine
+            && let (head, rest) = all.split_at_mut(i + 1)
+            && let Before {
+                snapshot,
+                unchanged,
+            } = &mut head[i].1
+            && let Some((taken, before)) = &*snapshot
             && *taken <= from
             && to <= taken + before.len()
             && from < to
         {
             unchanged.begin(start + taken, start + taken + before.len());
             let before = &before[from - taken..to - taken];
+            let (first, last) = ((start + from).div_ceil(PAGE), (start + to) / PAGE);
+            let watched = first < last && self.watched.load(Ordering::Relaxed) != NOT_WATCHED;
+            // Overlapped: asked before title memory is read, so a title write
+            // after the read shows as newer (our own writes do too, and those
+            // pages are copied again at the next refresh).
+            let asked_before = if overlapped && watched {
+                crate::watch::writes(first * PAGE, last * PAGE, true)
+            } else {
+                None
+            };
             // By 64 KiB piece: the copy compared with its bytes before the
             // submission, title memory read only where the GPU wrote.
             // An unchanged page is never modified by copy-back, so later
@@ -288,24 +465,25 @@ impl Shadow {
                 // writes it.
                 let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
                 let old = &before[at - from..at - from + n];
+                if later
+                    .iter()
+                    .any(|&(a, e)| a < start + at + n && e > start + at)
+                {
+                    written +=
+                        self.hand_on(start + at, host, old, &mut title, rest, gap, overlapped);
+                    at += n;
+                    continue;
+                }
                 if unchanged.differs(start + at, host, old)
                     && let title = &mut title.get_or_insert_with(|| vec![0u8; PAGE])[..n]
                     && crate::host::read_into((start + at) as *const u8, title)
                 {
                     // Title memory with the GPU's bytes put in; the copy
                     // takes the title's bytes in turn.
-                    let mut changed = false;
-                    for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old) {
-                        if *h != *o && *t != *h {
-                            *t = *h;
-                            changed = true;
-                        }
-                        *h = *t;
-                    }
+                    let (changed, runs) = merge(start + at, title, host, old, gap, overlapped);
+                    host.copy_from_slice(title);
                     if changed {
-                        crate::watch::writing(start + at, n);
-                        crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
-                        written += n;
+                        written += put_back(start + at, title, runs, overlapped);
                     }
                     synced.push((start + at) / PAGE);
                 }
@@ -314,11 +492,12 @@ impl Shadow {
             // Pages made equal to title memory are current in the copy, so
             // our own write is not taken for the title's; others keep what
             // they had (a title write there shows at the next refresh).
-            let (first, last) = ((start + from).div_ceil(PAGE), (start + to) / PAGE);
-            if first < last
+            if watched
                 && !synced.is_empty()
-                && self.watched.load(Ordering::Relaxed) != NOT_WATCHED
-                && let Some((now, _)) = crate::watch::writes(first * PAGE, last * PAGE, true)
+                && let Some((now, _)) = match overlapped {
+                    true => asked_before,
+                    false => crate::watch::writes(first * PAGE, last * PAGE, true),
+                }
             {
                 let base = start / PAGE;
                 let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
@@ -327,15 +506,60 @@ impl Shadow {
                 }
             }
         }
-        // Every submitted step that declared the range is done with it (one
-        // submission runs at a time), and the snapshot with the last range.
+        // Every step of this submission that declared the range is done with
+        // it, and its snapshot with its last range.
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
-        pending.retain(|&r| r != (address, address + len));
-        if pending.is_empty()
-            && let Some((_, bytes)) = snapshot.take()
+        pending.retain(|&r| r != (sub, address, address + len));
+        if !pending.iter().any(|r| r.0 == sub)
+            && let Some(i) = mine
+            && let (_, Before { snapshot, .. }) = all.remove(i)
+            && let Some((_, bytes)) = snapshot
         {
-            unchanged.clear();
             give_back(bytes);
+        }
+        written
+    }
+
+    /// [`Shadow::copy_back`] of one piece (at title address `address`) that
+    /// a later submission in flight also declared: the GPU's bytes (the copy
+    /// against `old`, this submission's snapshot) go into title memory where
+    /// it differs, as there, but the copy is read once and left alone (the
+    /// later GPU work may be writing it; what it writes after the read shows
+    /// in its own copy-back), and the later snapshots take the bytes read:
+    /// title memory holds them now, so the later copy-back does not put
+    /// them back over what the title writes meanwhile. The page is not
+    /// counted current (a refresh copies it again once nothing declares it).
+    #[allow(clippy::too_many_arguments)]
+    fn hand_on(
+        &self,
+        address: usize,
+        host: &[u8],
+        old: &[u8],
+        title: &mut Option<Vec<u8>>,
+        later: &mut [(u64, Before)],
+        gap: usize,
+        overlapped: bool,
+    ) -> usize {
+        let seen = host.to_vec();
+        let n = seen.len();
+        let mut written = 0;
+        if seen.as_slice() != old
+            && let title = &mut title.get_or_insert_with(|| vec![0u8; PAGE])[..n]
+            && crate::host::read_into(address as *const u8, title)
+        {
+            let (changed, runs) = merge(address, title, &seen, old, gap, overlapped);
+            if changed {
+                written = put_back(address, title, runs, overlapped);
+            }
+        }
+        let at = address - self.start as usize;
+        for (_, b) in later {
+            if let Some((taken, bytes)) = &mut b.snapshot {
+                let (a, e) = (at.max(*taken), (at + n).min(*taken + bytes.len()));
+                if a < e {
+                    bytes[a - *taken..e - *taken].copy_from_slice(&seen[a - at..e - at]);
+                }
+            }
         }
         written
     }
@@ -354,9 +578,20 @@ impl Shadow {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .iter()
-            .copied()
+            .map(|&(_, a, e)| (a, e))
             .filter(|&(a, e)| a < to && e > from)
             .collect();
+        // And what GPU work in flight changes in place (nothing without
+        // `VICTORY_IN_FLIGHT`; a refresh that asks for it waited for that
+        // work before it got here).
+        busy.extend(
+            self.in_place
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .map(|&(_, a, e)| (a, e))
+                .filter(|&(a, e)| a < to && e > from),
+        );
         if !busy.is_empty() {
             // Around ranges shaders are writing: the gaps, each as below
             // (in the world most submissions have such ranges; copying the
@@ -375,6 +610,54 @@ impl Shadow {
             return bytes;
         }
         self.update_free(from, to)
+    }
+
+    /// With submissions in flight (`VICTORY_IN_FLIGHT`), after a refresh of
+    /// `[from, to)`: puts the done writes of earlier submissions still in
+    /// flight that lie there into the copy. Title memory gets them only at
+    /// their completion, but this submission's GPU work runs after theirs
+    /// on the host queue, where a console GPU would see them written.
+    /// Bytes shaders declared are left alone. Returns the writes put in.
+    pub(crate) fn patch_flying(&self, from: usize, to: usize) -> usize {
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let writes = crate::timeline::flying_writes(from.max(start), to.min(end));
+        if writes.is_empty() {
+            return 0;
+        }
+        let mut pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        pending.extend(
+            self.in_place
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .copied(),
+        );
+        let mut put = 0;
+        for (_, at, bytes, value) in writes {
+            if at < start
+                || at + bytes > end
+                || at < from
+                || at + bytes > to
+                || pending.iter().any(|&(_, a, e)| a < at + bytes && e > at)
+            {
+                continue;
+            }
+            let value = value.to_le_bytes();
+            // SAFETY: inside the mapping (checked above); 4 or 8 bytes.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    value.as_ptr(),
+                    self.data.add(at - start),
+                    bytes.min(8),
+                );
+            }
+            put += 1;
+        }
+        put
     }
 
     /// [`Shadow::update`] of `[from, to)` (inside the buffer) where no
@@ -449,6 +732,194 @@ impl Shadow {
         let at = unsafe { self.data.add(from - start) };
         crate::host::copy_mapped(at, from as *const u8, to - from, false);
         to - from
+    }
+}
+
+/// Writes a copy-back piece (`title`: title memory at `address` with the
+/// GPU's bytes put in) into title memory: the runs of GPU-changed bytes
+/// when `overlapped`, else the whole piece. Returns the bytes written.
+fn put_back(address: usize, title: &[u8], runs: Vec<(usize, usize)>, overlapped: bool) -> usize {
+    if overlapped {
+        let mut written = 0;
+        for (a, b) in runs {
+            let to = address + a;
+            crate::watch::kernel_will_write(to, b - a);
+            crate::host::write_mapped(to as *mut u8, title[a..].as_ptr(), b - a);
+            crate::watch::kernel_wrote(to, b - a);
+            written += b - a;
+        }
+        written
+    } else {
+        crate::watch::writing(address, title.len());
+        crate::host::write_mapped(address as *mut u8, title.as_ptr(), title.len());
+        title.len()
+    }
+}
+
+/// Copy-back as a three-way merge of one piece at title address `address`:
+/// `title` (title memory now) takes `host`'s bytes (the GPU's copy) where
+/// the GPU changed them against `old` (the snapshot before the submission),
+/// by aligned dword, and only where the title has not changed that dword
+/// since the snapshot either: a CPU write made while the GPU ran is newer
+/// than the snapshot the GPU worked from, and wins (the title's memory may
+/// have been reused for its own data in the meantime). Returns whether
+/// `title` changed and, when `overlapped`, the runs of changed bytes with
+/// gaps under `gap` joined. Diagnostics builds count the conflicts
+/// (`copy-back conflicts` in the copy line); `VICTORY_COPY_BACK_GPU_WINS`
+/// restores the old rule (the GPU's bytes always win) for comparison.
+fn merge(
+    address: usize,
+    title: &mut [u8],
+    host: &[u8],
+    old: &[u8],
+    gap: usize,
+    overlapped: bool,
+) -> (bool, Vec<(usize, usize)>) {
+    #[cfg(feature = "diagnostics")]
+    let gpu_wins = {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| crate::switch::on("VICTORY_COPY_BACK_GPU_WINS"))
+    };
+    #[cfg(not(feature = "diagnostics"))]
+    let gpu_wins = false;
+    let n = title.len();
+    let mut changed = false;
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    let mut i = 0;
+    while i < n {
+        let end = (i + 4 - (address + i) % 4).min(n);
+        let (h, o) = (&host[i..end], &old[i..end]);
+        if h != o && title[i..end] != *h {
+            if gpu_wins || title[i..end] == *o {
+                title[i..end].copy_from_slice(h);
+                changed = true;
+                if overlapped {
+                    match runs.last_mut() {
+                        Some((_, e)) if i - *e < gap => *e = end,
+                        _ => runs.push((i, end)),
+                    }
+                }
+            } else {
+                CONFLICTS.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        i = end;
+    }
+    (changed, runs)
+}
+
+/// Dwords copy-back left to a newer CPU write (see [`merge`]).
+pub(crate) static CONFLICTS: AtomicU64 = AtomicU64::new(0);
+
+/// Diagnostics (`VICTORY_WATCH_HIGH_ONES`): the host pipeline the
+/// recording thread bound last, and the GPU write ranges recent draws and
+/// dispatches declared with it, so a suspicious copy-back can name them.
+#[cfg(feature = "diagnostics")]
+mod writers {
+    use std::cell::RefCell;
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    thread_local! {
+        static PIPELINE: RefCell<String> = const { RefCell::new(String::new()) };
+    }
+    static RANGES: Mutex<VecDeque<(u64, u64, String)>> = Mutex::new(VecDeque::new());
+
+    pub(crate) fn on() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| crate::switch::on("VICTORY_WATCH_HIGH_ONES"))
+    }
+
+    pub(crate) fn bound(name: &str) {
+        if on() {
+            PIPELINE.with(|p| name.clone_into(&mut p.borrow_mut()));
+        }
+    }
+
+    pub(super) fn declared(address: u64, len: u64) {
+        if !on() {
+            return;
+        }
+        let name = PIPELINE.with(|p| p.borrow().clone());
+        let mut ranges = RANGES.lock().unwrap_or_else(|e| e.into_inner());
+        if ranges.len() >= 8192 {
+            ranges.pop_front();
+        }
+        ranges.push_back((address, len, name));
+    }
+
+    /// Pipelines that declared writes covering `at`, most recent first.
+    pub(super) fn covering(at: u64) -> Vec<String> {
+        let ranges = RANGES.lock().unwrap_or_else(|e| e.into_inner());
+        let mut out: Vec<String> = Vec::new();
+        for (a, n, name) in ranges.iter().rev() {
+            if *a <= at && at < a + n && !out.contains(name) {
+                out.push(name.clone());
+                if out.len() >= 6 {
+                    break;
+                }
+            }
+        }
+        out
+    }
+}
+
+#[cfg(feature = "diagnostics")]
+pub(crate) use writers::bound as note_bound_pipeline;
+
+#[cfg(feature = "diagnostics")]
+fn note_writer(address: u64, len: u64) {
+    writers::declared(address, len);
+}
+
+/// Diagnostics (`VICTORY_WATCH_HIGH_ONES`): logs a write of ours into
+/// title memory (copy-back, readback) that turns the high dword of an
+/// 8-byte-aligned qword that held a title pointer into 0xFFFFFFFF, with
+/// the qword before and after and the title buffer it belongs to, so a
+/// write that clobbers the upper half of 64-bit values can be traced. At
+/// most 200 lines.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn high_ones(address: usize, bytes: &[u8]) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static LOGGED: AtomicU32 = AtomicU32::new(0);
+    if !writers::on() || LOGGED.load(Ordering::Relaxed) >= 200 {
+        return;
+    }
+    let end = address + bytes.len();
+    let dword = |at: usize| -> u32 {
+        u32::from_le_bytes(bytes[at - address..at - address + 4].try_into().unwrap())
+    };
+    // Qwords whose high dword lies wholly inside the write.
+    let mut q = address.saturating_sub(4) & !7;
+    while q + 8 <= end {
+        let hi = q + 4;
+        if hi >= address && dword(hi) == u32::MAX {
+            let mut old = [0u8; 8];
+            if crate::host::read_into(q as *const u8, &mut old) {
+                let old = u64::from_le_bytes(old);
+                // Only where a title pointer was (high dword 1-15, as
+                // title addresses here are below 64 GiB): plain -1 data
+                // over other data is common and not what is looked for.
+                if (1..16).contains(&(old >> 32)) {
+                    let lo = if q >= address { dword(q) } else { old as u32 };
+                    let buffer = find(q as u64, 8).map(|s| format!("{:#x}+{:#x}", s.start, s.len));
+                    tracing::warn!(
+                        qword = format_args!("{q:#x}"),
+                        before = format_args!("{old:#018x}"),
+                        after = format_args!("{:#018x}", (u64::from(u32::MAX) << 32) | u64::from(lo)),
+                        write = format_args!("{address:#x}+{:#x}", bytes.len()),
+                        buffer = ?buffer,
+                        writers = ?writers::covering(q as u64),
+                        "a write of ours sets a qword's high dword to 0xFFFFFFFF"
+                    );
+                    if LOGGED.fetch_add(1, Ordering::Relaxed) >= 200 {
+                        return;
+                    }
+                }
+            }
+        }
+        q += 8;
     }
 }
 
@@ -825,6 +1296,131 @@ mod tests {
             "past the buffer"
         );
         assert!(shadow.bytes(start, 0).is_none(), "nothing to read");
+        unregister(resource, start);
+    }
+
+    /// Two submissions in flight declare the same range. The first one's
+    /// copy-back puts its GPU bytes into title memory and hands them to the
+    /// second's snapshot, leaving the copy alone; the second's then puts
+    /// back only what its own GPU work wrote (not the first's bytes over
+    /// what the title wrote after seeing them) and brings the copy in line.
+    #[cfg(windows)]
+    #[test]
+    fn copy_backs_in_flight_hand_bytes_on_in_order() {
+        let _retire = crate::host::isolated_retire_scope();
+        if host().is_none() {
+            return;
+        }
+        let mut title = vec![0u8; 4096];
+        let start = title.as_ptr() as u64;
+        let resource = 0xdead_beef_0003_usize;
+        register(resource, start, title.len() as u64);
+        let shadow = find(start, 64).expect("shadow");
+        let (a, n) = (start as usize, title.len());
+        shadow.update(a, n);
+        shadow.writing(a, n, 1);
+        shadow.writing(a, n, 2);
+        // The first submission's GPU work; the title writes elsewhere.
+        shadow.gpu_wrote(start + 10, &[0xaa]);
+        title[20] = 0x55;
+        assert_eq!(shadow.update(a, n), 0, "declared: no refresh over it");
+        shadow.copy_back(a, n, None, 1);
+        assert_eq!((title[10], title[20]), (0xaa, 0x55));
+        assert_eq!(
+            shadow.bytes(start + 20, 1),
+            Some(&[0][..]),
+            "the copy is left to the second submission"
+        );
+        // The title overwrites the first one's output; the second one's
+        // GPU work writes elsewhere.
+        title[10] = 0x11;
+        shadow.gpu_wrote(start + 30, &[0xbb]);
+        shadow.copy_back(a, n, None, 2);
+        assert_eq!((title[10], title[20], title[30]), (0x11, 0x55, 0xbb));
+        for at in [10, 20, 30] {
+            assert_eq!(
+                shadow.bytes(start + at, 1),
+                Some(&title[at as usize..][..1])
+            );
+        }
+        assert!(
+            shadow.before.lock().unwrap().is_empty(),
+            "snapshots given back"
+        );
+        title[40] = 1;
+        assert_eq!(shadow.update(a, n), n, "nothing declared any more");
+        unregister(resource, start);
+    }
+
+    /// What a later submission in flight changes in place (clamped
+    /// indirect arguments) is neither refreshed over nor written by an
+    /// earlier copy-back; a shader value counts only once it differs from
+    /// the submission's snapshot.
+    #[cfg(windows)]
+    #[test]
+    fn in_place_ranges_and_shader_values_in_flight() {
+        let _retire = crate::host::isolated_retire_scope();
+        if host().is_none() {
+            return;
+        }
+        let mut title = vec![0u8; 4096];
+        let start = title.as_ptr() as u64;
+        let resource = 0xdead_beef_0005_usize;
+        register(resource, start, title.len() as u64);
+        let shadow = find(start, 64).expect("shadow");
+        let (a, n) = (start as usize, title.len());
+        shadow.update(a, n);
+        shadow.writing(a, 256, 1);
+        assert_eq!(shadow.gpu_changed(a + 16, 4, 1), None, "not written yet");
+        shadow.gpu_wrote(start + 16, &5u32.to_le_bytes());
+        assert_eq!(shadow.gpu_changed(a + 16, 4, 1), Some(5));
+        assert_eq!(shadow.gpu_changed(a + 512, 4, 1), None, "not declared");
+        // Submission 2 clamps arguments at 64..96 in place.
+        shadow.in_place(2, a + 64, a + 96);
+        shadow.gpu_wrote(start + 64, &[7]);
+        title[65] = 9;
+        title[600] = 3;
+        shadow.copy_back(a, 256, None, 1);
+        assert_eq!(title[16], 5);
+        assert_eq!(shadow.bytes(start + 64, 2), Some(&[7, 0][..]), "left alone");
+        shadow.update(a, n);
+        assert_eq!(
+            shadow.bytes(start + 64, 2),
+            Some(&[7, 0][..]),
+            "not refreshed"
+        );
+        assert_eq!(shadow.bytes(start + 600, 1), Some(&[3][..]));
+        shadow.in_place_done(2);
+        shadow.update(a, n);
+        assert_eq!(shadow.bytes(start + 64, 2), Some(&title[64..66]));
+        unregister(resource, start);
+    }
+
+    /// One submission at a time: its copy-back puts the GPU's bytes back
+    /// and takes the title's into the copy, as before snapshots were per
+    /// submission.
+    #[cfg(windows)]
+    #[test]
+    fn one_submission_copies_back_and_syncs_the_copy() {
+        let _retire = crate::host::isolated_retire_scope();
+        if host().is_none() {
+            return;
+        }
+        let mut title = vec![0u8; 4096];
+        let start = title.as_ptr() as u64;
+        let resource = 0xdead_beef_0004_usize;
+        register(resource, start, title.len() as u64);
+        let shadow = find(start, 64).expect("shadow");
+        let (a, n) = (start as usize, title.len());
+        shadow.update(a, n);
+        shadow.writing(a + 8, 64, 7);
+        shadow.gpu_wrote(start + 9, &[0xcc]);
+        title[12] = 0x22;
+        shadow.copy_back(a + 8, 64, None, 7);
+        assert_eq!((title[9], title[12]), (0xcc, 0x22));
+        assert_eq!(shadow.bytes(start + 12, 1), Some(&[0x22][..]));
+        assert!(shadow.before.lock().unwrap().is_empty());
+        assert!(shadow.pending.lock().unwrap().is_empty());
         unregister(resource, start);
     }
 

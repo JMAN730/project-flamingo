@@ -189,6 +189,7 @@ impl Pending {
                     hash: shader.hash.clone(),
                     container: Vec::new(),
                     translated: OnceLock::from(Some(Translated { host, used })),
+                    mesh_fallback: OnceLock::new(),
                     #[cfg(feature = "diagnostics")]
                     wave64: OnceLock::new(),
                 }))
@@ -225,6 +226,21 @@ static DONE: (Mutex<()>, Condvar) = (Mutex::new(()), Condvar::new());
 
 /// Waiting allowed per title frame, over all threads.
 const BUDGET: Duration = Duration::from_millis(500);
+
+/// The wait budget per title frame: [`BUDGET`], or in diagnostics builds
+/// `VICTORY_PIPELINE_WAIT_MS` (a large value makes every first use wait for
+/// its pipeline, so no draw or dispatch of a chain is dropped while the rest
+/// runs; a debugging aid for data a half-run chain leaves behind).
+fn budget() -> Duration {
+    static BUDGET_SET: OnceLock<Duration> = OnceLock::new();
+    *BUDGET_SET.get_or_init(|| {
+        std::env::var("VICTORY_PIPELINE_WAIT_MS")
+            .ok()
+            .filter(|_| cfg!(feature = "diagnostics"))
+            .and_then(|v| v.trim().parse().ok())
+            .map_or(BUDGET, Duration::from_millis)
+    })
+}
 
 /// Pipelines queued and not made yet.
 static WAITING: AtomicU64 = AtomicU64::new(0);
@@ -318,7 +334,7 @@ fn wait(p: &Pending, frame: u64) {
     if FRAME.swap(frame, Ordering::Relaxed) != frame {
         WAITED_US.store(0, Ordering::Relaxed);
     }
-    let left = BUDGET.saturating_sub(Duration::from_micros(WAITED_US.load(Ordering::Relaxed)));
+    let left = budget().saturating_sub(Duration::from_micros(WAITED_US.load(Ordering::Relaxed)));
     let started = Instant::now();
     let (lock, done) = &DONE;
     let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());

@@ -31,6 +31,35 @@ macro_rules! once {
     }};
 }
 
+/// The number of most detailed mips to drop for sampled host textures.
+/// 0: keep original resolution (default).
+/// 1: drop 1 mip (halves dimensions, ~75% VRAM savings).
+/// 2: drop 2 mips (quarters dimensions, ~93.75% VRAM savings).
+/// 3: drop 3 mips (eighths dimensions, ~98.4% VRAM savings).
+pub(crate) fn texture_mip_drop() -> u32 {
+    static DROP: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *DROP.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_MIP_DROP")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .map_or(0, |v| v.min(3))
+    })
+}
+
+/// The minimum texture dimension (both width and height) eligible for mip-dropping.
+/// Defaults to 1024. Textures smaller than this on either axis (or under 2048 if configured)
+/// are preserved at full resolution. Configurable via `VICTORY_TEXTURE_MIP_DROP_MIN_SIZE`.
+pub(crate) fn texture_mip_drop_min_size() -> u64 {
+    static MIN_SIZE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MIN_SIZE.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_MIP_DROP_MIN_SIZE")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(1024)
+    })
+}
+
 /// A texture's upload state: the staging buffer laid out as the host
 /// texture's subresources, and what was last detiled.
 pub(crate) struct Staging {
@@ -46,6 +75,8 @@ pub(crate) struct Staging {
     tiled_bytes: usize,
     /// Mips per array slice.
     mips: u32,
+    /// Dropped mips count (offset into console mips for detiling).
+    pub(crate) mip_drop: u32,
     memory: *const u8,
     last: Mutex<Last>,
 }
@@ -401,6 +432,12 @@ pub(crate) fn upload_from(list: &HostList, resource: This, texture: &ID3D12Resou
 }
 
 impl Staging {
+    /// The title memory a refresh reads: `[start, end)`.
+    pub(crate) fn title_range(&self) -> (usize, usize) {
+        let start = self.memory as usize;
+        (start, start + self.tiled_bytes)
+    }
+
     /// Detiles the texture memory into the staging buffer if it changed
     /// since the last time (and is mapped at all).
     pub(crate) fn refresh(&self) {
@@ -437,11 +474,15 @@ impl Staging {
         // smallest mip occupies less than the whole layout. Arrays and 3D
         // textures can have resident slices after a hole; copy their full
         // range through the sparse reader below.
-        if resident < size && self.layout.bytes_from(self.mips - 1) < self.layout.size {
+        if resident < size
+            && self.layout.bytes_from(self.mips - 1 + self.mip_drop) < self.layout.size
+        {
             let end = self.mips;
-            let first =
-                (self.first..end).find(|&mip| self.layout.bytes_from(mip) <= resident as u64);
-            let bytes = first.map_or(0, |mip| self.layout.bytes_from(mip) as usize);
+            let first = (self.first..end)
+                .find(|&mip| self.layout.bytes_from(mip + self.mip_drop) <= resident as u64);
+            let bytes = first.map_or(0, |mip| {
+                self.layout.bytes_from(mip + self.mip_drop) as usize
+            });
             with_tiled_copy(self.memory, bytes, |tiled| {
                 self.changed(last, tiled, first.unwrap_or(end));
             });
@@ -500,6 +541,7 @@ impl Staging {
         for (i, (footprint, &rows)) in self.footprints.iter().zip(&self.rows).enumerate() {
             let sub = self.first + i as u32;
             let (mip, slice) = (sub % self.mips, sub / self.mips);
+            let console_mip = mip + self.mip_drop;
             let f = footprint.Footprint;
             let pitch = f.RowPitch as usize;
             let len = self.footprint_bytes(i);
@@ -511,11 +553,15 @@ impl Staging {
                 linear.fill(0);
                 continue;
             }
-            if let Err(e) =
-                self.layout
-                    .detile(tiled, mip, slice, linear, pitch, pitch * rows as usize)
-            {
-                tracing::warn!(?e, mip, slice, "texture not detiled");
+            if let Err(e) = self.layout.detile(
+                tiled,
+                console_mip,
+                slice,
+                linear,
+                pitch,
+                pitch * rows as usize,
+            ) {
+                tracing::warn!(?e, console_mip, slice, "texture not detiled");
                 return;
             }
         }
@@ -593,8 +639,11 @@ fn staging(resource: This, texture: &ID3D12Resource, requested: u32) -> Option<A
     let host = host()?;
     // SAFETY: a live resource.
     let d = unsafe { texture.GetDesc() };
+    // Host mips the texture lost (`VICTORY_TEXTURE_MIP_DROP`): host mip `m`
+    // is console mip `m + mip_drop`.
+    let mip_drop = u32::from(desc.mip_levels).saturating_sub(u32::from(d.MipLevels));
     let first = first_mip(&layout, u32::from(d.MipLevels));
-    let tiled_bytes = layout.bytes_from(first) as usize;
+    let tiled_bytes = layout.bytes_from(first + mip_drop) as usize;
     let count = if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
         u32::from(d.MipLevels)
     } else {
@@ -623,7 +672,12 @@ fn staging(resource: This, texture: &ID3D12Resource, requested: u32) -> Option<A
             d.Width, d.Height, d.DepthOrArraySize, d.Format.0
         )
     });
-    tracing::debug!(?desc, total, "texture contents uploaded from title memory");
+    tracing::debug!(
+        ?desc,
+        total,
+        mip_drop,
+        "texture contents uploaded from title memory"
+    );
     let s = Arc::new(Staging {
         buffer,
         size: total,
@@ -634,6 +688,7 @@ fn staging(resource: This, texture: &ID3D12Resource, requested: u32) -> Option<A
         rows,
         layout,
         mips: u32::from(d.MipLevels),
+        mip_drop,
         memory,
         last: Mutex::default(),
     });

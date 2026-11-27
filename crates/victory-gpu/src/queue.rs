@@ -134,6 +134,11 @@ impl InFlight {
         self.0.as_deref().expect("in-flight host list")
     }
 
+    #[cfg(not(test))]
+    fn shared(&self) -> Arc<crate::host::HostList> {
+        self.0.clone().expect("in-flight host list")
+    }
+
     fn take(mut self) -> Arc<crate::host::HostList> {
         let list = self.0.take().expect("in-flight host list");
         list.end_submit();
@@ -146,6 +151,30 @@ impl Drop for InFlight {
     fn drop(&mut self) {
         if let Some(list) = self.0.take() {
             list.cancel_submit();
+        }
+    }
+}
+
+/// Whether host submissions finish on the completion thread
+/// (`VICTORY_ASYNC_SUBMIT=1`, experimental).
+#[cfg(all(windows, not(test)))]
+fn async_submit() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ASYNC_SUBMIT").is_some_and(|v| v != "0"))
+}
+
+/// Runs the pinned lists and waits for them on this thread.
+#[cfg(windows)]
+fn run_now(in_flight: Vec<InFlight>) {
+    if let Some(host) = crate::host::host() {
+        crate::descriptor::sync_all_heaps();
+        let runs: Vec<_> = in_flight.iter().map(InFlight::list).collect();
+        host.execute(&runs);
+        for entry in in_flight {
+            let list = entry.take();
+            if let Ok(orphan) = Arc::try_unwrap(list) {
+                host.recycle_list(orphan);
+            }
         }
     }
 }
@@ -176,6 +205,63 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
             // mid-list memory wait) keeps its `InFlight` pin until execution
             // completes.
             let in_flight = std::mem::take(batch);
+            // `VICTORY_ASYNC_SUBMIT=1`: the GPU wait and copy-back finish on
+            // the completion thread; what the queue does next (fence
+            // signals) waits for them.
+            // shortcut: experimental; the title crashes during its loading
+            // with it on (work it records meanwhile may race the GPU).
+            // `VICTORY_IN_FLIGHT=<n>`: prepared and submitted now, completed
+            // later in submission order; the queue goes on with further
+            // submissions and holds what the title's CPU sees (fence
+            // signals) until it has completed (`host::in_flight_limit`).
+            #[cfg(not(test))]
+            if crate::host::in_flight_limit() > 1 {
+                timeline.submit(Op::RunInFlight(Box::new(move || {
+                    let Some(host) = crate::host::host() else {
+                        drop(in_flight);
+                        return 0;
+                    };
+                    crate::descriptor::sync_all_heaps();
+                    let runs: Vec<_> = in_flight.iter().map(InFlight::shared).collect();
+                    host.execute_in_flight(
+                        runs,
+                        Box::new(move || {
+                            for entry in in_flight {
+                                let list = entry.take();
+                                if let Ok(orphan) = Arc::try_unwrap(list) {
+                                    host.recycle_list(orphan);
+                                }
+                            }
+                        }),
+                    )
+                })));
+            } else if async_submit() {
+                timeline.submit(Op::RunAsync(Box::new(move |resume| {
+                    let Some(host) = crate::host::host() else {
+                        drop(in_flight);
+                        resume();
+                        return;
+                    };
+                    crate::descriptor::sync_all_heaps();
+                    let runs: Vec<_> = in_flight.iter().map(InFlight::shared).collect();
+                    host.execute_async(
+                        runs,
+                        Box::new(move || {
+                            for entry in in_flight {
+                                let list = entry.take();
+                                if let Ok(orphan) = Arc::try_unwrap(list) {
+                                    host.recycle_list(orphan);
+                                }
+                            }
+                            resume();
+                        }),
+                    );
+                })));
+            } else {
+                timeline.submit(Op::Run(Box::new(move || run_now(in_flight))));
+            }
+            // Tests read results as soon as the queue call returns.
+            #[cfg(test)]
             timeline.submit(Op::Run(Box::new(move || {
                 if let Some(host) = crate::host::host() {
                     crate::descriptor::sync_all_heaps();
@@ -215,6 +301,12 @@ pub(crate) struct Plane {
     count: u32,
     resources: *const This,
 }
+
+/// Bytes from one present plane's description to the next: token, count,
+/// resources, source rectangles and placement, then 32 bytes (colour space,
+/// flags and more) this does not read. Measured: the second plane's token
+/// and count follow 9 words after the first's.
+const PLANE_BYTES: usize = 72;
 /// Submission tagged with the frame it belongs to `(count, lists, frame
 /// token, flags)`; frames are paced elsewhere, so it runs as a plain one.
 extern "system" fn execute_x(this: This, count: u32, lists: *const This, _token: u64, _flags: u32) {
@@ -328,15 +420,22 @@ fn system_timestamp() -> u64 {
 /// Frames presented so far.
 static FRAMES: AtomicU64 = AtomicU64::new(0);
 
+/// Frames the title has presented so far (for clocks that follow the
+/// frame rate, `victory-hle`'s `VICTORY_TIME_SCALE=auto`).
+pub fn frames_presented() -> u64 {
+    FRAMES.load(Ordering::Relaxed)
+}
+
 #[cfg(feature = "diagnostics")]
 pub(crate) fn presented() -> u64 {
     FRAMES.load(Ordering::Relaxed)
 }
 
-/// Shows the first plane's first resource in our window.
+/// Shows the first plane's first resource in our window, with the second
+/// plane's (an interface over the game, in Series S mode) blended over it.
 ///
-/// shortcut: one plane, no scaling or placement, the source expected in
-/// the common state.
+/// shortcut: two planes at most, stretched to the window; source
+/// rectangles and placement are not read.
 extern "system" fn present(
     this: This,
     planes: u32,
@@ -351,21 +450,36 @@ extern "system" fn present(
     } else {
         None
     };
-    let resource = plane
-        .filter(|plane| plane.count > 0 && !plane.resources.is_null())
-        // SAFETY: the plane lists `count` resources.
-        .map(|plane| unsafe { *plane.resources })
-        .filter(|resource| !resource.is_null())
-        .map(object::Held::new);
+    let first = |plane: Option<&Plane>| {
+        plane
+            .filter(|plane| plane.count > 0 && !plane.resources.is_null())
+            // SAFETY: the plane lists `count` resources.
+            .map(|plane| unsafe { *plane.resources })
+            .filter(|resource| !resource.is_null())
+            .map(object::Held::new)
+    };
+    let resource = first(plane);
+    let overlay = if planes > 1 {
+        // SAFETY: the title passes `planes` descriptions, `PLANE_BYTES` apart.
+        first(unsafe {
+            plane_parameters
+                .cast::<u8>()
+                .add(PLANE_BYTES)
+                .cast::<Plane>()
+                .as_ref()
+        })
+    } else {
+        None
+    };
     queue(this)
         .timeline
-        .submit(Op::Run(Box::new(move || show(resource))));
+        .submit(Op::Run(Box::new(move || show(resource, overlay))));
     S_OK
 }
 
 /// A present, once the queue's work before it has run: counts the frame
-/// and shows the plane's first resource.
-fn show(resource: Option<object::Held>) {
+/// and shows the first plane's resource, with the second plane's over it.
+fn show(resource: Option<object::Held>, overlay: Option<object::Held>) {
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
     if frame.is_power_of_two() {
         let (draws, dispatches) = crate::list::take_counts();
@@ -405,9 +519,28 @@ fn show(resource: Option<object::Held>) {
         && let Some(host) = crate::host::host()
     {
         const COPY_SOURCE: u32 = 0x800;
+        const READ: u32 = 0x40; // non-pixel shader resource
         let state = crate::resource::host_transition(resource, COPY_SOURCE)
             .map_or(COPY_SOURCE, |(_, before)| before);
-        let shown = host.present(texture, state, frame);
+        // The overlay is read by the compose pass, and left as it was.
+        // Diagnostics: `VICTORY_PLANES=base` shows the first plane alone.
+        #[cfg(feature = "diagnostics")]
+        let overlay = {
+            static BASE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            let base_only = *BASE
+                .get_or_init(|| std::env::var("VICTORY_PLANES").is_ok_and(|v| v.trim() == "base"));
+            if base_only { None } else { overlay }
+        };
+        let overlay = overlay.as_ref().map(object::Held::get).and_then(|o| {
+            let texture = crate::resource::host_resource(o)?;
+            let state =
+                crate::resource::host_transition(o, READ).map_or(READ, |(_, before)| before);
+            Some((o, texture, state))
+        });
+        let shown = host.present(texture, state, overlay.map(|(_, t, s)| (t, s)), frame);
+        if let Some((o, _, state)) = overlay {
+            crate::resource::host_transition(o, state);
+        }
         crate::resource::host_transition(resource, state);
         #[cfg(feature = "diagnostics")]
         blinks(frame, resource, state, shown);
@@ -415,7 +548,7 @@ fn show(resource: Option<object::Held>) {
         let _ = shown;
     }
     #[cfg(not(windows))]
-    let _ = resource;
+    let _ = (resource, overlay);
 }
 /// Diagnostics: logs a presented frame that is black after one that was
 /// not, with what was presented and how many draws ran since.

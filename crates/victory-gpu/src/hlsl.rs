@@ -39,6 +39,7 @@ fn bundled_shader(source: &str) -> Option<&'static [u8]> {
         include_str!("../shaders/argument_clamp.hlsl") => Some(bytecode!("argument_clamp")),
         include_str!("../shaders/rect_rewrite.hlsl") => Some(bytecode!("rect_rewrite")),
         include_str!("../shaders/rect_expand.hlsl") => Some(bytecode!("rect_expand")),
+        include_str!("../shaders/mesh_draws.hlsl") => Some(bytecode!("mesh_draws")),
         _ => None,
     }
 }

@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use victory_pipeline::{Cache, Converter};
-use victory_shader::emit::{HostShader, StaticSampler, UserData};
+use victory_shader::emit::{HostShader, StaticSampler, StructuredSrv, UserData};
 use victory_shader::{HwStage, RootType};
 
 static CACHE: OnceLock<Cache> = OnceLock::new();
@@ -69,6 +69,10 @@ fn build(wave32: bool) -> &'static [u8; 32] {
                 bytes.extend_from_slice(&limit.to_le_bytes());
                 bytes.extend_from_slice(&victory_shader::emit::shader_opt().to_le_bytes());
                 bytes.push(u8::from(wave32));
+                bytes.push(u8::from(victory_shader::emit::host_wave64()));
+                // `VICTORY_WAVE64_SPLIT_ONLY` counts per shader (`cached`).
+                bytes.extend_from_slice(&victory_shader::emit::fixes().to_le_bytes());
+                bytes.extend_from_slice(&victory_shader::switch::bits().to_le_bytes());
                 *blake3::hash(&bytes).as_bytes()
             }
             Err(e) => {
@@ -94,6 +98,29 @@ pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
         Some(cache) => cached(cache, build(wave32), container, translate),
         None => translate(container),
     }
+}
+
+/// The translation of a pixel shader container for a host without
+/// barycentrics (`victory_shader::emit::translate_without_barycentrics`),
+/// from the cache when there is one. Its entries have keys of their own:
+/// the build fingerprint is salted with the variant.
+pub(crate) fn host_shader_without_barycentrics(container: &[u8]) -> Result<HostShader, String> {
+    let wave32 = allow_wave32();
+    let translate = |c: &[u8]| {
+        victory_shader::emit::translate_without_barycentrics(c, wave32).map_err(|e| e.to_string())
+    };
+    match CACHE.get() {
+        Some(cache) => {
+            let build = without_barycentrics_build(build(wave32));
+            cached(cache, &build, container, translate)
+        }
+        None => translate(container),
+    }
+}
+
+/// The fingerprint of translations without barycentrics made by `build`.
+fn without_barycentrics_build(build: &[u8; 32]) -> [u8; 32] {
+    *blake3::hash(&[&build[..], b"without barycentrics"].concat()).as_bytes()
 }
 
 /// The cache entry's converter: the build and the container in, the encoded
@@ -129,7 +156,14 @@ fn cached(
     container: &[u8],
     translate: impl Fn(&[u8]) -> Result<HostShader, String> + Send + Sync,
 ) -> Result<HostShader, String> {
-    let input = [&build[..], container].concat();
+    // Whether the split filter takes this shader is part of its key, so a
+    // shader keeps its entry across bisection runs with different filters.
+    let input = if victory_shader::emit::split_takes(container) {
+        [&build[..], container].concat()
+    } else {
+        let left_out = blake3::hash(&[&build[..], b"split left out"].concat());
+        [&left_out.as_bytes()[..], container].concat()
+    };
     let converter = Translate {
         translate,
         ran: AtomicBool::new(false),
@@ -172,7 +206,7 @@ fn cached(
         .unwrap_or_else(|| (converter.translate)(container))
 }
 
-const MAGIC: &[u8; 4] = b"VSH2";
+const MAGIC: &[u8; 4] = b"VSH3";
 const REFUSAL_MAGIC: &[u8; 4] = b"VSE1";
 const STAGES: [HwStage; 8] = [
     HwStage::Ls,
@@ -267,6 +301,32 @@ fn encode(outcome: &Result<HostShader, String>) -> Vec<u8> {
         word(&mut out, slots.len() as u32);
         out.extend(slots);
     }
+    word(&mut out, s.structured_srvs.len() as u32);
+    for srv in &s.structured_srvs {
+        word(&mut out, u32::from(srv.slot));
+        word(&mut out, srv.offset_dwords);
+        word(&mut out, srv.stride);
+    }
+    let reads = victory_shader::emit::heap_reads(&s.dxil);
+    word(&mut out, reads.len() as u32);
+    for r in reads.iter() {
+        for v in [
+            u32::from(r.slot),
+            r.offset_dwords,
+            u32::from(r.sampler),
+            r.props.0,
+            r.props.1,
+            u32::from(r.dynamic) | u32::from(r.absolute) << 1,
+            r.index_from.map_or(0, |(slot, _)| u32::from(slot) + 1),
+            r.index_from.map_or(0, |(_, dword)| dword),
+            r.index_load.map_or(0, |l| u32::from(l.slot) + 1),
+            r.index_load.map_or(0, |l| l.dword),
+            r.index_load.map_or(0, |l| l.byte),
+            r.index_load.map_or(0, |l| l.mask),
+        ] {
+            word(&mut out, v);
+        }
+    }
     out
 }
 
@@ -335,6 +395,52 @@ fn decode(bytes: &[u8]) -> Option<Result<HostShader, String>> {
     let root_cbvs = r.list()?;
     let root_srvs = r.list()?;
     let root_uavs = r.list()?;
+    let n = r.word()? as usize;
+    let mut structured_srvs = Vec::with_capacity(n.min(256));
+    for _ in 0..n {
+        structured_srvs.push(StructuredSrv {
+            slot: u8::try_from(r.word()?).ok()?,
+            offset_dwords: r.word()?,
+            stride: r.word()?,
+        });
+    }
+    let n = r.word()? as usize;
+    let mut heap_reads = Vec::with_capacity(n.min(256));
+    for _ in 0..n {
+        heap_reads.push(victory_shader::emit::HeapRead {
+            slot: u8::try_from(r.word()?).ok()?,
+            offset_dwords: r.word()?,
+            sampler: r.word()? != 0,
+            props: (r.word()?, r.word()?),
+            dynamic: false,
+            absolute: false,
+            index_from: None,
+            index_load: None,
+        });
+        let flags = r.word()?;
+        let (from_slot, from_dword) = (r.word()?, r.word()?);
+        let load = [r.word()?, r.word()?, r.word()?, r.word()?];
+        let last = heap_reads.last_mut()?;
+        last.dynamic = flags & 1 != 0;
+        last.absolute = flags & 2 != 0;
+        last.index_from = from_slot
+            .checked_sub(1)
+            .and_then(|s| u8::try_from(s).ok())
+            .map(|s| (s, from_dword));
+        last.index_load = load[0]
+            .checked_sub(1)
+            .and_then(|s| u8::try_from(s).ok())
+            .map(|slot| victory_shader::emit::IndexLoad {
+                slot,
+                dword: load[1],
+                byte: load[2],
+                mask: load[3],
+            });
+    }
+    if !r.0.is_empty() {
+        return None;
+    }
+    victory_shader::emit::note_heap_reads(&dxil, heap_reads);
     r.0.is_empty().then_some(Ok(HostShader {
         stage,
         dxil,
@@ -344,6 +450,7 @@ fn decode(bytes: &[u8]) -> Option<Result<HostShader, String>> {
         root_cbvs,
         root_srvs,
         root_uavs,
+        structured_srvs,
     }))
 }
 
@@ -372,6 +479,11 @@ mod tests {
             root_cbvs: vec![2],
             root_srvs: vec![0, 3],
             root_uavs: vec![1],
+            structured_srvs: vec![StructuredSrv {
+                slot: 0,
+                offset_dwords: 8,
+                stride: 64,
+            }],
         }
     }
 
@@ -402,6 +514,32 @@ mod tests {
         assert_eq!(runs.load(Ordering::Relaxed), 3);
         assert_eq!(cached(&cache, &build, container, translate), Ok(shader()));
         assert_eq!(runs.load(Ordering::Relaxed), 3);
+    }
+
+    /// A translation without barycentrics has an entry of its own: the
+    /// plain translation of the same container is not served for it, nor
+    /// the other way round.
+    #[test]
+    fn translations_without_barycentrics_have_entries_of_their_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open(dir.path()).unwrap();
+        let build = [7u8; 32];
+        let container = b"a pixel shader with barycentrics".as_slice();
+        let mut fallback = shader();
+        fallback.dxil = b"DXBC without barycentrics".to_vec();
+        assert_eq!(
+            cached(&cache, &build, container, |_: &[u8]| Ok(shader())),
+            Ok(shader())
+        );
+        let variant = without_barycentrics_build(&build);
+        assert_ne!(variant, build);
+        assert_eq!(
+            cached(&cache, &variant, container, |_: &[u8]| Ok(fallback.clone())),
+            Ok(fallback.clone())
+        );
+        let never = |_: &[u8]| -> Result<HostShader, String> { panic!("translated again") };
+        assert_eq!(cached(&cache, &build, container, never), Ok(shader()));
+        assert_eq!(cached(&cache, &variant, container, never), Ok(fallback));
     }
 
     #[test]
@@ -503,6 +641,46 @@ mod tests {
             }
         }
         files
+    }
+
+    #[test]
+    fn heap_reads_come_back_with_their_entry() {
+        use victory_shader::emit::{HeapRead, IndexLoad, heap_reads, note_heap_reads};
+        let mut s = shader();
+        // A container digest of its own, so other tests do not share it.
+        s.dxil = b"DXBCheap-reads-test-digest".to_vec();
+        let reads = vec![
+            HeapRead {
+                slot: 0,
+                offset_dwords: 16,
+                sampler: false,
+                props: (2, 0x409),
+                dynamic: false,
+                absolute: false,
+                index_from: None,
+                index_load: None,
+            },
+            HeapRead {
+                slot: 1,
+                offset_dwords: 0,
+                sampler: false,
+                props: (11, 0),
+                dynamic: true,
+                absolute: true,
+                index_from: Some((1, 1)),
+                index_load: Some(IndexLoad {
+                    slot: 1,
+                    dword: 1,
+                    byte: 8,
+                    mask: 0xfffff,
+                }),
+            },
+        ];
+        note_heap_reads(&s.dxil, reads.clone());
+        let bytes = encode(&Ok(s.clone()));
+        note_heap_reads(&s.dxil, Vec::new());
+        assert_eq!(decode(&bytes), Some(Ok(s.clone())));
+        assert_eq!(&*heap_reads(&s.dxil), reads.as_slice());
     }
 
     #[test]

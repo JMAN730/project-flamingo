@@ -18,6 +18,8 @@ victory-shader.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# The synthetic mesh program the draw tests run.
+victory-shader = { workspace = true, features = ["samples"] }
 
 [features]
 # Debugging switches (frame capture, the host debug layer, per-draw data).
