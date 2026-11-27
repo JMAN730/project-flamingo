@@ -2653,8 +2653,13 @@ impl State {
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
         // A host without mesh shaders runs the mesh program as a compute
-        // pass and draws what it stored.
-        let fallback = crate::pipeline::host_pipeline(self.pipeline as This)
+        // pass and draws what it stored. From the pipeline the draw is
+        // prepared with (`prepare_for`): one made for the strides bound now
+        // has its compute half too, where the title pipeline has no host
+        // pipeline for every stride.
+        let bound = self.bound_pipeline(false);
+        let fallback = bound
+            .as_deref()
             .and_then(|p| p.fallback.as_ref().map(|f| (p, f)));
         let ran = self.prepare_for(list, false, true)
             && match fallback {
@@ -3414,9 +3419,11 @@ impl State {
         let why = |_: &str| {};
         // Without mesh shaders a mesh dispatch is a compute pass and a draw
         // of one instance per thread group (`execute_indirect_mesh`).
-        let without_mesh_shaders = (kind == MESH)
-            .then(|| crate::pipeline::host_pipeline(self.pipeline as This))
-            .flatten()
+        // From the pipeline bound for the strides in use now, as a direct
+        // mesh dispatch takes it.
+        let bound_mesh = (kind == MESH).then(|| self.bound_pipeline(false)).flatten();
+        let without_mesh_shaders = bound_mesh
+            .as_deref()
             .and_then(|p| p.fallback.as_ref().map(|f| (p, f)));
         let len = u64::from(stride) * u64::from(max.max(1));
         let Some(args) = crate::shadow::find(arguments, len) else {
