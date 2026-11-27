@@ -1557,4 +1557,63 @@ mod tests {
         assert_eq!((t.containers, t.duplicates), (3, 1));
         assert_eq!(lock(&seen).len(), 2);
     }
+
+    /// A pixel shader as the emitter hands it over, whose feature flags
+    /// (`SFI0`) ask for the host's barycentrics or do not.
+    fn pixel_shader(barycentrics: bool) -> emit::HostShader {
+        // The barycentrics bit of the DXIL shader feature flags.
+        let flags: u64 = if barycentrics { 0x2_0000 } else { 0 };
+        emit::HostShader {
+            stage: HwStage::Ps,
+            dxil: dxbc(&[(b"SFI0", &flags.to_le_bytes())]),
+            user_data: Vec::new(),
+            samplers: Vec::new(),
+            static_samplers: Vec::new(),
+            root_cbvs: Vec::new(),
+            root_srvs: Vec::new(),
+            root_uavs: Vec::new(),
+            structured_srvs: Vec::new(),
+        }
+    }
+
+    fn refused() -> Result<emit::HostShader, ShaderError> {
+        Err(ShaderError::Unsupported {
+            offset: 0,
+            what: "a synthetic refusal",
+        })
+    }
+
+    /// A program that needs no barycentrics whose fallback emission fails is
+    /// a failure row, not a program that "emits differently".
+    #[test]
+    fn a_failed_fallback_without_barycentrics_is_a_failure_not_a_difference() {
+        let native = pixel_shader(false);
+        assert!(!native.needs_barycentrics());
+        let mut t = Tally::default();
+        let label = || "synth.bin Ps".to_owned();
+        check_barycentric(&native, refused(), &mut t, &mut no_checks(), &label);
+
+        assert_eq!(t.barycentric_same, [0, 0]);
+        assert_eq!(t.barycentric, [0; 4]);
+        assert_eq!(t.failed.len(), 1, "{:#?}", t.failure_lines());
+        let (reason, failed) = t.failed.iter().next().unwrap();
+        assert!(reason.starts_with("barycentric fallback: "), "{reason}");
+        assert!(reason.contains("a synthetic refusal"), "{reason}");
+        assert_eq!((failed.total, failed.stages.ps), (1, 1));
+    }
+
+    /// A program that needs barycentrics counts as tried even when its
+    /// fallback emission fails.
+    #[test]
+    fn a_failed_fallback_with_barycentrics_still_counts_as_tried() {
+        let native = pixel_shader(true);
+        assert!(native.needs_barycentrics());
+        let mut t = Tally::default();
+        let label = || "synth.bin Ps".to_owned();
+        check_barycentric(&native, refused(), &mut t, &mut no_checks(), &label);
+
+        assert_eq!(t.barycentric, [1, 0, 0, 0]);
+        assert_eq!(t.barycentric_same, [0, 0]);
+        assert_eq!(t.failed.values().map(|f| f.total).sum::<usize>(), 1);
+    }
 }
