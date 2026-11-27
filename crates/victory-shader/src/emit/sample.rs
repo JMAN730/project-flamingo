@@ -263,7 +263,7 @@ pub(super) fn mesh_with(extra: &[u32]) -> MeshSample {
 }
 
 /// The sample program's translation attempt, as the error it stops with.
-#[cfg(test)]
+#[cfg(all(test, windows))]
 pub(super) fn mesh_error(extra: &[u32]) -> Option<crate::ShaderError> {
     let native = program(extra);
     let p = ir::build(&native.code, native.wave64, native.vgprs).ok()?;
