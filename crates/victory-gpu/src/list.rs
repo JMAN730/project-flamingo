@@ -414,6 +414,7 @@ fn hoist(this: This) {
     let needs_separate = list.has_work.load(std::sync::atomic::Ordering::Acquire)
         || !current.untouched()
         || crate::indirect::hoist_mode() == 5;
+    let mut queries_go_on = false;
     let clamps = if needs_separate {
         let Some(clamps) = crate::host::host()
             .and_then(|h| h.acquire_list().ok())
@@ -422,10 +423,11 @@ fn hoist(this: This) {
             return;
         };
         if let Some(old) = host.replace(next.clone()) {
-            end_open_queries(&old);
+            let open = end_open_queries(&old);
             old.close();
             segments.push(Segment::List(old.clone()));
             state.reapply_host(&next, &old);
+            queries_go_on = continue_queries(&next, open);
         }
         clamps
     } else {
@@ -435,8 +437,9 @@ fn hoist(this: This) {
         state.reapply_host(&next, &old);
         old
     };
+    // A query that goes on in the new list is work recorded there.
     list.has_work
-        .store(false, std::sync::atomic::Ordering::Release);
+        .store(queries_go_on, std::sync::atomic::Ordering::Release);
     state.hoist(clamps, &next);
 }
 
@@ -1542,8 +1545,9 @@ extern "system" fn begin_query(this: This, heap: This, kind: u32, index: u32) {
         && let Some(list) = host_list(this)
     {
         list.keep(&host_heap);
+        crate::query::starts_over(heap, index);
         // SAFETY: an open list; the index is the title's, inside its heap
-        // (which the host heap matches in size).
+        // (whose queries the host heap has, and spare ones after them).
         unsafe {
             list.list.BeginQuery(
                 &host_heap,
@@ -1551,7 +1555,8 @@ extern "system" fn begin_query(this: This, heap: This, kind: u32, index: u32) {
                 index,
             )
         };
-        crate::query::begun(heap, kind, index, std::sync::Arc::as_ptr(&list) as usize);
+        let here = std::sync::Arc::as_ptr(&list) as usize;
+        crate::query::begun(heap, kind, index, index, here);
         mark_work(this);
     }
     #[cfg(not(windows))]
@@ -1560,33 +1565,74 @@ extern "system" fn begin_query(this: This, heap: This, kind: u32, index: u32) {
 
 /// Ends the occlusion queries still open in host list `list`, which is
 /// about to be closed in the middle of the title's list (a split): a host
-/// query may not stay open past the end of its list.
-// shortcut: the query then counts only what was drawn before the split;
-// the title's own end, recorded in the next host list, finds nothing to end.
+/// query may not stay open past the end of its list. Returns them as (heap,
+/// kind, index), to go on in the next host list ([`continue_queries`]).
 #[cfg(windows)]
-fn end_open_queries(list: &std::sync::Arc<crate::host::HostList>) {
-    for (heap, kind, index) in crate::query::take_open(std::sync::Arc::as_ptr(list) as usize) {
+fn end_open_queries(list: &std::sync::Arc<crate::host::HostList>) -> Vec<(This, u32, u32)> {
+    let open = crate::query::take_open(std::sync::Arc::as_ptr(list) as usize);
+    let mut ended = Vec::with_capacity(open.len());
+    for (heap, kind, index, host_index) in open {
         let Some(host_heap) = crate::query::occlusion_heap(heap) else {
             continue;
         };
-        // SAFETY: a list still open; the query was begun in it and not
-        // ended since.
+        // SAFETY: a list still open; the host query was begun in it and
+        // not ended since.
         unsafe {
             list.list.EndQuery(
                 &host_heap,
                 windows::Win32::Graphics::Direct3D12::D3D12_QUERY_TYPE(kind as i32),
-                index,
+                host_index,
             )
         };
+        ended.push((heap, kind, index));
     }
+    ended
 }
 
-#[cfg(not(windows))]
-fn end_open_queries<T>(_: &T) {}
+/// Begins again, in host list `next`, the queries a split ended in the list
+/// before it ([`end_open_queries`]): each goes on as a spare host query
+/// that the title's own end then ends, and its resolve combines the parts
+/// ([`resolve_occlusion`]). Returns whether any query went on.
+// shortcut: with no spare host query left (or no new host list, where the
+// caller drops them), a query counts only what was drawn before the split;
+// the title's own end, recorded in the next host list, finds nothing to end.
+#[cfg(windows)]
+fn continue_queries(
+    next: &std::sync::Arc<crate::host::HostList>,
+    ended: Vec<(This, u32, u32)>,
+) -> bool {
+    let mut any = false;
+    for (heap, kind, index) in ended {
+        let Some(host_heap) = crate::query::occlusion_heap(heap) else {
+            continue;
+        };
+        let Some(spare) = crate::query::continues(heap, index) else {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                tracing::warn!("no spare host query for an occlusion query open across a list split: it counts only the draws before the split");
+            });
+            continue;
+        };
+        next.keep(&host_heap);
+        // SAFETY: an open list; `spare` is one of the host heap's spare
+        // queries, which only this query uses until it begins anew.
+        unsafe {
+            next.list.BeginQuery(
+                &host_heap,
+                windows::Win32::Graphics::Direct3D12::D3D12_QUERY_TYPE(kind as i32),
+                spare,
+            )
+        };
+        let here = std::sync::Arc::as_ptr(next) as usize;
+        crate::query::begun(heap, kind, index, spare, here);
+        any = true;
+    }
+    any
+}
 
 /// `EndQuery(heap, type, index)`: ends a host occlusion query begun in the
-/// same host list (after a list split between the two, the query was ended
-/// at the split, [`end_open_queries`]).
+/// same host list (after a list split between the two, that is the spare
+/// host query it went on as, [`continue_queries`]).
 extern "system" fn end_query(this: This, heap: This, kind: u32, index: u32) {
     #[cfg(windows)]
     if matches!(kind, OCCLUSION | BINARY_OCCLUSION)
@@ -1594,20 +1640,20 @@ extern "system" fn end_query(this: This, heap: This, kind: u32, index: u32) {
         && let Some(list) = host_list(this)
     {
         let here = std::sync::Arc::as_ptr(&list) as usize;
-        if crate::query::take_begun(heap, index, here) {
-            // SAFETY: an open list; the query was begun in it.
+        if let Some(host_index) = crate::query::take_begun(heap, index, here) {
+            // SAFETY: an open list; the host query was begun in it.
             unsafe {
                 list.list.EndQuery(
                     &host_heap,
                     windows::Win32::Graphics::Direct3D12::D3D12_QUERY_TYPE(kind as i32),
-                    index,
+                    host_index,
                 )
             };
             mark_work(this);
         } else {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| {
-                tracing::info!("an occlusion query ended in a host list it was not begun in (ended at the list split, or never begun)");
+                tracing::info!("an occlusion query ended in a host list it was not begun in (ended at a list split without going on, or never begun)");
             });
         }
     }
@@ -1621,8 +1667,11 @@ extern "system" fn end_query(this: This, heap: This, kind: u32, index: u32) {
 /// Whether a query has ended is the host GPU's to know when the list runs
 /// (a list recorded earlier can run after the one that ends it): every
 /// host query has a result from the heap's start (`crate::query`), the
-/// last one ended before the list runs, or 0 if none was. False if `heap`
-/// has no host occlusion heap.
+/// last one ended before the list runs, or 0 if none was. A query that
+/// went on past a split of its host list ([`continue_queries`]) has
+/// further parts in spare host queries: those are resolved behind the
+/// others and combined into its result before the copy. False if `heap` has
+/// no host occlusion heap.
 #[cfg(windows)]
 fn resolve_occlusion(
     this: This,
@@ -1646,24 +1695,30 @@ fn resolve_occlusion(
     let Some(target) = buffer_range(buffer, offset, bytes) else {
         return true;
     };
-    let Some((staging, data)) = list.readback(host, bytes) else {
+    let parts = crate::query::parts(heap, first, count);
+    let Some((staging, data)) = list.readback(host, bytes + 8 * parts.len() as u64) else {
         return true;
     };
     list.keep(&host_heap);
+    let kind_d3d = windows::Win32::Graphics::Direct3D12::D3D12_QUERY_TYPE(kind as i32);
     // SAFETY: an open list; every query of the host heap has a result; the
-    // readback buffer holds `bytes`.
+    // readback buffer holds `bytes` and 8 more for each later part.
     unsafe {
-        list.list.ResolveQueryData(
-            &host_heap,
-            windows::Win32::Graphics::Direct3D12::D3D12_QUERY_TYPE(kind as i32),
-            first,
-            count,
-            &staging,
-            0,
-        )
-    };
+        list.list
+            .ResolveQueryData(&host_heap, kind_d3d, first, count, &staging, 0);
+        for (nth, &(_, spare)) in parts.iter().enumerate() {
+            let at = bytes + 8 * nth as u64;
+            list.list
+                .ResolveQueryData(&host_heap, kind_d3d, spare, 1, &staging, at);
+        }
+    }
     let len = bytes as usize;
-    list.defer_readback(target, data, len, len, 1, len, len);
+    if parts.is_empty() {
+        list.defer_readback(target, data, len, len, 1, len, len);
+    } else {
+        let places = parts.iter().map(|&(place, _)| place).collect();
+        list.defer_query_results(target, data, count as usize, kind, places);
+    }
     #[cfg(feature = "diagnostics")]
     {
         let n = u64::from(count);
@@ -2266,13 +2321,19 @@ fn record_wait(this: This, address: u64, comparison: u32, reference: u64, mask: 
                 && let Some(prev) = host.take()
             {
                 finish_hoist(&mut segments, &mut state);
-                end_open_queries(&prev);
+                let open = end_open_queries(&prev);
                 prev.close();
                 segments.push(Segment::List(prev.clone()));
                 match crate::host::host().and_then(|h| h.acquire_list().ok()) {
                     Some(new) => {
                         let new = std::sync::Arc::new(new);
                         state.reapply_host(&new, &prev);
+                        // A query that goes on in the new list is work
+                        // recorded there.
+                        if continue_queries(&new, open) {
+                            list.has_work
+                                .store(true, std::sync::atomic::Ordering::Release);
+                        }
                         *host = Some(new);
                     }
                     None => {
@@ -3532,5 +3593,260 @@ mod tests {
 
         assert_eq!(release(list), 0);
         assert_eq!(release(allocator), 0);
+    }
+
+    /// An occlusion query open across a split of its host list (a memory
+    /// wait) counts the draws on both sides: it goes on in the next host
+    /// list as a spare host query, and its resolve combines the parts, a
+    /// sum for sample counts and "any" for a binary query. Beginning the
+    /// query again later leaves the earlier parts out. Needs a host GPU;
+    /// the draws are recorded on the host lists directly.
+    #[cfg(windows)]
+    #[test]
+    fn an_occlusion_query_counts_the_draws_on_both_sides_of_a_list_split() {
+        use windows::Win32::Foundation::RECT;
+        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+        use windows::Win32::Graphics::Direct3D::{D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, ID3DBlob};
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::{
+            DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC,
+        };
+        use windows::core::s;
+
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let device = &host.device;
+        // One triangle that covers the whole target.
+        let source = r#"
+            [RootSignature("RootFlags(0)")]
+            float4 vs(uint id : SV_VertexID) : SV_Position {
+                return float4(id == 2 ? 3 : -1, id == 1 ? -3 : 1, 0, 1);
+            }
+            float4 ps() : SV_Target0 { return 1; }
+        "#;
+        let compile = |entry, target| {
+            let mut code: Option<ID3DBlob> = None;
+            // SAFETY: the source and names are live; `code` is our output.
+            unsafe {
+                D3DCompile(
+                    source.as_ptr().cast(),
+                    source.len(),
+                    s!("occlusion-split-test"),
+                    None,
+                    None,
+                    entry,
+                    target,
+                    0,
+                    0,
+                    &mut code,
+                    None,
+                )
+                .expect("compile fixture shader");
+            }
+            code.expect("fixture bytecode")
+        };
+        let (vs, ps) = (
+            compile(s!("vs"), s!("vs_5_1")),
+            compile(s!("ps"), s!("ps_5_1")),
+        );
+        const SIDE: u32 = 4;
+        let format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        let samples = DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        };
+        // SAFETY: the compiled shaders, with the root signature the vertex
+        // shader carries, outlive the calls; plain object creation.
+        let (root, pso, target) = unsafe {
+            let bytecode = |blob: &ID3DBlob| D3D12_SHADER_BYTECODE {
+                pShaderBytecode: blob.GetBufferPointer(),
+                BytecodeLength: blob.GetBufferSize(),
+            };
+            let code = bytecode(&vs);
+            let root: ID3D12RootSignature = device
+                .CreateRootSignature(
+                    0,
+                    std::slice::from_raw_parts(code.pShaderBytecode.cast(), code.BytecodeLength),
+                )
+                .expect("root signature");
+            let mut desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::transmute_copy(&root),
+                VS: code,
+                PS: bytecode(&ps),
+                SampleMask: u32::MAX,
+                RasterizerState: D3D12_RASTERIZER_DESC {
+                    FillMode: D3D12_FILL_MODE_SOLID,
+                    CullMode: D3D12_CULL_MODE_NONE,
+                    DepthClipEnable: true.into(),
+                    ..Default::default()
+                },
+                PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+                NumRenderTargets: 1,
+                SampleDesc: samples,
+                ..Default::default()
+            };
+            desc.RTVFormats[0] = format;
+            desc.BlendState.RenderTarget[0].RenderTargetWriteMask =
+                D3D12_COLOR_WRITE_ENABLE_ALL.0 as u8;
+            let pso: ID3D12PipelineState = device
+                .CreateGraphicsPipelineState(&desc)
+                .expect("graphics pipeline");
+            let mut target: Option<ID3D12Resource> = None;
+            device
+                .CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES {
+                        Type: D3D12_HEAP_TYPE_DEFAULT,
+                        ..Default::default()
+                    },
+                    D3D12_HEAP_FLAG_NONE,
+                    &D3D12_RESOURCE_DESC {
+                        Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                        Width: u64::from(SIDE),
+                        Height: SIDE,
+                        DepthOrArraySize: 1,
+                        MipLevels: 1,
+                        Format: format,
+                        SampleDesc: samples,
+                        Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                        ..Default::default()
+                    },
+                    D3D12_RESOURCE_STATE_RENDER_TARGET,
+                    None,
+                    &mut target,
+                )
+                .expect("render target");
+            (root, pso, target.expect("render target"))
+        };
+        // The whole of the draw's state goes on the title list's host list
+        // of the moment: a list after a split starts without it.
+        let draw = |list: This| {
+            let host_list = host_list(list).expect("host list");
+            let l = &host_list.list;
+            let view = host.rtv(Some(&target), None);
+            // SAFETY: an open list; the pipeline, root signature and target
+            // live until the test ends, after the lists ran.
+            unsafe {
+                l.SetGraphicsRootSignature(&root);
+                l.SetPipelineState(&pso);
+                l.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                l.RSSetViewports(&[D3D12_VIEWPORT {
+                    Width: SIDE as f32,
+                    Height: SIDE as f32,
+                    MaxDepth: 1.0,
+                    ..Default::default()
+                }]);
+                l.RSSetScissorRects(&[RECT {
+                    right: SIDE as i32,
+                    bottom: SIDE as i32,
+                    ..Default::default()
+                }]);
+                l.OMSetRenderTargets(1, Some(&view), false, None);
+                l.DrawInstanced(3, 1, 0, 0);
+            }
+            mark_work(list);
+        };
+
+        let null = std::ptr::null();
+        let (queue, _) = crate::queue::test_queue();
+        let execute = slot::<extern "system" fn(This, u32, *const This)>(queue, 0x50);
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        let mut allocator = null;
+        assert_eq!(
+            create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
+            S_OK
+        );
+        let new_list = || {
+            let mut list = null;
+            assert_eq!(
+                create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list),
+                S_OK
+            );
+            list
+        };
+        let heap = crate::query::test_occlusion_heap(4);
+        if crate::query::occlusion_heap(heap).is_none() {
+            assert_eq!(release(heap), 0);
+            assert_eq!(release(allocator), 0);
+            assert_eq!(release(queue), 0);
+            return; // the host made no occlusion heap
+        }
+        let results = crate::resource::test_buffer(64);
+        let (data, _) = crate::resource::buffer_bytes(results).expect("a buffer");
+        // The results as the title reads them, once the first has landed.
+        let landed = || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                // SAFETY: the buffer's 64 bytes, alive until released below.
+                let now = unsafe { data.cast::<[u64; 4]>().read_volatile() };
+                if now[0] != u64::MAX || std::time::Instant::now() > deadline {
+                    return now;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        };
+        let unset = || {
+            // SAFETY: the buffer's 64 bytes; no list that writes them runs.
+            unsafe { data.cast::<[u64; 4]>().write_volatile([u64::MAX; 4]) }
+        };
+
+        // Query 0 is open over both draws; queries 1 (binary) and 2 are
+        // begun before the split and see only the draw after it; query 3
+        // sees no draw.
+        let list = new_list();
+        let wait32 =
+            slot::<extern "system" fn(This, u64, u32, u32, u32)>(list, test_slot(list, 71));
+        let gate = std::sync::atomic::AtomicU32::new(42);
+        begin_query(list, heap, OCCLUSION, 0);
+        draw(list);
+        begin_query(list, heap, BINARY_OCCLUSION, 1);
+        begin_query(list, heap, OCCLUSION, 2);
+        let before = host_list(list).expect("host list");
+        // EQUAL (3) to a value the memory already holds: only the split.
+        wait32(list, (&raw const gate) as u64, 3, 42, u32::MAX);
+        let after = host_list(list).expect("host list");
+        assert!(!std::sync::Arc::ptr_eq(&before, &after), "the wait split");
+        assert_eq!(
+            crate::query::parts(heap, 0, 4),
+            [(0, 4), (1, 6), (2, 5)],
+            "each open query goes on as a spare host query past the title's 4"
+        );
+        draw(list);
+        for index in [0, 1, 2] {
+            let kind = if index == 1 {
+                BINARY_OCCLUSION
+            } else {
+                OCCLUSION
+            };
+            end_query(list, heap, kind, index);
+        }
+        begin_query(list, heap, OCCLUSION, 3);
+        end_query(list, heap, OCCLUSION, 3);
+        resolve_queries(list, heap, OCCLUSION, 0, 1, results, 0);
+        resolve_queries(list, heap, BINARY_OCCLUSION, 1, 1, results, 8);
+        resolve_queries(list, heap, OCCLUSION, 2, 2, results, 16);
+        assert_eq!(close(list), S_OK);
+        unset();
+        execute(queue, 1, &list);
+        let one_draw = u64::from(SIDE * SIDE);
+        assert_eq!(landed(), [2 * one_draw, 1, one_draw, 0]);
+
+        // Query 0 again, with no split: the spare queries of its last run
+        // are not part of this result.
+        let again = new_list();
+        begin_query(again, heap, OCCLUSION, 0);
+        assert_eq!(crate::query::parts(heap, 0, 4), [(1, 6), (2, 5)]);
+        draw(again);
+        end_query(again, heap, OCCLUSION, 0);
+        resolve_queries(again, heap, OCCLUSION, 0, 1, results, 0);
+        assert_eq!(close(again), S_OK);
+        unset();
+        execute(queue, 1, &again);
+        assert_eq!(landed()[0], one_draw);
+
+        drop((before, after));
+        for object in [list, again, allocator, queue, results, heap] {
+            assert_eq!(release(object), 0);
+        }
     }
 }

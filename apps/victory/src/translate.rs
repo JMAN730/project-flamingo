@@ -1493,4 +1493,127 @@ mod tests {
             t.lines
         );
     }
+
+    /// A DXBC container holding `parts`, each a tag and its data.
+    fn dxbc(parts: &[(&[u8; 4], &[u8])]) -> Vec<u8> {
+        let mut bytes = empty_dxbc();
+        let mut offset = 32 + 4 * parts.len();
+        for (_, data) in parts {
+            bytes.extend_from_slice(&(offset as u32).to_le_bytes());
+            offset += 8 + data.len();
+        }
+        for (tag, data) in parts {
+            bytes.extend_from_slice(*tag);
+            bytes.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(data);
+        }
+        bytes[0x18..0x1C].copy_from_slice(&(offset as u32).to_le_bytes());
+        bytes[0x1C..0x20].copy_from_slice(&(parts.len() as u32).to_le_bytes());
+        bytes
+    }
+
+    fn no_checks() -> Checks {
+        Checks {
+            keep: None,
+            validator: None,
+            host: None,
+            mesh_fallback: false,
+            barycentric_fallback: false,
+        }
+    }
+
+    /// The lowering is chosen by the container's digest, so two containers
+    /// that share a program part and differ elsewhere are both tallied;
+    /// only a byte-identical container is a duplicate.
+    #[test]
+    fn containers_sharing_a_program_part_are_tallied_separately() {
+        let program = [0u8; 16];
+        let a = dxbc(&[(b"DXIL", &program), (b"STAT", &[1; 4])]);
+        let b = dxbc(&[(b"DXIL", &program), (b"STAT", &[2; 4])]);
+        let (ca, cb) = (Container::parse(&a).unwrap(), Container::parse(&b).unwrap());
+        assert_eq!(
+            ca.part(FourCC::DXIL).unwrap().data,
+            cb.part(FourCC::DXIL).unwrap().data
+        );
+        assert_ne!(a, b);
+
+        let seen = Mutex::new(HashSet::new());
+        let mut t = Tally::default();
+        let mut checks = no_checks();
+        let path = Path::new("synth.bin");
+        for (offset, data) in [(0, &a), (0x100, &b)] {
+            let source = Source::Raw { offset, data };
+            translate(&source, path, &seen, &mut t, &mut checks);
+        }
+        assert_eq!((t.containers, t.duplicates), (2, 0));
+        assert_eq!(lock(&seen).len(), 2);
+
+        // The same bytes again, found elsewhere in the file.
+        let source = Source::Raw {
+            offset: 0x200,
+            data: &a,
+        };
+        translate(&source, path, &seen, &mut t, &mut checks);
+        assert_eq!((t.containers, t.duplicates), (3, 1));
+        assert_eq!(lock(&seen).len(), 2);
+    }
+
+    /// A pixel shader as the emitter hands it over, whose feature flags
+    /// (`SFI0`) ask for the host's barycentrics or do not.
+    fn pixel_shader(barycentrics: bool) -> emit::HostShader {
+        // The barycentrics bit of the DXIL shader feature flags.
+        let flags: u64 = if barycentrics { 0x2_0000 } else { 0 };
+        emit::HostShader {
+            stage: HwStage::Ps,
+            dxil: dxbc(&[(b"SFI0", &flags.to_le_bytes())]),
+            user_data: Vec::new(),
+            samplers: Vec::new(),
+            static_samplers: Vec::new(),
+            root_cbvs: Vec::new(),
+            root_srvs: Vec::new(),
+            root_uavs: Vec::new(),
+            structured_srvs: Vec::new(),
+        }
+    }
+
+    fn refused() -> Result<emit::HostShader, ShaderError> {
+        Err(ShaderError::Unsupported {
+            offset: 0,
+            what: "a synthetic refusal",
+        })
+    }
+
+    /// A program that needs no barycentrics whose fallback emission fails is
+    /// a failure row, not a program that "emits differently".
+    #[test]
+    fn a_failed_fallback_without_barycentrics_is_a_failure_not_a_difference() {
+        let native = pixel_shader(false);
+        assert!(!native.needs_barycentrics());
+        let mut t = Tally::default();
+        let label = || "synth.bin Ps".to_owned();
+        check_barycentric(&native, refused(), &mut t, &mut no_checks(), &label);
+
+        assert_eq!(t.barycentric_same, [0, 0]);
+        assert_eq!(t.barycentric, [0; 4]);
+        assert_eq!(t.failed.len(), 1, "{:#?}", t.failure_lines());
+        let (reason, failed) = t.failed.iter().next().unwrap();
+        assert!(reason.starts_with("barycentric fallback: "), "{reason}");
+        assert!(reason.contains("a synthetic refusal"), "{reason}");
+        assert_eq!((failed.total, failed.stages.ps), (1, 1));
+    }
+
+    /// A program that needs barycentrics counts as tried even when its
+    /// fallback emission fails.
+    #[test]
+    fn a_failed_fallback_with_barycentrics_still_counts_as_tried() {
+        let native = pixel_shader(true);
+        assert!(native.needs_barycentrics());
+        let mut t = Tally::default();
+        let label = || "synth.bin Ps".to_owned();
+        check_barycentric(&native, refused(), &mut t, &mut no_checks(), &label);
+
+        assert_eq!(t.barycentric, [1, 0, 0, 0]);
+        assert_eq!(t.barycentric_same, [0, 0]);
+        assert_eq!(t.failed.values().map(|f| f.total).sum::<usize>(), 1);
+    }
 }

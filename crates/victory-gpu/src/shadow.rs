@@ -6521,6 +6521,101 @@ mod tests {
         assert!(!shadow.never_copied(address, 8));
     }
 
+    /// The refresh of a range earlier lists write (`update_busy`) puts the
+    /// pages it copies under the copy-back rule: a dword the title rewrites
+    /// after it stays the title's when the card copy is merged back, where
+    /// on a page no refresh reached the GPU's changed bytes are still taken
+    /// as they are. Needs a host that makes card copies.
+    #[cfg(windows)]
+    #[test]
+    fn a_page_update_busy_refreshed_keeps_the_titles_newer_write() {
+        use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
+            PAGE_READWRITE, UnmapViewOfFile,
+        };
+
+        if host().is_none() {
+            return;
+        }
+        let len = 2 * PAGE;
+        // SAFETY: a fresh anonymous section of two pages.
+        let section: HANDLE = unsafe {
+            CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                len as u32,
+                std::ptr::null(),
+            )
+        };
+        assert!(!section.is_null());
+        // SAFETY: maps the whole section made above.
+        let view = unsafe { MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, len) };
+        assert!(!view.Value.is_null());
+        let ptr = view.Value.cast::<u8>();
+        let va0 = ptr as usize;
+        crate::lazy_back::clear_hot_for_test_pub(va0 / PAGE);
+        crate::inplace::title_memory_section(section as usize, len as u64, true);
+        assert!(crate::inplace::title_memory_view(
+            va0,
+            len,
+            section as usize,
+            0
+        ));
+        // SAFETY: both pages of the view are mapped read-write.
+        unsafe { std::ptr::write_bytes(ptr, 0x11, len) };
+
+        // The copy begins as zeros: it holds no title bytes yet.
+        let mut side = vec![0u8; len];
+        let shadow = Shadow::new_card_sized_for_test(side.as_mut_ptr(), va0 as u64, len as u64)
+            .expect("the host made buffers a moment ago");
+        assert!(shadow.never_copied(va0, 8));
+
+        // An earlier list writes the first page, so it is refreshed this way.
+        assert_eq!(shadow.update_busy(va0, va0 + PAGE), (PAGE, true));
+        assert!(side[..PAGE].iter().all(|&b| b == 0x11));
+        assert!(side[PAGE..].iter().all(|&b| b == 0));
+
+        // The title then rewrites the first dword of each page, and the GPU
+        // writes the first two dwords of each.
+        let rewritten = [0x22, 0x11, 0x11, 0x11];
+        let gpu_wrote = [0xc3, 0xc3, 0xc3, 0xc3, 0xc4, 0xc4, 0xc4, 0xc4];
+        let mut gpu = side.clone();
+        for page in [0, PAGE] {
+            // SAFETY: inside the two mapped pages.
+            unsafe { std::ptr::copy_nonoverlapping(rewritten.as_ptr(), ptr.add(page), 4) };
+            gpu[page..page + 8].copy_from_slice(&gpu_wrote);
+        }
+        let mut scratch = Vec::new();
+        let first = shadow.card_merge(0, &gpu[..PAGE], &mut scratch);
+        let second = shadow.card_merge(PAGE, &gpu[PAGE..], &mut scratch);
+        // SAFETY: both pages are still mapped; nothing else writes them.
+        let title = unsafe { std::slice::from_raw_parts(ptr, len) };
+        let (first_page, second_page) = (title[..8].to_vec(), title[PAGE..PAGE + 8].to_vec());
+
+        drop(shadow);
+        crate::lazy_back::clear_hot_for_test_pub(va0 / PAGE);
+        crate::watch::title_memory_remapped(va0, len);
+        // SAFETY: the view and section made above, used by nothing else now.
+        unsafe {
+            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: view.Value });
+            CloseHandle(section);
+        }
+
+        assert_eq!(
+            first_page,
+            [0x22, 0x11, 0x11, 0x11, 0xc4, 0xc4, 0xc4, 0xc4],
+            "the refreshed page keeps the title's dword and takes the GPU's other one"
+        );
+        assert_eq!(
+            second_page, gpu_wrote,
+            "nothing says what the title had on the page never refreshed"
+        );
+        assert_eq!((first, second), (8, 8));
+    }
+
     #[cfg(windows)]
     #[test]
     fn unregister_retires_shadow_until_active_epoch_finishes() {
