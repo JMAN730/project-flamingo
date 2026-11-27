@@ -121,22 +121,46 @@ pub(crate) fn occlusion_heap(
     host_queries(this).map(|q| q.heap.clone())
 }
 
-/// Queries begun on the host and not yet ended: (host list, heap, index).
-/// Each recording list pairs its own `BeginQuery` and `EndQuery`, so lists
-/// recording the same query at once do not end each other's.
+/// Queries begun on the host and not yet ended, by (host list, heap,
+/// index): the query's kind. Each recording list pairs its own `BeginQuery`
+/// and `EndQuery`, so lists recording the same query at once do not end
+/// each other's.
 // shortcut: a list reset between a title's begin and end keeps the entry,
 // which an end in its next recording would then match.
 #[cfg(windows)]
-static OPEN: std::sync::Mutex<Option<std::collections::HashSet<(usize, usize, u32)>>> =
-    std::sync::Mutex::new(None);
+static OPEN: std::sync::Mutex<Option<OpenQueries>> = std::sync::Mutex::new(None);
 
-/// Notes query `index` of `this` begun in host list `list`.
+/// (host list, heap, index) to the query's kind.
 #[cfg(windows)]
-pub(crate) fn begun(this: This, index: u32, list: usize) {
+type OpenQueries = std::collections::HashMap<(usize, usize, u32), u32>;
+
+/// Notes query `index` of `this`, of kind `kind`, begun in host list `list`.
+#[cfg(windows)]
+pub(crate) fn begun(this: This, kind: u32, index: u32, list: usize) {
     OPEN.lock()
         .unwrap_or_else(|e| e.into_inner())
         .get_or_insert_with(Default::default)
-        .insert((list, this as usize, index));
+        .insert((list, this as usize, index), kind);
+}
+
+/// The queries begun in host list `list` and not ended there, as (heap,
+/// kind, index), forgetting them: the list is about to be closed, and a
+/// query may not stay open past the end of its list.
+#[cfg(windows)]
+pub(crate) fn take_open(list: usize) -> Vec<(This, u32, u32)> {
+    let mut open = OPEN.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(open) = open.as_mut() else {
+        return Vec::new();
+    };
+    let mut taken: Vec<(usize, u32, u32)> = open
+        .extract_if(|key, _| key.0 == list)
+        .map(|((_, heap, index), kind)| (heap, kind, index))
+        .collect();
+    taken.sort_unstable();
+    taken
+        .into_iter()
+        .map(|(heap, kind, index)| (heap as This, kind, index))
+        .collect()
 }
 
 /// Whether query `index` of `this` was begun in host list `list` and not
@@ -146,7 +170,7 @@ pub(crate) fn take_begun(this: This, index: u32, list: usize) -> bool {
     OPEN.lock()
         .unwrap_or_else(|e| e.into_inner())
         .as_mut()
-        .is_some_and(|open| open.remove(&(list, this as usize, index)))
+        .is_some_and(|open| open.remove(&(list, this as usize, index)).is_some())
 }
 
 /// Device method.
@@ -285,8 +309,8 @@ mod tests {
         // A heap address no other test uses; never dereferenced.
         let heap = 0x5157_0000_usize as This;
         let (a, b) = (0xa000_usize, 0xb000_usize);
-        begun(heap, 3, a);
-        begun(heap, 3, b);
+        begun(heap, 0, 3, a);
+        begun(heap, 0, 3, b);
         assert!(take_begun(heap, 3, a));
         assert!(take_begun(heap, 3, b));
         // Each end is taken once, and an end without a begin is not.
@@ -294,9 +318,28 @@ mod tests {
         assert!(!take_begun(heap, 3, b));
         assert!(!take_begun(heap, 4, a));
         // Another index of the same list is its own query.
-        begun(heap, 5, a);
+        begun(heap, 0, 5, a);
         assert!(!take_begun(heap, 6, a));
         assert!(take_begun(heap, 5, a));
+    }
+
+    /// A list about to be closed gives up the queries still open in it,
+    /// with their kinds, and only its own.
+    #[cfg(windows)]
+    #[test]
+    fn a_closing_list_gives_up_its_open_queries() {
+        let heap = 0x5157_1000_usize as This;
+        let (a, b) = (0xa100_usize, 0xb100_usize);
+        begun(heap, 0, 7, a);
+        begun(heap, 1, 2, a);
+        begun(heap, 0, 7, b);
+        assert!(take_begun(heap, 7, a));
+        begun(heap, 0, 9, a);
+        assert_eq!(take_open(a), [(heap, 0, 9), (heap, 1, 2)]);
+        assert!(take_open(a).is_empty());
+        // The ends the title records later find nothing to end.
+        assert!(!take_begun(heap, 9, a));
+        assert_eq!(take_open(b), [(heap, 0, 7)]);
     }
 
     /// A new host occlusion heap has a result for every query before the

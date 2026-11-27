@@ -422,6 +422,7 @@ fn hoist(this: This) {
             return;
         };
         if let Some(old) = host.replace(next.clone()) {
+            end_open_queries(&old);
             old.close();
             segments.push(Segment::List(old.clone()));
             state.reapply_host(&next, &old);
@@ -741,15 +742,10 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
         ) {
             // The same title description makes the same host copy unless
             // one lost more top levels than the other.
-            if crate::resource::dropped_mips(dst) != crate::resource::dropped_mips(src) {
-                static ONCE: std::sync::Once = std::sync::Once::new();
-                ONCE.call_once(|| {
-                    tracing::warn!(
-                        "copy skipped: the host textures lost different mip levels to memory"
-                    );
-                });
-                return;
-            }
+            let dropped = (
+                crate::resource::dropped_mips(dst),
+                crate::resource::dropped_mips(src),
+            );
             if crate::texture::title_written(from) {
                 crate::texture::upload(&list, src, from);
             }
@@ -762,8 +758,12 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             list.mark_work();
             #[cfg(feature = "diagnostics")]
             list.note_op(|| format!("copy resource {src:?} to {dst:?}"));
-            // SAFETY: an open list and live textures.
-            unsafe { list.list.CopyResource(to, from) };
+            if dropped.0 == dropped.1 {
+                // SAFETY: an open list and live textures.
+                unsafe { list.list.CopyResource(to, from) };
+            } else {
+                copy_shared_levels(&list, to, from, dropped);
+            }
             mark_work(this);
         } else if let (Some((to, a)), Some((from, b))) = (
             crate::resource::buffer_bytes(dst),
@@ -777,6 +777,84 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
     }
     #[cfg(not(windows))]
     let _ = (this, dst, src);
+}
+
+/// The subresources of host texture `from` copied to the same title
+/// subresources of `to`, for two host copies of one title description that
+/// lost different numbers of top mip levels (`dropped`: `to`'s, `from`'s):
+/// the levels both still have.
+// shortcut: the levels only the destination has keep what they held.
+#[cfg(windows)]
+fn copy_shared_levels(
+    list: &crate::host::HostList,
+    to: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    from: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    dropped: (u32, u32),
+) {
+    use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+    use windows::core::Interface;
+    // SAFETY: live textures.
+    let (d, s) = unsafe { (to.GetDesc(), from.GetDesc()) };
+    let layers = |desc: &windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DESC| {
+        if desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
+            1
+        } else {
+            u32::from(desc.DepthOrArraySize)
+        }
+    };
+    let (to_mips, from_mips) = (u32::from(d.MipLevels), u32::from(s.MipLevels));
+    let (to_layers, from_layers) = (layers(&d), layers(&s));
+    for (to_sub, from_sub) in shared_levels(
+        (to_mips, to_layers, dropped.0),
+        (from_mips, from_layers, dropped.1),
+        crate::device::plane_count(d.Format.0 as u32),
+    ) {
+        // SAFETY: plain data; zeros are a location naming subresource 0.
+        let mut to_location: CopyLocation = unsafe { std::mem::zeroed() };
+        to_location.resource = to.as_raw().cast_const().cast();
+        to_location.footprint.offset = u64::from(to_sub);
+        let mut from_location = to_location;
+        from_location.resource = from.as_raw().cast_const().cast();
+        from_location.footprint.offset = u64::from(from_sub);
+        // SAFETY: an open list; both locations in the host's layout, naming
+        // live textures and subresources they have, of the same size (the
+        // same title level of the same description).
+        unsafe {
+            list.list.CopyTextureRegion(
+                (&raw const to_location).cast(),
+                0,
+                0,
+                0,
+                (&raw const from_location).cast(),
+                None,
+            )
+        };
+    }
+}
+
+/// Pairs of host subresources (destination, source) holding the same title
+/// subresource, for two host copies given as (mip levels, layers, top
+/// levels dropped) with `planes` planes each: every plane and layer of the
+/// title levels neither copy dropped.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn shared_levels(to: (u32, u32, u32), from: (u32, u32, u32), planes: u32) -> Vec<(u32, u32)> {
+    let ((to_mips, to_layers, to_dropped), (from_mips, from_layers, from_dropped)) = (to, from);
+    let layers = to_layers.min(from_layers);
+    let first = to_dropped.max(from_dropped);
+    // Title levels: each copy's own plus the ones it dropped.
+    let last = (to_mips + to_dropped).min(from_mips + from_dropped);
+    let mut out = Vec::new();
+    for plane in 0..planes {
+        for layer in 0..layers {
+            for level in first..last {
+                out.push((
+                    level - to_dropped + (layer + plane * to_layers) * to_mips,
+                    level - from_dropped + (layer + plane * from_layers) * from_mips,
+                ));
+            }
+        }
+    }
+    out
 }
 
 extern "system" fn copy_resource_x(this: This, dst: This, src: This, _flags: u32) {
@@ -1473,16 +1551,42 @@ extern "system" fn begin_query(this: This, heap: This, kind: u32, index: u32) {
                 index,
             )
         };
-        crate::query::begun(heap, index, std::sync::Arc::as_ptr(&list) as usize);
+        crate::query::begun(heap, kind, index, std::sync::Arc::as_ptr(&list) as usize);
         mark_work(this);
     }
     #[cfg(not(windows))]
     let _ = (this, heap, kind, index);
 }
 
+/// Ends the occlusion queries still open in host list `list`, which is
+/// about to be closed in the middle of the title's list (a split): a host
+/// query may not stay open past the end of its list.
+// shortcut: the query then counts only what was drawn before the split;
+// the title's own end, recorded in the next host list, finds nothing to end.
+#[cfg(windows)]
+fn end_open_queries(list: &std::sync::Arc<crate::host::HostList>) {
+    for (heap, kind, index) in crate::query::take_open(std::sync::Arc::as_ptr(list) as usize) {
+        let Some(host_heap) = crate::query::occlusion_heap(heap) else {
+            continue;
+        };
+        // SAFETY: a list still open; the query was begun in it and not
+        // ended since.
+        unsafe {
+            list.list.EndQuery(
+                &host_heap,
+                windows::Win32::Graphics::Direct3D12::D3D12_QUERY_TYPE(kind as i32),
+                index,
+            )
+        };
+    }
+}
+
+#[cfg(not(windows))]
+fn end_open_queries<T>(_: &T) {}
+
 /// `EndQuery(heap, type, index)`: ends a host occlusion query begun in the
-/// same host list (a list split between the two drops the query, whose
-/// last result stays).
+/// same host list (after a list split between the two, the query was ended
+/// at the split, [`end_open_queries`]).
 extern "system" fn end_query(this: This, heap: This, kind: u32, index: u32) {
     #[cfg(windows)]
     if matches!(kind, OCCLUSION | BINARY_OCCLUSION)
@@ -1503,7 +1607,7 @@ extern "system" fn end_query(this: This, heap: This, kind: u32, index: u32) {
         } else {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| {
-                tracing::info!("an occlusion query ended in a host list it was not begun in: its last result stays");
+                tracing::info!("an occlusion query ended in a host list it was not begun in (ended at the list split, or never begun)");
             });
         }
     }
@@ -2162,6 +2266,7 @@ fn record_wait(this: This, address: u64, comparison: u32, reference: u64, mask: 
                 && let Some(prev) = host.take()
             {
                 finish_hoist(&mut segments, &mut state);
+                end_open_queries(&prev);
                 prev.close();
                 segments.push(Segment::List(prev.clone()));
                 match crate::host::host().and_then(|h| h.acquire_list().ok()) {
@@ -2379,6 +2484,28 @@ pub(crate) fn test_slot(list: This, slot_index: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Two host copies of a 5-level, 2-layer texture, one whole and one
+    /// without its top 2 levels: the 3 levels both have pair up, per layer.
+    #[test]
+    fn copies_that_dropped_different_levels_pair_the_levels_both_have() {
+        // Destination whole, source dropped 2.
+        assert_eq!(
+            shared_levels((5, 2, 0), (3, 2, 2), 1),
+            [(2, 0), (3, 1), (4, 2), (7, 3), (8, 4), (9, 5)]
+        );
+        // The other way round.
+        assert_eq!(
+            shared_levels((3, 2, 2), (5, 2, 0), 1),
+            [(0, 2), (1, 3), (2, 4), (3, 7), (4, 8), (5, 9)]
+        );
+        // Both dropped, differently: title levels 3 and 4 remain in both.
+        assert_eq!(shared_levels((4, 1, 1), (2, 1, 3), 1), [(2, 0), (3, 1)]);
+        // A second plane follows every layer of the first.
+        assert_eq!(shared_levels((2, 1, 0), (1, 1, 1), 2), [(1, 0), (3, 1)]);
+        // Nothing in common.
+        assert!(shared_levels((1, 1, 0), (1, 1, 1), 1).is_empty());
+    }
     use crate::object::slot;
 
     #[test]

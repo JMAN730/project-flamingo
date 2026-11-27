@@ -362,7 +362,7 @@ fn format_support(format: u32) -> (u32, u32) {
     }
 }
 
-fn plane_count(format: u32) -> u32 {
+pub(crate) fn plane_count(format: u32) -> u32 {
     1 + u32::from(matches!(format, 19..=22 | 44..=47))
 }
 

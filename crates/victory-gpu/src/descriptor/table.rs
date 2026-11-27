@@ -84,6 +84,10 @@ pub(crate) struct BufferTable {
     /// Views listed since the last draw or dispatch that read the table:
     /// their copy and range, to copy once.
     fresh: Vec<(Arc<Shadow>, u64, u64)>,
+    /// Whether the last [`Self::alias`] found the heap out of free slots
+    /// for a new raw view: slots come back as recordings finish, so the
+    /// record is worth making again.
+    starved: bool,
 }
 
 // SAFETY: `data` is the persistent mapping of `buffer`, written only under
@@ -110,6 +114,7 @@ impl BufferTable {
             aliases: HashMap::new(),
             seen: u64::MAX,
             fresh: Vec::new(),
+            starved: false,
         })
     }
 
@@ -134,7 +139,10 @@ impl BufferTable {
         if let Some(&(slot, _)) = self.aliases.get(&key) {
             return Some((slot, w.bias));
         }
-        let slot = heap.dynamic(1)?;
+        let Some(slot) = heap.dynamic(1) else {
+            self.starved = true;
+            return None;
+        };
         heap.raw_at(slot, shadow, w.start, w.len);
         self.aliases.insert(key, (slot, shadow.clone()));
         Some((slot, w.bias))
@@ -148,6 +156,7 @@ impl BufferTable {
             return;
         }
         self.seen = writes;
+        let mut again = false;
         for index in 0..self.made.len() as u32 {
             let at = start + u64::from(index) * 32;
             // SAFETY: a descriptor slot in title memory.
@@ -166,6 +175,7 @@ impl BufferTable {
                 .then(|| view_at(i, generation))
                 .flatten()
                 .and_then(|view| super::host::selected_buffer(&view));
+            self.starved = false;
             let record = read.and_then(|read| {
                 let offset = read.shadow.offset(read.address);
                 let left = read.shadow.left(read.address);
@@ -182,6 +192,15 @@ impl BufferTable {
                 _ => {}
             }
             self.write(index, record.unwrap_or_default());
+            if record.is_none() && self.starved {
+                // Not made for want of a slot: forgotten, so the next
+                // look makes it, and the next bind looks.
+                self.made[index as usize] = 0;
+                again = true;
+            }
+        }
+        if again {
+            self.seen = u64::MAX;
         }
     }
 

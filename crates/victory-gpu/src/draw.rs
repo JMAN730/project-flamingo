@@ -1178,6 +1178,9 @@ impl State {
                 return;
             }
             done.push((index, uav));
+            // The console reads 27 bits of an index, as `indexed_buffer`
+            // does.
+            let index = index & (u32::MAX >> 5);
             // An index past the heap (a value the title left unset, say)
             // names no view.
             let Some(at) = heap
@@ -1268,7 +1271,8 @@ impl State {
         }
         let heap = crate::descriptor::heap(key as This);
 
-        let at = self.user_value(compute, l.slot, RootType::Constants, l.dword);
+        // The console reads 27 bits of an index.
+        let at = self.user_value(compute, l.slot, RootType::Constants, l.dword) & (u32::MAX >> 5);
         let slot = heap.start.checked_add(u64::from(at) << 5)?;
         heap.index(slot)?;
         let view = crate::descriptor::view(slot)?;
@@ -1941,7 +1945,11 @@ impl State {
         let mut uses_heap = false;
         let mut uses_heap_srv = false;
         let mut uses_heap_uav = false;
-        for stage in &p.stages {
+        // With a mesh program run as a compute pass (a host without mesh
+        // shaders), that pass reads the heap too, and may be the only
+        // stage that does.
+        let fallback = p.fallback.as_ref().map(|f| &f.stage);
+        for stage in p.stages.iter().chain(fallback) {
             for u in &stage.translated().used {
                 if u.root == RootType::ResourceHeap {
                     uses_heap = true;

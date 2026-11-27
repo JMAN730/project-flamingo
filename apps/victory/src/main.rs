@@ -113,8 +113,9 @@ enum Command {
         /// Only these comma-separated hash prefixes.
         #[arg(long)]
         only: Option<String>,
-        /// Thread groups per dispatch, x.
-        #[arg(long, default_value_t = 1)]
+        /// Thread groups per dispatch, x (at least 1: a dispatch of no
+        /// groups runs nothing, and nothing would agree with nothing).
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
         groups: u32,
         /// Translate and plan the bindings only.
         #[arg(long)]

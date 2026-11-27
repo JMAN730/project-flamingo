@@ -26,8 +26,6 @@ pub fn run(
     if let Some(dir) = out.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    let mut report =
-        std::fs::File::create(&out).with_context(|| format!("creating {}", out.display()))?;
     let only: Vec<String> = only
         .unwrap_or_default()
         .split(',')
@@ -38,12 +36,16 @@ pub fn run(
     let mut programs: BTreeMap<String, Vec<u8>> = BTreeMap::new();
     let mut seen = HashSet::new();
     let mut walk_errors = 0;
+    let mut unread = 0;
     for root in &paths {
         for entry in scan_entries(root, &mut walk_errors) {
             if !entry.file_type().is_file() || entry.metadata().map_or(0, |m| m.len()) > MAX_FILE {
                 continue;
             }
             let Ok(data) = std::fs::read(entry.path()) else {
+                // Counted with the entries the walk could not read: the
+                // scan is then reported as incomplete.
+                unread += 1;
                 continue;
             };
             for source in sources(&data) {
@@ -63,6 +65,11 @@ pub fn run(
             }
         }
     }
+    walk_errors += unread;
+    // Made only now, after the inputs are read: a report path that is also
+    // an input would otherwise be emptied before it is scanned.
+    let mut report =
+        std::fs::File::create(&out).with_context(|| format!("creating {}", out.display()))?;
     let harness = Harness::new().map_err(anyhow::Error::msg)?;
     let header = format!(
         "split-diff: {} wave64 compute programs; groups {groups:?}; reference {}",
@@ -106,7 +113,12 @@ pub fn run(
             Outcome::Ran(r) => {
                 let mut parts = Vec::new();
                 let mut class = "agree";
+                // Agreement takes a comparison that ran: a variant that
+                // failed, or none compared at all, leaves it unknown.
+                let (mut compared, mut failed) = (false, false);
                 for v in &r.variants {
+                    compared |= v.result.is_ok() && v.diff.is_some();
+                    failed |= v.result.is_err();
                     let s = match (&v.result, v.diff) {
                         (Err(e), _) => {
                             class = if e.contains("device removed") {
@@ -138,6 +150,9 @@ pub fn run(
                         }
                     };
                     parts.push(s);
+                }
+                if class == "agree" && (failed || !compared) {
+                    class = "incomplete";
                 }
                 if class == "differ" || class == "nondeterministic" {
                     differing.push((hash.clone(), class));

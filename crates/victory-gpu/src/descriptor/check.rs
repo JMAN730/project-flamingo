@@ -303,6 +303,13 @@ pub(crate) fn note(at: D3D12_CPU_DESCRIPTOR_HANDLE, kind: Kind) {
     let old = slots.insert(at.ptr, Slot { kind, read_by: 0 });
     let Some(old) = old else { return };
     if old.read_by == 0 || old.kind == kind {
+        // The same kind written again: whoever read the slot still reads
+        // it, so a later change of kind is still theirs to hear of.
+        if old.kind == kind
+            && let Some(slot) = slots.get_mut(&at.ptr)
+        {
+            slot.read_by = old.read_by;
+        }
         return;
     }
     // SAFETY: the host's own fence.

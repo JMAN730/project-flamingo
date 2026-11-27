@@ -246,6 +246,8 @@ pub(crate) fn held(timeline: &Arc<Timeline>) {
     with(|s| {
         let next = s.ids.len() as u32;
         let queue = *s.ids.entry(k).or_insert(next);
+        // A cause a scan noted for a wait already gone is not this one's.
+        s.causes.remove(&k);
         s.pending.entry(k).or_insert(Pending {
             queue,
             registered: Instant::now(),
