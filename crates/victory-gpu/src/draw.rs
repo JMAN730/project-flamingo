@@ -1096,11 +1096,17 @@ impl State {
         let _mark_after = MarkWorkGuard(list);
         self.depth_sampled = false;
         let l = &list.list;
+        // A mesh program run as a compute pass binds its root views from
+        // the same heap.
         let needs_root_heap = self.heaps[0] == 0
-            && p.stages.iter().any(|stage| {
-                !stage.root_uavs.is_empty()
-                    || (!stage.root_srvs.is_empty() && crate::pipeline::host::bounded_root_srvs())
-            });
+            && p.stages
+                .iter()
+                .chain(p.fallback.as_ref().map(|f| &f.stage))
+                .any(|stage| {
+                    !stage.root_uavs.is_empty()
+                        || (!stage.root_srvs.is_empty()
+                            && crate::pipeline::host::bounded_root_srvs())
+                });
         if !self.bind_heaps(list, needs_root_heap) {
             return false;
         }
@@ -2324,6 +2330,10 @@ impl State {
         if x == 0 {
             return true;
         }
+        // No dispatch has more groups in a dimension; a count past that
+        // (a value the title left unset) would otherwise record millions
+        // of parts.
+        let x = x.min(GROUPS_MOST);
         let bytes = u64::from(x) * f.group_bytes;
         let buffer = list.mesh_buffer(bytes);
         // A dispatch has at most `GROUPS_MOST` groups in a dimension.
@@ -3564,6 +3574,9 @@ impl State {
             #[cfg(feature = "diagnostics")]
             self.frame_op("indirect mesh as compute and draw", false, ran);
             if ran {
+                // The compute pass may have stored to an argument buffer a
+                // later indirect draw reads through the window.
+                self.window = None;
                 self.note_gather_writes(list, p, false);
                 DRAWN.fetch_add(1, Ordering::Relaxed);
                 MESH_WITHOUT_MESH_SHADERS[1].fetch_add(1, Ordering::Relaxed);

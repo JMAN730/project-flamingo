@@ -587,7 +587,19 @@ fn translate(
     else {
         return t.fail(None, "no DXIL part (SM5 or older)".into(), example);
     };
-    if !lock(seen).insert(blake3::hash(program)) && !list {
+    // One program is tallied once, whatever containers carry it. With
+    // `VICTORY_WAVE_WIDE_ONLY` the lowering is chosen by the container's
+    // hash, so containers sharing a program can lower differently, and
+    // each is tallied.
+    static BY_CONTAINER: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let by_container =
+        *BY_CONTAINER.get_or_init(|| std::env::var_os("VICTORY_WAVE_WIDE_ONLY").is_some());
+    let key = if by_container {
+        blake3::hash(&bytes)
+    } else {
+        blake3::hash(program)
+    };
+    if !lock(seen).insert(key) && !list {
         t.duplicates += 1;
         return;
     }
@@ -756,10 +768,10 @@ fn check_barycentric(
     let fallback = match fallback {
         Ok(f) => f,
         Err(e) => {
+            // A program that needs none and whose fallback did not emit is
+            // a failure (reported below), not one that emits differently.
             if needs {
                 t.barycentric[0] += 1;
-            } else {
-                t.barycentric_same[1] += 1;
             }
             return t.fail(
                 Some(HwStage::Ps),

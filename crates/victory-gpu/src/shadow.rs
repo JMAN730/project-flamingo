@@ -467,6 +467,11 @@ pub(crate) struct Shadow {
     /// Per page of title memory from `start`'s on: the write-watch asking
     /// after which it was last copied (0: never).
     copied: Mutex<Vec<u64>>,
+    /// Per page of title memory from `start`'s on: whether any of it was
+    /// ever copied from title memory to the copy (a refresh of any part,
+    /// watched or not). Until then the copy's bytes there say nothing of
+    /// what the title holds.
+    refreshed: Box<[std::sync::atomic::AtomicBool]>,
     /// Whether the memory is write-watched: unknown, yes, no.
     watched: AtomicU8,
     /// Ranges shaders of a submission not yet copied back may be writing:
@@ -1640,6 +1645,7 @@ impl Shadow {
             len,
             born_seq: crate::host::birth_seq(),
             copied: Mutex::new(Vec::new()),
+            refreshed: Box::default(),
             watched: AtomicU8::new(NOT_WATCHED),
             pending: Mutex::default(),
             flights: Mutex::default(),
@@ -1671,6 +1677,9 @@ impl Shadow {
             len,
             born_seq: crate::host::birth_seq(),
             copied: Mutex::new(vec![0; pages as usize]),
+            refreshed: (0..pages)
+                .map(|_| std::sync::atomic::AtomicBool::new(false))
+                .collect(),
             watched: AtomicU8::new(0),
             pending: Mutex::default(),
             flights: Mutex::default(),
@@ -2413,18 +2422,18 @@ impl Shadow {
         changed
     }
 
-    /// Whether no page of title memory `[address, address + len)` was ever
-    /// copied to this copy (`false` for a copy that keeps no such record).
+    /// Whether no part of the pages of title memory `[address, address +
+    /// len)` was ever copied to this copy (`false` for a copy that keeps no
+    /// such record).
     fn never_copied(&self, address: usize, len: usize) -> bool {
         if len == 0 {
             return false;
         }
         let base = self.start as usize / PAGE;
-        let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
         (address / PAGE..=(address + len - 1) / PAGE).all(|page| {
             page.checked_sub(base)
-                .and_then(|i| copied.get(i))
-                .is_some_and(|&taken| taken == 0)
+                .and_then(|i| self.refreshed.get(i))
+                .is_some_and(|seen| !seen.load(Ordering::Acquire))
         })
     }
 
@@ -3813,6 +3822,15 @@ impl Shadow {
             }
             let off = from - start;
             let len = to - from;
+            // From here on the copy holds title bytes on these pages (a
+            // segment that then fails to copy is copied again, or leaves
+            // the page for the title's side of the copy-back rule).
+            let base = start / PAGE;
+            for page in from / PAGE..=(to - 1) / PAGE {
+                if let Some(seen) = self.refreshed.get(page - base) {
+                    seen.store(true, Ordering::Release);
+                }
+            }
             out.push(CopySeg {
                 src: from,
                 dst: (self.data as usize) + off,
