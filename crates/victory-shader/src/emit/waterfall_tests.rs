@@ -30,6 +30,58 @@ fn build_any(words: &[u32], buffers: bool) -> (HostShader, lower::Lowered) {
 }
 
 fn build_with_view(words: &[u32], buffer_stride: Option<u32>) -> (HostShader, lower::Lowered) {
+    let native = program(words, buffer_stride);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let lowered = lower::lower(&lower::Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+        mesh_buffer: false,
+    })
+    .expect("lower");
+    let static_samplers = lowered
+        .samplers
+        .iter()
+        .enumerate()
+        .map(|(n, &w)| {
+            let mut s = super::StaticSampler::from_words(w);
+            if lowered.cmp_samplers >> n & 1 != 0 {
+                s.filter |= 0x80;
+            }
+            s
+        })
+        .collect();
+    let shader = HostShader {
+        stage: HwStage::Cs,
+        dxil: lowered.dxil.clone(),
+        user_data: lowered.user_data.clone(),
+        samplers: lowered.samplers.clone(),
+        static_samplers,
+        root_cbvs: lowered.root_cbvs.clone(),
+        root_srvs: lowered.root_srvs.clone(),
+        root_uavs: lowered.root_uavs.clone(),
+        structured_srvs: Vec::new(),
+    };
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut shader.dxil.clone())
+            .expect("DXIL validation failed");
+    } else {
+        eprintln!("no dxil.dll; validation skipped");
+    }
+    (shader, lowered)
+}
+
+/// The wave32 compute program of 32 threads `build` lowers.
+fn program(words: &[u32], buffer_stride: Option<u32>) -> NativeProgram {
     let table = |user_data: u8| RootParam {
         root: RootType::Table,
         table_offset_dwords: 0,
@@ -53,7 +105,7 @@ fn build_with_view(words: &[u32], buffer_stride: Option<u32>) -> (HostShader, lo
     } else {
         range(ResourceType::Srv, 0, 8, 0, 0)
     };
-    let native = NativeProgram {
+    NativeProgram {
         stage: HwStage::Cs,
         wave64: false,
         vgprs: 32,
@@ -68,40 +120,7 @@ fn build_with_view(words: &[u32], buffer_stride: Option<u32>) -> (HostShader, lo
             threads: [32, 1, 1],
         }),
         code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
-    };
-    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
-    let st = structure::structure(&p).expect("structure");
-    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
-    let io = io::raise(&p, &native).expect("io::raise");
-    let lowered = lower::lower(&lower::Parts {
-        native: &native,
-        p: &p,
-        st: &st,
-        io: &io,
-        res: &res,
-        inputs: Vec::new(),
-        outputs: Vec::new(),
-        prims: Vec::new(),
-        mesh_stride: 0,
-    })
-    .expect("lower");
-    let shader = HostShader {
-        stage: HwStage::Cs,
-        dxil: lowered.dxil.clone(),
-        user_data: lowered.user_data.clone(),
-        samplers: lowered.samplers.clone(),
-        static_samplers: Vec::new(),
-        root_cbvs: lowered.root_cbvs.clone(),
-        root_srvs: lowered.root_srvs.clone(),
-        root_uavs: lowered.root_uavs.clone(),
-    };
-    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
-        v.validate(&mut shader.dxil.clone())
-            .expect("DXIL validation failed");
-    } else {
-        eprintln!("no dxil.dll; validation skipped");
     }
-    (shader, lowered)
 }
 
 /// Runs `shader` with `views` at heap indices 0.. (the UAV last) on the
@@ -109,6 +128,16 @@ fn build_with_view(words: &[u32], buffer_stride: Option<u32>) -> (HostShader, lo
 /// per one that ran, the UAV's 32 dwords. Empty when no SM 6.6 device is
 /// available: callers return early (`docs/code-standards.md`).
 fn run(shader: &HostShader, views: &[View]) -> Vec<(&'static str, Vec<u32>)> {
+    run_with_table(shader, views, None)
+}
+
+/// [`run`], the host's buffer view table (see `UserData`) at heap index
+/// `table` when the shader reads one.
+fn run_with_table(
+    shader: &HostShader,
+    views: &[View],
+    table: Option<u32>,
+) -> Vec<(&'static str, Vec<u32>)> {
     let samplers = [D3D12_SAMPLER_DESC {
         Filter: D3D12_FILTER_MIN_MAG_MIP_POINT,
         AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
@@ -138,8 +167,11 @@ fn run(shader: &HostShader, views: &[View]) -> Vec<(&'static str, Vec<u32>)> {
         // Both tables start at heap index 0.
         let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
         for u in &shader.user_data {
-            assert_eq!(u.root, RootType::Table, "{u:?}");
-            ud[u.index as usize] = 0;
+            ud[u.index as usize] = match u.root {
+                RootType::Table => 0,
+                RootType::ResourceHeap => table.expect("a buffer view table"),
+                _ => panic!("{u:?}"),
+            };
         }
         let words = host
             .dispatch(
@@ -222,6 +254,211 @@ fn lanes_sample_the_texture_their_arm_loaded_or_picked() {
 }
 
 #[test]
+fn lanes_holding_data_for_a_descriptor_sample_heap_index_zero() {
+    use crate::resource::tests::waterfall_joined_data_wave32;
+    // Lanes below 16 hold the second entry's descriptor, the others what the
+    // program computed in its registers (a lane's data, no descriptor).
+    let shader = build(&waterfall_joined_data_wave32(false), false);
+    let results = sampled(&shader);
+    if !device_ran(&results) {
+        return;
+    }
+    for (label, red) in results {
+        // shortcut: the lanes that hold data read heap index 0 (the first
+        // texture); on the console they read whatever those words name.
+        let want: Vec<f32> = (0..32).map(|l| if l < 16 { 2.0 } else { 1.0 }).collect();
+        assert_eq!(red, want, "{label}");
+    }
+}
+
+/// A uniform if/else (on the sampler table's address in s1, which is 0 in
+/// the tests) joining the two samplers a 2x1 texture is sampled at u = 1.25
+/// with. `first` takes the first arm: clamp (word 0 is 2) as an immediate
+/// sampler or, with `heap`, the heap sampler at index 0 (clamp, as `run`
+/// makes it). The other arm is the immediate wrap sampler (word 0 is 0).
+fn joined_samplers(first: bool, heap: bool) -> Vec<u32> {
+    let mut words = vec![
+        0xBE84_0300, // s_mov_b32 s4, s0
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xBE86_0301, // s_mov_b32 s6, s1
+        0xBE87_0380, // s_mov_b32 s7, 0
+        0xF40C_0302,
+        0xFA00_0000, // s_load_dwordx8 s[12:19], s[4:5], 0x0
+        0xF408_0A02,
+        0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
+        0x7E04_02FF,
+        0x3FA0_0000,                                   // v_mov_b32 v2, 1.25
+        0x7E06_02F0,                                   // v_mov_b32 v3, 0.5
+        0x3420_0082,                                   // v_lshlrev_b32 v16, 2, v0
+        if first { 0xBF06_8001 } else { 0xBF06_8101 }, // s_cmp_eq_u32 s1, 0 or 1
+    ];
+    if heap {
+        words.extend([
+            0xBF84_0003, // s_cbranch_scc0 -> else
+            0xF408_0203,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[6:7], 0x0 (the heap sampler)
+            0xBF82_0004, // s_branch -> join
+            0xBE88_0380, // s_mov_b32 s8, 0
+            0xBE89_0380, // s_mov_b32 s9, 0
+            0xBE8A_0380, // s_mov_b32 s10, 0
+            0xBE8B_0380, // s_mov_b32 s11, 0
+        ]);
+    } else {
+        words.extend([
+            0xBF84_0002, // s_cbranch_scc0 -> else
+            0xB008_0002, // s_movk_i32 s8, 2 (clamp)
+            0xBF82_0001, // s_branch -> join
+            0xBE88_0380, // s_mov_b32 s8, 0 (wrap)
+            0xBE89_0380, // s_mov_b32 s9, 0
+            0xBE8A_0380, // s_mov_b32 s10, 0
+            0xBE8B_0380, // s_mov_b32 s11, 0
+        ]);
+    }
+    words.extend([
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xF09C_0F08,
+        0x0043_0C02, // image_sample_lz v[12:15], v[2:3], s[12:19], s[8:11] dmask:0xf dim:SQ_RSRC_IMG_2D
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0xE070_1000,
+        0x800A_0C10, // buffer_store_dword v12, v16, s[40:43], 0 offen
+        0xBF81_0000, // s_endpgm
+    ]);
+    words
+}
+
+#[test]
+fn a_sampler_chosen_by_control_flow_is_sampled_with_each_choice() {
+    for heap in [false, true] {
+        for first in [true, false] {
+            let words = joined_samplers(first, heap);
+            // Not what every other program is lowered as: a join of
+            // immediate samplers is refused in the first tries.
+            let native = program(&words, None);
+            let p = ir::build(&native.code, false, native.vgprs).unwrap();
+            let st = structure::structure(&p).unwrap();
+            let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+            let io = io::raise(&p, &native).unwrap();
+            let parts = lower::Parts {
+                native: &native,
+                p: &p,
+                st: &st,
+                io: &io,
+                res: &res,
+                inputs: Vec::new(),
+                outputs: Vec::new(),
+                prims: Vec::new(),
+                mesh_stride: 0,
+                mesh_buffer: false,
+            };
+            let refusal = lower::lower_with_wave32(&parts, true, None, None, false);
+            let refusal = refusal.err().expect("refused outside the last chance");
+            assert!(
+                refusal.to_string().contains("chosen by control flow"),
+                "{refusal}"
+            );
+            // Lowered (and validated by `dxil.dll` when present) with the
+            // last chance. The immediate samplers: wrap and, but with the
+            // heap's, clamp (the heap one is a descriptor, not a binding).
+            let (shader, lowered) = build_any(&words, false);
+            assert_eq!(
+                lowered.samplers.len(),
+                if heap { 1 } else { 2 },
+                "{heap} {first}"
+            );
+            // At u = 1.25 of two texels wrap reads the first, clamp the
+            // second. The UAV is the table's third entry.
+            let texels = [[1.0f32, 0.0, 0.0, 1.0], [2.0, 0.0, 0.0, 1.0]];
+            let spare = [[0.0f32; 4]];
+            let views = [
+                View::Texture(2, 1, &texels),
+                View::Texture(1, 1, &spare),
+                View::RawUav(32),
+            ];
+            let results = run(&shader, &views);
+            if !device_ran(&results) {
+                return;
+            }
+            for (label, got) in results {
+                let red: Vec<f32> = got.into_iter().map(f32::from_bits).collect();
+                // The first arm's sampler clamps, the other wraps.
+                let want = if first { 2.0 } else { 1.0 };
+                assert_eq!(red, vec![want; 32], "{label} heap {heap} first {first}");
+            }
+        }
+    }
+}
+
+/// Cube sampling of lane `l`'s face `l & 3` at (1.25, 1.75): `d` with the
+/// gradients 0 or, for `steep`, 1.0 (`image_sample_d`, face coordinates'
+/// gradients first), else `image_sample_lz`. The red channel of the cube's
+/// texels is their face number.
+fn cube_sample(d: bool, steep: bool) -> Vec<u32> {
+    let mut words = vec![
+        0xBE84_0300, // s_mov_b32 s4, s0
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xBE86_0301, // s_mov_b32 s6, s1
+        0xBE87_0380, // s_mov_b32 s7, 0
+        0xF40C_0302,
+        0xFA00_0000, // s_load_dwordx8 s[12:19], s[4:5], 0x0
+        0xF408_0203,
+        0xFA00_0000, // s_load_dwordx4 s[8:11], s[6:7], 0x0
+        0xF408_0A02,
+        0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
+        0x3420_0082, // v_lshlrev_b32 v16, 2, v0
+        0x3612_0083, // v_and_b32 v9, 3, v0
+        0x7E10_0D09, // v_cvt_f32_u32 v8, v9
+        0x7E0C_02FF,
+        0x3FA0_0000, // v_mov_b32 v6, 1.25
+        0x7E0E_02FF,
+        0x3FE0_0000, // v_mov_b32 v7, 1.75
+    ];
+    if d {
+        let gradient = if steep { 0x7E00_02F2 } else { 0x7E00_0280 }; // v_mov_b32 v0, 1.0 or 0
+        for v in 2..6u32 {
+            // v_mov_b32 v<v>, 1.0 or 0
+            words.push(gradient | v << 17);
+        }
+    }
+    words.extend([
+        0xBF8C_C07F,                               // s_waitcnt lgkmcnt(0)
+        if d { 0xF088_0F18 } else { 0xF09C_0F18 }, // image_sample_d or _lz, dim:CUBE
+        if d { 0x0043_0C02 } else { 0x0043_0C06 }, // address from v2 (v6 for lz)
+        0xBF8C_3F70,                               // s_waitcnt vmcnt(0)
+        0xE070_1000,
+        0x800A_0C10, // buffer_store_dword v12, v16, s[40:43], 0 offen
+        0xBF81_0000, // s_endpgm
+    ]);
+    words
+}
+
+#[test]
+fn a_cube_sample_with_gradients_takes_the_face_the_coordinates_name() {
+    // 4x4 texels per face, 6 faces: the red of a texel is its face.
+    let texels: Vec<[f32; 4]> = (0..96).map(|i| [(i / 16) as f32, 0.0, 0.0, 1.0]).collect();
+    // Faces 0-3 by lane: the same with or without gradients, steep or not
+    // (the view has one level).
+    let want: Vec<f32> = (0..32).map(|l| (l & 3) as f32).collect();
+    for (d, steep) in [(false, false), (true, false), (true, true)] {
+        let (shader, _) = build_any(&cube_sample(d, steep), false);
+        // The UAV is the table's third entry.
+        let spare = [[0.0f32; 4]];
+        let views = [
+            View::Cube(4, &texels),
+            View::Texture(1, 1, &spare),
+            View::RawUav(32),
+        ];
+        let results = run(&shader, &views);
+        if !device_ran(&results) {
+            return;
+        }
+        for (label, got) in results {
+            let red: Vec<f32> = got.into_iter().map(f32::from_bits).collect();
+            assert_eq!(red, want, "{label}, gradients {d} steep {steep}");
+        }
+    }
+}
+
+#[test]
 fn lanes_load_from_the_buffer_their_nested_arms_chose() {
     use crate::resource::tests::WATERFALL_JOINED_BUFFER_WAVE32;
     let shader = build(WATERFALL_JOINED_BUFFER_WAVE32, true);
@@ -254,6 +491,102 @@ fn lanes_load_from_the_buffer_their_nested_arms_chose() {
             .collect();
         assert_eq!(got, want, "{label}");
     }
+}
+
+/// `WATERFALL_INDEXED_WAVE32` (each lane's entry at a byte offset only the
+/// loop's first lane names) loading element `lane` of a buffer instead of
+/// sampling: a view no fixed table entry names.
+fn indexed_buffer_waterfall() -> Vec<u32> {
+    use crate::resource::tests::WATERFALL_INDEXED_WAVE32;
+    let mut words = WATERFALL_INDEXED_WAVE32.to_vec();
+    let at = words.iter().position(|&w| w == 0xF40C_0302).unwrap();
+    // s_load_dwordx4 s[12:15], s[4:5], s20
+    words[at] = 0xF408_0302;
+    let at = words.iter().position(|&w| w == 0xF09C_0F08).unwrap();
+    // buffer_load_dword v12, v0, s[12:15], 0 idxen
+    words[at] = 0xE030_2000;
+    words[at + 1] = 0x8003_0C00;
+    words
+}
+
+#[test]
+fn lanes_load_with_the_stride_and_view_the_host_table_lists() {
+    // No stride in the program's metadata (0): only the views know it.
+    let (shader, _) = build_with_view(&indexed_buffer_waterfall(), Some(0));
+    assert!(
+        shader
+            .user_data
+            .iter()
+            .any(|u| u.root == RootType::ResourceHeap && !u.indexed_buffer),
+        "{:?}",
+        shader.user_data
+    );
+    // The table at heap index 3 lists entry 0 as 8-byte elements from byte
+    // 0 of the raw view at 4, entry 1 as 12-byte elements from byte 16 of
+    // the one at 5 (20 elements: lanes past them read zeros).
+    let mut table = vec![0u32; 4 * 8];
+    table[..4].copy_from_slice(&[4, 8, 0, 32]);
+    table[4..8].copy_from_slice(&[5, 12, 16, 20]);
+    let first: Vec<u32> = (0..64)
+        .map(|i| if i % 2 == 0 { 100 + i / 2 } else { 0xDEAD })
+        .collect();
+    let mut second = vec![0xBEEF; 4];
+    for i in 0..32 {
+        second.extend([200 + i, 0xDEAD, 0xDEAD]);
+    }
+    let unread = [0u32; 4];
+    let views = [
+        View::Buffer {
+            data: &unread,
+            stride: Stride::Raw,
+        },
+        View::Buffer {
+            data: &unread,
+            stride: Stride::Raw,
+        },
+        View::RawUav(32),
+        View::Buffer {
+            data: &table,
+            stride: Stride::Raw,
+        },
+        View::Buffer {
+            data: &first,
+            stride: Stride::Raw,
+        },
+        View::Buffer {
+            data: &second,
+            stride: Stride::Raw,
+        },
+    ];
+    let results = run_with_table(&shader, &views, Some(3));
+    if !device_ran(&results) {
+        return;
+    }
+    for (label, got) in results {
+        // Element `lane` of the first view in even lanes, of the second in
+        // odd ones below 20 (its element count), zeros past it.
+        let want: Vec<u32> = (0..32)
+            .map(|l| match (l % 2, l) {
+                (0, _) => 100 + l,
+                (_, 0..20) => 200 + l,
+                _ => 0,
+            })
+            .collect();
+        assert_eq!(got, want, "{label}");
+    }
+}
+
+#[test]
+fn a_buffer_of_known_stride_reads_no_host_table() {
+    let (shader, _) = build_with_view(&indexed_buffer_waterfall(), Some(4));
+    assert!(
+        shader
+            .user_data
+            .iter()
+            .all(|u| u.root != RootType::ResourceHeap),
+        "{:?}",
+        shader.user_data
+    );
 }
 
 #[test]
@@ -477,6 +810,45 @@ fn scalar_structured_load_and_record_count_use_the_same_view() {
             for (label, result) in results {
                 assert_eq!(result, vec![expected; 32], "{label}");
             }
+        }
+    }
+}
+
+/// A raw view's record count is its size in bytes, read from the same
+/// descriptor the scalar load takes whole: the program has no stride to
+/// give, so the view is raw like the load's.
+#[test]
+fn scalar_load_and_record_count_use_the_same_raw_view() {
+    #[rustfmt::skip]
+    let words = [
+        0xbe840300, 0xbe850380,     // s[4:5] = view table
+        0xf4080202, 0xfa000000,     // s_load_dwordx4 s[8:11], s[4:5], 0
+        0xf4080302, 0xfa000040,     // s_load_dwordx4 s[12:15], s[4:5], 64
+        0xf4200404, 0xfa000014,     // s_buffer_load_dword s16, s[8:11], 20
+        0x80110a10,                 // s_add_u32 s17, s16, s10 (record count)
+        0x7e020211,                 // v_mov_b32 v1, s17
+        0x34040082,                 // v_lshlrev_b32 v2, 2, v0 (lane * 4)
+        0xe0701000, 0x80030102,     // buffer_store_dword v1, v2, s[12:15], 0 offen
+        0xbf810000,                 // s_endpgm
+    ];
+    let (shader, _) = build_with_view(&words, Some(0));
+    for dwords in [8usize, 16] {
+        let data: Vec<u32> = (0..dwords as u32).map(|n| 0x100 + n).collect();
+        let views = [
+            View::Buffer {
+                data: &data,
+                stride: Stride::Raw,
+            },
+            View::Texture(1, 1, &[[0.0; 4]]),
+            View::RawUav(32),
+        ];
+        let results = run(&shader, &views);
+        if !device_ran(&results) {
+            return;
+        }
+        for (label, result) in results {
+            let want = data[5] + 4 * dwords as u32;
+            assert_eq!(result, vec![want; 32], "{label}: {dwords} dwords");
         }
     }
 }

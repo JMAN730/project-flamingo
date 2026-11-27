@@ -437,6 +437,18 @@ pub struct UsedResource {
     pub slot: u8,
 }
 
+/// The native programs of a container: those of its `DXIL` part, or else
+/// the compute program of its `ACCC` part ([`crate::accc`]).
+pub fn container_programs(c: &crate::Container<'_>) -> Result<Vec<NativeProgram>, ShaderError> {
+    match c.part(crate::FourCC::DXIL) {
+        Some(dxil) => native_programs(dxil.data),
+        None if !crate::switch::no_accc() && c.part(crate::accc::ACCC).is_some() => {
+            crate::accc::accc_programs(c)
+        }
+        None => Err(Malformed("no DXIL part")),
+    }
+}
+
 /// The native programs in a `DXIL` part's data; empty for the PC layout.
 pub fn native_programs(part: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
     if part.get(XDAT_OFFSET..XDAT_OFFSET + 4) != Some(b"XDAT") {
@@ -531,83 +543,13 @@ fn programs(fssm: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
                 slot: e[17],
             })
             .collect::<Vec<RootParam>>();
-        // A parameter's SGPRs must exist: `user_sgpr` and the high half of a
-        // root descriptor are computed from these bytes ([`sgpr_span`]).
-        if layout.iter().any(|p| {
-            let (first, span) = sgpr_span(stage, p);
-            u64::from(first) + u64::from(span) > u64::from(SGPRS)
-        }) {
-            return Err(Malformed("root parameter outside the SGPRs"));
-        }
-        // A table or heap parameter is one 32-bit address. Resource tracking
-        // maps each SGPR it states to the parameter (`resource::param_of`),
-        // and the host fills every dword of a table with that address
-        // (`draw::user_value`; lowering reads a heap's as 0), so an SGPR past
-        // the first would silently read the address too.
-        if layout.iter().any(|p| {
-            matches!(
-                p.root,
-                RootType::Table | RootType::ResourceHeap | RootType::SamplerHeap
-            ) && p.sgprs > 1
-        }) {
-            return Err(Malformed("root address wider than one SGPR"));
-        }
-        // Resource tracking maps an SGPR to the first parameter covering it
-        // (`resource::param_of`), so a second parameter over the same SGPR
-        // would have its reads attributed to the first. The ranges of one
-        // table share its SGPR (and its address), so only different slots
-        // are refused.
-        if !params_apart(stage, &layout) {
-            return Err(Malformed("root parameters share an SGPR"));
-        }
         let used = table(RECORD_USED, RECORD_COUNTS + 4)?
             .as_chunks::<{ ENTRY_SIZE as usize }>()
             .0
             .iter()
-            .map(|e| UsedResource {
-                kind: match e[0] {
-                    0 => ResourceType::Srv,
-                    1 => ResourceType::Sampler,
-                    2 => ResourceType::Cbv,
-                    3 => ResourceType::Uav,
-                    n => ResourceType::Other(n),
-                },
-                root: RootType::from_raw(e[1].into()),
-                table_offset_dwords: le32(e, 4),
-                lower_bound: le32(e, 8),
-                stride: le32(e, 12),
-                dwords: e[16],
-                user_data: e[17],
-                slot: e[18],
-            })
+            .map(used_entry)
             .collect::<Vec<UsedResource>>();
-        // The host binds a table read by its root slot (`draw::tables`),
-        // while lowering finds what a read is by the table address's SGPR
-        // (`used_kind`). A read naming no table parameter with both would be
-        // classified from one table and its descriptors bound from another,
-        // or from none. A root descriptor's read is likewise found by its
-        // SGPR (`handle`, which picks CBV or SRV from it) and bound by the
-        // parameter's slot, so it must name that parameter with both too.
-        let named = |u: &UsedResource| {
-            layout
-                .iter()
-                .any(|p| p.root == u.root && p.slot == u.slot && p.user_data == u.user_data)
-        };
-        if used.iter().any(|u| u.root == RootType::Table && !named(u)) {
-            return Err(Malformed("used descriptor names no root table"));
-        }
-        if used
-            .iter()
-            .any(|u| u.root == RootType::Descriptor && !named(u))
-        {
-            return Err(Malformed("used descriptor names no root descriptor"));
-        }
-        if !used_one_way(&used) {
-            return Err(Malformed("used descriptors read one descriptor two ways"));
-        }
-        if !tables_one_heap(&used) {
-            return Err(Malformed("root table mixes samplers and views"));
-        }
+        check_resources(stage, &layout, &used)?;
         // The record is in bounds, so its end is too.
         let stage_data = &payload[(start + RECORD_SIZE) as usize..];
         let io = match stage {
@@ -630,6 +572,93 @@ fn programs(fssm: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
     Ok(out)
 }
 
+/// A used-resource entry: 20 bytes, the same in an `XDAT` record's table
+/// and in an `ACCC` part's resource records.
+pub(crate) fn used_entry(e: &[u8; ENTRY_SIZE as usize]) -> UsedResource {
+    UsedResource {
+        kind: match e[0] {
+            0 => ResourceType::Srv,
+            1 => ResourceType::Sampler,
+            2 => ResourceType::Cbv,
+            3 => ResourceType::Uav,
+            n => ResourceType::Other(n),
+        },
+        root: RootType::from_raw(e[1].into()),
+        table_offset_dwords: le32(e, 4),
+        lower_bound: le32(e, 8),
+        stride: le32(e, 12),
+        dwords: e[16],
+        user_data: e[17],
+        slot: e[18],
+    }
+}
+
+/// Refuses a root layout and used-resource list that lowering and the host
+/// would read inconsistently (each check says why).
+pub(crate) fn check_resources(
+    stage: HwStage,
+    layout: &[RootParam],
+    used: &[UsedResource],
+) -> Result<(), ShaderError> {
+    // A parameter's SGPRs must exist: `user_sgpr` and the high half of a
+    // root descriptor are computed from these bytes ([`sgpr_span`]).
+    if layout.iter().any(|p| {
+        let (first, span) = sgpr_span(stage, p);
+        u64::from(first) + u64::from(span) > u64::from(SGPRS)
+    }) {
+        return Err(Malformed("root parameter outside the SGPRs"));
+    }
+    // A table or heap parameter is one 32-bit address. Resource tracking
+    // maps each SGPR it states to the parameter (`resource::param_of`),
+    // and the host fills every dword of a table with that address
+    // (`draw::user_value`; lowering reads a heap's as 0), so an SGPR past
+    // the first would silently read the address too.
+    if layout.iter().any(|p| {
+        matches!(
+            p.root,
+            RootType::Table | RootType::ResourceHeap | RootType::SamplerHeap
+        ) && p.sgprs > 1
+    }) {
+        return Err(Malformed("root address wider than one SGPR"));
+    }
+    // Resource tracking maps an SGPR to the first parameter covering it
+    // (`resource::param_of`), so a second parameter over the same SGPR
+    // would have its reads attributed to the first. The ranges of one
+    // table share its SGPR (and its address), so only different slots
+    // are refused.
+    if !params_apart(stage, layout) {
+        return Err(Malformed("root parameters share an SGPR"));
+    }
+    // The host binds a table read by its root slot (`draw::tables`),
+    // while lowering finds what a read is by the table address's SGPR
+    // (`used_kind`). A read naming no table parameter with both would be
+    // classified from one table and its descriptors bound from another,
+    // or from none. A root descriptor's read is likewise found by its
+    // SGPR (`handle`, which picks CBV or SRV from it) and bound by the
+    // parameter's slot, so it must name that parameter with both too.
+    let named = |u: &UsedResource| {
+        layout
+            .iter()
+            .any(|p| p.root == u.root && p.slot == u.slot && p.user_data == u.user_data)
+    };
+    if used.iter().any(|u| u.root == RootType::Table && !named(u)) {
+        return Err(Malformed("used descriptor names no root table"));
+    }
+    if used
+        .iter()
+        .any(|u| u.root == RootType::Descriptor && !named(u))
+    {
+        return Err(Malformed("used descriptor names no root descriptor"));
+    }
+    if !used_one_way(used) {
+        return Err(Malformed("used descriptors read one descriptor two ways"));
+    }
+    if !tables_one_heap(used) {
+        return Err(Malformed("root table mixes samplers and views"));
+    }
+    Ok(())
+}
+
 /// A compute program's dispatch settings. `COMPUTE_PGM_RSRC2.LDS_SIZE` is a
 /// 9-bit count of 512-byte granules, so it can state up to 255.5 KiB, which
 /// lowering would declare as the group's shared memory; like a mesh group's,
@@ -640,10 +669,22 @@ fn programs(fssm: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
 /// parameter covering one of those SGPRs would make the same register both a
 /// root parameter and a group id, so such a layout is refused.
 fn compute_io(data: &[u8], layout: &[RootParam]) -> Result<ComputeIo, ShaderError> {
+    let mut threads = [0; 3];
+    for (k, n) in threads.iter_mut().enumerate() {
+        *n = u32_at(data, CS_THREADS + 4 * k)?;
+    }
     let cs = ComputeIo {
         rsrc2: u32_at(data, CS_RSRC2)?,
-        threads: group_size(data)?,
+        threads: group_size(threads)?,
     };
+    checked_compute(cs, layout)
+}
+
+/// [`compute_io`]'s checks of dispatch settings read from anywhere.
+pub(crate) fn checked_compute(
+    cs: ComputeIo,
+    layout: &[RootParam],
+) -> Result<ComputeIo, ShaderError> {
     if cs.lds_bytes() > MAX_LDS_BYTES {
         return Err(Malformed("implausible LDS size"));
     }
@@ -737,11 +778,7 @@ fn tables_one_heap(used: &[UsedResource]) -> bool {
 /// components and writes them as the DXIL `numthreads`, so each must be one
 /// that HLSL allows: a zero or oversized group is refused here rather than
 /// overflowing that product (a debug panic) or emitting an invalid shader.
-fn group_size(data: &[u8]) -> Result<[u32; 3], ShaderError> {
-    let mut threads = [0; 3];
-    for (k, n) in threads.iter_mut().enumerate() {
-        *n = u32_at(data, CS_THREADS + 4 * k)?;
-    }
+pub(crate) fn group_size(threads: [u32; 3]) -> Result<[u32; 3], ShaderError> {
     // Each component is checked first, so the product fits a u64.
     if threads
         .iter()

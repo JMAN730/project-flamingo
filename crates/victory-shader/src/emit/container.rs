@@ -44,6 +44,7 @@ impl SigElement {
             18 => Some((68, "SV_DepthLessEqual")),
             19 => Some((67, "SV_DepthGreaterEqual")),
             20 => Some((69, "SV_StencilRef")),
+            28 => Some((23, "SV_Barycentrics")),
             30 => Some((25, "SV_CullPrimitive")),
             _ => None,
         }
@@ -110,7 +111,17 @@ pub(crate) fn separate_interpolation(elements: &mut [SigElement]) {
 
 /// Input, output and primitive signatures follow the resource and string tables
 /// in PSV version 1 and later. Select the producer's per-vertex output records.
-fn producer_records(mut data: &[u8], stage: u8) -> Option<std::slice::ChunksExact<'_, u8>> {
+fn producer_records(data: &[u8], stage: u8) -> Option<std::slice::ChunksExact<'_, u8>> {
+    stage_records(data, stage, true)
+}
+
+/// The input (`outputs` false) or per-vertex output records of a `PSV0` of
+/// `stage`.
+fn stage_records(
+    mut data: &[u8],
+    stage: u8,
+    outputs: bool,
+) -> Option<std::slice::ChunksExact<'_, u8>> {
     fn take<'a>(data: &mut &'a [u8], bytes: usize) -> Option<&'a [u8]> {
         let (head, rest) = data.split_at_checked(bytes)?;
         *data = rest;
@@ -124,6 +135,7 @@ fn producer_records(mut data: &[u8], stage: u8) -> Option<std::slice::ChunksExac
     if *info.get(24)? != stage {
         return None;
     }
+    let want_outputs = outputs;
     let inputs = usize::from(*info.get(28)?);
     let outputs = usize::from(*info.get(29)?);
     let resources = word(&mut data)?;
@@ -139,8 +151,37 @@ fn producer_records(mut data: &[u8], stage: u8) -> Option<std::slice::ChunksExac
     if stride < 16 {
         return None;
     }
-    take(&mut data, inputs.checked_mul(stride)?)?;
+    let input_records = take(&mut data, inputs.checked_mul(stride)?)?;
+    if !want_outputs {
+        return Some(input_records.chunks_exact(stride));
+    }
     Some(take(&mut data, outputs.checked_mul(stride)?)?.chunks_exact(stride))
+}
+
+/// The interpolation modes of a pixel shader's inputs as its `PSV0` records
+/// declare them (the signature parts have none), for the elements that have
+/// a register.
+pub(super) fn input_interpolation(data: &[u8], inputs: &mut [SigElement]) {
+    let Some(records) = stage_records(data, 0, false) else {
+        return;
+    };
+    for record in records {
+        let (rows, start, packing) = (record[8], record[9], record[10]);
+        let (comp, mode) = (record[12], record[13]);
+        if packing & 0x40 == 0 || !(1..=7).contains(&mode) {
+            continue;
+        }
+        for e in inputs.iter_mut().filter(|e| {
+            e.sig_comp() == u32::from(comp)
+                && e.col == (packing >> 4) & 3
+                && e.cols == packing & 15
+                && e.row.is_some_and(|row| {
+                    (u32::from(start)..u32::from(start) + u32::from(rows)).contains(&row)
+                })
+        }) {
+            e.interp = mode;
+        }
+    }
 }
 
 /// Preserve declared interpolation for user semantics, including flat floats.

@@ -95,6 +95,7 @@ fn run_lds_program(body: &[u32], expected: &[u32]) {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        mesh_buffer: false,
     })
     .expect("lower");
 
@@ -107,6 +108,7 @@ fn run_lds_program(body: &[u32], expected: &[u32]) {
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
+        structured_srvs: Vec::new(),
     };
 
     #[cfg(windows)]

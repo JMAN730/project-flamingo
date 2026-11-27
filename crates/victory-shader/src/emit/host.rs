@@ -188,6 +188,17 @@ impl Host {
         &self,
         stages: &[(&HostShader, D3D12_SHADER_VISIBILITY)],
     ) -> Result<ID3D12RootSignature, String> {
+        self.root_signature_with(stages, None)
+    }
+
+    /// [`Host::root_signature_for`], with the buffer of a mesh program run
+    /// without mesh shaders as the last root parameter when `buffer` gives
+    /// its kind (a root UAV or SRV) and the stage that sees it.
+    fn root_signature_with(
+        &self,
+        stages: &[(&HostShader, D3D12_SHADER_VISIBILITY)],
+        buffer: Option<(D3D12_ROOT_PARAMETER_TYPE, D3D12_SHADER_VISIBILITY)>,
+    ) -> Result<ID3D12RootSignature, String> {
         let mut params: Vec<D3D12_ROOT_PARAMETER1> = stages
             .iter()
             .map(|&(s, vis)| D3D12_ROOT_PARAMETER1 {
@@ -259,6 +270,33 @@ impl Host {
                 },
                 ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
             });
+        }
+        if let Some((kind, visibility)) = buffer {
+            params.push(D3D12_ROOT_PARAMETER1 {
+                ParameterType: kind,
+                Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                    Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                        ShaderRegister: 0,
+                        RegisterSpace: super::MESH_BUFFER_SPACE,
+                        Flags: D3D12_ROOT_DESCRIPTOR_FLAG_NONE,
+                    },
+                },
+                ShaderVisibility: visibility,
+            });
+            // The filling shader is told its first thread group's number.
+            if kind == D3D12_ROOT_PARAMETER_TYPE_UAV {
+                params.push(D3D12_ROOT_PARAMETER1 {
+                    ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+                    Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                        Constants: D3D12_ROOT_CONSTANTS {
+                            ShaderRegister: 0,
+                            RegisterSpace: super::MESH_BUFFER_SPACE,
+                            Num32BitValues: 1,
+                        },
+                    },
+                    ShaderVisibility: visibility,
+                });
+            }
         }
         let mut samplers = Vec::new();
         for &(s, vis) in stages {
@@ -370,6 +408,32 @@ impl Host {
         gs: Option<&[u8]>,
         ps: &[u8],
     ) -> Result<ID3D12PipelineState, String> {
+        self.pipeline_with_cull(root, vs, gs, ps, D3D12_CULL_MODE_NONE)
+    }
+
+    /// A graphics pipeline from a vertex, a geometry and a pixel shader
+    /// (the barycentric stage, `barycentric_gs`).
+    pub fn pipeline_with_geometry(
+        &self,
+        vs: &HostShader,
+        gs: &[u8],
+        ps: &HostShader,
+    ) -> Result<(ID3D12RootSignature, ID3D12PipelineState), String> {
+        let root = self.root_signature(vs, ps)?;
+        let pso = self.pipeline_with_gs(&root, &vs.dxil, Some(gs), &ps.dxil)?;
+        Ok((root, pso))
+    }
+
+    /// As [`Host::pipeline_with_gs`], culling as `cull` says (clockwise
+    /// triangles face front).
+    pub fn pipeline_with_cull(
+        &self,
+        root: &ID3D12RootSignature,
+        vs: &[u8],
+        gs: Option<&[u8]>,
+        ps: &[u8],
+        cull: D3D12_CULL_MODE,
+    ) -> Result<ID3D12PipelineState, String> {
         let inputs = sig(vs, FourCC::ISG1)?;
         let names: Vec<CString> = inputs
             .iter()
@@ -410,7 +474,7 @@ impl Host {
             SampleMask: u32::MAX,
             RasterizerState: D3D12_RASTERIZER_DESC {
                 FillMode: D3D12_FILL_MODE_SOLID,
-                CullMode: D3D12_CULL_MODE_NONE,
+                CullMode: cull,
                 DepthClipEnable: true.into(),
                 ..Default::default()
             },
@@ -446,6 +510,44 @@ impl Host {
         // SAFETY: the description points at live data.
         let pso = unsafe { self.device.CreateGraphicsPipelineState(&desc) };
         pso.map_err(err)
+    }
+
+    /// The two pipelines of a mesh program on a host without mesh shaders
+    /// (`super::meshbuf`): the compute half (user data is root parameter 0,
+    /// the buffer, a root UAV, and the first thread group's number, a root
+    /// constant, the last two), then the vertex half with `ps`
+    /// (user data of the pixel stage is root parameter 1, the buffer, a root
+    /// SRV, the last one).
+    #[allow(clippy::type_complexity)]
+    pub fn mesh_fallback_pipelines(
+        &self,
+        fallback: &super::MeshFallback,
+        ps: &HostShader,
+    ) -> Result<
+        (
+            (ID3D12RootSignature, ID3D12PipelineState),
+            (ID3D12RootSignature, ID3D12PipelineState),
+        ),
+        String,
+    > {
+        let root = self.root_signature_with(
+            &[(&fallback.compute, D3D12_SHADER_VISIBILITY_ALL)],
+            Some((D3D12_ROOT_PARAMETER_TYPE_UAV, D3D12_SHADER_VISIBILITY_ALL)),
+        )?;
+        let pso = self.compute_pipeline_with(&root, &fallback.compute.dxil)?;
+        let compute = (root, pso);
+        let root = self.root_signature_with(
+            &[
+                (&fallback.vertex, D3D12_SHADER_VISIBILITY_VERTEX),
+                (ps, D3D12_SHADER_VISIBILITY_PIXEL),
+            ],
+            Some((
+                D3D12_ROOT_PARAMETER_TYPE_SRV,
+                D3D12_SHADER_VISIBILITY_VERTEX,
+            )),
+        )?;
+        let pso = self.pipeline_with(&root, &fallback.vertex.dxil, &ps.dxil)?;
+        Ok((compute, (root, pso)))
     }
 
     /// A mesh pipeline from a mesh and a pixel shader (user data of the mesh
@@ -649,6 +751,7 @@ fn stub(pixel: bool, outputs: Vec<SigElement>) -> HostShader {
         root_cbvs: Vec::new(),
         root_srvs: Vec::new(),
         root_uavs: Vec::new(),
+        structured_srvs: Vec::new(),
     }
 }
 
@@ -693,6 +796,28 @@ pub(super) enum TriangleDraw {
     TwoTriangles,
     Indexed,
     IndirectIndexed,
+    /// Four vertices as a triangle strip.
+    Strip,
+}
+
+/// The compute half of a mesh program run without mesh shaders, for
+/// [`Host::draw_filled`]: it fills the buffer the draw then reads.
+#[cfg(test)]
+pub struct Fill<'a> {
+    pub root: &'a ID3D12RootSignature,
+    pub pso: &'a ID3D12PipelineState,
+    /// User data, root parameter 0.
+    pub user_data: Vec<u32>,
+    /// The root parameters of the buffer: the compute half's root UAV and
+    /// the draw's root SRV.
+    pub uav: u32,
+    pub srv: u32,
+    /// The buffer's size, and the vertices drawn per thread group.
+    pub bytes: u64,
+    pub vertices: u32,
+    /// The number the program is told its first thread group has (the root
+    /// constant after `uav`).
+    pub first_group: u32,
 }
 
 #[cfg(test)]
@@ -704,7 +829,7 @@ impl Host {
         pso: &ID3D12PipelineState,
         d: &Draw,
     ) -> Result<Vec<[f32; 4]>, String> {
-        self.draw_triangle(root, pso, d, TriangleDraw::Direct)
+        self.draw_with(root, pso, d, TriangleDraw::Direct, None)
     }
 
     pub(super) fn draw_triangle(
@@ -713,6 +838,30 @@ impl Host {
         pso: &ID3D12PipelineState,
         d: &Draw,
         command: TriangleDraw,
+    ) -> Result<Vec<[f32; 4]>, String> {
+        self.draw_with(root, pso, d, command, None)
+    }
+
+    /// [`Host::draw`]; with `fill`, a compute pass of `d.mesh_groups` thread
+    /// groups first fills a buffer, and the draw is `fill.vertices` vertices
+    /// with one instance per group, reading that buffer.
+    pub fn draw_filled(
+        &self,
+        root: &ID3D12RootSignature,
+        pso: &ID3D12PipelineState,
+        d: &Draw,
+        fill: Option<&Fill>,
+    ) -> Result<Vec<[f32; 4]>, String> {
+        self.draw_with(root, pso, d, TriangleDraw::Direct, fill)
+    }
+
+    fn draw_with(
+        &self,
+        root: &ID3D12RootSignature,
+        pso: &ID3D12PipelineState,
+        d: &Draw,
+        command: TriangleDraw,
+        fill: Option<&Fill>,
     ) -> Result<Vec<[f32; 4]>, String> {
         let dev = &self.device;
         let (w, h) = d.size;
@@ -905,7 +1054,41 @@ impl Host {
                 Some(vb)
             };
             list.SetDescriptorHeaps(&[Some(views.clone()), Some(sampler_heap.clone())]);
+            let filled = match fill {
+                None => None,
+                Some(f) => {
+                    let mut desc = buf_desc(f.bytes.max(4));
+                    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+                    let buffer = make(
+                        D3D12_HEAP_TYPE_DEFAULT,
+                        &desc,
+                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        None,
+                    )?;
+                    list.SetComputeRootSignature(f.root);
+                    list.SetPipelineState(f.pso);
+                    list.SetComputeRoot32BitConstants(
+                        0,
+                        f.user_data.len() as u32,
+                        f.user_data.as_ptr().cast(),
+                        0,
+                    );
+                    list.SetComputeRootUnorderedAccessView(f.uav, buffer.GetGPUVirtualAddress());
+                    list.SetComputeRoot32BitConstant(f.uav + 1, f.first_group, 0);
+                    list.Dispatch(d.mesh_groups, 1, 1);
+                    list.ResourceBarrier(&[transition(
+                        &buffer,
+                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                    )]);
+                    list.SetPipelineState(pso);
+                    Some(buffer)
+                }
+            };
             list.SetGraphicsRootSignature(root);
+            if let (Some(f), Some(buffer)) = (fill, &filled) {
+                list.SetGraphicsRootShaderResourceView(f.srv, buffer.GetGPUVirtualAddress());
+            }
             for (param, arg) in &d.roots {
                 match arg {
                     Root::Constants(data) => list.SetGraphicsRoot32BitConstants(
@@ -939,7 +1122,11 @@ impl Host {
                 bottom: h as i32,
                 ..Default::default()
             }]);
-            list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            list.IASetPrimitiveTopology(if matches!(command, TriangleDraw::Strip) {
+                D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP
+            } else {
+                D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST
+            });
             if let Some(vb) = &vb {
                 list.IASetVertexBuffers(
                     0,
@@ -953,7 +1140,9 @@ impl Host {
             // An offset and negative base exercise the same addressing in both
             // indexed calls. The indirect arguments follow the index data in the same buffer.
             let mut signature: Option<ID3D12CommandSignature> = None;
-            if matches!(
+            if let Some(f) = fill {
+                list.DrawInstanced(f.vertices, d.mesh_groups, 0, 0);
+            } else if matches!(
                 command,
                 TriangleDraw::Indexed | TriangleDraw::IndirectIndexed
             ) {
@@ -999,10 +1188,10 @@ impl Host {
                 let list6: ID3D12GraphicsCommandList6 = list.cast().map_err(err)?;
                 list6.DispatchMesh(d.mesh_groups, 1, 1);
             } else {
-                let count = if matches!(command, TriangleDraw::TwoTriangles) {
-                    6
-                } else {
-                    3
+                let count = match command {
+                    TriangleDraw::TwoTriangles => 6,
+                    TriangleDraw::Strip => 4,
+                    _ => 3,
                 };
                 list.DrawInstanced(count, 1, 0, 0);
             }

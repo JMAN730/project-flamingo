@@ -21,6 +21,8 @@ use crate::ir::{EXEC, Inst, Program, Reg, Value};
 pub(crate) enum Op {
     AddU,
     AddF,
+    /// `v_add_f16`: a sum of the low halves (16-bit floats).
+    AddH,
     MinU,
     MaxU,
     MinI,
@@ -37,6 +39,7 @@ impl Op {
         Some(match name {
             "v_add_nc_u32" => Op::AddU,
             "v_add_f32" => Op::AddF,
+            "v_add_f16" => Op::AddH,
             "v_min_u32" => Op::MinU,
             "v_max_u32" => Op::MaxU,
             "v_min_i32" => Op::MinI,
@@ -55,6 +58,7 @@ impl Op {
         match self {
             Op::AddU | Op::Or | Op::Xor | Op::MaxU => k == 0,
             Op::AddF => k == 0 || k == 0x8000_0000,
+            Op::AddH => k & 0xFFFF == 0 || k & 0xFFFF == 0x8000,
             Op::MinU | Op::And => k == u32::MAX,
             Op::MinI => k == 0x7FFF_FFFF,
             Op::MaxI => k == 0x8000_0000,
@@ -65,7 +69,7 @@ impl Op {
 
     /// Counting a lane twice changes the result.
     fn counts(self) -> bool {
-        matches!(self, Op::AddU | Op::AddF | Op::Xor)
+        matches!(self, Op::AddU | Op::AddF | Op::AddH | Op::Xor)
     }
 }
 
@@ -105,11 +109,25 @@ pub(crate) enum Shape {
 /// index and the shapes of the values it writes.
 pub(crate) struct Section {
     pub end: usize,
+    /// `v_readlane_b32` instructions right after the restore that read what
+    /// the section left (EXEC does not govern them): the simulation follows
+    /// them too, since the values they read have no shape of their own.
+    pub tail: usize,
     pub shapes: HashMap<Value, Shape>,
 }
 
 /// Every whole-wave section of `block`, by start index.
 pub(crate) fn sections(p: &Program, block: usize) -> HashMap<usize, Section> {
+    sections_with(p, block, false)
+}
+
+/// [`sections`]; with `follow_tail`, the lane reads after a restore that read what
+/// the section left are followed too.
+pub(crate) fn sections_with(
+    p: &Program,
+    block: usize,
+    follow_tail: bool,
+) -> HashMap<usize, Section> {
     let insts = &p.blocks[block].insts;
     let wave: u32 = if p.wave64 { 64 } else { 32 };
     let mut out = HashMap::new();
@@ -143,8 +161,36 @@ pub(crate) fn sections(p: &Program, block: usize) -> HashMap<usize, Section> {
         let Some(end) = end else {
             break;
         };
-        let shapes = simulate(&insts[i + 1..end], wave, saved);
-        out.insert(i, Section { end, shapes });
+        let body = &insts[i + 1..end];
+        let mut shapes = simulate(body, &[], wave, saved);
+        let mut tail = 0;
+        let after = insts[end + 1..]
+            .iter()
+            .take_while(|t| t.name() == "v_readlane_b32")
+            .count();
+        if after > 0 && follow_tail {
+            let reads = &insts[end + 1..end + 1 + after];
+            let longer = simulate(body, reads, wave, saved);
+            // Taken only where a readlane reads a value the section left
+            // with no shape and the simulation then gives its result one.
+            let wanted = reads.iter().any(|r| {
+                let Fields::Valu(v) = &r.fields else {
+                    return false;
+                };
+                let Some(&Operand::Vector { reg, .. }) = v.src.first() else {
+                    return false;
+                };
+                r.read(Reg::V(reg)).is_some_and(|x| {
+                    !shapes.contains_key(&x)
+                        && body.iter().any(|b| b.writes.iter().any(|w| w.1 == x))
+                }) && r.writes.iter().any(|w| longer.contains_key(&w.1))
+            });
+            if wanted {
+                shapes = longer;
+                tail = after;
+            }
+        }
+        out.insert(i, Section { end, tail, shapes });
         i = end + 1;
     }
     out
@@ -230,7 +276,7 @@ fn combine(op: Op, a: Sym, b: Sym) -> Sym {
     }
 }
 
-fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
+fn simulate(insts: &[Inst], tail: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
     let all = if wave == 64 {
         u64::MAX
     } else {
@@ -241,7 +287,7 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
     let mut uni: HashMap<Value, Sym> = HashMap::new();
     // Masks the section derives from the saved EXEC (`s_and` with it).
     let mut masked = vec![saved];
-    for inst in insts {
+    for inst in insts.iter().chain(tail) {
         let name = inst.name();
         if inst.write(Reg::S(EXEC)).is_some() {
             // Constant lane sets (prefix sums); anything else ends what
@@ -483,6 +529,8 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
                     .collect()
             }
             (n, Some(a)) => match (Op::of(n), src(1)) {
+                // A 16-bit operation on the high halves is another one.
+                (Some(Op::AddH), _) if v.opsel != 0 => vec![Sym::Unknown; wave as usize],
                 (Some(op), Some(b)) => (0..wave as usize)
                     .map(|l| combine(op, a[l], b[l]))
                     .collect(),
@@ -876,6 +924,74 @@ mod tests {
             0xBEFE_0400, // s_mov_b64 exec, s[0:1]
         ]);
         words
+    }
+
+    /// The console's OR reduction of 64 lanes: each 32-lane half reduced into
+    /// every lane of it, lane 0's half ORed into all lanes (only the upper
+    /// half then holds the total), and lane 63 read after the restore.
+    fn wave64_or_words(read_after: bool) -> Vec<u32> {
+        let mut words = vec![
+            0xBE80_25C1, // s_or_saveexec_b64 s[0:1], -1
+            0xD501_0001,
+            0x0002_0080, // v_cndmask_b32_e64 v1, 0, v0, s0
+        ];
+        for xmask in [0x6101, 0x6201, 0x6401, 0x6801] {
+            words.extend([
+                0x3802_02FA,
+                0xFF01_0000 | xmask, // v_or_b32_dpp v1, v1, v1 row_xmask
+            ]);
+        }
+        words.extend([
+            0xD777_0002,
+            0x0305_8301, // v_permlane16_b32 v2, v1, -1, -1
+            0xD778_0003,
+            0x0305_8302, // v_permlanex16_b32 v3, v2, -1, -1
+            0x3808_0702, // v_or_b32 v4, v2, v3
+            0xD760_0002,
+            0x0001_0104, // v_readlane_b32 s2, v4, 0
+            0x3808_0802, // v_or_b32 v4, s2, v4
+            0xBEFE_0400, // s_mov_b64 exec, s[0:1]
+        ]);
+        if read_after {
+            words.extend([0xD760_0003, 0x0001_7F04]); // v_readlane_b32 s3, v4, 63
+        }
+        words.push(0xBF81_0000); // s_endpgm
+        words
+    }
+
+    /// Only for a program translation retries (`sections_with`).
+    #[test]
+    fn a_first_pass_leaves_the_readlane_out() {
+        let p = build_wave64(&wave64_or_words(true));
+        assert_eq!(sections(&p, 0)[&0].tail, 0);
+    }
+
+    /// A lane read right after the restore, from a value no lane agrees on,
+    /// belongs to the section: the reduction is what that lane holds.
+    #[test]
+    fn a_readlane_after_the_restore_follows_the_section() {
+        let p = build_wave64(&wave64_or_words(true));
+        let insts = &p.blocks[0].insts;
+        let saved = insts[0].write(Reg::S(0)).unwrap();
+        let x = insts[1].read(Reg::V(0)).unwrap();
+        let found = sections_with(&p, 0, true);
+        let section = &found[&0];
+        assert_eq!(section.tail, 1);
+        let total = insts[insts.len() - 2].write(Reg::S(3)).unwrap();
+        assert_eq!(
+            section.shapes.get(&total),
+            Some(&Shape::Active(Op::Or, x, saved, 0))
+        );
+        // The half-reduced value itself has no shape.
+        let half = insts[insts.len() - 4].write(Reg::V(4)).unwrap();
+        assert_eq!(section.shapes.get(&half), None);
+    }
+
+    /// Without the lane read the section ends at its restore.
+    #[test]
+    fn a_section_without_a_readlane_after_it_has_no_tail() {
+        let p = build_wave64(&wave64_or_words(false));
+        assert_eq!(sections_with(&p, 0, true)[&0].tail, 0);
     }
 
     fn wave64_sum_program(extra_inside: &[u32], before: &[u32], after: &[u32]) -> Program {

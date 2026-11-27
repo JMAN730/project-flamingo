@@ -63,6 +63,7 @@ fn compute_writes_through_spilled_root_uav() {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        mesh_buffer: false,
     })
     .expect("lower");
 
@@ -75,6 +76,7 @@ fn compute_writes_through_spilled_root_uav() {
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
+        structured_srvs: Vec::new(),
     };
 
     assert_eq!(shader.root_uavs, [slot]);

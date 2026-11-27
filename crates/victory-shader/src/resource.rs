@@ -123,6 +123,30 @@ pub struct Resources {
     /// dword within the parameter.
     pub params: Vec<(Value, usize, u32)>,
     pub waterfall: Waterfall,
+    /// Buffer accesses whose descriptor the code made raw after loading it
+    /// ([`Tracer::unraw`]): their source is the loaded descriptor, read by
+    /// byte address.
+    pub raw: Vec<Site>,
+    /// Addresses in the program's constant table that control flow (or SCC)
+    /// joins from sums with different computed terms ([`CodeJoin`]).
+    pub code_joins: Vec<CodeJoin>,
+}
+
+/// An address in the program's constant table ([`CODE`]) that joins sums
+/// on one `s_getpc_b64` with different computed terms (an index picked per
+/// path, say). Its [`Address::dynamic`] is the joined value itself, which
+/// includes the program counter: lowering gives that `s_getpc_b64` the byte
+/// offset of the next instruction in the code, so the joined value is the
+/// byte offset in the code that the address reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CodeJoin {
+    /// The low dword `s_getpc_b64` writes.
+    pub pc: Value,
+    /// The joined address value ([`Address::dynamic`]).
+    pub address: Value,
+    /// The lowest byte offset in the code an arm adds to (before its
+    /// computed term), where the constant table begins at the latest.
+    pub lowest: u32,
 }
 
 /// Waterfall loops over descriptors that differ between lanes: each pass
@@ -156,7 +180,29 @@ pub fn track(
     stage: HwStage,
     lanes: Option<&Structured>,
 ) -> Result<Resources, ShaderError> {
-    let t = Tracer::new(p, layout, stage, lanes)?;
+    // What is traced only for programs everything else refused is a last
+    // chance, so that every other program's resources stay as they were. The
+    // refusal reported is the first one.
+    match track_with(p, layout, stage, lanes, false) {
+        Err(refusal @ ShaderError::Unsupported { .. })
+            if lanes.is_some() && !crate::switch::no_last_chance() =>
+        {
+            track_with(p, layout, stage, lanes, true).map_err(|_| refusal)
+        }
+        result => result,
+    }
+}
+
+/// `leftovers`: the last chance of [`track`].
+fn track_with(
+    p: &Program,
+    layout: &[RootParam],
+    stage: HwStage,
+    lanes: Option<&Structured>,
+    leftovers: bool,
+) -> Result<Resources, ShaderError> {
+    let mut t = Tracer::new(p, layout, stage, lanes)?;
+    t.leftovers = leftovers;
     let mut out = Resources {
         params: p
             .inputs
@@ -193,6 +239,9 @@ pub fn track(
             let mut address_wf = Vec::new();
             let mut descriptor = |op: &Operand, role| -> Result<(), ShaderError> {
                 let source = t.descriptor(inst, op, b).map_err(fail)?;
+                if t.made_raw(inst, op) {
+                    out.raw.push(site);
+                }
                 first_lane.extend(t.first_lane_words(inst, op).unwrap_or_default());
                 if let Source::Loaded { load, .. } = source
                     && load.0 == b
@@ -288,6 +337,7 @@ pub fn track(
     // The proof needs the per-lane form. Without it nothing is emitted, and
     // its failure is the one to report, so the reads stay unproven here.
     if t.lanes.is_none() {
+        out.code_joins = t.code_joins(&out);
         return Ok(out);
     }
     for (block, (accesses, mut reads)) in first_lane_at {
@@ -341,6 +391,7 @@ pub fn track(
             out.waterfall.loads.extend(loads);
         }
     }
+    out.code_joins = t.code_joins(&out);
     Ok(out)
 }
 
@@ -432,6 +483,10 @@ struct Tracer<'a> {
     rpo: Vec<usize>,
     /// Memo of [`Tracer::uniform`] per value.
     uniform_memo: std::cell::RefCell<Vec<Option<bool>>>,
+    /// The last chance of [`track`]: what is traced only for programs
+    /// every earlier attempt refused (so that every other program's
+    /// descriptors stay as they were).
+    leftovers: bool,
 }
 
 /// VALU operations whose result is uniform when their operands are: the
@@ -548,6 +603,7 @@ impl<'a> Tracer<'a> {
             lanes,
             rpo,
             uniform_memo: std::cell::RefCell::new(vec![None; n]),
+            leftovers: false,
         };
         t.origin = t.propagate_copies(n)?;
         Ok(t)
@@ -1127,13 +1183,22 @@ impl<'a> Tracer<'a> {
         }
         let base = s.base.ok_or_else(|| self.why_no_base(s.dynamic))?;
         if let Some(pc) = self.getpc(base) {
-            if s.base_included {
-                return Err(self.why_no_base(s.dynamic));
-            }
             // A table in the code: the base is the next instruction's offset.
             let high = pc.writes.get(1).map(|w| w.1);
             if !self.high_half(hi, high) && !high.is_some_and(|h| self.carried(hi, h)) {
                 return Err("an address with an untracked high half");
+            }
+            if s.base_included {
+                // Joined from several sums on this base ([`CodeJoin`]): the
+                // joined value is the whole address.
+                let Some(joined) = s.dynamic.filter(|_| extra.dynamic.is_none()) else {
+                    return Err(self.why_no_base(s.dynamic));
+                };
+                return Ok(Address {
+                    param: CODE,
+                    offset: extra.offset,
+                    dynamic: Some(joined),
+                });
             }
             return Ok(Address {
                 param: CODE,
@@ -1330,6 +1395,42 @@ impl<'a> Tracer<'a> {
         }
     }
 
+    /// The [`CodeJoin`]s among the addresses `r` holds: code addresses
+    /// whose computed term is a join on one `s_getpc_b64`.
+    fn code_joins(&self, r: &Resources) -> Vec<CodeJoin> {
+        let built = r.descriptors.iter().flat_map(|d| {
+            d.source.leaves().into_iter().filter_map(|l| match l {
+                Source::Built { address, .. } => Some(*address),
+                _ => None,
+            })
+        });
+        let mut joins: Vec<CodeJoin> = Vec::new();
+        for a in r.scalar.iter().map(|s| s.1).chain(built) {
+            let (CODE, Some(d)) = (a.param, a.dynamic) else {
+                continue;
+            };
+            let s = self.sum(Term::Value(d));
+            let Some(pc) = s.base.filter(|_| s.base_included) else {
+                continue;
+            };
+            let Some(at) = self.getpc(pc) else {
+                continue;
+            };
+            let lowest = (at.machine.offset as u32 + 4)
+                .wrapping_add(s.offset)
+                .wrapping_add(a.offset);
+            match joins.iter_mut().find(|j| j.address == d) {
+                Some(j) => j.lowest = j.lowest.min(lowest),
+                None => joins.push(CodeJoin {
+                    pc,
+                    address: d,
+                    lowest,
+                }),
+            }
+        }
+        joins
+    }
+
     fn why_no_base(&self, dynamic: Option<Value>) -> &'static str {
         let Some(v) = dynamic else {
             return "a constant address";
@@ -1512,6 +1613,9 @@ impl<'a> Tracer<'a> {
             return Ok(Source::Constant(consts));
         }
         if let Some(source) = self.loaded(words) {
+            return Ok(source);
+        }
+        if let Some(source) = self.unraw(words).and_then(|w| self.loaded(&w)) {
             return Ok(source);
         }
         if let [lo, hi, Term::Const(w2), Term::Const(w3)] = *words {
@@ -2737,7 +2841,16 @@ impl<'a> Tracer<'a> {
                         None => *w,
                     })
                     .collect();
-                self.per_lane(&edge, joins, known).map(Some)
+                match self.per_lane(&edge, joins, known) {
+                    Ok(source) => Ok(Some(source)),
+                    // shortcut: the register holds float data on this edge
+                    // (a lane that skipped the write and still holds what
+                    // the program computed there), no descriptor: the
+                    // lane's access reads garbage on the console too, and
+                    // here takes index 0 (as an edge no lane takes does).
+                    Err(_) if self.leftovers && self.data_words(&edge) => Ok(None),
+                    Err(e) => Err(e),
+                }
             } else {
                 Ok(None)
             };
@@ -2752,6 +2865,21 @@ impl<'a> Tracer<'a> {
         }
         joins.pop();
         Ok(Some(Source::LanePhi { block, args }))
+    }
+
+    /// Whether one of `words` is the result of a floating-point operation:
+    /// no descriptor's dword is, so what they hold is data the program
+    /// computed, not a descriptor.
+    fn data_words(&self, words: &[Term]) -> bool {
+        words.iter().any(|w| {
+            let Term::Value(v) = *w else { return false };
+            self.def(v).is_some_and(|i| {
+                let name = i.name();
+                name.starts_with("v_")
+                    && ["_f32", "_f16", "_f64"].iter().any(|t| name.contains(t))
+                    && !name.starts_with("v_cvt_")
+            })
+        })
     }
 
     /// Whether a path leads from block `from` to block `to` (to `from`
@@ -2830,7 +2958,19 @@ impl<'a> Tracer<'a> {
             return Err(SELECT);
         }
         let reach = (lanes.reach[b], true);
-        let meet = |conditions: &[(Bool, bool)]| lanes.bools.meet(conditions);
+        let meet = |conditions: &[(Bool, bool)]| {
+            // Without the paths that reach the loop the conditions may
+            // already exclude each other: what the search proves of fewer
+            // atoms holds for any lanes, where a program with many paths
+            // can exhaust its budget (which says "some lane can").
+            if self.leftovers {
+                let rest: Vec<_> = conditions.iter().copied().filter(|c| *c != reach).collect();
+                if !lanes.bools.meet(&rest) {
+                    return false;
+                }
+            }
+            lanes.bools.meet(conditions)
+        };
         let mut out = Waterfall::default();
         let mut required = vec![(remaining, true)];
         for (i, inst) in block.insts[..access].iter().enumerate() {
@@ -2923,6 +3063,56 @@ impl<'a> Tracer<'a> {
     }
 
     /// Consecutive dwords of one scalar load.
+    /// Whether the descriptor operand `op` of `inst` is a loaded one the
+    /// code made raw ([`Tracer::unraw`]).
+    fn made_raw(&self, inst: &Inst, op: &Operand) -> bool {
+        let Operand::Scalar { code, dwords: 4 } = *op else {
+            return false;
+        };
+        let words = (0..4)
+            .map(|k| inst.read(Reg::S(code + k)).map(|v| self.origin(v)))
+            .collect::<Option<Vec<_>>>();
+        words.is_some_and(|w| self.unraw(&w).is_some_and(|w| self.loaded(&w).is_some()))
+    }
+
+    /// The words of a buffer descriptor before the code made it raw, as the
+    /// console's compute compiler does to address a structured or typed
+    /// buffer by byte: dword 2 (records) multiplied by the stride in dword 1
+    /// (`s_bfe_u32` of bits 16-29, at least 1), that stride cleared, and
+    /// dword 3's `OOB_SELECT` set to 3 (raw). The view then covers the same
+    /// bytes as the original, without a stride.
+    fn unraw(&self, words: &[Term]) -> Option<[Term; 4]> {
+        let [w0, Term::Value(v1), Term::Value(v2), Term::Value(v3)] = *words else {
+            return None;
+        };
+        // The operand of a two-operand op other than constant `c`.
+        let other = |[a, b]: [Term; 2], c: u32| match (a, b) {
+            (x, Term::Const(k)) | (Term::Const(k), x) if k == c => Some(x),
+            _ => None,
+        };
+        let w1 = other(self.sop2(v1, &["s_and_b32"])?.1, 0xC000_FFFF)?;
+        let w3 = other(self.sop2(v3, &["s_or_b32"])?.1, 0x3000_0000)?;
+        let Term::Value(cleared) = w3 else {
+            return None;
+        };
+        let w3 = other(self.sop2(cleared, &["s_and_b32"])?.1, 0xCFFF_FFFF)?;
+        let stride_of = |t: Term| {
+            let Term::Value(m) = t else { return false };
+            let Some(Term::Value(f)) = self.sop2(m, &["s_max_u32"]).and_then(|o| other(o.1, 1))
+            else {
+                return false;
+            };
+            self.sop2(f, &["s_bfe_u32"])
+                .is_some_and(|(_, [x, field])| x == w1 && field == Term::Const(0x000E_0010))
+        };
+        let w2 = match self.sop2(v2, &["s_mul_i32"])?.1 {
+            [s, n] if stride_of(s) => n,
+            [n, s] if stride_of(s) => n,
+            _ => return None,
+        };
+        Some([w0, w1, w2, w3])
+    }
+
     fn loaded(&self, words: &[Term]) -> Option<Source> {
         let Term::Value(v0) = words[0] else {
             return None;
@@ -2946,7 +3136,7 @@ impl<'a> Tracer<'a> {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Moved {
+pub(crate) enum Moved {
     Const(u32),
     Value(Value),
 }
@@ -2955,63 +3145,88 @@ impl Tracer<'_> {
     /// For `v_readlane_b32` of a constant lane: the SGPR spilled to that
     /// lane, found by following the VGPR's `v_writelane_b32` writes.
     fn restored(&self, inst: &Inst) -> Option<Moved> {
-        let Fields::Valu(v) = &inst.fields else {
-            return None;
-        };
-        if inst.name() != "v_readlane_b32" {
-            return None;
-        }
-        let [Operand::Vector { reg, .. }, lane] = v.src[..] else {
-            return None;
-        };
-        self.spilled(inst.read(Reg::V(reg))?, lane_of(lane)?, &mut Vec::new())
-            .ok()
-            .flatten()
+        restored_in(
+            inst,
+            &|v| self.phis[v.0 as usize].map(|(b, i)| &self.p.blocks[b].phis[i]),
+            &|v| self.def(v),
+        )
     }
+}
 
-    /// What lane `lane` of VGPR value `v` holds: `Ok(None)` for a phi in
-    /// `seen` (already being resolved), `Err` if not a spilled SGPR.
-    fn spilled(&self, v: Value, lane: u32, seen: &mut Vec<Value>) -> Result<Option<Moved>, ()> {
-        if let Some((b, i)) = self.phis[v.0 as usize] {
-            if seen.contains(&v) {
-                return Ok(None);
-            }
-            seen.push(v);
-            let mut found = None;
-            for &a in &self.p.blocks[b].phis[i].args {
-                if let Some(m) = self.spilled(a, lane, seen)? {
-                    if found.is_some_and(|f| f != m) {
-                        return Err(());
-                    }
-                    found = Some(m);
-                }
-            }
-            return Ok(found);
-        }
-        let inst = self.def(v).ok_or(())?;
-        let Fields::Valu(w) = &inst.fields else {
-            return Err(());
-        };
-        let (Some(Operand::Vector { reg, .. }), [value, at]) = (w.dst, &w.src[..]) else {
-            return Err(());
-        };
-        if inst.name() != "v_writelane_b32" {
-            return Err(());
-        }
-        if lane_of(*at).ok_or(())? != lane {
-            return self.spilled(inst.read(Reg::V(reg)).ok_or(())?, lane, seen);
-        }
-        match *value {
-            Operand::Scalar { code, .. } if code != NULL => {
-                inst.read(Reg::S(code)).map(Moved::Value)
-            }
-            Operand::Literal(x) => Some(Moved::Const(x)),
-            Operand::Const(c) => inline(c).map(Moved::Const),
-            _ => None,
-        }
-        .map(Some)
-        .ok_or(())
+/// For `v_readlane_b32` of a constant lane: what the SGPR spilled to that
+/// lane holds, found by following the VGPR's `v_writelane_b32` writes
+/// through phis (`phi` and `def` say what defines a value).
+pub(crate) fn restored_in<'a>(
+    inst: &Inst,
+    phi: &dyn Fn(Value) -> Option<&'a crate::ir::Phi>,
+    def: &dyn Fn(Value) -> Option<&'a Inst>,
+) -> Option<Moved> {
+    let Fields::Valu(v) = &inst.fields else {
+        return None;
+    };
+    if inst.name() != "v_readlane_b32" {
+        return None;
     }
+    let [Operand::Vector { reg, .. }, lane] = v.src[..] else {
+        return None;
+    };
+    spilled(
+        inst.read(Reg::V(reg))?,
+        lane_of(lane)?,
+        &mut Vec::new(),
+        phi,
+        def,
+    )
+    .ok()
+    .flatten()
+}
+
+/// What lane `lane` of VGPR value `v` holds: `Ok(None)` for a phi in
+/// `seen` (already being resolved), `Err` if not a spilled SGPR.
+fn spilled<'a>(
+    v: Value,
+    lane: u32,
+    seen: &mut Vec<Value>,
+    phi: &dyn Fn(Value) -> Option<&'a crate::ir::Phi>,
+    def: &dyn Fn(Value) -> Option<&'a Inst>,
+) -> Result<Option<Moved>, ()> {
+    if let Some(p) = phi(v) {
+        if seen.contains(&v) {
+            return Ok(None);
+        }
+        seen.push(v);
+        let mut found = None;
+        for &a in &p.args {
+            if let Some(m) = spilled(a, lane, seen, phi, def)? {
+                if found.is_some_and(|f| f != m) {
+                    return Err(());
+                }
+                found = Some(m);
+            }
+        }
+        return Ok(found);
+    }
+    let inst = def(v).ok_or(())?;
+    let Fields::Valu(w) = &inst.fields else {
+        return Err(());
+    };
+    let (Some(Operand::Vector { reg, .. }), [value, at]) = (w.dst, &w.src[..]) else {
+        return Err(());
+    };
+    if inst.name() != "v_writelane_b32" {
+        return Err(());
+    }
+    if lane_of(*at).ok_or(())? != lane {
+        return spilled(inst.read(Reg::V(reg)).ok_or(())?, lane, seen, phi, def);
+    }
+    match *value {
+        Operand::Scalar { code, .. } if code != NULL => inst.read(Reg::S(code)).map(Moved::Value),
+        Operand::Literal(x) => Some(Moved::Const(x)),
+        Operand::Const(c) => inline(c).map(Moved::Const),
+        _ => None,
+    }
+    .map(Some)
+    .ok_or(())
 }
 
 /// A lane select given as a constant.
@@ -3031,8 +3246,21 @@ fn copy_source(inst: &Inst, k: usize) -> Option<Moved> {
     if inst.name() == "s_movk_i32" {
         return Some(Moved::Const(i32::from((*imm)? as i16) as u32));
     }
+    // A run of ones, from a size and an offset that are inline constants
+    // (the way a compiler makes a mask it has no inline form for).
+    if inst.name() == "s_bfm_b32"
+        && let [Operand::Const(size), Operand::Const(offset)] = src[..]
+    {
+        let (size, offset) = (inline(size)? & 31, inline(offset)? & 31);
+        return Some(Moved::Const(((1u32 << size) - 1) << offset));
+    }
     let src = src.first()?;
     match (inst.name(), *src) {
+        // A 32-bit literal fills a 64-bit move zero-extended or
+        // sign-extended, by the operand's type; the two agree below 2^31.
+        ("s_mov_b64", Operand::Literal(x)) if x >> 31 == 0 => {
+            Some(Moved::Const(if k == 0 { x } else { 0 }))
+        }
         ("s_mov_b32" | "s_mov_b64", Operand::Scalar { code, .. }) if code != NULL => {
             inst.read(Reg::S(code + k as u8)).map(Moved::Value)
         }
@@ -3214,6 +3442,34 @@ pub(crate) mod tests {
                     }
                 ),
             ]
+        );
+    }
+
+    /// A sampler a program makes from constants (`s_movk_i32`, `s_bfm_b32` of
+    /// inline constants, a 64-bit move of a literal) is a constant descriptor.
+    #[test]
+    fn samplers_made_from_constants_are_constant_descriptors() {
+        let r = track_words(
+            &[
+                0xBE82_030C, // s_mov_b32 s2, s12
+                0xBE83_0380, // s_mov_b32 s3, 0
+                0xF40C_0001,
+                0xFA00_0000, // s_load_dwordx8 s[0:7], s[2:3], null
+                0xB008_1234, // s_movk_i32 s8, 0x1234
+                0x9209_8C8C, // s_bfm_b32 s9, 12, 12
+                0xBE8A_04FF,
+                0x0018_5300, // s_mov_b64 s[10:11], 0x185300
+                0xF080_0F08,
+                0x0040_0002, // image_sample v[0:3], v[2:3], s[0:7], s[8:11]
+                S_ENDPGM,
+            ],
+            &[param(Table, 12, 1)],
+            HwStage::Ps,
+        );
+        let sampler = r.descriptors.iter().find(|d| d.role == Role::Sampler);
+        assert_eq!(
+            sampler.map(|d| &d.source),
+            Some(&Source::Constant(vec![0x1234, 0x00FF_F000, 0x18_5300, 0]))
         );
     }
 
@@ -3892,6 +4148,24 @@ pub(crate) mod tests {
         0x800A_0C10, // buffer_store_dword v12, v16, s[40:43], 0 offen
         0xBF81_0000, // s_endpgm
     ];
+
+    /// [`WATERFALL_JOINED_WAVE32`] where the lanes of the else arm (16 and
+    /// up) hold what the program computed in v[4:11], not a descriptor
+    /// (`v_add_f32 v4, v2, v2` and on, or with `integer` `v_and_b32`): the
+    /// then arm (lanes below 16) takes the second entry.
+    pub(crate) fn waterfall_joined_data_wave32(integer: bool) -> Vec<u32> {
+        let mut words = WATERFALL_JOINED_WAVE32.to_vec();
+        let then = words.iter().position(|&w| w == 0x7E08_0218).unwrap();
+        let other = words.iter().position(|&w| w == 0x7E08_0220).unwrap();
+        // VOP2: op in bits 25-30 (v_add_f32 is 3, v_and_b32 0x1b), the
+        // destination in 17-24, the second source v2 in 9-16, v2 as src0.
+        let op = if integer { 0x1b } else { 3 };
+        for k in 0..8 {
+            words[then + k] = words[other + k];
+            words[other + k] = op << 25 | (4 + k as u32) << 17 | 2 << 9 | 258;
+        }
+        words
+    }
 
     /// The console compiler's waterfall (the title's ray-tracing
     /// resolve and others): each lane holds its entry's byte offset in the
@@ -4754,6 +5028,58 @@ pub(crate) mod tests {
                 }
             ),
             "{err:?}"
+        );
+    }
+
+    #[test]
+    fn lanes_that_hold_data_instead_of_a_descriptor_are_a_last_chance_edge() {
+        let words = waterfall_joined_data_wave32(false);
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let layout = [param(Table, 0, 1), param(Table, 1, 1)];
+        let l = lanes(&p);
+        // Not as every other program is traced: the else arm's dwords are
+        // computed, not a descriptor.
+        let err = track_with(&p, &layout, HwStage::Cs, l.as_ref(), false).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ShaderError::Unsupported {
+                    what: "a descriptor read from the first lane of computed VGPRs",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+        // With the last chance the then arm's entry is traced and the lanes
+        // that hold data have no source (they read heap index 0).
+        let r = track(&p, &layout, HwStage::Cs, l.as_ref()).unwrap();
+        let image = r
+            .descriptors
+            .iter()
+            .find(|d| d.role == Role::Resource)
+            .unwrap();
+        assert!(matches!(image.source, Source::LanePhi { .. }));
+        // One descriptor (the second entry) is all there is to read: the
+        // other edge, of the lanes that hold data, has no source.
+        let offsets: Vec<u32> = image
+            .source
+            .leaves()
+            .into_iter()
+            .map(|s| table_offset(&r, s))
+            .collect();
+        assert_eq!(offsets, [0x20]);
+        assert_eq!(r.waterfall.compares.len(), 4);
+    }
+
+    #[test]
+    fn lanes_that_hold_integers_instead_of_a_descriptor_stay_refused() {
+        // An integer result may be a descriptor's dword (a copy through
+        // arithmetic): only float results are taken for data.
+        let words = waterfall_joined_data_wave32(true);
+        assert_eq!(
+            refusal(&words, false),
+            "a descriptor read from the first lane of computed VGPRs"
         );
     }
 

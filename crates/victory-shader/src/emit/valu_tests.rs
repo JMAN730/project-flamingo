@@ -139,8 +139,7 @@ fn try_build_valu_cs(body: &[u32]) -> Result<HostShader, ShaderError> {
 
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
     let st = structure::structure(&p).expect("structure");
-    let res =
-        resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
     let io = io::raise(&p, &native).expect("io::raise");
     let lowered = lower::lower(&lower::Parts {
         native: &native,
@@ -152,6 +151,7 @@ fn try_build_valu_cs(body: &[u32]) -> Result<HostShader, ShaderError> {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        mesh_buffer: false,
     })?;
 
     Ok(HostShader {
@@ -163,6 +163,7 @@ fn try_build_valu_cs(body: &[u32]) -> Result<HostShader, ShaderError> {
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
+        structured_srvs: Vec::new(),
     })
 }
 
@@ -363,6 +364,165 @@ fn packed_add_selects_halves_of_inline_constants() {
             assert_eq!(got, expected, "{backend}: {words:08x?}");
         });
     }
+}
+
+#[test]
+fn packed_fmac_adds_each_halfs_product_to_the_destination() {
+    let body = [
+        vop1(0x001, 0, vgpr(3)), // v_mov_b32 v0, v3 (the accumulator)
+        0x3c << 25 | 2 << 9 | u32::from(vgpr(1)), // v_pk_fmac_f16 v0, v1, v2
+    ];
+    let shader = build_valu_cs(&body);
+    // (a, b, accumulator) -> each half of a * b + accumulator.
+    let cases = [
+        ([0x4000_3C00, 0x4200_4000, 0x3C00_3800, 0], 0x4700_4100),
+        ([0xBC00_3C00, 0x3C00_C000, 0, 0], 0xBC00_C000),
+    ];
+    let inputs: Vec<[u32; 4]> = cases.iter().map(|c| c.0).collect();
+    run_cases(&shader, &inputs, |backend, i, _, got| {
+        assert_eq!(got, cases[i].1, "{backend}: case {i}");
+    });
+}
+
+/// `v_dot4c_i32_i8 v0, v1, v2`: the destination plus four signed byte
+/// products, wrapping.
+#[test]
+fn dot4c_adds_four_signed_byte_products_to_the_destination() {
+    let body = [
+        vop1(0x001, 0, vgpr(3)), // v_mov_b32 v0, v3 (the accumulator)
+        0x0D << 25 | 2 << 9 | u32::from(vgpr(1)), // v_dot4c_i32_i8 v0, v1, v2
+    ];
+    let shader = build_valu_cs(&body);
+    let dot = |a: u32, b: u32, acc: u32| {
+        (0..4).fold(acc, |s, i| {
+            let (x, y) = ((a >> (8 * i)) as u8 as i8, (b >> (8 * i)) as u8 as i8);
+            s.wrapping_add((i32::from(x) * i32::from(y)) as u32)
+        })
+    };
+    let cases = [
+        [0x0403_0201, 0x0807_0605, 0, 0],
+        [0xFF80_7F01, 0x7F80_FF02, 100, 0],
+        [0x8080_8080, 0x8080_8080, 0xFFFF_FFF0, 0],
+        [0xFEFD_FCFB, 0x0102_0304, 7, 0],
+    ];
+    let inputs: Vec<[u32; 4]> = cases.iter().map(|c| [c[0], c[1], c[2], 0]).collect();
+    run_cases(&shader, &inputs, |backend, i, _, got| {
+        let c = cases[i];
+        assert_eq!(got, dot(c[0], c[1], c[2]), "{backend}: case {i}");
+    });
+    // Negative bytes really are negative: -1 * 1 + -2 * 1 + 0 + 0.
+    assert_eq!(dot(0x0000_FEFF, 0x0000_0101, 0) as i32, -3);
+}
+
+/// VOP3P `v_dot4_i32_i8` (0x16) and `v_dot4_u32_u8` (0x17) `v0, v1, v2, v3`.
+#[test]
+fn dot4_adds_four_byte_products_to_its_third_operand() {
+    let cases = [
+        [0x0403_0201, 0x0807_0605, 0, 0],
+        [0xFF80_7F01, 0x7F80_FF02, 100, 0],
+        [0x8080_8080, 0x8080_8080, 0xFFFF_FFF0, 0],
+        [0xFEFD_FCFB, 0x0102_0304, 7, 0],
+    ];
+    let inputs: Vec<[u32; 4]> = cases.iter().map(|c| [c[0], c[1], c[2], 0]).collect();
+    for (op, signed) in [(0x16u32, true), (0x17, false)] {
+        // opsel_hi 0b111 as the assembler writes it for a non-packed op.
+        let body = [
+            0x33 << 26 | op << 16 | 1 << 14,
+            u32::from(vgpr(1)) | u32::from(vgpr(2)) << 9 | u32::from(vgpr(3)) << 18 | 0b11 << 27,
+        ];
+        let shader = build_valu_cs(&body);
+        run_cases(&shader, &inputs, |backend, i, _, got| {
+            let c = cases[i];
+            let want = (0..4).fold(c[2], |s, k| {
+                let (x, y) = ((c[0] >> (8 * k)) as u8, (c[1] >> (8 * k)) as u8);
+                let p = if signed {
+                    (i32::from(x as i8) * i32::from(y as i8)) as u32
+                } else {
+                    u32::from(x) * u32::from(y)
+                };
+                s.wrapping_add(p)
+            });
+            assert_eq!(got, want, "{backend}: op {op:#x} case {i}");
+        });
+    }
+}
+
+/// `scc`, `vccz` and `execz` as scalar source operands read as 0 or 1.
+#[test]
+fn scc_vccz_and_execz_read_as_numbers() {
+    // s_cmp_eq_u32 s0, s1; s_mul_i32 s6, s2, scc.
+    let scc = [
+        0xBF06_0000 | u32::from(sgpr(1)) << 8 | u32::from(sgpr(0)),
+        sop2(0x26, 6, 2, 253),
+        vop1(0x001, 0, sgpr(6)),
+    ];
+    let shader = build_valu_cs(&scc);
+    let cases = [[5, 5, 9, 0], [5, 6, 9, 0], [0, 0, 7, 0]];
+    run_cases(&shader, &cases, |backend, i, _, got| {
+        let c = cases[i];
+        assert_eq!(
+            got,
+            if c[0] == c[1] { c[2] } else { 0 },
+            "{backend}: scc {i}"
+        );
+    });
+    // s_mov_b32 vcc_lo, s0; s_add_u32 s6, s2, vccz: one more when vcc_lo is 0.
+    let vccz = [
+        s_mov_b32(106, 0),
+        sop2(0x00, 6, 2, 251),
+        vop1(0x001, 0, sgpr(6)),
+    ];
+    let shader = build_valu_cs(&vccz);
+    let cases = [[0, 0, 40, 0], [1, 0, 40, 0], [0x8000_0000, 0, 40, 0]];
+    run_cases(&shader, &cases, |backend, i, _, got| {
+        assert_eq!(
+            got,
+            if cases[i][0] == 0 { 41 } else { 40 },
+            "{backend}: vccz {i}"
+        );
+    });
+    // The one lane runs, so execz is 0.
+    let execz = [sop2(0x00, 6, 2, 252), vop1(0x001, 0, sgpr(6))];
+    let shader = build_valu_cs(&execz);
+    run_cases(&shader, &[[0, 0, 40, 0]], |backend, _, _, got| {
+        assert_eq!(got, 40, "{backend}: execz");
+    });
+}
+
+/// The console compiler's conversion of the buffer descriptor in s[8:11]
+/// to a raw one: records times the stride (at least 1), the stride
+/// cleared, `OOB_SELECT` 3. `oob` is what dword 3 is OR-ed with.
+fn made_raw(oob: u32) -> Vec<u32> {
+    vec![
+        sop2(0x27, 12, 9, 0xFF), // s_bfe_u32 s12, s9, 0xe0010 (the stride)
+        0x000E_0010,
+        sop2(0x09, 12, 0x81, 12), // s_max_u32 s12, 1, s12
+        sop2(0x0E, 11, 11, 0xFF), // s_and_b32 s11, s11, 0xcfffffff
+        0xCFFF_FFFF,
+        sop2(0x26, 10, 12, 10),   // s_mul_i32 s10, s12, s10
+        sop2(0x10, 11, 11, 0xFF), // s_or_b32 s11, s11, oob
+        oob,
+        sop2(0x0E, 9, 9, 0xFF), // s_and_b32 s9, s9, 0xc000ffff
+        0xC000_FFFF,
+        vop1(0x001, 0, vgpr(1)), // v_mov_b32 v0, v1
+    ]
+}
+
+#[test]
+fn a_descriptor_made_raw_is_the_loaded_view_by_byte() {
+    let shader = build_valu_cs(&made_raw(0x3000_0000));
+    run_cases(&shader, &[[0x1234_5678, 0, 0, 0]], |backend, _, _, got| {
+        assert_eq!(got, 0x1234_5678, "{backend}");
+    });
+    // Another change to dword 3 is not that conversion.
+    assert_eq!(
+        try_build_valu_cs(&made_raw(0x1000_0000)).unwrap_err(),
+        ShaderError::Unsupported {
+            // The store after 7 dwords of setup and the 11 above.
+            offset: 4 * (7 + 11),
+            what: "a descriptor changed after loading"
+        }
+    );
 }
 
 #[test]

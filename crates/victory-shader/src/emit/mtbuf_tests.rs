@@ -94,6 +94,7 @@ fn buffer_shader(
             st: &st,
             io: &io,
             res: &res,
+            mesh_buffer: false,
         },
         true,
         Some(view_stride),

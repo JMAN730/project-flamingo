@@ -99,9 +99,15 @@ fn branch(before: &[u32], inside: &[u32], after: &[u32]) -> Vec<u32> {
 /// Lowers `words` as a wave32 compute program of 32 lanes with the table
 /// of views at s0 (the raw UAV at entry 0).
 fn lowered(words: &[u32]) -> Result<lower::Lowered, crate::ShaderError> {
+    lowered_as(words, false)
+}
+
+/// [`lowered`] for a program of one wave of 32 or (`wave64`) 64 lanes.
+fn lowered_as(words: &[u32], wave64: bool) -> Result<lower::Lowered, crate::ShaderError> {
+    let lanes = if wave64 { 64 } else { LANES } as u32;
     let native = NativeProgram {
         stage: HwStage::Cs,
-        wave64: false,
+        wave64,
         vgprs: 32,
         layout: vec![RootParam {
             root: RootType::Table,
@@ -123,7 +129,7 @@ fn lowered(words: &[u32]) -> Result<lower::Lowered, crate::ShaderError> {
         }],
         io: StageIo::Cs(ComputeIo {
             rsrc2: 1 << 1,
-            threads: [LANES as u32, 1, 1],
+            threads: [lanes, 1, 1],
         }),
         code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
     };
@@ -141,11 +147,16 @@ fn lowered(words: &[u32]) -> Result<lower::Lowered, crate::ShaderError> {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        mesh_buffer: false,
     })
 }
 
-fn build(words: &[u32]) -> HostShader {
-    let lowered = lowered(words).expect("lower");
+pub(super) fn build(words: &[u32]) -> HostShader {
+    build_as(words, false)
+}
+
+fn build_as(words: &[u32], wave64: bool) -> HostShader {
+    let lowered = lowered_as(words, wave64).expect("lower");
     let shader = HostShader {
         stage: HwStage::Cs,
         dxil: lowered.dxil,
@@ -155,6 +166,7 @@ fn build(words: &[u32]) -> HostShader {
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
+        structured_srvs: Vec::new(),
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut shader.dxil.clone())
@@ -167,7 +179,7 @@ fn build(words: &[u32]) -> HostShader {
 
 /// Runs `shader` on the hardware GPU and on WARP (each skipped without a
 /// device) and checks that every lane stored `want[lane]`.
-fn check(shader: &HostShader, want: &[u32; LANES]) {
+pub(super) fn check(shader: &HostShader, want: &[u32; LANES]) {
     let _one = super::valu_tests::ONE_AT_A_TIME
         .lock()
         .unwrap_or_else(|e| e.into_inner());
@@ -313,4 +325,138 @@ fn a_mask_both_arms_write_is_refused() {
     body.extend_from_slice(&[s_or_b32(EXEC_LO, EXEC_LO, 6), v_mov_b32(1, 20)]);
     let e = lowered(&program(&body)).err().expect("lowered");
     assert!(e.to_string().contains("lane mask"), "{e}");
+}
+
+const fn s_add_u32(sdst: u32, src0: u32, src1: u32) -> u32 {
+    sop2(0x00, sdst, src0, src1)
+}
+const fn s_cselect_b32(sdst: u32, src0: u32, src1: u32) -> u32 {
+    sop2(0x0A, sdst, src0, src1)
+}
+const fn s_cselect_b64(sdst: u32, src0: u32, src1: u32) -> u32 {
+    sop2(0x0B, sdst, src0, src1)
+}
+const fn s_and_b32(sdst: u32, src0: u32, src1: u32) -> u32 {
+    sop2(0x0E, sdst, src0, src1)
+}
+const fn s_and_b64(sdst: u32, src0: u32, src1: u32) -> u32 {
+    sop2(0x0F, sdst, src0, src1)
+}
+const fn s_orn2_b32(sdst: u32, src0: u32, src1: u32) -> u32 {
+    sop2(0x16, sdst, src0, src1)
+}
+const fn s_orn2_b64(sdst: u32, src0: u32, src1: u32) -> u32 {
+    sop2(0x17, sdst, src0, src1)
+}
+/// `s_cmp_ge_u32 src0, src1`.
+const fn s_cmp_ge_u32(src0: u32, src1: u32) -> u32 {
+    0xBF09_0000 | src1 << 8 | src0
+}
+/// `s_cbranch_scc0` by `words` (negative: back).
+const fn s_cbranch_scc0(words: i16) -> u32 {
+    0xBF84_0000 | words as u16 as u32
+}
+
+/// A wave-wide loop as the console compiler writes a wait for every lane:
+/// each pass, the lanes whose counter (v1) is below their lane number (v0)
+/// add one to it; the lane mask of those lanes, ANDed with EXEC, sets SCC
+/// when some lane is left, `s_cselect` turns that into all ones or zero, and
+/// the loop goes round while that is all ones and the pass count (s16) is
+/// below `limit` (an inline constant). `wave64` selects the 64-bit forms.
+fn any_lane_left_loop(limit: u32, wave64: bool) -> Vec<u32> {
+    // (the mask, SCC as a number, the pass-count test): SGPR pairs in wave64
+    let (mask, any, count_over, stop) = if wave64 {
+        (
+            s_and_b64(20, VCC_LO, EXEC_LO),
+            s_cselect_b64(22, 0xC1, 0x80),
+            s_cselect_b64(24, 0xC1, 0x80),
+            s_orn2_b64(24, 24, 22),
+        )
+    } else {
+        (
+            s_and_b32(20, VCC_LO, EXEC_LO),
+            s_cselect_b32(21, 0xC1, 0x80),
+            s_cselect_b32(22, 0xC1, 0x80),
+            s_orn2_b32(22, 22, 21),
+        )
+    };
+    let mut w = vec![
+        v_mov_b32(3, 0x81),  // v3 = 1
+        s_mov_b32(16, 0x80), // s16 = 0 (s[8:11] is the descriptor)
+    ];
+    let top = [
+        0x7D88_0300, // v_cmp_gt_u32 vcc, v0, v1: the lanes still counting
+        mask,        // s20 = vcc & exec
+        any,         // SCC (some lane is left) as all ones or zero
+        0x0204_0680, // v_cndmask_b32 v2, 0, v3, vcc
+        0x4A02_0302, // v_add_nc_u32 v1, v2, v1
+        s_add_u32(16, 16, 0x81),
+        s_cmp_ge_u32(16, limit),
+        count_over,
+        stop,
+    ];
+    w.extend(top);
+    w.push(s_cbranch_scc0(-(top.len() as i16 + 1)));
+    program(&w)
+}
+
+/// The loop runs until no lane is left: every lane's counter reaches its
+/// lane number.
+#[test]
+fn a_wave_wide_loop_on_a_mask_runs_until_no_lane_is_left() {
+    let shader = build(&any_lane_left_loop(0xC0, false));
+    let want: [u32; LANES] = std::array::from_fn(|l| l as u32);
+    check(&shader, &want);
+}
+
+/// The pass count ends the loop first when it is the other way round.
+#[test]
+fn a_wave_wide_loop_on_a_mask_stops_at_its_pass_count() {
+    // 16 passes: the lanes above 16 stop there.
+    let shader = build(&any_lane_left_loop(0x90, false));
+    let want: [u32; LANES] = std::array::from_fn(|l| l.min(16) as u32);
+    check(&shader, &want);
+}
+
+/// The 64-bit forms of the same loop lower and validate; the wave size of a
+/// host that runs them is the console's.
+#[test]
+fn a_wave64_loop_on_a_mask_translates() {
+    let words = any_lane_left_loop(0xC0, true);
+    let shader = build_as(&words, true);
+    assert!(!shader.dxil.is_empty());
+}
+
+/// A VGPR the code spills SGPRs to lane by lane holds one it cannot follow
+/// (the program counter, here); a lane it can follow is still read back.
+#[test]
+fn a_lane_spilled_beside_one_the_code_cannot_follow_is_read_back() {
+    let shader = build(&program(&[
+        0xBE84_1F00, // s_getpc_b64 s[4:5]
+        s_mov_b32(6, 0x85),
+        0xD761_0004,
+        0x0001_0004, // v_writelane_b32 v4, s4, 0
+        0xD761_0004,
+        0x0001_0206, // v_writelane_b32 v4, s6, 1
+        0xD760_0007,
+        0x0001_0304, // v_readlane_b32 s7, v4, 1
+        v_mov_b32(1, 7),
+    ]));
+    check(&shader, &[5; LANES]);
+}
+
+/// The lane that holds it is refused.
+#[test]
+fn the_lane_the_code_cannot_follow_is_refused() {
+    let e = lowered(&program(&[
+        0xBE84_1F00, // s_getpc_b64 s[4:5]
+        0xD761_0004,
+        0x0001_0004, // v_writelane_b32 v4, s4, 0
+        0xD760_0007,
+        0x0001_0304 & !0x200, // v_readlane_b32 s7, v4, 0
+        v_mov_b32(1, 7),
+    ]))
+    .err()
+    .expect("lowered");
+    assert!(e.to_string().contains("s_getpc_b64"), "{e}");
 }

@@ -69,6 +69,8 @@ pub(crate) struct Usage {
     pub heap_samplers: bool,
     /// A 64-bit atomic.
     pub atomic64: bool,
+    /// An attribute read at one vertex (SM 6.1).
+    pub vertex_attributes: bool,
 }
 
 /// What makes two instructions without an effect the same value.
@@ -1005,6 +1007,8 @@ impl Module {
                         Some((_, 0)) => u.heap_views = true,
                         _ => u.heap_samplers = true,
                     }
+                } else if name.starts_with("attributeAtVertex") {
+                    u.vertex_attributes = true;
                 } else if name.starts_with("atomic") && name.ends_with(".i64") {
                     u.atomic64 = true;
                 } else if name.starts_with("textureLoad") || name.starts_with("bufferLoad") {

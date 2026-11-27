@@ -408,6 +408,7 @@ mod tests {
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
+            structured_srvs: Vec::new(),
         };
         (
             host(crate::native::HwStage::Vs, vs),
