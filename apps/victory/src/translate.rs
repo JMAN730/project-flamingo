@@ -13,9 +13,7 @@ use victory_shader::emit::host::{self, Host};
 #[cfg(windows)]
 use victory_shader::emit::validator::Validator;
 use victory_shader::structure::{self, Atom, LaneExit};
-use victory_shader::{
-    Container, FourCC, HwStage, NativeProgram, RootType, ShaderError, ir, native_programs,
-};
+use victory_shader::{Container, FourCC, HwStage, NativeProgram, RootType, ShaderError, ir};
 use victory_shader::{io, resource};
 
 use crate::shader::{MAX_FILE, Source, scan_entries, sources};
@@ -165,6 +163,16 @@ struct Tally {
     ms_emitted: usize,
     ms_validated: usize,
     ms_pipelines: usize,
+    /// Mesh programs as hosts without mesh shaders run them
+    /// (`--mesh-fallback`): tried, emitted, validated, pipelines.
+    fallback: [usize; 4],
+    /// Pixel programs that need barycentrics, emitted as hosts without them
+    /// run them (`--barycentric-fallback`): tried, emitted, validated (with
+    /// their geometry shader), pipelines.
+    barycentric: [usize; 4],
+    /// Pixel programs that need no barycentrics whose emission for hosts
+    /// without them is byte for byte their plain one, and those whose is not.
+    barycentric_same: [usize; 2],
     /// Programs in stages the emitter does not emit (`LS`, `HS`, `ES`, `GS`)
     /// that were not refused by an earlier pass.
     not_emitted: StageCounts,
@@ -362,6 +370,15 @@ impl Tally {
         self.not_emitted.merge(&other.not_emitted);
         self.refused += other.refused;
         self.validator_rejected += other.validator_rejected;
+        for (mine, theirs) in self.fallback.iter_mut().zip(other.fallback) {
+            *mine += theirs;
+        }
+        for (mine, theirs) in self.barycentric.iter_mut().zip(other.barycentric) {
+            *mine += theirs;
+        }
+        for (mine, theirs) in self.barycentric_same.iter_mut().zip(other.barycentric_same) {
+            *mine += theirs;
+        }
         for (k, n) in other.exports {
             *self.exports.entry(k).or_default() += n;
         }
@@ -388,12 +405,17 @@ struct Checks {
     keep: Option<Kept>,
     validator: Option<Validator>,
     host: Option<(Host, emit::HostShader)>,
+    /// Also emit mesh programs for hosts without mesh shaders.
+    mesh_fallback: bool,
+    /// Also emit pixel programs for hosts without barycentrics.
+    barycentric_fallback: bool,
 }
 
 pub fn run(
     paths: Vec<PathBuf>,
     validate: bool,
     pipelines: bool,
+    (mesh_fallback, barycentric_fallback): (bool, bool),
     list: bool,
     jobs: Option<usize>,
 ) -> Result<()> {
@@ -409,6 +431,13 @@ pub fn run(
     }
     if pipelines {
         Host::new(false).map_err(anyhow::Error::msg)?;
+        // As the running title does on a 32-lane host (`victory-gpu`'s
+        // `supports_wave32`): `VICTORY_WAVE64_SPLIT=1` runs Wave64 programs as
+        // two 32-lane halves instead of declaring `WaveSize(64)`.
+        // shortcut: assumes the host has 32-lane waves.
+        if std::env::var_os("VICTORY_WAVE64_SPLIT").is_some_and(|v| v != "0") {
+            victory_shader::emit::set_host_wave64(false);
+        }
     }
     let pairs: Vec<(String, String)> = std::env::var("VICTORY_PAIRS")
         .unwrap_or_default()
@@ -447,6 +476,8 @@ pub fn run(
                             host: pipelines
                                 .then(|| Host::new(false).ok().map(|h| (h, host::stub_ps())))
                                 .flatten(),
+                            mesh_fallback,
+                            barycentric_fallback,
                         };
                         while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
                             translate(job, entry.path(), &seen, &mut t, &mut checks);
@@ -460,6 +491,25 @@ pub fn run(
     let mut t = total.into_inner().unwrap_or_else(|e| e.into_inner());
     for line in t.summary_lines(validate) {
         println!("{line}");
+    }
+    if mesh_fallback {
+        let [tried, emitted, validated, made] = t.fallback;
+        println!(
+            "             {emitted} emitted of {tried} mesh programs without mesh shaders; \
+             {validated} validated, {made} pipelines"
+        );
+    }
+    if barycentric_fallback {
+        let [tried, emitted, validated, made] = t.barycentric;
+        let [same, different] = t.barycentric_same;
+        println!(
+            "             {emitted} emitted of {tried} pixel programs that need barycentrics, \
+             for hosts without them; {validated} validated, {made} pipelines"
+        );
+        println!(
+            "             {same} pixel programs without barycentrics emit the same for such \
+             hosts, {different} differ"
+        );
     }
     if !pairs.is_empty() {
         let host = Host::new(false).map_err(anyhow::Error::msg)?;
@@ -517,14 +567,18 @@ fn translate(
     let Ok(container) = Container::parse(&bytes) else {
         return t.fail(None, "no DXIL part (SM5 or older)".into(), example);
     };
-    let Some(dxil) = container.part(FourCC::DXIL).map(|p| p.data) else {
+    // A compute container may carry its program in an `ACCC` part instead.
+    let Some(program) = [FourCC::DXIL, victory_shader::accc::ACCC]
+        .into_iter()
+        .find_map(|f| container.part(f).map(|p| p.data))
+    else {
         return t.fail(None, "no DXIL part (SM5 or older)".into(), example);
     };
-    if !lock(seen).insert(blake3::hash(dxil)) && !list {
+    if !lock(seen).insert(blake3::hash(program)) && !list {
         t.duplicates += 1;
         return;
     }
-    let programs = match native_programs(dxil) {
+    let programs = match victory_shader::container_programs(&container) {
         Ok(p) => p,
         Err(e) => return t.fail(None, e.to_string(), example),
     };
@@ -621,6 +675,11 @@ fn tally_program(
                 match emit::emit(container, p, &program, &s, &i, &r) {
                     Ok(shader) => {
                         *counter(t, p.stage, 1) += 1;
+                        if p.stage == HwStage::Ps && checks.barycentric_fallback {
+                            let fallback =
+                                emit::emit_without_barycentrics(container, p, &program, &s, &i, &r);
+                            check_barycentric(&shader, fallback, t, checks, &label);
+                        }
                         check(shader, t, checks, label);
                     }
                     Err(ShaderError::Unsupported { offset, what }) => {
@@ -632,6 +691,21 @@ fn tally_program(
                     Err(e) => {
                         t.refused += 1;
                         t.fail(Some(p.stage), format!("emit: {e}"), label);
+                    }
+                }
+                if p.stage == HwStage::Ms && checks.mesh_fallback {
+                    t.fallback[0] += 1;
+                    match emit::emit_mesh_fallback(container, p, &program, &s, &i, &r) {
+                        Ok(fallback) => {
+                            t.fallback[1] += 1;
+                            check_fallback(fallback, t, checks, label);
+                        }
+                        Err(ShaderError::Unsupported { offset, what }) => {
+                            t.fail(Some(p.stage), format!("mesh fallback: {what}"), || {
+                                format!("{} at {offset:#x}", label())
+                            });
+                        }
+                        Err(e) => t.fail(Some(p.stage), format!("mesh fallback: {e}"), label),
                     }
                 }
             } else {
@@ -649,6 +723,145 @@ fn tally_program(
             });
         }
     }
+}
+
+/// A pixel program emitted for hosts without barycentrics (`fallback`)
+/// beside its plain emission `native`: one that needs none must be the
+/// same; one that does is validated with its geometry shader and gets a
+/// pipeline behind a stub vertex shader, if asked to.
+fn check_barycentric(
+    native: &emit::HostShader,
+    fallback: Result<emit::HostShader, ShaderError>,
+    t: &mut Tally,
+    checks: &mut Checks,
+    label: &impl Fn() -> String,
+) {
+    let needs = native.needs_barycentrics();
+    let fallback = match fallback {
+        Ok(f) => f,
+        Err(e) => {
+            if needs {
+                t.barycentric[0] += 1;
+            } else {
+                t.barycentric_same[1] += 1;
+            }
+            return t.fail(
+                Some(HwStage::Ps),
+                format!("barycentric fallback: {e}"),
+                label,
+            );
+        }
+    };
+    if !needs {
+        if fallback == *native {
+            t.barycentric_same[0] += 1;
+        } else {
+            t.barycentric_same[1] += 1;
+            t.fail(
+                Some(HwStage::Ps),
+                "barycentric fallback: a program without barycentrics emits differently".into(),
+                label,
+            );
+        }
+        return;
+    }
+    t.barycentric[0] += 1;
+    if fallback.needs_barycentrics() {
+        return t.fail(
+            Some(HwStage::Ps),
+            "barycentric fallback: still needs the host's barycentrics".into(),
+            label,
+        );
+    }
+    t.barycentric[1] += 1;
+    // The stub vertex shader feeds the plain program's inputs, as `check`'s.
+    let made = host::stub_vs(native).and_then(|vs| {
+        emit::barycentric_gs(&vs.dxil, &fallback.dxil)
+            .map(|gs| (vs, gs))
+            .map_err(|e| e.to_string())
+    });
+    let (vs, mut gs) = match made {
+        Ok(made) => made,
+        Err(e) => {
+            return t.fail(
+                Some(HwStage::Ps),
+                format!("barycentric fallback geometry shader: {e}"),
+                label,
+            );
+        }
+    };
+    if let Some(v) = checks.validator.as_mut() {
+        let mut ps = fallback.dxil.clone();
+        for (what, dxil) in [("pixel", &mut ps), ("geometry", &mut gs)] {
+            if let Err(text) = v.validate(dxil) {
+                let first = text
+                    .lines()
+                    .find(|l| l.contains("error"))
+                    .unwrap_or(text.lines().next().unwrap_or(""))
+                    .to_owned();
+                let reason = format!("barycentric fallback validator ({what}): {first}");
+                return t.fail(Some(HwStage::Ps), reason, label);
+            }
+        }
+        t.barycentric[2] += 1;
+    }
+    if let Some((h, _)) = &checks.host {
+        match h.pipeline_with_geometry(&vs, &gs, &fallback) {
+            Ok(_) => {
+                t.barycentric[3] += 1;
+                if t.list {
+                    t.lines.push(format!(
+                        "{}  barycentric fallback pipeline created",
+                        label()
+                    ));
+                }
+            }
+            Err(e) => t.fail(
+                Some(HwStage::Ps),
+                format!("barycentric fallback pipeline: {e}"),
+                label,
+            ),
+        }
+    }
+}
+
+/// Validates both halves of a mesh program emitted for hosts without mesh
+/// shaders, and makes their pipelines, if asked to.
+fn check_fallback(
+    mut fallback: emit::MeshFallback,
+    t: &mut Tally,
+    checks: &mut Checks,
+    label: impl Fn() -> String,
+) {
+    if let Some((h, stub_ps)) = &checks.host {
+        match h.mesh_fallback_pipelines(&fallback, stub_ps) {
+            Ok(_) => t.fallback[3] += 1,
+            Err(e) => t.fail(
+                Some(HwStage::Ms),
+                format!("mesh fallback pipeline: {e}"),
+                &label,
+            ),
+        }
+    }
+    let Some(v) = checks.validator.as_mut() else {
+        return;
+    };
+    let halves = [
+        ("compute", &mut fallback.compute.dxil),
+        ("vertex", &mut fallback.vertex.dxil),
+    ];
+    for (half, dxil) in halves {
+        if let Err(text) = v.validate(dxil) {
+            let first = text
+                .lines()
+                .find(|l| l.contains("error"))
+                .unwrap_or(text.lines().next().unwrap_or(""))
+                .to_owned();
+            let reason = format!("mesh fallback validator ({half}): {first}");
+            return t.fail(Some(HwStage::Ms), reason, &label);
+        }
+    }
+    t.fallback[2] += 1;
 }
 
 /// Validates an emitted shader if asked to.
@@ -688,7 +901,11 @@ fn check(
                     t.lines.push(format!("{}  pipeline created", label()));
                 }
             }
-            Err(e) => t.fail(Some(shader.stage), format!("pipeline: {e}"), &label),
+            Err(e) => t.fail(
+                Some(shader.stage),
+                format!("pipeline: {e} ({})", shader.declared()),
+                &label,
+            ),
         }
     }
     let Some(v) = checks.validator.as_mut() else {
@@ -763,6 +980,7 @@ fn tally_io(r: &io::Io, t: &mut Tally) {
         match i {
             io::Interp::Interpolated { .. } => t.interpolated += 1,
             io::Interp::Vertex { .. } => t.vertex_values += 1,
+            io::Interp::Computed { second, .. } => t.interpolated += usize::from(*second),
         }
     }
     for e in &r.exports {
@@ -951,6 +1169,15 @@ mod offline {
         }
 
         pub fn compute_pipeline(&self, _: &HostShader) -> Result<(), String> {
+            match *self {}
+        }
+
+        pub fn pipeline_with_geometry(
+            &self,
+            _: &HostShader,
+            _: &[u8],
+            _: &HostShader,
+        ) -> Result<(), String> {
             match *self {}
         }
     }
@@ -1149,6 +1376,8 @@ mod tests {
             keep: None,
             validator: None,
             host: None,
+            mesh_fallback: false,
+            barycentric_fallback: false,
         };
         let mut t = Tally {
             list: true,
