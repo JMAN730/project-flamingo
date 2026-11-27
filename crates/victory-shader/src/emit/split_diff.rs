@@ -255,23 +255,20 @@ impl Harness {
             }
             written.0 = written.0.max(w.0);
             written.1 = written.1.max(w.1);
-            // A profile on which the program writes nothing tells nothing
-            // (the first is always reported).
-            if n > 0 && w.0 == 0 && first.is_ok() {
-                continue;
-            }
-            variants.push(variant(name("split"), first, None));
+            let quiet = n > 0 && w.0 == 0 && first.is_ok();
+            let mut profile = Vec::new();
+            profile.push(variant(name("split"), first, None));
             let again = self.run(&self.host, &split, plan, opts);
-            variants.push(variant(name("split-again"), again, base.as_ref()));
+            profile.push(variant(name("split-again"), again, base.as_ref()));
             if let Some(pairs) = &pairs {
                 let r = pairs
                     .clone()
                     .and_then(|s| self.run(&self.host, &s, plan, opts));
                 let pairs_base = r.as_ref().ok().cloned();
-                variants.push(variant(name("split-pairs"), r, base.as_ref()));
+                profile.push(variant(name("split-pairs"), r, base.as_ref()));
                 if let Ok(s) = pairs {
                     let again = self.run(&self.host, s, plan, opts);
-                    variants.push(variant(
+                    profile.push(variant(
                         name("split-pairs-again"),
                         again,
                         pairs_base.as_ref(),
@@ -280,12 +277,23 @@ impl Harness {
             }
             if let (Some((reference, _)), Some(cs)) = (&self.reference, &native_cs) {
                 let r = cs.clone().and_then(|s| self.run(reference, &s, plan, opts));
-                variants.push(variant(name("native"), r, base.as_ref()));
+                profile.push(variant(name("native"), r, base.as_ref()));
             }
-            if variants
+            let removed = profile
                 .iter()
-                .any(|v| matches!(&v.result, Err(e) if e.contains("device removed")))
-            {
+                .any(|v| matches!(&v.result, Err(e) if e.contains("device removed")));
+            // A profile on which nothing writes tells nothing (the first is
+            // always reported). Drop it only once every comparison ran and left
+            // the outputs as the split did: a reference that writes where the
+            // split does not is exactly the fault to report.
+            let silent = quiet
+                && profile
+                    .iter()
+                    .all(|v| v.result.is_ok() && v.diff.is_none_or(|d| d.0 == 0));
+            if !silent {
+                variants.append(&mut profile);
+            }
+            if removed {
                 break;
             }
         }
