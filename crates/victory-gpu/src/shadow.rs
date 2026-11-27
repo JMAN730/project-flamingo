@@ -2396,13 +2396,22 @@ impl Shadow {
         Some(written)
     }
 
-    /// [`take_gpu_writes`] for a piece of this copy, except where title
-    /// memory never went to the copy: `held` is then no record of what the
-    /// title had (the copy began as zeros), so differing from it says
-    /// nothing about a CPU write, and the GPU's changed bytes are taken as
-    /// they are.
+    /// The merge of a piece of this copy on the paths that run after a
+    /// submission's lists rather than with them (card copies, the relay,
+    /// lazy readback): the GPU's changed bytes are taken as they are.
+    ///
+    /// [`take_gpu_writes`]'s three-way rule is not the default here. On
+    /// these paths the title runs on while the work is in flight and
+    /// `held` is the copy as last brought up to date, not what one
+    /// submission started from, so the rule finds a "newer CPU write" many
+    /// times a second in the title's world, where the path that copies back
+    /// with the submission finds a handful in a whole run; with it the
+    /// title soon reads a pointer made of two halves and stops.
+    /// `VICTORY_COPY_BACK_LATE_RULE=1` applies it here anyway, to study
+    /// (never where title memory never went to the copy: `held` is then no
+    /// record of what the title had, the copy having begun as zeros).
     fn take_gpu_writes(&self, address: usize, gpu: &[u8], held: &[u8], title: &mut [u8]) -> bool {
-        if !self.never_copied(address, title.len()) {
+        if late_rule() && !self.never_copied(address, title.len()) {
             return take_gpu_writes(address, gpu, held, title);
         }
         let mut changed = false;
@@ -5006,9 +5015,10 @@ fn stale_pages_in(
 /// and only where the title has not changed that dword since either: a CPU
 /// write made while the GPU ran is newer than the bytes the GPU worked
 /// from, and wins (the title's memory may have been reused for its own
-/// data in the meantime). Returns whether `title` changed. Every copy-back
-/// path (one submission at a time, relay, card and ReBAR copies, lazy
-/// readback) merges through this. [`CONFLICTS`] counts the dwords left to
+/// data in the meantime). Returns whether `title` changed. The copy-back
+/// that runs with a submission merges through this; the paths that run
+/// after it (relay, card copies, lazy readback) only when asked to
+/// ([`Shadow::take_gpu_writes`]). [`CONFLICTS`] counts the dwords left to
 /// the CPU (`copy-back conflicts` in the diagnostics copy line);
 /// `VICTORY_COPY_BACK_GPU_WINS` (diagnostics builds) restores the old rule,
 /// the GPU's bytes always win, for comparison.
@@ -5052,6 +5062,21 @@ fn take_gpu_writes(address: usize, gpu: &[u8], held: &[u8], title: &mut [u8]) ->
         i = end;
     }
     changed
+}
+
+/// Whether the merges that run after a submission's lists use the three-way
+/// rule ([`Shadow::take_gpu_writes`]): `VICTORY_COPY_BACK_LATE_RULE=1`
+/// (diagnostics builds), and always in tests, which keep the rule's
+/// behaviour there pinned down.
+fn late_rule() -> bool {
+    #[cfg(feature = "diagnostics")]
+    let asked = {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| crate::switch::on("VICTORY_COPY_BACK_LATE_RULE"))
+    };
+    #[cfg(not(feature = "diagnostics"))]
+    let asked = false;
+    cfg!(test) || asked
 }
 
 /// Dwords copy-back left to a newer CPU write (see [`take_gpu_writes`]).

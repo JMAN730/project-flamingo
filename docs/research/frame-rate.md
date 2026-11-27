@@ -658,6 +658,26 @@ as a record of what was tried.
 
 Kept and carried onto main's code: the three-way copy-back rule (the CPU
 wins when title memory changed since the submission's snapshot;
-`VICTORY_COPY_BACK_GPU_WINS=1` restores the old rule) at every place GPU
-writes are merged back, and `VICTORY_TEXTURE_MIP_DROP` on top of main's mip
+`VICTORY_COPY_BACK_GPU_WINS=1` restores the old rule) on the copy-back that
+runs with a submission, and `VICTORY_TEXTURE_MIP_DROP` on top of main's mip
 pressure mechanism.
+
+First runs of the merged tree on the GTX 1080 (runs 193-198), three faults,
+all from the two sides meeting:
+
+- Loading made 16 GB of host textures and ran out of memory (193). Main
+  exempts textures the title places in its own memory from giving up mip
+  levels under pressure, and `VICTORY_TEXTURE_MIP_DROP` went through the
+  same gate; the title's streamed textures are placed ones. The switch now
+  reaches them (196: 4 GB, as before the merge).
+- World frames took 2 to 6 minutes (196). Main remakes a streamed texture's
+  view when more of its levels arrive; with levels dropped, the check
+  compared the title's level numbers with the host copy's and remade every
+  such view at every draw. Both sides now use the host copy's numbers
+  (197: about 1 s a frame).
+- The title stopped on a bad pointer at frame 2090 (197), with 4 to 97
+  copy-back conflicts every 5 s where run 192 had 3 in all. On main's late
+  paths (relay, card copies, lazy readback) the three-way rule finds CPU
+  writes all the time, and a pointer can keep a half from each side. With
+  the old rule (198) the world ran 15 minutes. The rule is now opt-in
+  there (`VICTORY_COPY_BACK_LATE_RULE=1`).

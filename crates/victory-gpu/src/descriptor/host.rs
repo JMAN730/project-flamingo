@@ -3345,6 +3345,7 @@ fn narrow_to_resident(
     if resident.1 == 0 {
         return None;
     }
+    let resident = resident_on_host(resource, resident);
     // SAFETY: a live resource.
     let mips = u32::from(unsafe { texture.GetDesc() }.MipLevels);
     let asked = match desc.ViewDimension {
@@ -3396,6 +3397,13 @@ fn narrow_to_resident(
     Some((first, count))
 }
 
+/// The resident levels `window` (first, count) of title texture `resource`,
+/// which name the title's levels, as its host copy numbers them: the copy
+/// may lack the title's top levels (`resource::dropped_mips`).
+fn resident_on_host(resource: crate::object::This, window: (u32, u32)) -> (u32, u32) {
+    crate::resource::rebase_mip_range(window.0, window.1, crate::resource::dropped_mips(resource))
+}
+
 /// Whether a host SRV made with `host_mips` for title view `view` should be
 /// remade because more (or all) streamed levels have arrived.
 fn residency_widened(view: &View, title: usize, host_mips: (u32, u32)) -> bool {
@@ -3405,8 +3413,19 @@ fn residency_widened(view: &View, title: usize, host_mips: (u32, u32)) -> bool {
     // SAFETY: a live resource when this slot still holds it.
     let rd = unsafe { texture.GetDesc() };
     let mips = u32::from(rd.MipLevels);
+    // What the title asks for, as the host copy numbers its levels: the
+    // view was made that way, and a copy without its top levels would
+    // otherwise differ from the title's numbers at every look.
+    let on_host = |words: &[u32; 10]| {
+        let mut desc = srv_desc(words);
+        drop_mips_in_srv(
+            &mut desc,
+            crate::resource::dropped_mips(title as crate::object::This),
+        );
+        asked_srv_mips(&desc, mips)
+    };
     let asked = match view {
-        View::Shader(_, Some(w)) => match asked_srv_mips(&srv_desc(w), mips) {
+        View::Shader(_, Some(w)) => match on_host(w) {
             Some(a) => a,
             None => return false,
         },
@@ -3415,7 +3434,7 @@ fn residency_widened(view: &View, title: usize, host_mips: (u32, u32)) -> bool {
                 Ok(w) => w,
                 Err(_) => return false,
             };
-            match asked_srv_mips(&srv_desc(&words), mips) {
+            match on_host(&words) {
                 Some(a) => a,
                 None => return false,
             }
@@ -3449,7 +3468,11 @@ fn residency_widened(view: &View, title: usize, host_mips: (u32, u32)) -> bool {
         }
     } else {
         match crate::texture::resident(title as crate::object::This) {
-            Some(window) if window.1 > 0 => crate::texture::narrowed(asked, window, mips),
+            Some(window) if window.1 > 0 => crate::texture::narrowed(
+                asked,
+                resident_on_host(title as crate::object::This, window),
+                mips,
+            ),
             // Fully mapped (or no longer tracked as partial): the title's range.
             _ if host_mips != asked => asked,
             _ => return false,

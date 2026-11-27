@@ -252,6 +252,8 @@ The on/off switches below (`...=1`) are off when unset or set to `0`.
 | `VICTORY_KEYS_FILE=<path>` | presses the keys named one per line in that file (same names), read while the title runs: each held 0.2 s, 0.2 s apart; append lines as screens appear (the legal-notices screen takes `Down`, `Down`, `Enter` a few seconds apart) |
 | `VICTORY_CRASH_BREAKPOINTS=1` | appends first-chance breakpoints to `crashes.log`, including ones a handler may recover from |
 | `VICTORY_CRASH_SAVE=<rva>:<len>,...` | saves title memory to the cache folder on a crash |
+| `VICTORY_COPY_BACK_GPU_WINS=1` | copy-back with a submission takes every byte the GPU changed, also where the title wrote the same dword since (the rule before the three-way merge) |
+| `VICTORY_COPY_BACK_LATE_RULE=1` | the three-way merge also on the copy-back that runs after a submission (relay, card copies, lazy readback), where it is off: the title's world stops on it |
 | `VICTORY_CAPTURE=<dir>` | saves presented frames (powers of two, or `VICTORY_CAPTURE_FRAMES=<list>`) |
 | `VICTORY_PLANE_STATS=1` | with `VICTORY_PRESENT_TWO_PLANES=1`, logs RGB statistics for successful two-plane presents listed in `VICTORY_CAPTURE_FRAMES` |
 | `VICTORY_DUMP_TARGETS=1` | with `VICTORY_CAPTURE` and `VICTORY_CAPTURE_FRAMES`, saves every render target of those frames |
