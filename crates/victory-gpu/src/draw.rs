@@ -1141,7 +1141,12 @@ impl State {
         // Depth textures it writes through unordered access: their colour
         // twins hold what they lack from here on.
         list.twins_written();
-        if compute || p.stages.iter().any(|stage| stage.translated().stores) {
+        if compute
+            || p.stages
+                .iter()
+                .chain(p.fallback.as_ref().map(|f| &f.stage))
+                .any(|stage| stage.translated().stores)
+        {
             list.buffers_written();
             self.wrote = true;
         }
@@ -2399,7 +2404,8 @@ impl State {
     ///   gather into the list prelude.
     fn note_gather_writes(&self, list: &HostList, p: &HostPipeline, compute: bool) {
         let mut poisoned: Vec<u64> = Vec::new();
-        for stage in &p.stages {
+        // A mesh program run as a compute pass writes what it writes too.
+        for stage in p.stages.iter().chain(p.fallback.as_ref().map(|f| &f.stage)) {
             let t = stage.translated();
             if !t.stores {
                 continue;
@@ -3551,6 +3557,7 @@ impl State {
             #[cfg(feature = "diagnostics")]
             self.frame_op("indirect mesh as compute and draw", false, ran);
             if ran {
+                self.note_gather_writes(list, p, false);
                 DRAWN.fetch_add(1, Ordering::Relaxed);
                 MESH_WITHOUT_MESH_SHADERS[1].fetch_add(1, Ordering::Relaxed);
             } else {
@@ -3740,7 +3747,11 @@ impl State {
                     && kind != DISPATCH
                     && max == 1
                     && count.is_none()
-                    && !p.stages.iter().any(|stage| stage.translated().stores);
+                    && !p
+                        .stages
+                        .iter()
+                        .chain(p.fallback.as_ref().map(|f| &f.stage))
+                        .any(|stage| stage.translated().stores);
                 if !windowed || list.first_use(WINDOW_USE) {
                     self.window = None;
                 }
