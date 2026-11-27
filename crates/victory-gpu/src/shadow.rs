@@ -2422,6 +2422,21 @@ impl Shadow {
         changed
     }
 
+    /// Notes that the copy takes title bytes on the pages of title memory
+    /// `[from, to)` (a copy that then fails is made again, or leaves the
+    /// page to the title's side of the copy-back rule).
+    fn mark_refreshed(&self, from: usize, to: usize) {
+        if from >= to {
+            return;
+        }
+        let base = self.start as usize / PAGE;
+        for page in from / PAGE..=(to - 1) / PAGE {
+            if let Some(seen) = page.checked_sub(base).and_then(|i| self.refreshed.get(i)) {
+                seen.store(true, Ordering::Release);
+            }
+        }
+    }
+
     /// Whether no part of the pages of title memory `[address, address +
     /// len)` was ever copied to this copy (`false` for a copy that keeps no
     /// such record).
@@ -3276,6 +3291,9 @@ impl Shadow {
         };
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let base = start / PAGE;
+        // Every page of the range is copied here unless it already was (a
+        // page never copied counts as stale).
+        self.mark_refreshed(from.max(start), to.min(end));
         // Acquire `LAZY_STATE` strictly BEFORE `self.copied` (lock order).
         let owned = if crate::lazy_back::active() {
             crate::lazy_back::owned_blocks_with_clean_in(
@@ -3822,15 +3840,7 @@ impl Shadow {
             }
             let off = from - start;
             let len = to - from;
-            // From here on the copy holds title bytes on these pages (a
-            // segment that then fails to copy is copied again, or leaves
-            // the page for the title's side of the copy-back rule).
-            let base = start / PAGE;
-            for page in from / PAGE..=(to - 1) / PAGE {
-                if let Some(seen) = self.refreshed.get(page - base) {
-                    seen.store(true, Ordering::Release);
-                }
-            }
+            self.mark_refreshed(from, to);
             out.push(CopySeg {
                 src: from,
                 dst: (self.data as usize) + off,
@@ -6436,6 +6446,54 @@ mod tests {
         assert!(shadow.before.read().unwrap().snapshot.is_none());
         assert!(shadow.pending.lock().unwrap().is_empty());
         unregister(resource, start);
+    }
+
+    /// The copy-back rule of one copy: on a page that never took title
+    /// bytes the GPU's changed bytes are taken as they are; once any
+    /// refresh touched the page (through the copy runs, or the path for
+    /// ranges earlier lists write), a dword the title rewrote stays the
+    /// title's.
+    #[cfg(windows)]
+    #[test]
+    fn a_refreshed_page_keeps_the_titles_newer_write() {
+        if host().is_none() {
+            return;
+        }
+        let mut side = vec![0x11u8; 2 * PAGE];
+        let start = 0x7000_0000_u64;
+        let Some(shadow) =
+            Shadow::new_card_sized_for_test(side.as_mut_ptr(), start, side.len() as u64)
+        else {
+            return;
+        };
+        let address = start as usize;
+        let held = [0x11u8; 8];
+        let gpu = [0xc3, 0xc3, 0xc3, 0xc3, 0x11, 0x11, 0x11, 0x11];
+        // The title rewrote the dword the GPU also wrote.
+        let rewritten = [0x22, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11];
+
+        let mut title = rewritten;
+        assert!(shadow.never_copied(address, 8));
+        assert!(shadow.take_gpu_writes(address, &gpu, &held, &mut title));
+        assert_eq!(title, gpu, "nothing says the title wrote: the GPU's bytes");
+
+        // The second page, refreshed as a range an earlier list writes is.
+        let second = address + PAGE;
+        shadow.mark_refreshed(second, second + 16);
+        assert!(!shadow.never_copied(second, 8));
+        let mut title = rewritten;
+        assert!(!shadow.take_gpu_writes(second, &gpu, &held, &mut title));
+        assert_eq!(title, rewritten, "the title's newer dword stays");
+        // A range reaching into a refreshed page is under the rule too.
+        assert!(!shadow.never_copied(second - 4, 8));
+
+        // The copy runs mark the pages they copy to.
+        let mut segs = Vec::new();
+        assert_eq!(
+            shadow.push_copy_segs(&[(address, address + 4)], &mut segs),
+            4
+        );
+        assert!(!shadow.never_copied(address, 8));
     }
 
     #[cfg(windows)]

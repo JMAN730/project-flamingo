@@ -1179,7 +1179,14 @@ impl Resource {
                 let clear = clear
                     .as_ref()
                     .map_or(std::ptr::null(), |c| std::ptr::from_ref(c).cast::<c_void>());
-                let mip_drop = !placed_views().contains(&(this as usize));
+                // A texture the title placed in its own memory keeps its
+                // levels under memory pressure (it may show a full target),
+                // but gives up the ones `VICTORY_TEXTURE_MIP_DROP` asks
+                // for: the title's streamed textures are placed ones, and
+                // most of what a card short of video memory has to shed.
+                // (`crate::texture`'s alias copy pairs levels by size.)
+                let mip_drop =
+                    !placed_views().contains(&(this as usize)) || forced_mip_drop(&self.desc) > 0;
                 let (texture, state, dropped) = host_texture(&self.desc, state, clear, mip_drop)?;
                 Some(std::sync::Arc::new(HostTexture {
                     texture,

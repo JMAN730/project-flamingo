@@ -581,24 +581,17 @@ fn translate(
         return t.fail(None, "no DXIL part (SM5 or older)".into(), example);
     };
     // A compute container may carry its program in an `ACCC` part instead.
-    let Some(program) = [FourCC::DXIL, victory_shader::accc::ACCC]
+    if ![FourCC::DXIL, victory_shader::accc::ACCC]
         .into_iter()
-        .find_map(|f| container.part(f).map(|p| p.data))
-    else {
+        .any(|f| container.part(f).is_some())
+    {
         return t.fail(None, "no DXIL part (SM5 or older)".into(), example);
-    };
-    // One program is tallied once, whatever containers carry it. With
-    // `VICTORY_WAVE_WIDE_ONLY` the lowering is chosen by the container's
-    // hash, so containers sharing a program can lower differently, and
-    // each is tallied.
-    static BY_CONTAINER: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let by_container =
-        *BY_CONTAINER.get_or_init(|| std::env::var_os("VICTORY_WAVE_WIDE_ONLY").is_some());
-    let key = if by_container {
-        blake3::hash(&bytes)
-    } else {
-        blake3::hash(program)
-    };
+    }
+    // A container is tallied once. By its own digest, not its program
+    // part's: the lowering is chosen by the container's hash (a built-in
+    // list, or `VICTORY_WAVE_WIDE_ONLY`), so two containers sharing a
+    // program can lower differently.
+    let key = blake3::hash(&bytes);
     if !lock(seen).insert(key) && !list {
         t.duplicates += 1;
         return;

@@ -314,7 +314,7 @@ Runs 21-27 (mip drop ported, hangs traced):
 
 Next step (user is raising TdrDelay to 10 s and TdrDdiDelay to 20 s, then rebooting):
 re-run with
-`VICTORY_TEXTURE_MIP_DROP=2 VICTORY_TEXTURE_MIP_DROP_MIN_SIZE=256 VICTORY_SKIP_PIPELINES=5d113aa6830760b6 VICTORY_LOG=info target\diag\victory.exe run <exe> --console series-s --execute`
+`$env:VICTORY_TEXTURE_MIP_DROP='2'; $env:VICTORY_TEXTURE_MIP_DROP_MIN_SIZE='256'; $env:VICTORY_SKIP_PIPELINES='5d113aa6830760b6'; $env:VICTORY_LOG='info'; target\diag\victory.exe run <exe> --console series-s --execute`
 (drop the skip once the timeout is raised, to test whether `5d113…` was just slow).
 Then measure world fps and find the latency between submissions (GPU 6-48% busy).
 Input: click the window, hold Enter about 0.3 s.
@@ -379,8 +379,8 @@ Asynchronous submission (runs 33-34), local, behind `VICTORY_ASYNC_SUBMIT=1`:
 
 Stable configuration on the GTX 1080 (picture, loading, intro credits, world,
 10+ min without a crash):
-`VICTORY_TEXTURE_MIP_DROP=2 VICTORY_TEXTURE_MIP_DROP_MIN_SIZE=256 VICTORY_SKIP_PIPELINES=5d113aa6830760b6 target\diag\victory.exe run <exe> --console series-s --execute`
-plus, optionally, `VICTORY_ASYNC_SUBMIT=1`.
+`$env:VICTORY_TEXTURE_MIP_DROP='2'; $env:VICTORY_TEXTURE_MIP_DROP_MIN_SIZE='256'; $env:VICTORY_SKIP_PIPELINES='5d113aa6830760b6'; target\diag\victory.exe run <exe> --console series-s --execute`
+plus, optionally, `$env:VICTORY_ASYNC_SUBMIT='1'` set first.
 
 - Black screen: fixed by the black-screen session (Series S presents two
   planes; `planes.rs` + `shaders/plane_compose.hlsl` blend them).
