@@ -13,7 +13,10 @@
 //! after; work runs with no lock held.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+#[cfg(any(not(windows), test))]
+use std::sync::atomic::AtomicU32;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::Instant;
 
@@ -43,51 +46,40 @@ pub(crate) fn memory_wait_timeouts() -> u64 {
     MEMORY_WAIT_TIMEOUTS.load(Ordering::Relaxed)
 }
 
-/// Whether `[address, address + width)` is committed, remembering pages
-/// found committed for up to a second. Waits are checked on every memory
-/// write notification; asking the kernel each time (`VirtualQuery`) took
-/// most of a world frame's CPU time. A page the title decommits is asked
-/// again within a second.
-#[cfg(windows)]
-fn committed_recently(address: u64, width: usize) -> bool {
-    use std::collections::HashSet;
-    use std::sync::Mutex;
-    use std::time::{Duration, Instant};
-    static SEEN: Mutex<Option<(Instant, HashSet<u64>)>> = Mutex::new(None);
-    let first = address >> 12;
-    let last = (address + width as u64 - 1) >> 12;
-    {
-        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-        let (since, pages) = seen.get_or_insert_with(|| (Instant::now(), HashSet::new()));
-        if since.elapsed() > Duration::from_secs(1) {
-            *since = Instant::now();
-            pages.clear();
-        }
-        if (first..=last).all(|p| pages.contains(&p)) {
-            return true;
-        }
-    }
-    if !crate::texture::committed(address as *const u8, width) {
-        return false;
-    }
-    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some((_, pages)) = seen.as_mut() {
-        pages.extend(first..=last);
-    }
-    true
-}
-
 impl MemoryWait {
+    /// Target memory address and comparison width in bytes (4 or 8).
+    #[cfg(windows)]
+    pub(crate) fn place(&self) -> (usize, usize) {
+        (self.address as usize, if self.width == 4 { 4 } else { 8 })
+    }
+
+    /// Whether `val` satisfies this wait's masked comparison (used by
+    /// `crate::host::late_met` against queued bottom-of-pipe writes).
+    #[cfg(windows)]
+    pub(crate) fn holds_for(&self, val: u64) -> bool {
+        let (lhs, rhs) = if self.width == 4 {
+            (
+                u64::from((val as u32) & self.mask),
+                u64::from(self.reference as u32),
+            )
+        } else {
+            (val, self.reference)
+        };
+        self.holds(lhs, rhs)
+    }
+
     /// Whether the memory location currently satisfies the wait condition.
     ///
-    /// On Windows, checks that `[address, address + width)` is committed before
-    /// reading so a freed or decommitted title address resolves cleanly instead
-    /// of faulting the process.
+    /// On Windows, reads only the 4 or 8 target bytes through the kernel
+    /// (`ReadProcessMemory`) instead of querying `VirtualQuery` first, avoiding
+    /// multi-millisecond page-table region walks on large title allocations
+    /// while still resolving uncommitted, freed, or inaccessible addresses
+    /// cleanly without faulting.
     pub(crate) fn satisfied(&self) -> bool {
         if self.address == 0 {
             return true;
         }
-        let width = usize::from(self.width);
+        let width = if self.width == 4 { 4 } else { 8 };
         if self.address.checked_add(width as u64).is_none() {
             tracing::warn!(
                 address = format_args!("{:#x}", self.address),
@@ -97,31 +89,43 @@ impl MemoryWait {
             return true;
         }
         #[cfg(windows)]
-        if !committed_recently(self.address, width) {
-            tracing::warn!(
-                address = format_args!("{:#x}", self.address),
-                width = self.width,
-                "GPU memory wait address is not committed; resolving wait"
-            );
-            return true;
-        }
-        let (lhs, rhs) = if self.width == 4 {
+        let (lhs, rhs) = {
+            let mut raw = [0u8; 8];
+            if !crate::host::read_into(self.address as *const u8, &mut raw[..width]) {
+                tracing::warn!(
+                    address = format_args!("{:#x}", self.address),
+                    width = self.width,
+                    "GPU memory wait address is not committed; resolving wait"
+                );
+                return true;
+            }
+            // Pair with Release stores from CPU or bottom-of-pipe writers.
+            std::sync::atomic::fence(Ordering::Acquire);
+            if width == 4 {
+                let val = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
+                (u64::from(val & self.mask), u64::from(self.reference as u32))
+            } else {
+                (u64::from_le_bytes(raw), self.reference)
+            }
+        };
+        #[cfg(not(windows))]
+        let (lhs, rhs) = if width == 4 {
             let val = if self.address.is_multiple_of(align_of::<AtomicU32>() as u64) {
-                // SAFETY: verified committed on Windows (or live test memory); aligned 32-bit read.
+                // SAFETY: live aligned 32-bit test memory.
                 unsafe { AtomicU32::from_ptr(self.address as *mut u32) }.load(Ordering::Acquire)
             } else {
                 std::sync::atomic::fence(Ordering::Acquire);
-                // SAFETY: verified committed on Windows (or live test memory); 32-bit read.
+                // SAFETY: live 32-bit test memory.
                 unsafe { (self.address as *const u32).read_unaligned() }
             };
             (u64::from(val & self.mask), u64::from(self.reference as u32))
         } else {
             let val = if self.address.is_multiple_of(align_of::<AtomicU64>() as u64) {
-                // SAFETY: verified committed on Windows (or live test memory); aligned 64-bit read.
+                // SAFETY: live aligned 64-bit test memory.
                 unsafe { AtomicU64::from_ptr(self.address as *mut u64) }.load(Ordering::Acquire)
             } else {
                 std::sync::atomic::fence(Ordering::Acquire);
-                // SAFETY: verified committed on Windows (or live test memory); 64-bit read.
+                // SAFETY: live 64-bit test memory.
                 unsafe { (self.address as *const u64).read_unaligned() }
             };
             (val, self.reference)
@@ -142,168 +146,6 @@ impl MemoryWait {
             _ => true,
         }
     }
-
-    /// Whether `value`, stored by a `bytes`-byte write at the wait's
-    /// address, would meet it (None: the write does not cover the wait's
-    /// bytes as it reads them).
-    pub(crate) fn met_by(&self, bytes: usize, value: u64) -> Option<bool> {
-        match (self.width, bytes) {
-            (4, 4 | 8) => Some(self.holds(
-                u64::from(value as u32 & self.mask),
-                u64::from(self.reference as u32),
-            )),
-            (8, 8) => Some(self.holds(value, self.reference)),
-            _ => None,
-        }
-    }
-}
-
-/// Host submissions in flight (`VICTORY_IN_FLIGHT`, see
-/// `host::in_flight_limit`): the host fence value of the last submission
-/// whose completion (copy-back, done writes) has run. Completions run in
-/// submission order, so every submission up to it is complete.
-static COMPLETED: AtomicU64 = AtomicU64::new(0);
-
-/// Queues holding work back until [`COMPLETED`] reaches a value. Leaf lock,
-/// taken under a timeline's state, never the other way round.
-static COMPLETION_WAITERS: Mutex<Vec<(u64, std::sync::Weak<Timeline>)>> = Mutex::new(Vec::new());
-
-/// The done writes (bottom-of-pipe writes of known values) of host
-/// submissions in flight: (host fence value, address, bytes, value), in
-/// submission order. Leaf lock.
-static FLYING_WRITES: Mutex<Vec<(u64, usize, usize, u64)>> = Mutex::new(Vec::new());
-/// Whether [`FLYING_WRITES`] has entries (so waits need not lock it).
-static FLYING: AtomicU32 = AtomicU32::new(0);
-
-/// GPU memory waits met by a submission in flight before it completed, by
-/// its done writes and by what its shaders wrote, since the frame-rate
-/// line last read them.
-pub(crate) static MET_IN_FLIGHT: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
-
-/// A submission (host fence value `value`) was handed to the host queue;
-/// `writes` are its done writes of known values (address, bytes, value).
-pub(crate) fn fly_writes(value: u64, writes: impl IntoIterator<Item = (usize, usize, u64)>) {
-    let mut flying = FLYING_WRITES.lock().unwrap_or_else(|e| e.into_inner());
-    flying.extend(
-        writes
-            .into_iter()
-            .map(|(at, bytes, v)| (value, at, bytes, v)),
-    );
-    FLYING.store(u32::from(!flying.is_empty()), Ordering::Release);
-}
-
-/// The submission's done writes landed in title memory.
-pub(crate) fn land_writes(value: u64) {
-    let mut flying = FLYING_WRITES.lock().unwrap_or_else(|e| e.into_inner());
-    flying.retain(|w| w.0 != value);
-    FLYING.store(u32::from(!flying.is_empty()), Ordering::Release);
-}
-
-/// The done writes in flight that touch `[from, to)`: (host fence value,
-/// address, bytes, value).
-pub(crate) fn flying_writes(from: usize, to: usize) -> Vec<(u64, usize, usize, u64)> {
-    if FLYING.load(Ordering::Acquire) == 0 {
-        return Vec::new();
-    }
-    let flying = FLYING_WRITES.lock().unwrap_or_else(|e| e.into_inner());
-    flying
-        .iter()
-        .filter(|&&(_, at, bytes, _)| at < to && at + bytes > from)
-        .copied()
-        .collect()
-}
-
-/// The first submission in flight whose done write meets `wait` (its host
-/// fence value), if any.
-///
-/// Why a queue may go on behind such a wait before that submission
-/// completes: the wait only orders GPU work. The host has one in-order
-/// queue and that submission is already on it, so whatever the waiting
-/// queue submits next runs on the GPU after it (ExecuteCommandLists
-/// boundaries are full barriers on the host: work and caches of one call
-/// are done before the next starts). What must not move ahead is what a
-/// CPU observes: the waiting queue's later non-GPU work (fence signals,
-/// presents, page mappings) is held until that submission has completed
-/// ([`Timeline`]'s `need`), and a later submission whose preparation reads,
-/// on the CPU, title memory that one writes at completion first waits for
-/// it (`host`'s landing check); where the GPU reads such a value through a
-/// host copy, the copy is given it (`host`'s refresh patch). The title's
-/// CPU never sees the value early: title memory gets it at completion, as
-/// before.
-///
-/// Values shaders of a submission in flight write count too, once they
-/// are in its host copy (`host::shader_meets`): the same ordering holds.
-pub(crate) fn in_flight_meets(wait: &MemoryWait) -> Option<u64> {
-    met_in_flight(wait).map(|(value, _)| value)
-}
-
-/// [`in_flight_meets`], and whether shaders (not a done write) met it.
-fn met_in_flight(wait: &MemoryWait) -> Option<(u64, bool)> {
-    if wait.address == 0 {
-        return None;
-    }
-    if FLYING.load(Ordering::Acquire) != 0 {
-        let flying = FLYING_WRITES.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(value) = first_meeting(wait, &flying) {
-            return Some((value, false));
-        }
-    }
-    #[cfg(windows)]
-    if let Some(value) = crate::host::shader_meets(wait) {
-        return Some((value, true));
-    }
-    None
-}
-
-/// [`in_flight_meets`] over `writes` (in submission order).
-fn first_meeting(wait: &MemoryWait, writes: &[(u64, usize, usize, u64)]) -> Option<u64> {
-    writes
-        .iter()
-        .filter(|w| w.1 as u64 == wait.address)
-        .find(|w| wait.met_by(w.2, w.3) == Some(true))
-        .map(|w| w.0)
-}
-
-/// The host fence value of the last submission completed in flight.
-pub(crate) fn completed_value() -> u64 {
-    COMPLETED.load(Ordering::Acquire)
-}
-
-/// Submissions up to host fence value `value` have completed: the queues
-/// that waited for it, to wake once no lock is held.
-pub(crate) fn completed(value: u64) -> Vec<Arc<Timeline>> {
-    COMPLETED.fetch_max(value, Ordering::AcqRel);
-    let now = COMPLETED.load(Ordering::Acquire);
-    let mut woken = Vec::new();
-    let mut waiters = COMPLETION_WAITERS.lock().unwrap_or_else(|e| e.into_inner());
-    waiters.retain(|(wanted, queue)| {
-        if *wanted <= now {
-            woken.extend(queue.upgrade());
-            false
-        } else {
-            queue.strong_count() > 0
-        }
-    });
-    woken
-}
-
-/// Whether submissions up to `value` have completed; if not, `queue` is
-/// woken once they have (checked under the waiters' lock, so no completion
-/// is missed).
-fn completion_reached(value: u64, queue: &Arc<Timeline>) -> bool {
-    if value == 0 || COMPLETED.load(Ordering::Acquire) >= value {
-        return true;
-    }
-    let mut waiters = COMPLETION_WAITERS.lock().unwrap_or_else(|e| e.into_inner());
-    if COMPLETED.load(Ordering::Acquire) >= value {
-        return true;
-    }
-    let weak = Arc::downgrade(queue);
-    match waiters.iter_mut().find(|(_, q)| q.ptr_eq(&weak)) {
-        Some(existing) => existing.0 = existing.0.max(value),
-        None => waiters.push((value, weak)),
-    }
-    false
 }
 
 /// One step of a queue's work.
@@ -314,20 +156,7 @@ pub(crate) enum Op {
     WaitMemory(MemoryWait, Option<Instant>),
     /// Command lists to run, a fence to signal.
     Run(Box<dyn FnOnce() + Send>),
-    /// Work that finishes later (a host submission the GPU still runs):
-    /// what follows is held back until it calls the resume it is given.
-    RunAsync(Box<dyn FnOnce(Resume) + Send>),
-    /// A host submission left in flight (`VICTORY_IN_FLIGHT`): the work
-    /// prepares and submits it and returns its host fence value (0: none).
-    /// What follows runs at once if it is GPU work too (another
-    /// `RunInFlight`) or a wait; [`Op::Run`] and [`Op::RunAsync`] (fence
-    /// signals, presents, page mappings: what the title's CPU sees) are
-    /// held until the submission has completed.
-    RunInFlight(Box<dyn FnOnce() -> u64 + Send>),
 }
-
-/// Called once when an [`Op::RunAsync`] has finished.
-pub(crate) type Resume = Box<dyn FnOnce() + Send>;
 
 #[derive(Default)]
 pub(crate) struct Timeline {
@@ -346,22 +175,15 @@ struct State {
     busy: bool,
     /// The first op is a wait not reached yet, registered with its fence.
     held: bool,
-    /// An [`Op::RunAsync`] started and has not resumed yet.
-    running_async: bool,
     /// Since when, and why ([`HELD_US`] index), the queue has been held.
     held_since: Option<(Instant, usize)>,
-    /// The host fence value whose submission must have completed before
-    /// the queue's next [`Op::Run`] or [`Op::RunAsync`]: its own
-    /// submissions in flight, and those whose done writes met its memory
-    /// waits early (0: none).
-    need: u64,
 }
 
 /// Microseconds queues spent held, summed over queues: behind a fence wait,
-/// a GPU memory wait, a submission still finishing; then running work, and
-/// time inside the driver's ExecuteCommandLists. The frame-rate line reads
+/// a GPU memory wait; then running work, and time inside the driver's
+/// ExecuteCommandLists. The frame-rate line reads
 /// and resets them.
-pub(crate) static HELD_US: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+pub(crate) static HELD_US: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
 impl Timeline {
     fn lock(&self) -> MutexGuard<'_, State> {
@@ -372,11 +194,6 @@ impl Timeline {
     /// Work another thread is running for the queue is waited for, as a
     /// submission's own work is.
     pub(crate) fn submit(self: &Arc<Self>, op: Op) {
-        // `VICTORY_ASYNC_SUBMIT` 3 to 5: a queue call finishes submission
-        // work left for the title's threads first (nothing otherwise).
-        #[cfg(windows)]
-        crate::host::run_pending();
-        let called = Instant::now();
         #[cfg(feature = "diagnostics")]
         wait_stats::queue_called();
         let mut s = self.lock();
@@ -386,12 +203,7 @@ impl Timeline {
         while s.busy && s.done < ticket {
             s = self.moved.wait(s).unwrap_or_else(|e| e.into_inner());
         }
-        let _ = called;
         if s.done >= ticket {
-            return;
-        }
-        // Behind work that finishes later: its resume runs what follows.
-        if s.running_async {
             return;
         }
         // Still held back unless the value was reached by a path that does
@@ -400,13 +212,10 @@ impl Timeline {
             match s.ops.front() {
                 Some(Op::Wait(fence, value)) if !fence.reached(*value) => return,
                 Some(Op::WaitMemory(wait, deadline))
-                    if !wait.satisfied()
-                        && in_flight_meets(wait).is_none()
-                        && deadline.is_none_or(|d| Instant::now() < d) =>
+                    if !wait.satisfied() && deadline.is_none_or(|d| Instant::now() < d) =>
                 {
                     return;
                 }
-                Some(Op::Run(_) | Op::RunAsync(_)) if !completion_reached(s.need, self) => return,
                 _ => {}
             }
         }
@@ -415,46 +224,56 @@ impl Timeline {
         self.run(s);
     }
 
+    /// Adds work to the queue and returns immediately, scheduling it on the
+    /// asynchronous submission worker when `VICTORY_ASYNC_SUBMIT=1` is active.
+    #[cfg(windows)]
+    pub(crate) fn submit_async(self: &Arc<Self>, op: Op) {
+        {
+            let mut s = self.lock();
+            s.ops.push_back(op);
+            s.pushed += 1;
+        }
+        crate::queue::async_schedule(self);
+    }
+
     /// The fence this queue waits for moved: runs what it held back.
     pub(crate) fn wake(self: &Arc<Self>) {
         let s = self.lock();
-        if !s.busy && !s.running_async {
-            self.run(s);
-        }
-    }
-
-    /// An [`Op::RunAsync`] finished: counts it done and runs what it held
-    /// back (unless the thread that started it is still running the queue,
-    /// which goes on by itself).
-    fn resume(self: &Arc<Self>) {
-        let mut s = self.lock();
-        s.running_async = false;
-        s.done += 1;
-        self.moved.notify_all();
         if !s.busy {
             self.run(s);
         }
     }
 
-    fn run<'a>(self: &'a Arc<Self>, mut s: MutexGuard<'a, State>) {
+    fn run<'a>(self: &'a Arc<Self>, s: MutexGuard<'a, State>) {
+        #[cfg(windows)]
+        let use_late = crate::host::late();
+        #[cfg(not(windows))]
+        let use_late = false;
+        self.run_with(s, use_late, |wait| {
+            #[cfg(windows)]
+            {
+                crate::host::late_met(wait)
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = wait;
+                false
+            }
+        });
+    }
+
+    fn run_with<'a>(
+        self: &'a Arc<Self>,
+        mut s: MutexGuard<'a, State>,
+        use_late_met: bool,
+        check_late_met: impl Fn(&MemoryWait) -> bool,
+    ) {
         s.busy = true;
         s.held = false;
         if let Some((since, why)) = s.held_since.take() {
             HELD_US[why].fetch_add(since.elapsed().as_micros() as u64, Ordering::Relaxed);
         }
-        loop {
-            // Behind submissions in flight: what the title's CPU sees waits
-            // for their completion.
-            if matches!(s.ops.front(), Some(Op::Run(_) | Op::RunAsync(_)))
-                && !completion_reached(s.need, self)
-            {
-                s.held = true;
-                s.held_since = Some((Instant::now(), 2));
-                break;
-            }
-            let Some(op) = s.ops.pop_front() else {
-                break;
-            };
+        while let Some(op) = s.ops.pop_front() {
             match op {
                 Op::Wait(fence, value) => {
                     // Checked and registered under the fence's lock, so a
@@ -468,16 +287,16 @@ impl Timeline {
                 }
                 Op::WaitMemory(wait, deadline) => {
                     let was_registered = deadline.is_some();
-                    let met = wait.satisfied();
-                    if !met && let Some((value, shaders)) = met_in_flight(&wait) {
-                        // Met by a submission already on the host queue.
-                        s.need = s.need.max(value);
-                        MET_IN_FLIGHT[usize::from(shaders)].fetch_add(1, Ordering::Relaxed);
-                        #[cfg(feature = "diagnostics")]
-                        if was_registered {
-                            wait_stats::released(self, &wait, wait_stats::How::Early { shaders });
-                        }
-                    } else if !met {
+                    let mut met = wait.satisfied();
+                    if !met && use_late_met {
+                        // Drop `Timeline::state` before `late_met` -> `settle_now`
+                        // (`Host::submitted` + `LINE_LANDED`) so concurrent wakes
+                        // never deadlock or invert lock order.
+                        drop(s);
+                        met = check_late_met(&wait);
+                        s = self.lock();
+                    }
+                    if !met {
                         let deadline = deadline.unwrap_or_else(|| {
                             Instant::now() + crate::fence::memory_wait_timeout()
                         });
@@ -540,30 +359,8 @@ impl Timeline {
                     drop(s);
                     let started = Instant::now();
                     work();
-                    HELD_US[3].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+                    HELD_US[2].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
                     s = self.lock();
-                }
-                Op::RunInFlight(work) => {
-                    drop(s);
-                    let started = Instant::now();
-                    let value = work();
-                    HELD_US[3].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
-                    s = self.lock();
-                    s.need = s.need.max(value);
-                }
-                Op::RunAsync(work) => {
-                    s.running_async = true;
-                    drop(s);
-                    let me = Arc::clone(self);
-                    work(Box::new(move || me.resume()));
-                    s = self.lock();
-                    if s.running_async {
-                        // Finishes later; its resume runs the rest.
-                        s.held_since = Some((Instant::now(), 2));
-                        break;
-                    }
-                    // It finished already, and its resume counted it.
-                    continue;
                 }
             }
             s.done += 1;
@@ -647,87 +444,6 @@ mod tests {
             }
             .satisfied()
         );
-    }
-
-    #[test]
-    fn a_done_write_in_flight_meets_a_wait_as_the_memory_would() {
-        let wait = |width, comparison, reference| MemoryWait {
-            address: 0x1000,
-            reference,
-            mask: u32::MAX,
-            width,
-            comparison,
-        };
-        let writes = [
-            (5, 0x1000, 4, 3),
-            (6, 0x1000, 8, 0x1_0000_0009),
-            (7, 0x2000, 4, 9),
-        ];
-        // The first submission whose write meets it: the low 32 bits of
-        // the 8-byte write are 9.
-        assert_eq!(first_meeting(&wait(4, 7, 9), &writes), Some(6));
-        assert_eq!(first_meeting(&wait(4, 7, 3), &writes), Some(5));
-        assert_eq!(first_meeting(&wait(8, 3, 0x1_0000_0009), &writes), Some(6));
-        // A 4-byte write does not cover an 8-byte wait; nothing meets 10.
-        assert_eq!(first_meeting(&wait(8, 7, 0), &writes), Some(6));
-        assert_eq!(first_meeting(&wait(8, 3, 3), &writes), None);
-        assert_eq!(first_meeting(&wait(4, 7, 10), &writes), None);
-    }
-
-    /// Behind a memory wait a submission in flight meets, a queue goes on
-    /// with GPU work at once, but its fence signals (what the title's CPU
-    /// sees) wait until every submission it is behind has completed.
-    #[test]
-    fn work_behind_submissions_in_flight_waits_for_their_completion() {
-        let timeline = Arc::new(Timeline::default());
-        let cell = AtomicU32::new(0);
-        let address = (&raw const cell) as u64;
-        // Far above any value another test completes.
-        let value = 1 << 62;
-        fly_writes(value, [(address as usize, 4, 9)]);
-        let wait = MemoryWait {
-            address,
-            reference: 7,
-            mask: u32::MAX,
-            width: 4,
-            comparison: 7,
-        };
-        let met = MET_IN_FLIGHT[0].load(Ordering::Relaxed);
-        timeline.submit(Op::WaitMemory(
-            wait,
-            Some(Instant::now() + Duration::from_secs(5)),
-        ));
-        let submitted = Arc::new(AtomicBool::new(false));
-        let flag = submitted.clone();
-        timeline.submit(Op::RunInFlight(Box::new(move || {
-            flag.store(true, Ordering::Release);
-            value + 1
-        })));
-        assert!(
-            submitted.load(Ordering::Acquire),
-            "GPU work goes on behind a wait met in flight"
-        );
-        assert!(MET_IN_FLIGHT[0].load(Ordering::Relaxed) > met);
-        assert!(!crate::fence::has_memory_waiter(&timeline));
-        let signalled = Arc::new(AtomicBool::new(false));
-        let flag = signalled.clone();
-        timeline.submit(Op::Run(Box::new(move || {
-            flag.store(true, Ordering::Release);
-        })));
-        assert!(!signalled.load(Ordering::Acquire), "held behind both");
-        land_writes(value);
-        for queue in completed(value) {
-            queue.wake();
-        }
-        assert!(
-            !signalled.load(Ordering::Acquire),
-            "still behind its own submission"
-        );
-        for queue in completed(value + 1) {
-            queue.wake();
-        }
-        assert!(signalled.load(Ordering::Acquire));
-        assert_eq!(cell.load(Ordering::Relaxed), 0, "memory itself untouched");
     }
 
     #[test]
@@ -831,5 +547,172 @@ mod tests {
             "MEMORY_WAITERS entry must be unregistered before post-wait work runs"
         );
         assert!(!crate::fence::has_memory_waiter(&timeline));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn memory_wait_resolves_noaccess_committed_page_without_faulting() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, VirtualAlloc, VirtualFree,
+        };
+        // SAFETY: committing a single `PAGE_NOACCESS` page for read-safety verification.
+        let page = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                4096,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_NOACCESS,
+            )
+        };
+        assert!(!page.is_null());
+        let wait = MemoryWait {
+            address: page as u64,
+            reference: 1,
+            mask: u32::MAX,
+            width: 4,
+            comparison: 3,
+        };
+        assert!(wait.satisfied());
+        // SAFETY: freeing the page we allocated above.
+        unsafe { VirtualFree(page, 0, MEM_RELEASE) };
+    }
+
+    /// A wait checked on a committed page whose page is then freed (or
+    /// decommitted) is checked again without faulting: nothing remembers the
+    /// page as committed between checks.
+    #[cfg(windows)]
+    #[test]
+    fn memory_wait_on_a_page_freed_after_a_check_resolves_without_faulting() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_DECOMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
+            VirtualFree,
+        };
+        for release in [false, true] {
+            // SAFETY: one committed page, decommitted or freed below.
+            let page = unsafe {
+                VirtualAlloc(
+                    std::ptr::null(),
+                    4096,
+                    MEM_RESERVE | MEM_COMMIT,
+                    PAGE_READWRITE,
+                )
+            };
+            assert!(!page.is_null());
+            let wait = MemoryWait {
+                address: page as u64 + 8,
+                reference: 1,
+                mask: u32::MAX,
+                width: 8,
+                comparison: 3,
+            };
+            assert!(!wait.satisfied(), "the page holds zeros");
+            // SAFETY: our page, decommitted or freed; read by `satisfied` only
+            // through fault-safe reads.
+            unsafe {
+                match release {
+                    false => VirtualFree(page, 4096, MEM_DECOMMIT),
+                    true => VirtualFree(page, 0, MEM_RELEASE),
+                };
+            }
+            assert!(wait.satisfied(), "an unreadable address resolves the wait");
+            if !release {
+                // SAFETY: releasing the reservation left by the decommit.
+                unsafe { VirtualFree(page, 0, MEM_RELEASE) };
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn memory_wait_reads_committed_value_inside_large_allocation() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        const SIZE: usize = 16 << 20;
+        // SAFETY: a 16 MiB committed allocation freed before returning.
+        let base = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                SIZE,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE,
+            )
+        };
+        assert!(!base.is_null());
+        let wait = MemoryWait {
+            address: base as u64,
+            reference: 42,
+            mask: u32::MAX,
+            width: 4,
+            comparison: 3,
+        };
+        assert!(!wait.satisfied());
+        // SAFETY: aligned 32-bit cell at the start of our committed allocation.
+        unsafe { (*(base as *const AtomicU32)).store(42, Ordering::Release) };
+        assert!(wait.satisfied());
+        // SAFETY: freeing our allocation.
+        unsafe { VirtualFree(base, 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn wait_memory_drops_timeline_state_before_late_met() {
+        let timeline = Arc::new(Timeline::default());
+        let cell = AtomicU32::new(0);
+        let wait = MemoryWait {
+            address: (&raw const cell) as u64,
+            reference: 1,
+            mask: u32::MAX,
+            width: 4,
+            comparison: 3,
+        };
+        let ran = Arc::new(AtomicBool::new(false));
+        let ran_work = ran.clone();
+
+        {
+            let mut s = timeline.lock();
+            s.ops.push_back(Op::WaitMemory(wait, None));
+            s.ops.push_back(Op::Run(Box::new(move || {
+                ran_work.store(true, Ordering::Release);
+            })));
+            s.pushed = 2;
+
+            let tl_cb = timeline.clone();
+            let late_called = AtomicBool::new(false);
+            timeline.run_with(s, true, |_w| {
+                late_called.store(true, Ordering::Release);
+                // 1. `Timeline::state` must NOT be held across `late_met` / `settle_now`.
+                assert!(
+                    tl_cb.state.try_lock().is_ok(),
+                    "Timeline::state must be dropped before calling late_met"
+                );
+                // 2. Re-entrant `wake()` (e.g. from `settle_now` -> `woken.run()`)
+                //    must acquire `Timeline::state` cleanly without deadlocking.
+                tl_cb.wake();
+                // 3. Another thread must also be able to lock `Timeline::state`
+                //    while `late_met` is in flight (zero AB-BA lock inversion).
+                let tl_other = tl_cb.clone();
+                let other_locked = std::thread::spawn(move || {
+                    let guard = tl_other.state.try_lock();
+                    let ok = guard.is_ok();
+                    drop(guard);
+                    tl_other.wake();
+                    ok
+                })
+                .join()
+                .expect("concurrent wake thread panicked");
+                assert!(
+                    other_locked,
+                    "concurrent thread must acquire Timeline::state during late_met"
+                );
+                cell.store(1, Ordering::Release);
+                true
+            });
+            assert!(late_called.load(Ordering::Acquire));
+        }
+
+        assert!(
+            ran.load(Ordering::Acquire),
+            "post-wait work must run once late_met satisfies the memory wait"
+        );
     }
 }

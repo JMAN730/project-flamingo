@@ -399,6 +399,16 @@ impl Tally {
 type Kept = std::sync::Arc<Mutex<Vec<(String, emit::HostShader)>>>;
 
 /// The optional checks after emission, one set per thread.
+/// Dumped shaders and validator reports (`VICTORY_EMIT_DUMP`) are
+/// game-derived (rule #1), so their directory must be outside the repo, as
+/// `Config` requires of the cache and data directories.
+fn emit_dump_outside_repo(dir: Option<&std::ffi::OsStr>) -> Result<()> {
+    if let Some(dir) = dir {
+        victory_core::ensure_outside_repo(Path::new(dir))?;
+    }
+    Ok(())
+}
+
 struct Checks {
     /// Shaders named in `VICTORY_PAIRS` (`vs+ps,...`, label substrings),
     /// kept to build those pipelines after the walk.
@@ -419,6 +429,7 @@ pub fn run(
     list: bool,
     jobs: Option<usize>,
 ) -> Result<()> {
+    emit_dump_outside_repo(std::env::var_os("VICTORY_EMIT_DUMP").as_deref())?;
     let paths = crate::default_paths(paths)?;
     let dll = validate.then(Validator::default_path).flatten();
     if validate {
@@ -555,12 +566,14 @@ fn translate(
         return t.fail(None, "corrupt record".into(), location);
     };
     let list = t.list;
-    let hash = list.then(|| blake3::hash(&bytes).to_hex().to_string());
+    let hash = blake3::hash(&bytes).to_hex().to_string();
+    let short_hash = &hash[..16];
     let example = || {
         let location = location();
-        match &hash {
-            Some(hash) => format!("{location} hash={}", &hash[..16]),
-            None => location,
+        if list {
+            format!("{location} hash={short_hash}")
+        } else {
+            location
         }
     };
     t.containers += 1;
@@ -583,13 +596,14 @@ fn translate(
         Err(e) => return t.fail(None, e.to_string(), example),
     };
     for p in programs {
-        tally_program(&container, &p, &example, t, checks);
+        tally_program(&container, &p, short_hash, &example, t, checks);
     }
 }
 
 fn tally_program(
     container: &Container<'_>,
     p: &NativeProgram,
+    hash: &str,
     example: &impl Fn() -> String,
     t: &mut Tally,
     checks: &mut Checks,
@@ -672,7 +686,9 @@ fn tally_program(
             } else if let (Some(r), Some(i), Some(s)) = (res, raised, structured) {
                 let label = || format!("{} {:?}", example(), p.stage);
                 *counter(t, p.stage, 0) += 1;
-                match emit::emit(container, p, &program, &s, &i, &r) {
+                match emit::emit_with_wave32_for_hash(
+                    container, p, &program, &s, &i, &r, true, hash,
+                ) {
                     Ok(shader) => {
                         *counter(t, p.stage, 1) += 1;
                         if p.stage == HwStage::Ps && checks.barycentric_fallback {
@@ -1180,6 +1196,14 @@ mod offline {
         ) -> Result<(), String> {
             match *self {}
         }
+
+        pub fn mesh_fallback_pipelines(
+            &self,
+            _: &victory_shader::emit::MeshFallback,
+            _: &HostShader,
+        ) -> Result<(), String> {
+            match *self {}
+        }
     }
 
     pub mod host {
@@ -1199,6 +1223,24 @@ mod offline {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Shader dumps are game-derived, so a dump directory in the repo is
+    /// refused; one outside it, or none, is not.
+    #[test]
+    fn emit_dump_inside_repo_is_refused() {
+        let inside = Path::new(env!("CARGO_MANIFEST_DIR")).join("no-such-dump-dir");
+        let err = emit_dump_outside_repo(Some(inside.as_os_str())).unwrap_err();
+        assert!(
+            matches!(
+                err.downcast_ref(),
+                Some(victory_core::PolicyError::InsideRepo { .. })
+            ),
+            "{err}"
+        );
+        let outside = tempfile::tempdir().unwrap();
+        emit_dump_outside_repo(Some(outside.path().as_os_str())).unwrap();
+        emit_dump_outside_repo(None).unwrap();
+    }
     use victory_shader::native::{ComputeIo, StageIo};
 
     fn empty_dxbc() -> Vec<u8> {
@@ -1393,18 +1435,18 @@ mod tests {
                 threads: [1, 1, 1],
             }),
         );
-        tally_program(&container, &cs, &example, &mut t, &mut checks);
+        tally_program(&container, &cs, "", &example, &mut t, &mut checks);
 
         // Tessellation and geometry stages are counted in `not_emitted`, not refused.
         for stage in [HwStage::Ls, HwStage::Hs, HwStage::Es, HwStage::Gs] {
             let prog = endpgm_program(stage, StageIo::None);
-            tally_program(&container, &prog, &example, &mut t, &mut checks);
+            tally_program(&container, &prog, "", &example, &mut t, &mut checks);
         }
 
         // An unemitted stage that fails IR building is counted once as refused, not `not_emitted`.
         let mut bad_gs = endpgm_program(HwStage::Gs, StageIo::None);
         bad_gs.code = 0xFFFF_FFFFu32.to_le_bytes().to_vec();
-        tally_program(&container, &bad_gs, &example, &mut t, &mut checks);
+        tally_program(&container, &bad_gs, "", &example, &mut t, &mut checks);
 
         // A vertex shader that fails IR building records `vs 1` on its refusal line.
         let mut bad_vs = endpgm_program(
@@ -1415,7 +1457,7 @@ mod tests {
             },
         );
         bad_vs.code = 0xFFFF_FFFFu32.to_le_bytes().to_vec();
-        tally_program(&container, &bad_vs, &example, &mut t, &mut checks);
+        tally_program(&container, &bad_vs, "", &example, &mut t, &mut checks);
 
         assert_eq!(t.programs, 7);
         assert_eq!(t.emitted_total(), 1);

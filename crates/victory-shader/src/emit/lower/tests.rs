@@ -1,10 +1,26 @@
-use super::{Lowered, Numeric, Parts, buffer_format, half_shift, lower};
+//! Unit tests of `lower`, a child module so `lower.rs` stays under the asset policy's size limit.
+
+use super::{Lowered, Numeric, Parts, buffer_format, f16_nan_widen_bits, half_shift, lower};
 use crate::native::{
     ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
 };
 use crate::{io, ir, resource, structure};
 
 const S_ENDPGM: u32 = 0xBF81_0000;
+
+#[test]
+fn structured_buffer_properties_match_dword_record_alignment() {
+    for (stride, srv) in [(4, 0x000c), (12, 0x020c), (16, 0x020c)] {
+        assert_eq!(
+            super::Lower::buffer_props(Some(stride), false),
+            (srv, stride)
+        );
+        assert_eq!(
+            super::Lower::buffer_props(Some(stride), true),
+            (srv | 0x1000, stride)
+        );
+    }
+}
 
 /// The blocks of `words` (a wave32 program) whose `s_barrier` loses its
 /// thread-group sync.
@@ -57,6 +73,136 @@ fn a_barrier_after_a_reconverged_branch_keeps_its_sync() {
     assert_eq!(fence_only(&words), Vec::<usize>::new());
 }
 
+/// A wave32 exit mask grown while lanes leave a loop at different
+/// iterations, counted after the loop: every lane is in the mask (32),
+/// not each lane's own bit (1). Issue #465.
+#[test]
+fn loop_exit_mask_counted_after_the_loop_is_wave_wide() {
+    let words: &[u32] = &[
+        0x4A02_0081, // v_add_nc_u32 v1, 1, v0  (lane i loops i + 1 times)
+        0xBE8A_0380, // s_mov_b32 s10, 0
+        0x4E02_0281, // loop: v_subrev_nc_u32 v1, 1, v1
+        0x7D84_0280, // v_cmp_eq_u32 vcc_lo, 0, v1
+        0x880A_0A6A, // s_or_b32 s10, vcc_lo, s10
+        0x8A7E_0A7E, // s_andn2_b32 exec_lo, exec_lo, s10
+        0xBF89_FFFB, // s_cbranch_execnz loop
+        0x887E_0A7E, // s_or_b32 exec_lo, exec_lo, s10
+        0xBE89_0F0A, // s_bcnt1_i32_b32 s9, s10
+        0x7E04_0209, // v_mov_b32 v2, s9
+        S_ENDPGM,
+    ];
+    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 256,
+        layout: vec![],
+        used: vec![],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 1 << 1,
+            threads: [32, 1, 1],
+        }),
+        code,
+    };
+    let p = ir::build(&native.code, false, 256).unwrap();
+    let st = structure::structure(&p).unwrap();
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+    let io = io::raise(&p, &native).unwrap();
+    let lowered = lower(&Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: vec![],
+        outputs: vec![],
+        prims: vec![],
+        mesh_stride: 0,
+        mesh_buffer: false,
+    })
+    .expect("lower");
+    // The count is a ballot of the reconverged wave, not a per-lane 0/1.
+    assert!(lowered.wave_ops, "exit-mask count must ballot the wave");
+    assert!(
+        lowered.mask_ballots_after_loop > 0,
+        "exit-mask count must ballot after the loop, not inside it"
+    );
+}
+
+/// A mask written before a branch and counted inside it still ballots at
+/// the definition: `reaches(def, def)` alone must not count as a loop.
+#[test]
+fn a_mask_before_a_branch_is_not_balloted_as_after_a_loop() {
+    let words: &[u32] = &[
+        0x7D88_008A, // v_cmp_gt_u32 vcc_lo, 10, v0
+        0xBE94_036A, // s_mov_b32 s20, vcc_lo
+        0xBE86_3C6A, // s_and_saveexec_b32 s6, vcc_lo
+        0xBF88_0001, // s_cbranch_execz over the count
+        0xBE89_0F14, // s_bcnt1_i32_b32 s9, s20
+        0x7E04_0209, // v_mov_b32 v2, s9
+        0x881E_067E, // s_or_b32 exec_lo, exec_lo, s6
+        S_ENDPGM,
+    ];
+    let lowered = lower_words(words, 1 << 1).expect("lower");
+    assert_eq!(
+        lowered.mask_ballots_after_loop, 0,
+        "acyclic mask defs must keep definition-site ballots"
+    );
+}
+
+/// Wave64 form of [`loop_exit_mask_counted_after_the_loop_is_wave_wide`].
+#[test]
+fn wave64_loop_exit_mask_counted_after_the_loop_is_wave_wide() {
+    let words: &[u32] = &[
+        0x4A02_0081, // v_add_nc_u32 v1, 1, v0
+        0xBE8A_0480, // s_mov_b64 s[10:11], 0
+        0x4E02_0281, // loop: v_subrev_nc_u32 v1, 1, v1
+        0x7D84_0280, // v_cmp_eq_u32 vcc, 0, v1
+        0x888A_0A6A, // s_or_b64 s[10:11], vcc, s[10:11]
+        0x8AFE_0A7E, // s_andn2_b64 exec, exec, s[10:11]
+        0xBF89_FFFB, // s_cbranch_execnz loop
+        0x88FE_0A7E, // s_or_b64 exec, exec, s[10:11]
+        0xBE89_100A, // s_bcnt1_i32_b64 s9, s[10:11]
+        0x7E04_0209, // v_mov_b32 v2, s9
+        S_ENDPGM,
+    ];
+    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: true,
+        vgprs: 256,
+        layout: vec![],
+        used: vec![],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 1 << 1,
+            threads: [64, 1, 1],
+        }),
+        code,
+    };
+    let p = ir::build(&native.code, true, 256).unwrap();
+    let st = structure::structure(&p).unwrap();
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+    let io = io::raise(&p, &native).unwrap();
+    let lowered = lower(&Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: vec![],
+        outputs: vec![],
+        prims: vec![],
+        mesh_stride: 0,
+        mesh_buffer: false,
+    })
+    .expect("lower");
+    assert!(lowered.wave_ops, "exit-mask count must ballot the wave");
+    assert!(
+        lowered.mask_ballots_after_loop > 0,
+        "exit-mask count must ballot after the loop, not inside it"
+    );
+}
+
 /// Lowers a synthetic compute program with these input registers and
 /// returns the lowered result.
 fn lower_words(words: &[u32], rsrc2: u32) -> Result<super::Lowered, crate::ShaderError> {
@@ -96,6 +242,144 @@ fn lowers(words: &[u32], rsrc2: u32) -> Result<(), crate::ShaderError> {
     lower_words(words, rsrc2).map(|_| ())
 }
 
+/// `ds_swizzle_b32` must ballot-mask inactive source lanes to 0 (VIC-BT-018):
+/// a plain `waveReadLaneAt` would otherwise return a stale VGPR.
+#[test]
+fn ds_swizzle_b32_zeros_inactive_source_lanes() {
+    // s_mov_b32 exec_lo, 0x5555 (odd lanes inactive); ds_swizzle_b32 v1, v0
+    // offset:0x41f (and:0x1f or:0 xor:1 — exchange with the neighbour).
+    let words = [0xBEFE_03FF, 0x0000_5555, 0xD8D4_041F, 0x0100_0000, S_ENDPGM];
+    let lowered = lower_words(&words, 0).expect("ds_swizzle_b32 lowers");
+    assert!(
+        lowered.has_wave_ballot,
+        "ds_swizzle_b32 must ballot-mask inactive source lanes to 0"
+    );
+    assert!(lowered.wave_ops, "ds_swizzle_b32 uses wave operations");
+}
+
+/// A wave64 mesh shader's quad swizzle asks the ballot about the source's
+/// host lane (quad-local, from `waveGetLaneIndex`), not its console lane
+/// number: console lanes 32..63 have no bit in a wave32 host's ballot.
+#[test]
+fn mesh_quad_swizzle_checks_the_host_lane_of_its_source() {
+    // ds_swizzle_b32 v1, v0 offset:0x80b1 (quad mode, pairs swapped).
+    let words = [0xD8D4_80B1, 0x0100_0000, S_ENDPGM];
+    let native = NativeProgram {
+        stage: HwStage::Ms,
+        wave64: true,
+        vgprs: 4,
+        layout: vec![],
+        used: vec![],
+        io: StageIo::Ms(crate::native::MeshIo {
+            outputs: vec![],
+            clip_cntl: 0,
+            threads: 64,
+            max_vertices: 3,
+            max_primitives: 1,
+            topology: 2,
+            lds_bytes: 0,
+        }),
+        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    let p = ir::build(&native.code, true, native.vgprs).unwrap();
+    let st = structure::structure(&p).unwrap();
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+    let io = io::raise(&p, &native).unwrap();
+    let lowered = lower(&Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: vec![],
+        outputs: vec![],
+        prims: vec![],
+        mesh_stride: 0,
+        mesh_buffer: false,
+    })
+    .expect("mesh quad swizzle lowers");
+    assert!(lowered.has_wave_ballot, "inactive sources still read 0");
+    assert!(
+        called(&lowered, "waveGetLaneIndex"),
+        "the ballot bit is the host lane's, not the console lane number"
+    );
+    // A pattern every quad uses alike: the pair swap is one exchange.
+    assert!(
+        called(&lowered, "quadOp.i32"),
+        "swap across x is one QuadOp"
+    );
+}
+
+/// A Valid-Mask export on one path in, bypassed on the other, joining a
+/// block with a plain `done` export: the lanes whose last guard was false
+/// still die (VIC-BT-011).
+#[test]
+fn pixel_discard_follows_a_vm_export_that_only_some_paths_run() {
+    let words = [
+        0xBE81_0380u32, // s_mov_b32 s1, 0
+        0xBF06_8001,    // s_cmp_eq_u32 s1, 0
+        0xBF85_0005,    // s_cbranch_scc1 over the narrowed export
+        0x7D84_0080,    // v_cmp_eq_u32 vcc, 0, v0
+        0xBE80_3C6A,    // s_and_saveexec_b32 s0, vcc_lo
+        0xF800_1090,    // exp null vm
+        0,
+        0x887E_007E, // s_or_b32 exec_lo, exec_lo, s0
+        0xF800_080F, // exp mrt0 done
+        0,
+        S_ENDPGM,
+    ];
+    let native = NativeProgram {
+        stage: HwStage::Ps,
+        wave64: false,
+        vgprs: 1,
+        layout: vec![],
+        used: vec![],
+        io: StageIo::Ps {
+            inputs: vec![],
+            input_addr: 0,
+            rsrc2: Default::default(),
+            db_shader_control: 0,
+            patches: vec![],
+        },
+        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    let target = super::super::container::SigElement {
+        name: "SV_Target".into(),
+        index: 0,
+        kind: 16,
+        comp: 5,
+        interp: 0,
+        row: Some(0),
+        col: 0,
+        cols: 4,
+        usage: 0,
+        half: false,
+    };
+    let p = ir::build(&native.code, false, native.vgprs).unwrap();
+    let st = structure::structure(&p).unwrap();
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+    let io = io::raise(&p, &native).unwrap();
+    assert!(io.exports.iter().any(|e| e.vm && !e.done));
+    assert!(io.exports.iter().any(|e| e.done && !e.vm));
+    let lowered = lower(&Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: vec![],
+        outputs: vec![target],
+        prims: vec![],
+        mesh_stride: 0,
+        mesh_buffer: false,
+    })
+    .expect("partial-path vm export lowers");
+    assert!(
+        lowered.has_discard_op,
+        "lanes whose last Valid Mask guard was false must be discarded"
+    );
+}
+
 #[test]
 fn med3_f32_emits_dxil_isnan_instead_of_fcmp_uno() {
     // v_med3_f32 v0, v1, v2, v3 (VOP3 opcode 0x157)
@@ -118,6 +402,57 @@ fn med3_f32_emits_dxil_isnan_instead_of_fcmp_uno() {
     );
 }
 
+/// `v_cmp_{f,tru}_{f32,f16}` are false and true whatever the operands,
+/// NaNs included; they lower as constants like the integer forms, since
+/// `fcmp false`/`fcmp true` remove the WARP device at dispatch.
+#[test]
+fn float_compares_that_are_always_false_or_true_are_constants() {
+    for op in [0x000u32, 0x00F, 0x0C8, 0x0CF] {
+        // v_cmp_*_e64 s20, v1, v2; v_cndmask_b32_e64 v0, 0, 1, s20
+        let words = [
+            0x35 << 26 | op << 16 | 20,
+            (256 + 1) | (256 + 2) << 9,
+            0x35 << 26 | 0x101 << 16,
+            128 | 129 << 9 | 20 << 18,
+            S_ENDPGM,
+        ];
+        let lowered = lower_words(&words, 0).unwrap_or_else(|e| panic!("{op:#x}: {e}"));
+        assert!(
+            !lowered.has_fcmp_constant,
+            "{op:#x} must not emit fcmp false/true"
+        );
+    }
+}
+
+/// VOP3 `v_add_f32` with output modifier `omod` in bits 28:27 of word 1.
+fn v_add_f32_omod(omod: u8) -> [u32; 3] {
+    let src0 = 256 + 1u32;
+    let src1 = 256 + 2u32;
+    [
+        // VOP3 opcode 0x103 = VOP2 v_add_f32 (0x003) at the VOP2 base.
+        0x35 << 26 | (0x103u32 << 16),
+        src0 | (src1 << 9) | (u32::from(omod) & 3) << 27,
+        S_ENDPGM,
+    ]
+}
+
+#[test]
+fn write_f_omod_flushes_neg_zero_with_fcmp_oeq() {
+    // Plain add has no signed-zero flush; omod must compare against +0.
+    let plain = lower_words(&v_add_f32_omod(0), 0).unwrap();
+    assert!(
+        !plain.has_fcmp_oeq,
+        "v_add_f32 without omod must not emit fcmp oeq"
+    );
+    for omod in 1..=3 {
+        let lowered = lower_words(&v_add_f32_omod(omod), 0).unwrap();
+        assert!(
+            lowered.has_fcmp_oeq,
+            "v_add_f32 omod={omod} must emit fcmp oeq to flush -0.0"
+        );
+    }
+}
+
 /// A pixel shader that exports `v0` as a render-target colour, with
 /// `input_addr` enabling its input VGPRs.
 fn lower_ps(input_addr: u32) -> Result<Lowered, crate::ShaderError> {
@@ -133,6 +468,7 @@ fn lower_ps(input_addr: u32) -> Result<Lowered, crate::ShaderError> {
         io: StageIo::Ps {
             inputs: vec![],
             input_addr,
+            rsrc2: Default::default(),
             db_shader_control: 0,
             patches: vec![],
         },
@@ -179,6 +515,83 @@ fn pixel_sample_coverage_input_reads_dx_op_coverage() {
     assert!(!without.has_coverage_op);
 }
 
+/// VIC-BT-011: pixel survival follows the last `exp` with `vm`, and
+/// conditional non-`done` MRT writes are latched under EXEC instead of
+/// being refused or discarded on `done`'s guard alone.
+#[test]
+fn pixel_export_tracks_last_vm_and_masks_mrt_under_exec() {
+    use super::super::container::SigElement;
+    // v_cmp_eq_u32 vcc, 0, v0; s_and_saveexec_b32 s0, vcc_lo — narrow
+    // EXEC without a branch so the exports stay guarded in one block.
+    // exp mrt0 v0,v0,v0,v0 (no done, no vm) — previously "a conditional export".
+    // exp null done vm — last Valid Mask; survival uses this EXEC.
+    let words = [
+        0x7D84_0080u32, // v_cmp_eq_u32 vcc, 0, v0
+        0xBE80_3C6A,    // s_and_saveexec_b32 s0, vcc_lo
+        0xF800_000F,
+        0,
+        0xF800_1890,
+        0,
+        S_ENDPGM,
+    ];
+    let native = NativeProgram {
+        stage: HwStage::Ps,
+        wave64: false,
+        vgprs: 1,
+        layout: vec![],
+        used: vec![],
+        io: StageIo::Ps {
+            inputs: vec![],
+            // No SPI inputs: v0 is not a barycentric, only a compare/export source.
+            input_addr: 0,
+            rsrc2: Default::default(),
+            db_shader_control: 0,
+            patches: vec![],
+        },
+        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    let target = SigElement {
+        name: "SV_Target".into(),
+        index: 0,
+        kind: 16,
+        comp: 5,
+        interp: 0,
+        row: Some(0),
+        col: 0,
+        cols: 4,
+        usage: 0,
+        half: false,
+    };
+    let p = ir::build(&native.code, false, native.vgprs).unwrap();
+    let st = structure::structure(&p).unwrap();
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+    let io = io::raise(&p, &native).unwrap();
+    assert_eq!(io.exports.len(), 2);
+    assert!(!io.exports[0].done && !io.exports[0].vm);
+    assert!(io.exports[1].done && io.exports[1].vm);
+    assert!(
+        st.guards.iter().flatten().any(|g| g.is_some()),
+        "narrowed EXEC must guard the colour export"
+    );
+    let lowered = lower(&Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: vec![],
+        outputs: vec![target],
+        prims: vec![],
+        mesh_stride: 0,
+        mesh_buffer: false,
+    })
+    .expect("conditional MRT + last-vm done must lower");
+    assert!(
+        lowered.has_discard_op,
+        "pixel exit must discard from the last Valid Mask"
+    );
+}
+
 #[test]
 fn buffer_cache_invalidations_lower_as_no_ops() {
     // MUBUF opcode 0x071/0x072 with no data operand: the title asks the
@@ -193,8 +606,58 @@ fn buffer_cache_invalidations_lower_as_no_ops() {
     );
 }
 
-/// Lowers a pixel program with one target: whether it translates.
-fn lowers_ps(words: &[u32]) -> Result<(), crate::ShaderError> {
+/// VIC-BT-042: fused `v_fma_f16` keeps `256h×256h + (-65504h) = 32h`;
+/// unfused `v_mad_f16` / `v_mac_f16` overflow the product to +inf. All
+/// three opcodes must decode and lower; host execution is in `valu_tests`.
+#[test]
+fn f16_fma_and_mad_mac_lower() {
+    // Exact fused sum is finite; the product alone exceeds max finite f16.
+    let (a, b, c) = (256.0f64, 256.0f64, -65504.0f64);
+    assert_eq!(a * b + c, 32.0);
+    assert!(a * b > 65504.0);
+
+    let v = |n: u8| 256u32 + u32::from(n);
+    let vop3 = |op: u16, vdst: u8, src0: u32, src1: u32, src2: u32| -> [u32; 2] {
+        [
+            0x35 << 26 | (op as u32 & 0x3FF) << 16 | u32::from(vdst),
+            (src0 & 0x1FF) | (src1 & 0x1FF) << 9 | (src2 & 0x1FF) << 18,
+        ]
+    };
+    let names = |words: &[u32]| -> Vec<&'static str> {
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        crate::gfx10::decode(&code)
+            .unwrap()
+            .iter()
+            .map(|i| i.name().unwrap())
+            .collect()
+    };
+
+    // v_fma_f16 v0, v1, v2, v3 (VOP3 0x34b)
+    let mut fma = Vec::new();
+    fma.extend_from_slice(&vop3(0x34b, 0, v(1), v(2), v(3)));
+    fma.push(S_ENDPGM);
+    assert_eq!(names(&fma), ["v_fma_f16", "s_endpgm"]);
+    lowers(&fma, 0).expect("v_fma_f16");
+
+    // v_mad_f16 v0, v1, v2, v3 (VOP3 0x203)
+    let mut mad = Vec::new();
+    mad.extend_from_slice(&vop3(0x203, 0, v(1), v(2), v(3)));
+    mad.push(S_ENDPGM);
+    assert_eq!(names(&mad), ["v_mad_f16", "s_endpgm"]);
+    lowers(&mad, 0).expect("v_mad_f16");
+
+    // v_mac_f16 v0, v1, v2 (VOP3 encoding of VOP2 0x023 → 0x123);
+    // seed v0 from v3 so the accumulator is defined.
+    let mut mac = Vec::new();
+    mac.push(0x7E00_0303); // v_mov_b32 v0, v3
+    mac.extend_from_slice(&vop3(0x123, 0, v(1), v(2), 0));
+    mac.push(S_ENDPGM);
+    assert_eq!(names(&mac), ["v_mov_b32", "v_mac_f16", "s_endpgm"]);
+    lowers(&mac, 0).expect("v_mac_f16");
+}
+
+/// Lowers a pixel program with one target.
+fn lower_ps_words(words: &[u32]) -> Result<Lowered, crate::ShaderError> {
     let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
     let native = NativeProgram {
         stage: HwStage::Ps,
@@ -204,6 +667,7 @@ fn lowers_ps(words: &[u32]) -> Result<(), crate::ShaderError> {
         used: vec![],
         io: StageIo::Ps {
             inputs: vec![],
+            rsrc2: Default::default(),
             input_addr: 0,
             db_shader_control: 0,
             patches: vec![],
@@ -238,7 +702,58 @@ fn lowers_ps(words: &[u32]) -> Result<(), crate::ShaderError> {
         mesh_stride: 0,
         mesh_buffer: false,
     })
-    .map(|_| ())
+}
+
+/// Lowers a pixel program with one target: whether it translates.
+fn lowers_ps(words: &[u32]) -> Result<(), crate::ShaderError> {
+    lower_ps_words(words).map(|_| ())
+}
+
+/// `v_mov_b32_dpp8 v<dst>, v<src>` with lane selections `sel` (three bits
+/// per lane of each group of eight).
+const fn mov_dpp8(dst: u32, src: u32, sel: u32) -> [u32; 2] {
+    [0x7E00_02E9 | dst << 17, sel << 8 | src]
+}
+
+/// DPP8 in a pixel program where every lane picks a lane of its own quad
+/// (the two quads of a group of eight permuted differently) translates, as
+/// `quad_perm` does; DPP8 that reads across quads stays refused.
+#[test]
+fn pixel_dpp8_within_a_quad_translates_and_across_quads_is_refused() {
+    let read = |sel: u32| {
+        let [dpp0, dpp1] = mov_dpp8(1, 0, sel);
+        // v_mov_b32_dpp8 v1, v0; exp mrt0 v1, v1, v1, v1 done vm
+        lowers_ps(&[dpp0, dpp1, 0xF800_180F, 0x0101_0101, S_ENDPGM])
+    };
+    let selections = [3u32, 0, 2, 1, 4, 6, 5, 7];
+    let sel = (0..8).fold(0, |s, i| s | selections[i] << (3 * i));
+    read(sel).expect("in-quad DPP8");
+    // Lane 0 now reads lane 7, in the other quad.
+    let err = format!("{:?}", read(sel ^ 4).expect_err("cross-quad DPP8"));
+    assert!(err.contains("cross-lane"), "{err}");
+}
+
+/// A bare `v_readfirstlane_b32` in a pixel shader (not a proved waterfall
+/// descriptor read) wraps `waveReadLaneFirst` so a helper lane keeps its
+/// own value: `select(isHelperLane(), own, first)`. Compute is unchanged.
+#[test]
+fn pixel_readfirstlane_helper_lane_keeps_own_value() {
+    // v_readfirstlane_b32 s0, v0; v_mov_b32 v0, s0; exp mrt0 …; s_endpgm
+    let words = [0x7E00_0500, 0x7E00_0200, 0xF800_180F, 0, S_ENDPGM];
+    let ps = lower_ps_words(&words).expect("pixel readfirstlane");
+    assert!(ps.wave_ops);
+    assert!(
+        ps.has_helper_lane_op,
+        "pixel v_readfirstlane must emit dx.op.isHelperLane.i1"
+    );
+
+    // Same code as compute: no helpers, so no isHelperLane wrap.
+    let cs = lower_words(&words, 0).expect("compute readfirstlane");
+    assert!(cs.wave_ops);
+    assert!(
+        !cs.has_helper_lane_op,
+        "compute v_readfirstlane must stay bare waveReadLaneFirst"
+    );
 }
 
 /// Lowers a compute program of constants that allocates 512 bytes of LDS
@@ -297,6 +812,95 @@ fn permlanex16_reads_a_lane_of_the_other_row() {
         S_ENDPGM,
     ];
     lowers_lds(&words).unwrap();
+}
+
+/// VOP1 DPP16: `v_mov_b32_dpp vdst, vsrc row_shr:1` with `bound_ctrl` and `fi`.
+const fn vop1_dpp16_row_shr1(vdst: u8, vsrc: u8, bound_ctrl: bool, fi: bool) -> [u32; 2] {
+    [
+        0x7E00_0000 | (vdst as u32) << 17 | 0x01 << 9 | 0xFA,
+        (0xFu32) << 28
+            | 0xF << 24
+            | (bound_ctrl as u32) << 19
+            | (fi as u32) << 18
+            | 0x111 << 8
+            | vsrc as u32,
+    ]
+}
+
+/// VOP1 DPP8: `v_mov_b32_dpp vdst, vsrc dpp8:[1,0,3,2,5,4,7,6]` (`fi` via 0xEA).
+const fn vop1_dpp8_swap(vdst: u8, vsrc: u8, fi: bool) -> [u32; 2] {
+    let src0 = if fi { 0xEAu32 } else { 0xE9 };
+    let sel = 1 | 3 << 6 | 2 << 9 | 5 << 12 | 4 << 15 | 7 << 18 | 6 << 21;
+    [
+        0x7E00_0000 | (vdst as u32) << 17 | 0x01 << 9 | src0,
+        sel << 8 | vsrc as u32,
+    ]
+}
+
+/// Lowers a 32-thread compute shader that uses LDS (so the DPP result is
+/// consumed) and returns the lowered module.
+fn lower_wave32_dpp(words: &[u32]) -> Lowered {
+    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 8,
+        layout: vec![],
+        used: vec![],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 1 << 15,
+            threads: [32, 1, 1],
+        }),
+        code,
+    };
+    let p = ir::build(&native.code, false, 8).unwrap();
+    let st = structure::structure(&p).unwrap();
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+    let io = io::raise(&p, &native).unwrap();
+    lower(&Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: vec![],
+        outputs: vec![],
+        prims: vec![],
+        mesh_stride: 0,
+        mesh_buffer: false,
+    })
+    .expect("lower")
+}
+
+/// VIC-BT-008: with `fi:0`, DPP must ballot active lanes so inactive
+/// sources follow `bound_ctrl` (zero / preserve dest). With `fi:1`, no
+/// ballot is required for that check.
+#[test]
+fn dpp_fetch_inactive_ballots_source_lane_activity() {
+    let end = [0x7E04_0280u32, 0xD834_0000, 0x0000_0102, S_ENDPGM]; // v2=0; ds_write_b32 v2, v1
+    let with_fi = |fi: bool| {
+        let mut w = Vec::new();
+        w.extend_from_slice(&vop1_dpp16_row_shr1(1, 0, true, fi));
+        w.extend_from_slice(&end);
+        lower_wave32_dpp(&w)
+    };
+    assert!(
+        with_fi(false).has_wave_ballot,
+        "fi:0 must waveActiveBallot for source EXEC"
+    );
+    assert!(
+        !with_fi(true).has_wave_ballot,
+        "fi:1 must not ballot just to read inactive sources"
+    );
+    // DPP8 with fi:0 also ballots; fi:1 does not.
+    let dpp8 = |fi: bool| {
+        let mut w = Vec::new();
+        w.extend_from_slice(&vop1_dpp8_swap(1, 0, fi));
+        w.extend_from_slice(&end);
+        lower_wave32_dpp(&w)
+    };
+    assert!(dpp8(false).has_wave_ballot);
+    assert!(!dpp8(true).has_wave_ballot);
 }
 
 #[test]
@@ -408,6 +1012,114 @@ fn a_scalar_carry_chain_reaches_the_select() {
     }
 }
 
+/// The 24-bit multiplies lower both halves of their 48-bit product:
+/// `v_mul_i32_i24` and `v_mul_u32_u24` the low dword, `v_mul_hi_i32_i24`
+/// and `v_mul_hi_u32_u24` the high one. An LDS store keeps the result live.
+#[test]
+fn the_24_bit_multiplies_lower_both_halves() {
+    // VOP2 `op v0, v1, v2`.
+    for op in [0x09u32, 0x0A, 0x0B, 0x0C] {
+        let words = [
+            0x7E02_0285,               // v_mov_b32 v1, 5
+            0x7E04_0287,               // v_mov_b32 v2, 7
+            op << 25 | 2 << 9 | 0x101, // op v0, v1, v2
+            0x7E06_0280,               // v_mov_b32 v3, 0
+            0xD834_0000,
+            0x0000_0003, // ds_write_b32 v3, v0
+            S_ENDPGM,
+        ];
+        lowers_lds(&words).unwrap_or_else(|e| panic!("VOP2 {op:#x}: {e}"));
+    }
+}
+
+/// `v_sad_u8`, `v_sad_hi_u8`, `v_sad_u16`, `v_sad_u32` and `v_msad_u8` lower.
+/// An LDS store keeps the result live.
+#[test]
+fn sums_of_absolute_differences_lower() {
+    // VOP3 `op v0, v1, v2, v3`.
+    for op in [0x15Au32, 0x15B, 0x15C, 0x15D, 0x171] {
+        let words = [
+            0x7E02_0285, // v_mov_b32 v1, 5
+            0x7E04_0287, // v_mov_b32 v2, 7
+            0x7E06_0281, // v_mov_b32 v3, 1
+            0xD400_0000 | op << 16,
+            0x101 | 0x102 << 9 | 0x103 << 18,
+            0x7E06_0280, // v_mov_b32 v3, 0
+            0xD834_0000,
+            0x0000_0003, // ds_write_b32 v3, v0
+            S_ENDPGM,
+        ];
+        lowers_lds(&words).unwrap_or_else(|e| panic!("VOP3 {op:#x}: {e}"));
+    }
+}
+
+/// `v_mad_u32_u16` / `v_mad_i32_i16` (with op_sel halves) and `v_lerp_u8`
+/// lower (#405). An LDS store keeps the result live.
+#[test]
+fn mad_32_16_and_lerp_u8_lower() {
+    let vop3 = |op: u16, opsel: u8, vdst: u8, s0: u32, s1: u32, s2: u32| -> [u32; 2] {
+        [
+            0x35 << 26 | (op as u32 & 0x3FF) << 16 | (opsel as u32 & 0xF) << 11 | vdst as u32,
+            (s0 & 0x1FF) | (s1 & 0x1FF) << 9 | (s2 & 0x1FF) << 18,
+        ]
+    };
+    let (v0, v1, v2) = (256u32, 257, 258);
+    let store = |op_words: [u32; 2]| {
+        let mut words = vec![
+            0x7E00_0283, // v_mov_b32 v0, 3
+            0x7E02_0285, // v_mov_b32 v1, 5
+            0x7E04_0287, // v_mov_b32 v2, 7
+        ];
+        words.extend_from_slice(&op_words);
+        words.extend_from_slice(&[
+            0x7E06_0280, // v_mov_b32 v3, 0
+            0xD834_0000,
+            0x0000_0003, // ds_write_b32 v3, v0
+            S_ENDPGM,
+        ]);
+        lowers_lds(&words).unwrap();
+    };
+    store(vop3(0x373, 0, 0, v0, v1, v2)); // v_mad_u32_u16
+    store(vop3(0x373, 0b0011, 0, v0, v1, v0)); // opsel hi halves
+    store(vop3(0x375, 0, 0, v0, v1, v2)); // v_mad_i32_i16
+    store(vop3(0x14d, 0, 0, v0, v1, v2)); // v_lerp_u8
+}
+
+/// VOP3 integer `clamp` is unsigned saturation on carry/non-carry add/sub
+/// (VIC-BT-010). The LDS store forces the result live: without the fix,
+/// `write_i` leaves it missing and the store refuses translation.
+#[test]
+fn integer_vop3_clamp_lowers_add_and_sub() {
+    let v1 = 256 + 1u32;
+    let v2 = 256 + 2u32;
+    let store = |op_words: [u32; 2]| {
+        let mut words = vec![
+            0x7E02_0281, // v_mov_b32 v1, 1
+            0x7E04_0282, // v_mov_b32 v2, 2
+        ];
+        words.extend_from_slice(&op_words);
+        words.extend_from_slice(&[
+            0x7E06_0280, // v_mov_b32 v3, 0
+            0xD834_0000,
+            0x0000_0003, // ds_write_b32 v3, v0
+            S_ENDPGM,
+        ]);
+        lowers_lds(&words).unwrap();
+    };
+    // VOP2-as-VOP3: opcode + 0x100 (bare 0x025 is VOPC v_cmp_lg_f64).
+    // v_add_nc_u32 / v_sub_nc_u32 / v_subrev_nc_u32 with clamp.
+    for op in [0x125u16, 0x126, 0x127] {
+        store([0x35 << 26 | (op as u32) << 16 | 1 << 15, v1 | v2 << 9]);
+    }
+    // v_add_co_u32 / v_sub_co_u32 / v_subrev_co_u32 with clamp (carry → s16).
+    for op in [0x30fu16, 0x310, 0x319] {
+        store([
+            0x35 << 26 | (op as u32) << 16 | 1 << 15 | 16 << 8,
+            v1 | v2 << 9,
+        ]);
+    }
+}
+
 /// `s_cmov_b32`, which the scalar offset trace follows, lowers too: the
 /// source where SCC is set, the destination's old value where it is
 /// clear.
@@ -507,6 +1219,49 @@ fn perm_dynamic_selector_needs_no_int64() {
 }
 
 #[test]
+fn s_buffer_load_truncates_each_address_term_before_adding() {
+    // Hardware masks soffset and imm_offset with & ~3 independently
+    // before adding (VIC-BT-025): soffset=3 and offset:3 load byte 0, not 6.
+    let program = |soffset_imm: u32, imm: u32| {
+        let w0 = 0x3d << 26 | 8 << 18 | 13 << 6 | 4; // s13 from s[8:11]
+        let w1 = 12 << 25 | (imm & 0x1f_ffff);
+        vec![
+            0xBE81_0380, // s_mov_b32 s1, 0
+            0xF408_0200,
+            0xFA00_0000,               // s_load_dwordx4 s[8:11], s[0:1], null
+            0xBE8C_0380 | soffset_imm, // s_mov_b32 s12, imm
+            w0,
+            w1,          // s_buffer_load_dword s13, s[8:11], s12 offset:imm
+            0x7E02_020D, // v_mov_b32 v1, s13
+            0xD834_0000,
+            0x0000_0100, // ds_write_b32 v0, v1
+            S_ENDPGM,
+        ]
+    };
+    let layout = vec![root(RootType::Table, 0, 0)];
+    let used = vec![UsedResource {
+        kind: ResourceType::Cbv,
+        root: RootType::Table,
+        table_offset_dwords: 0,
+        lower_bound: 0,
+        stride: 0,
+        dwords: 4,
+        user_data: 0,
+        slot: 0,
+    }];
+    let bytes = |so, off| {
+        lower_with(&program(so, off), layout.clone(), used.clone())
+            .unwrap()
+            .smem_buffer_bytes
+    };
+    assert_eq!(bytes(3, 3), vec![0], "3+3 must not carry to byte 4");
+    assert_eq!(bytes(0, 0), vec![0]);
+    assert_eq!(bytes(4, 0), vec![4]);
+    assert_eq!(bytes(0, 4), vec![4]);
+    assert_eq!(bytes(5, 7), vec![8], "(5&~3)+(7&~3) = 8");
+}
+
+#[test]
 fn scalar_loads_through_a_heap_buffer_that_vector_loads_read_use_a_buffer_view() {
     // A descriptor from the resource heap (s0) at an index from a root
     // constant (s1), read by a scalar buffer load, then used by nothing
@@ -516,7 +1271,7 @@ fn scalar_loads_through_a_heap_buffer_that_vector_loads_read_use_a_buffer_view()
     // (a descriptor of the wrong type). A store makes it a UAV, which a
     // read-only view would not match either: that case is unchanged.
     // The same code reading a table entry the resource list leaves out
-    // keeps the constant buffer handle.
+    // keeps the constant buffer handle, and a listed heap CBV stays one.
     #[derive(Clone, Copy)]
     enum Also {
         Nothing,
@@ -575,6 +1330,30 @@ fn scalar_loads_through_a_heap_buffer_that_vector_loads_read_use_a_buffer_view()
         cbuffers(Also::Nothing, table),
         1,
         "unlisted table entry: a CBV"
+    );
+    // An unlisted heap view only scalar loads read skips heap index 0
+    // (the title's null texture) and still lowers.
+    assert!(
+        lower_with(&program(Also::Nothing), layout(heap), vec![]).is_ok(),
+        "heap-direct scalar view with null-slot skip"
+    );
+    // A listed ResourceHeap CBV keeps a live load at index 0 (no skip).
+    let listed = vec![UsedResource {
+        kind: ResourceType::Cbv,
+        root: RootType::ResourceHeap,
+        table_offset_dwords: 0,
+        lower_bound: 0,
+        stride: 0,
+        dwords: 0,
+        user_data: 0,
+        slot: 0,
+    }];
+    assert_eq!(
+        lower_with(&program(Also::Nothing), layout(heap), listed)
+            .unwrap()
+            .cbuffer_handles,
+        1,
+        "listed ResourceHeap CBV at slot 0 stays a CBV"
     );
 }
 
@@ -646,7 +1425,9 @@ fn buffer(
     let op_shift = if mtbuf { 16 } else { 18 };
     [
         class << 26
-            | u32::from(opcode & if mtbuf { 0x7 } else { 0x7F }) << op_shift
+            // MUBUF opcodes are 8 bits (0x00..0xff); MTBUF uses 4 bits
+            // split across the two words.
+            | u32::from(opcode & if mtbuf { 0x7 } else { 0xFF }) << op_shift
             | u32::from(format) << 19
             | u32::from(offen) << 12
             | u32::from(idxen) << 13
@@ -749,6 +1530,51 @@ fn a_four_dword_typed_fetch_inside_a_dword_loads_at_most_four_words_at_a_time() 
 }
 
 #[test]
+fn a_halfword_typed_fetch_at_byte_3_reads_the_next_dword() {
+    // `tbuffer_load_format_x` of 16_UINT at byte offset 3 straddles
+    // two dwords: `(lo >> 24) | (hi << 8)`. VIC-BT-019 / #440.
+    let odd = buffer(0x000, true, 11, 3, false, false, 0, 3, 8);
+    let (layout, used) = fetch_tables(0, 4);
+    let l = lower_with(&fetch_program(odd, 1), layout, used).unwrap();
+    assert_eq!(l.unaligned_typed_loads, 1);
+    let even = buffer(0x000, true, 11, 0, false, false, 0, 3, 8);
+    let (layout, used) = fetch_tables(0, 4);
+    let l = lower_with(&fetch_program(even, 1), layout, used).unwrap();
+    assert_eq!(l.unaligned_typed_loads, 0);
+}
+
+#[test]
+fn a_typed_fetch_fills_missing_channels_with_zero() {
+    // `tbuffer_load_format_xyzw` of 32_FLOAT has one format channel;
+    // the other three are 0 (not (0,0,0,1)). VIC-BT-019 / #440.
+    let fetch = buffer(0x003, true, 22, 0, false, false, 0, 3, 8);
+    let (layout, used) = fetch_tables(0, 4);
+    let l = lower_with(&fetch_program(fetch, 4), layout, used).unwrap();
+    assert!(!l.dxil.is_empty());
+    // The old path wrote float 1.0 into W; a single-channel 32_FLOAT
+    // fetch has no other reason to emit that constant.
+    assert!(
+        !l.dxil
+            .windows(4)
+            .any(|w| w == 1.0f32.to_bits().to_le_bytes()),
+        "missing-channel fill must not be float 1.0"
+    );
+}
+
+#[test]
+fn typed_float_widen_keeps_snan_payload() {
+    // 16_FLOAT sNaN 0x7C01 widens to 0x7F802000, not quieted
+    // 0x7FC02000. VIC-BT-019 / #440.
+    assert_eq!(f16_nan_widen_bits(0x7C01), 0x7F80_2000);
+    assert_eq!(f16_nan_widen_bits(0xFC01), 0xFF80_2000);
+    // A 16_FLOAT typed fetch lowers through the keep-sNaN path.
+    let fetch = buffer(0x000, true, 13, 0, false, false, 0, 3, 8);
+    let (layout, used) = fetch_tables(0, 4);
+    let l = lower_with(&fetch_program(fetch, 1), layout, used).unwrap();
+    assert!(l.widens_f16, "non-NaN values still use legacyF16ToF32");
+}
+
+#[test]
 fn a_typed_fetch_of_no_format_is_refused() {
     // Format 0 is not a format: the fetch must stop rather than read
     // whatever the descriptor holds.
@@ -768,6 +1594,147 @@ fn a_typed_fetch_of_no_format_is_refused() {
         ),
         "{err:?}"
     );
+}
+
+/// `v_mov_b32 vdst, literal`.
+fn v_mov_lit(vdst: u8, lit: u32) -> [u32; 2] {
+    [0x7E00_0000 | (vdst as u32) << 17 | 0x01 << 9 | 255, lit]
+}
+
+/// Seeds `v[reg]` then runs a d16 buffer load into it, writing the
+/// packed result VGPRs to LDS so they stay live.
+fn d16_buffer_program(opcode: u16, mtbuf: bool, format: u8, reg: u8, seed: u32) -> Vec<u32> {
+    let channels = match opcode & 3 {
+        0 => 1u8, // x
+        1 => 1,   // xy → one packed VGPR
+        2 => 2,   // xyz → two packed VGPRs
+        _ => 2,   // xyzw
+    };
+    let mut words = vec![
+        0xBE84_0300, // s_mov_b32 s4, s0
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF408_0202,
+        0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], null
+    ];
+    words.extend_from_slice(&v_mov_lit(reg, seed));
+    words.push(v_mov(3, 128)); // v3 = 0 (address / index)
+    words.extend_from_slice(&buffer(opcode, mtbuf, format, 0, false, !mtbuf, reg, 3, 8));
+    words.push(v_mov(5, 128)); // LDS address
+    for k in 0..channels {
+        words.extend_from_slice(&ds_write_b32(5, reg + k));
+    }
+    words.push(S_ENDPGM);
+    words
+}
+
+#[test]
+fn packed_d16_buffer_loads_keep_an_odd_high_half() {
+    // VIC-BT-015: buffer_load_format_d16_x / _xyz leave vdst[31:16] intact
+    // on the trailing VGPR; a full pair (xy) replaces the whole dword.
+    // MTBUF names the format; MUBUF typed d16 uses the same odd-half merge
+    // (covered end-to-end on Windows by the waterfall host test).
+    let (layout, used) = fetch_tables(0, 4);
+    for (label, opcode, format) in [
+        ("d16_x", 0x008u16, 13u8), // 16_FLOAT
+        ("d16_xy", 0x009, 29),     // 16_16_FLOAT
+        ("d16_xyz", 0x00a, 65),    // 16_16_16_16_UNORM
+    ] {
+        let want = u32::from(opcode != 0x009);
+        let l = lower_with(
+            &d16_buffer_program(opcode, true, format, 0, 0xDEAD_0000),
+            layout.clone(),
+            used.clone(),
+        )
+        .unwrap_or_else(|e| panic!("{label}: {e}"));
+        assert_eq!(l.d16_kept_high_halves, want, "{label}");
+    }
+    // MUBUF buffer_load_format_d16_*: same merge on the float typed view.
+    for (label, opcode) in [("d16_x", 0x080u16), ("d16_xy", 0x081), ("d16_xyz", 0x082)] {
+        let want = u32::from(opcode != 0x081);
+        let l = lower_with(
+            &d16_buffer_program(opcode, false, 0, 0, 0xDEAD_0000),
+            layout.clone(),
+            used.clone(),
+        )
+        .unwrap_or_else(|e| panic!("mubuf {label}: {e}"));
+        assert_eq!(l.d16_kept_high_halves, want, "mubuf {label}");
+    }
+}
+
+#[test]
+fn tbuffer_d16_integer_formats_saturate_to_16_bits() {
+    // VIC-BT-015: tbuffer_load_format_d16_x of 32_UINT / 32_SINT saturates
+    // to 16 bits rather than converting through f16.
+    let (layout, used) = fetch_tables(0, 4);
+    for format in [20u8, 21] {
+        // Seed the high half so the odd-channel merge is exercised too.
+        let l = lower_with(
+            &d16_buffer_program(0x008, true, format, 0, 0xDEAD_0000),
+            layout.clone(),
+            used.clone(),
+        )
+        .unwrap_or_else(|e| panic!("d16_x format {format}: {e}"));
+        assert_eq!(
+            l.d16_kept_high_halves, 1,
+            "format {format}: odd d16 channel keeps the high half"
+        );
+    }
+}
+
+/// `image_load` with `dmask` and optional `d16` into `v[vdata]`, address in
+/// `v[vaddr]`, resource `s[srsrc:srsrc+7]`.
+fn image_load(dmask: u8, d16: bool, vdata: u8, vaddr: u8, srsrc: u8) -> [u32; 2] {
+    let dim = 1u32; // SQ_RSRC_IMG_2D
+    [
+        0xF000_0000 | u32::from(dmask) << 8 | dim << 3,
+        u32::from(d16) << 31
+            | (u32::from(srsrc) >> 2 & 0x1F) << 16
+            | u32::from(vdata) << 8
+            | u32::from(vaddr),
+    ]
+}
+
+/// Seeds `v[reg]` then `image_load` d16 with `dmask` into it; writes the
+/// packed result to LDS so it stays live.
+fn d16_image_load_program(dmask: u8, reg: u8, seed: u32) -> Vec<u32> {
+    let channels = dmask.count_ones().div_ceil(2);
+    let mut words = vec![
+        0xBE84_0300, // s_mov_b32 s4, s0
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF40C_0302,
+        0xFA00_0000, // s_load_dwordx8 s[12:19], s[4:5], 0
+    ];
+    // v_mov_b32 v[reg], seed
+    words.extend_from_slice(&[0x7E00_0000 | (reg as u32) << 17 | 0x01 << 9 | 255, seed]);
+    words.push(v_mov(2, 128)); // v2 = 0 (x)
+    words.push(v_mov(3, 128)); // v3 = 0 (y)
+    words.extend_from_slice(&image_load(dmask, true, reg, 2, 12));
+    words.push(v_mov(5, 128)); // LDS address
+    for k in 0..channels as u8 {
+        words.extend_from_slice(&ds_write_b32(5, reg + k));
+    }
+    words.push(S_ENDPGM);
+    words
+}
+
+#[test]
+fn packed_d16_image_loads_keep_an_odd_high_half() {
+    // VIC-BT-017: a one-channel d16 image_load leaves vdst[31:16] intact;
+    // a full pair (dmask:0x3) replaces the whole dword.
+    let (layout, used) = texture_tables();
+    for (label, dmask, want) in [
+        ("dmask1", 0x1u8, 1u32),
+        ("dmask3", 0x3, 0),
+        ("dmask7", 0x7, 1),
+    ] {
+        let l = lower_with(
+            &d16_image_load_program(dmask, 0, 0x5A5A_0000),
+            layout.clone(),
+            used.clone(),
+        )
+        .unwrap_or_else(|e| panic!("{label}: {e}"));
+        assert_eq!(l.d16_kept_high_halves, want, "{label}");
+    }
 }
 
 /// Tables of 2D textures at s0 and samplers at s1.
@@ -1034,6 +2001,96 @@ fn level_zero_sample_with_offsets_lowers() {
     }
 }
 
+/// VIC-BT-009: the same immediate sampler words used non-comparison first
+/// then comparison (or the reverse) allocate two static slots so each
+/// annotateHandle matches `dx.resources` sampler kind.
+#[test]
+fn immediate_sampler_comparison_and_plain_get_distinct_slots() {
+    let setup = [
+        0xBE84_0300, // s_mov_b32 s4, s0
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF408_0A02,
+        0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
+        0xF40C_0302,
+        0xFA00_0000, // s_load_dwordx8 s[12:19], s[4:5], 0x0
+        0xBE88_03FF,
+        0x0000_0092, // s_mov_b32 s8, 0x92 (an immediate sampler)
+        0xBE89_0380, // s_mov_b32 s9, 0
+        0xBE8A_0380, // s_mov_b32 s10, 0
+        0xBE8B_0380, // s_mov_b32 s11, 0
+        0x3420_0082, // v_lshlrev_b32 v16, 2, v0
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    ];
+    // image_sample_lz v[12:15], v[2:3], s[12:19], s[8:11] dmask:0xf dim:2D
+    let sample_lz = [0x7E04_02F0, 0x7E06_02F0, 0xF09C_0F08, 0x0043_0C02];
+    // image_sample_c_lz v12, v[2:4], … dmask:0x1 (z-ref then coords)
+    let sample_c_lz = [
+        0x7E04_02F0,
+        0x7E06_02F0,
+        0x7E08_02F0,
+        0xF0BC_0108,
+        0x0043_0C02,
+    ];
+    let store = [
+        0xE070_1000,
+        0x800A_0C10, // buffer_store_dword v12, v16, s[40:43], 0 offen
+        S_ENDPGM,
+    ];
+    let lower_mix = |plain_first: bool| {
+        let mut words = setup.to_vec();
+        if plain_first {
+            words.extend_from_slice(&sample_lz);
+            words.extend_from_slice(&sample_c_lz);
+        } else {
+            words.extend_from_slice(&sample_c_lz);
+            words.extend_from_slice(&sample_lz);
+        }
+        words.extend_from_slice(&store);
+        let (_, mut used) = texture_and_uav_tables();
+        used.retain(|u| u.user_data == 0);
+        let layout = vec![root(RootType::Table, 0, 0)];
+        lower_with(&words, layout, used).unwrap()
+    };
+    for plain_first in [true, false] {
+        let l = lower_mix(plain_first);
+        assert_eq!(
+            l.samplers.len(),
+            2,
+            "plain_first={plain_first}: need distinct static slots"
+        );
+        assert_eq!(l.samplers[0], l.samplers[1]);
+        assert_eq!(
+            l.cmp_samplers.count_ones(),
+            1,
+            "plain_first={plain_first}: one comparison slot"
+        );
+        let cmp_slot = l.cmp_samplers.trailing_zeros();
+        let plain_slot = if cmp_slot == 0 { 1 } else { 0 };
+        assert_eq!(
+            l.cmp_samplers >> plain_slot & 1,
+            0,
+            "plain_first={plain_first}"
+        );
+        #[cfg(windows)]
+        if let Ok(mut v) = super::super::validator::Validator::load(
+            super::super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut l.dxil.clone())
+                .unwrap_or_else(|e| panic!("plain_first={plain_first}: {e}"));
+        }
+    }
+    // Same-kind reuse still shares one slot.
+    let mut words = setup.to_vec();
+    words.extend_from_slice(&sample_lz);
+    words.extend_from_slice(&sample_lz);
+    words.extend_from_slice(&store);
+    let (_, mut used) = texture_and_uav_tables();
+    used.retain(|u| u.user_data == 0);
+    let l = lower_with(&words, vec![root(RootType::Table, 0, 0)], used).unwrap();
+    assert_eq!(l.samplers.len(), 1);
+    assert_eq!(l.cmp_samplers, 0);
+}
+
 /// A compute program that sets `defined` VGPRs from v2 on (`offsets` first:
 /// the texel offset word) and samples 2D with the MIMG opcode `op`.
 fn gradient_sample(op: u32, a16: bool, defined: usize, offsets: bool) -> Vec<u32> {
@@ -1152,6 +2209,352 @@ fn gradient_sample_offsets_validate_as_dxil() {
                 .expect("DXIL validation failed");
         }
     }
+}
+
+#[test]
+fn biased_sample_reads_whole_bias_vgpr_and_packed_a16_coords() {
+    // 2D image_sample_b (0x25) and image_sample_b_o (0x35): bias (and
+    // the offset word) stay whole VGPRs; a16 only packs the coordinates.
+    for (op, a16, dwords, offsets) in [
+        (0x25, false, 3, false),
+        (0x25, true, 2, false),
+        (0x35, false, 4, true),
+        (0x35, true, 3, true),
+        (0x26, false, 4, false),
+        (0x26, true, 3, false),
+        (0x36, false, 5, true),
+        (0x36, true, 4, true),
+    ] {
+        let l = lower_gradient_sample(op, a16, dwords, offsets)
+            .unwrap_or_else(|e| panic!("op {op:#x} a16 {a16}: {e:?}"));
+        let want: Vec<usize> = (0..dwords).collect();
+        assert_eq!(address_reads(&l), want, "op {op:#x} a16 {a16}");
+        assert_eq!(l.widens_f16, a16, "op {op:#x} a16 {a16} f16 widen");
+    }
+}
+
+#[test]
+fn biased_a16_sample_validates_as_dxil() {
+    for (op, dwords, offsets) in [(0x25, 2, false), (0x35, 3, true)] {
+        #[cfg_attr(not(windows), allow(unused_variables))]
+        let l = lower_gradient_sample(op, true, dwords, offsets).unwrap();
+        #[cfg(windows)]
+        if let Ok(mut v) = super::super::validator::Validator::load(
+            super::super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut l.dxil.clone())
+                .expect("DXIL validation failed");
+        }
+    }
+}
+
+/// A compute program that loads the table of views at s0, sets the
+/// listed VGPRs to literals, runs one MIMG instruction on the first view
+/// (2D unless `dim` says otherwise) with the sampler `0x92` and stores
+/// the first result dword. The address starts at v2.
+fn image_words(op: u32, dmask: u32, dim: u32, a16: bool, addr: &[u32]) -> Vec<u32> {
+    let mut words = vec![
+        0xBE84_0300, // s_mov_b32 s4, s0
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF408_0A02,
+        0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
+        0xF40C_0302,
+        0xFA00_0000, // s_load_dwordx8 s[12:19], s[4:5], 0x0
+        0xBE88_03FF,
+        0x0000_0092, // s_mov_b32 s8, 0x92 (an immediate sampler)
+        0xBE89_0380, // s_mov_b32 s9, 0
+        0xBE8A_0380, // s_mov_b32 s10, 0
+        0xBE8B_0380, // s_mov_b32 s11, 0
+    ];
+    for (k, &value) in addr.iter().enumerate() {
+        // v_mov_b32 v(2 + k), literal
+        words.extend([0x7E00_02FF | (2 + k as u32) << 17, value]);
+    }
+    words.extend([
+        0x3420_0082, // v_lshlrev_b32 v16, 2, v0
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xF000_0000 | op << 18 | dmask << 8 | dim << 3,
+        0x0043_0C02 | u32::from(a16) << 30, // v[12:15], v[2:], s[12:19], s[8:11]
+        0xE070_1000,
+        0x800A_0C10, // buffer_store_dword v12, v16, s[40:43], 0 offen
+        S_ENDPGM,
+    ]);
+    words
+}
+
+/// [`image_words`] lowered; on Windows with `dxil.dll`, also validated.
+fn lower_image(words: &[u32]) -> Result<Lowered, crate::ShaderError> {
+    let (_, mut used) = texture_and_uav_tables();
+    used.retain(|u| u.user_data == 0);
+    let layout = vec![root(RootType::Table, 0, 0)];
+    let l = lower_with(words, layout, used)?;
+    #[cfg(windows)]
+    if let Ok(mut v) = super::super::validator::Validator::load(
+        super::super::validator::Validator::default_path().as_deref(),
+    ) {
+        v.validate(&mut l.dxil.clone())
+            .expect("DXIL validation failed");
+    }
+    Ok(l)
+}
+
+/// The integer-constant arguments of each call of `dx.op.<function>`.
+fn calls<'a>(l: &'a Lowered, function: &str) -> Vec<&'a [Option<i32>]> {
+    let name = format!("dx.op.{function}");
+    l.dx_ops
+        .iter()
+        .filter(|(n, _)| *n == name)
+        .map(|(_, args)| args.as_slice())
+        .collect()
+}
+
+fn called(l: &Lowered, function: &str) -> bool {
+    !calls(l, function).is_empty()
+}
+
+fn refused(words: &[u32]) -> String {
+    match lower_image(words) {
+        Err(crate::ShaderError::Unsupported { what, .. }) => what.to_string(),
+        Err(e) => panic!("{e}"),
+        Ok(_) => panic!("lowered"),
+    }
+}
+
+const F_HALF: u32 = 0x3F00_0000;
+const F_ONE: u32 = 0x3F80_0000;
+
+#[test]
+fn comparison_gathers_lower_to_gather_cmp() {
+    // image_gather4_c_lz: the reference, then the coordinates.
+    let words = image_words(0x4F, 0x1, 1, false, &[F_ONE, F_HALF, F_HALF]);
+    let l = lower_image(&words).unwrap();
+    assert!(called(&l, "textureGatherCmp.f32"));
+    assert!(!called(&l, "textureGather.f32"));
+    // Any one channel, through the same instruction.
+    for dmask in [0x2, 0x4, 0x8] {
+        let words = image_words(0x4F, dmask, 1, false, &[F_ONE, F_HALF, F_HALF]);
+        assert!(called(
+            &lower_image(&words).unwrap(),
+            "textureGatherCmp.f32"
+        ));
+    }
+    // 2D array: the slice is a third coordinate.
+    let words = image_words(0x4F, 0x1, 5, false, &[F_ONE, F_HALF, F_HALF, 0]);
+    assert!(called(
+        &lower_image(&words).unwrap(),
+        "textureGatherCmp.f32"
+    ));
+}
+
+#[test]
+fn comparison_gathers_take_programmable_offsets_after_the_offset_word() {
+    // image_gather4_c_lz_o: offsets x 2, y -1, then the reference.
+    let words = image_words(0x5F, 0x1, 1, false, &[0x3F02, F_ONE, F_HALF, F_HALF]);
+    let l = lower_image(&words).unwrap();
+    assert!(called(&l, "textureGatherCmp.f32"));
+    // Any other offset word lowers the same way, in range or not
+    // (the host takes -8..7 and the title's are 6-bit).
+    let words = image_words(0x5F, 0x2, 1, false, &[0x3F3F, F_ONE, F_HALF, F_HALF]);
+    assert!(called(
+        &lower_image(&words).unwrap(),
+        "textureGatherCmp.f32"
+    ));
+}
+
+#[test]
+fn comparison_gathers_of_unsupported_forms_are_refused() {
+    // Several channels, a cube with an offset and a 3D view.
+    let words = image_words(0x4F, 0x3, 1, false, &[F_ONE, F_HALF, F_HALF]);
+    assert_eq!(
+        refused(&words),
+        "a comparison sample of 16-bit coordinates or several channels"
+    );
+    let words = image_words(
+        0x5F,
+        0x1,
+        3,
+        false,
+        &[0x3F02, F_ONE, F_HALF, F_HALF, F_HALF],
+    );
+    assert_eq!(refused(&words), "a texel offset on a cube");
+    let words = image_words(0x4F, 0x1, 2, false, &[F_ONE, F_HALF, F_HALF, F_HALF]);
+    assert_eq!(refused(&words), "a gather of a view other than 2D or cube");
+}
+
+#[test]
+fn sample_offset_variants_lower_with_the_offset_word_first() {
+    // Offset words (x 1, y -1) lead every address.
+    let off = 0x3F01;
+    let cases: [(u32, u32, &str, &[u32], &str); 5] = [
+        // image_sample_l_o: offset, coordinates, level.
+        (
+            0x34,
+            0xF,
+            "l_o",
+            &[off, F_HALF, F_HALF, F_ONE],
+            "sampleLevel.f32",
+        ),
+        // image_sample_c_lz_o: offset, reference, coordinates.
+        (
+            0x3F,
+            0x1,
+            "c_lz_o",
+            &[off, F_ONE, F_HALF, F_HALF],
+            "sampleCmpLevelZero.f32",
+        ),
+        // image_sample_lz_o: offset, coordinates.
+        (0x37, 0xF, "lz_o", &[off, F_HALF, F_HALF], "sampleLevel.f32"),
+        // image_sample_d_o: offset, x gradients, y gradients, coordinates.
+        (
+            0x32,
+            0xF,
+            "d_o",
+            &[off, 0, 0, 0, 0, F_HALF, F_HALF],
+            "sampleGrad.f32",
+        ),
+        // image_sample_o: offset, coordinates (the level from the quad).
+        (0x30, 0xF, "o", &[off, F_HALF, F_HALF], "sampleGrad.f32"),
+    ];
+    for (op, dmask, label, addr, function) in cases {
+        let words = image_words(op, dmask, 1, false, addr);
+        let l = lower_image(&words).unwrap_or_else(|e| panic!("{label}: {e}"));
+        assert!(called(&l, function), "{label}");
+    }
+}
+
+#[test]
+fn a16_leaves_the_offset_and_gradients_whole_and_packs_the_coordinates() {
+    // image_sample_d_o with a16: offset, four f32 gradients, then one
+    // dword of two f16 coordinates.
+    let packed = 0x3800_3800; // (0.5, 0.5) as f16
+    let words = image_words(0x32, 0xF, 1, true, &[0x3F01, 0, 0, 0, 0, packed]);
+    let l = lower_image(&words).unwrap();
+    assert_eq!(calls(&l, "sampleGrad.f32")[0][7..9], [Some(1), Some(-1)]);
+    // image_sample_l_o: offset, then coordinates and level packed in
+    // pairs, so three f16 values take two dwords.
+    let words = image_words(0x34, 0xF, 1, true, &[0x3F01, packed, 0x3C00]);
+    let l = lower_image(&words).unwrap();
+    assert_eq!(calls(&l, "sampleLevel.f32")[0][7..9], [Some(1), Some(-1)]);
+}
+
+#[test]
+fn sample_offsets_must_be_constants_in_the_dxil_range() {
+    let at = |offset: u32| image_words(0x37, 0xF, 1, false, &[offset, F_HALF, F_HALF]);
+    for (offset, ok) in [
+        (0x0007, true),
+        (0x3F38, true),
+        (0x0008, false),
+        (0x3F37, false),
+    ] {
+        let r = lower_image(&at(offset));
+        assert_eq!(r.is_ok(), ok, "{offset:#x}");
+    }
+    // x from the thread id: not a constant.
+    let mut words = at(0);
+    let at_mov = words.iter().position(|&w| w == 0x7E04_02FF).unwrap();
+    words.splice(at_mov..at_mov + 2, [0x7E04_0300]); // v_mov_b32 v2, v0
+    assert_eq!(refused(&words), "a sample offset that is not constant");
+    // No texel offsets on cube samples.
+    let words = image_words(0x37, 0xF, 3, false, &[0x0001, F_HALF, F_HALF, F_HALF]);
+    assert_eq!(refused(&words), "a texel offset on a cube");
+}
+
+/// A pixel program: the view table at s0, literals in v2 on, one MIMG
+/// instruction, and the result exported to the target.
+fn lower_pixel_image(op: u32, dmask: u32, addr: &[u32]) -> Result<Lowered, crate::ShaderError> {
+    let mut words = vec![
+        0xBE84_0300, // s_mov_b32 s4, s0
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF40C_0302,
+        0xFA00_0000, // s_load_dwordx8 s[12:19], s[4:5], 0x0
+        0xBE88_03FF,
+        0x0000_0092, // s_mov_b32 s8, 0x92 (an immediate sampler)
+        0xBE89_0380, // s_mov_b32 s9, 0
+        0xBE8A_0380, // s_mov_b32 s10, 0
+        0xBE8B_0380, // s_mov_b32 s11, 0
+    ];
+    for (k, &value) in addr.iter().enumerate() {
+        words.extend([0x7E00_02FF | (2 + k as u32) << 17, value]);
+    }
+    words.extend([
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xF000_0000 | op << 18 | dmask << 8 | 1 << 3,
+        0x0043_0C02, // v[12:15], v[2:], s[12:19], s[8:11]
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0xF800_080F,
+        0x0F0E_0D0C, // exp mrt0 v12, v13, v14, v15 done
+        S_ENDPGM,
+    ]);
+    let (_, mut used) = texture_and_uav_tables();
+    used.retain(|u| u.user_data == 0);
+    let layout = vec![root(RootType::Table, 0, 0)];
+    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let native = NativeProgram {
+        stage: HwStage::Ps,
+        wave64: false,
+        vgprs: 32,
+        layout,
+        used,
+        io: StageIo::Ps {
+            inputs: vec![],
+            input_addr: 0,
+            rsrc2: Default::default(),
+            db_shader_control: 0,
+            patches: vec![],
+        },
+        code,
+    };
+    let p = ir::build(&native.code, false, 32).unwrap();
+    let st = structure::structure(&p).unwrap();
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
+    let io = io::raise(&p, &native).unwrap();
+    let target = crate::emit::container::SigElement {
+        name: "SV_Target".into(),
+        index: 0,
+        kind: 16,
+        comp: 9,
+        interp: 0,
+        row: Some(0),
+        col: 0,
+        cols: 4,
+        usage: 0,
+        half: false,
+    };
+    let l = lower(&Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: vec![],
+        outputs: vec![target],
+        prims: vec![],
+        mesh_stride: 0,
+        mesh_buffer: false,
+    })?;
+    #[cfg(windows)]
+    if let Ok(mut v) = super::super::validator::Validator::load(
+        super::super::validator::Validator::default_path().as_deref(),
+    ) {
+        v.validate(&mut l.dxil.clone())
+            .expect("DXIL validation failed");
+    }
+    Ok(l)
+}
+
+#[test]
+fn implicit_level_sample_offsets_lower_in_pixel_shaders() {
+    let off = 0x3F01;
+    // image_sample_b_o: offset, bias, coordinates.
+    let l = lower_pixel_image(0x35, 0xF, &[off, 0, F_HALF, F_HALF]).unwrap();
+    assert!(called(&l, "sampleBias.f32"));
+    assert_eq!(calls(&l, "sampleBias.f32")[0][7..9], [Some(1), Some(-1)]);
+    // image_sample_c_o: offset, reference, coordinates.
+    let l = lower_pixel_image(0x38, 0x1, &[off, F_ONE, F_HALF, F_HALF]).unwrap();
+    assert!(called(&l, "sampleCmp.f32"));
+    // image_sample_o: offset, coordinates.
+    let l = lower_pixel_image(0x30, 0xF, &[off, F_HALF, F_HALF]).unwrap();
+    assert!(called(&l, "sample.f32"));
 }
 
 #[test]
@@ -1467,5 +2870,421 @@ fn constant_64_bit_compares_lower_without_int64() {
             .data;
         let features = u64::from_le_bytes(sfi0.try_into().unwrap());
         assert_eq!(features & 0x8000, 0, "unexpected INT64 feature bit");
+    }
+}
+
+/// `LaneExit::Branch` with `taken == not_taken` must lower as a jump.
+/// Calling `edge` twice for the same `(from, to)` would overwrite the
+/// first critical-edge block in the map and leave `fill_phis` missing a
+/// CondBr predecessor (VIC-BT-007).
+#[test]
+fn identical_branch_arms_lower_as_a_jump() {
+    let words = [
+        0xBF06_0100u32, // s_cmp_eq_u32 s0, s1
+        0xBF85_0001,    // s_cbranch_scc1 -> end
+        0xBE82_0300,    // s_mov_b32 s2, s0
+        S_ENDPGM,
+    ];
+    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 256,
+        layout: vec![],
+        used: vec![],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 0,
+            threads: [1, 1, 1],
+        }),
+        code: code.clone(),
+    };
+    let p = ir::build(&code, false, 256).unwrap();
+    let mut st = structure::structure(&p).unwrap();
+    let mut collapsed = false;
+    for exit in &mut st.exits {
+        if let structure::LaneExit::Branch {
+            taken, not_taken, ..
+        } = exit
+        {
+            *not_taken = *taken;
+            collapsed = true;
+        }
+    }
+    assert!(
+        collapsed,
+        "fixture must expose a LaneExit::Branch to force identical arms"
+    );
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+    let io = io::raise(&p, &native).unwrap();
+    let lowered = lower(&Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: vec![],
+        outputs: vec![],
+        prims: vec![],
+        mesh_stride: 0,
+        mesh_buffer: false,
+    })
+    .expect("degenerate Branch arms must lower without PHI/edge map errors");
+    assert!(!lowered.dxil.is_empty());
+}
+
+/// Binary32 FMA with a round-to-odd sticky bit when the fused result is
+/// not exact — the same sequence `fmad_round_to_odd` emits in IR.
+fn f32_fma_round_to_odd(a: f32, b: f32, c: f32) -> f32 {
+    let r = a.mul_add(b, c);
+    let err = a.mul_add(b, -r) + c;
+    let mut bits = r.to_bits();
+    let sticky = err.to_bits() & 0x7FFF_FFFF != 0;
+    if sticky && bits & 0x7FFF_FFFF < 0x7F80_0000 && bits & 1 == 0 {
+        let abs = bits & 0x7FFF_FFFF;
+        if abs == 0 {
+            bits = if err.to_bits() & 0x8000_0000 == 0 {
+                0x1
+            } else {
+                0x8000_0001
+            };
+        } else {
+            // Same sign of residual and `r` → away from zero (+1 to bits).
+            let same_sign = (err.to_bits() ^ bits) & 0x8000_0000 == 0;
+            bits = if same_sign { bits + 1 } else { bits - 1 };
+        }
+    }
+    f32::from_bits(bits)
+}
+
+/// Nearest-even binary16 of an f64, by search over the half values so it
+/// does not share the lowering's bit arithmetic.
+fn f16_nearest_f64(x: f64) -> u16 {
+    if x.is_nan() {
+        return 0x7E00;
+    }
+    let sign = if x.is_sign_negative() { 0x8000 } else { 0 };
+    let a = x.abs();
+    if a >= 65520.0 {
+        return sign | 0x7C00;
+    }
+    let f16_to_f64 = |h: u16| -> f64 {
+        let exp = (h >> 10) & 0x1F;
+        let mant = h & 0x3FF;
+        match exp {
+            0 => {
+                if mant == 0 {
+                    0.0
+                } else {
+                    (mant as f64) * f64::from(2f32.powi(-24))
+                }
+            }
+            31 => f64::INFINITY,
+            e => (1.0 + (mant as f64) / 1024.0) * 2f64.powi(e as i32 - 15),
+        }
+    };
+    let (mut lo, mut hi) = (0u16, 0x7BFF);
+    while lo < hi {
+        let mid = (lo + hi).div_ceil(2);
+        if f16_to_f64(mid) <= a {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    let below = f16_to_f64(lo);
+    let above = if lo == 0x7BFF {
+        65536.0
+    } else {
+        f16_to_f64(lo + 1)
+    };
+    let pick = if a - below < above - a || (a - below == above - a && lo % 2 == 0) {
+        lo
+    } else {
+        lo + 1
+    };
+    sign | pick
+}
+
+/// Single-round `a*b + c` to binary16 (f64 FMA is exact enough here:
+/// every finite f32 product fits in f64, and the addend is f32).
+fn fma_f16_single_round(a: f32, b: f32, c: f32) -> u16 {
+    let exact = f64::from(a).mul_add(f64::from(b), f64::from(c));
+    f16_nearest_f64(exact)
+}
+
+/// Nearest-even binary16 of an f32 (via f64, which is exact for f32).
+fn f16_nearest_f32(x: f32) -> u16 {
+    f16_nearest_f64(f64::from(x))
+}
+
+#[test]
+fn fma_mix_f16_round_to_odd_matches_single_round() {
+    // Midpoint ties where f32 FMA alone then f16 RNE double-rounds the
+    // wrong way (VIC-BT-041): exact is just above 1 + 2^-11.
+    let above_mid = [
+        (1.0f32, 1.0f32, f32::from_bits(0x3A00_0001)),
+        (1.0, 1.0, 2.0f32.powi(-11) + 2.0f32.powi(-30)),
+        (-1.0, 1.0, -(2.0f32.powi(-11) + 2.0f32.powi(-30))),
+        (2.0, 0.5, f32::from_bits(0x3A00_0001)),
+    ];
+    for (a, b, c) in above_mid {
+        let want = fma_f16_single_round(a, b, c);
+        let got = f16_nearest_f32(f32_fma_round_to_odd(a, b, c));
+        let double = f16_nearest_f32(a.mul_add(b, c));
+        assert_ne!(
+            double, want,
+            "case should exercise double-rounding: {a:?}*{b:?}+{c:?}"
+        );
+        assert_eq!(
+            got, want,
+            "RTO path {a:?}*{b:?}+{c:?} = {got:#06x}, want {want:#06x} (double-round {double:#06x})"
+        );
+    }
+    // Just below the same midpoint: f32 FMA alone already ties correctly,
+    // but always-OR-1 sticky would cross the midpoint the wrong way.
+    let below_mid = [
+        (1.0f32, 1.0f32, 2.0f32.powi(-11) - 2.0f32.powi(-30)),
+        (-1.0, 1.0, -(2.0f32.powi(-11) - 2.0f32.powi(-30))),
+        (2.0, 0.5, 2.0f32.powi(-11) - 2.0f32.powi(-30)),
+    ];
+    for (a, b, c) in below_mid {
+        let want = fma_f16_single_round(a, b, c);
+        let got = f16_nearest_f32(f32_fma_round_to_odd(a, b, c));
+        let naive = f16_nearest_f32(f32::from_bits(a.mul_add(b, c).to_bits() | 1));
+        assert_ne!(
+            naive, want,
+            "case should catch always-OR-1: {a:?}*{b:?}+{c:?}"
+        );
+        assert_eq!(
+            got, want,
+            "below-mid RTO {a:?}*{b:?}+{c:?} = {got:#06x}, want {want:#06x} (naive {naive:#06x})"
+        );
+    }
+    // Exact and ordinary results still match single-round.
+    let ordinary = [
+        (2.0f32, 3.0f32, 1.0f32),
+        (1.0, 1.0, 1.0),
+        (0.0, 5.0, 1.5),
+        (-2.0, 3.0, 0.25),
+        (1.0, 1.0, 0.0),
+    ];
+    for (a, b, c) in ordinary {
+        let want = fma_f16_single_round(a, b, c);
+        let got = f16_nearest_f32(f32_fma_round_to_odd(a, b, c));
+        assert_eq!(got, want, "ordinary {a:?}*{b:?}+{c:?}");
+    }
+}
+
+#[test]
+fn fma_mix_f16_lowers() {
+    // VOP3P v_fma_mixlo_f16 / v_fma_mixhi_f16 v0, v1, v2, v3 (all f32).
+    let src0 = 256 + 1u32;
+    let src1 = 256 + 2u32;
+    let src2 = 256 + 3u32;
+    for op in [0x021u32, 0x022] {
+        let words = [
+            0x33 << 26 | (op << 16),
+            src0 | (src1 << 9) | (src2 << 18),
+            S_ENDPGM,
+        ];
+        lowers(&words, 0).unwrap_or_else(|e| panic!("op {op:#x}: {e}"));
+    }
+}
+
+/// s6 is 0 where every lane skips and the saved EXEC where some run: no
+/// lane mask at the per-lane join. EXEC taken from it guards only a
+/// `v_readlane` (written whatever EXEC holds) before it is restored.
+#[test]
+fn a_scalar_result_needs_no_exec() {
+    let words = [
+        0xBE86_0380, // s_mov_b32 s6, 0
+        0x7D88_0090, // v_cmp_gt_u32 vcc_lo, 16, v0
+        0xBE84_3C6A, // s_and_saveexec_b32 s4, vcc_lo
+        0xBF88_0001, // s_cbranch_execz +1
+        0xBE86_0304, // s_mov_b32 s6, s4
+        0xBEFE_0306, // s_mov_b32 exec_lo, s6
+        0xD760_0002, // v_readlane_b32 s2, v0, 3
+        0x0001_0700,
+        0xBEFE_0304, // s_mov_b32 exec_lo, s4
+        S_ENDPGM,
+    ];
+    lowers(&words, 1 << 7).expect("a lane read under an EXEC with no mask");
+}
+
+#[test]
+fn a_missing_value_on_a_path_no_lane_takes_is_dead() {
+    let refusal = |code: &[u32]| match lowers(code, 1 << 7) {
+        Ok(()) => None,
+        Err(crate::ShaderError::Unsupported { what, .. }) => Some(what),
+        Err(error) => panic!("{error}"),
+    };
+    // The timestamp stays in s6 only where s0 == 0, and those lanes
+    // overwrite it before the second join: it never reaches the read.
+    let mut joins = [
+        0xF490_0180,
+        0,           // s_memtime s[6:7]
+        0xBF06_8000, // s_cmp_eq_u32 s0, 0 (s0 = group id X)
+        0xBF85_0001, // s_cbranch_scc1: s0 == 0 keeps the timestamp
+        0xBE86_0380, // s_mov_b32 s6, 0
+        0xBF84_0001, // s_cbranch_scc0: s0 != 0 keeps that 0
+        0xBE86_0381, // s_mov_b32 s6, 1
+        0xBF07_8006, // s_cmp_lg_u32 s6, 0
+        0xBF85_0001,
+        0xBE83_0380,
+        S_ENDPGM,
+    ];
+    assert_eq!(refusal(&joins), None);
+    // Tested on the other side, the timestamp reaches the read.
+    joins[5] = 0xBF85_0001; // s_cbranch_scc1
+    assert!(refusal(&joins).is_some());
+    // The same through a VGPR whose old value a guarded write keeps
+    // (lanes outside it get 0 for a value with no DXIL form, as for any
+    // such write): keeping does not make the join live.
+    let kept = [
+        0xF490_0180,
+        0,           // s_memtime s[6:7]
+        0x7E02_0206, // v_mov_b32 v1, s6
+        0xBF06_8000, // s_cmp_eq_u32 s0, 0
+        0xBF85_0001, // s_cbranch_scc1: s0 == 0 keeps the timestamp
+        0x7E02_0280, // v_mov_b32 v1, 0
+        0xBF84_0004, // s_cbranch_scc0: s0 != 0 keeps that 0
+        0x7DA4_0080, // v_cmpx_eq_u32 exec, 0, v0
+        0x7E02_0282, // v_mov_b32 v1, 2 (the other lanes keep v1)
+        0xBEFE_03C1, // s_mov_b32 exec_lo, -1
+        0x7E02_0283, // v_mov_b32 v1, 3
+        0x7D84_0280, // v_cmp_eq_u32 vcc, 0, v1
+        0xBF87_0001, // s_cbranch_vccnz
+        0xBE83_0380,
+        S_ENDPGM,
+    ];
+    assert_eq!(refusal(&kept), None);
+}
+
+/// `v_mov_b32` and `v_cndmask_b32` are typeless: their `abs` and `neg`
+/// clear and flip bit 31 (`|-1 denormal|` stays a denormal), so they are
+/// integer operations, not `FAbs` (which flushes denormals and quiets sNaN).
+#[test]
+fn b32_moves_apply_abs_and_neg_to_the_sign_bit_only() {
+    const DS_WRITE: [u32; 2] = [0xD834_0000, 0x0000_0100]; // ds_write_b32 v0, v1
+    let cases: [&[u32]; 3] = [
+        // v_mov_b32_e64 v1, |v0|
+        &[0xD581_0101, 256],
+        // v_mov_b32_e64 v1, -v0
+        &[0xD581_0001, 256 | 1 << 29],
+        // s_mov_b32 s2, -1; v_cndmask_b32_e64 v1, |v0|, -v0, s2
+        &[0xBE82_03C1, 0xD501_0101, 256 | 256 << 9 | 2 << 18 | 2 << 29],
+    ];
+    for prefix in cases {
+        let words = [prefix, &DS_WRITE, &[S_ENDPGM]].concat();
+        let l = lower_words(&words, 1 << 15).expect("lowers"); // some LDS
+        assert!(
+            calls(&l, "unary.f32")
+                .iter()
+                .all(|args| args.first() != Some(&Some(6))),
+            "{prefix:08x?}: abs is not FAbs"
+        );
+    }
+}
+
+/// `v_cmp_class_f32`'s abs and neg flip the sign bit of the raw operand, as
+/// RDNA2 does: no FAbs (or fsub), which would flush a denormal to a zero and
+/// quiet a signalling NaN before it is classified.
+#[test]
+fn cmp_class_f32_modifiers_are_bitwise() {
+    // v_cmp_class_f32_e64 s6, |v1|, v2 with neg on src0 (VOP3 opcode 0x088).
+    let words = [
+        0x35 << 26 | 0x088 << 16 | 1 << 8 | 6,
+        (256 + 1) | (256 + 2) << 9 | 1 << 29,
+        S_ENDPGM,
+    ];
+    let l = lower_words(&words, 0).unwrap();
+    let fabs = l
+        .dx_ops
+        .iter()
+        .any(|(name, args)| name == "dx.op.unary.f32" && args.first() == Some(&Some(6)));
+    assert!(!fabs, "v_cmp_class_f32 abs must not lower to FAbs");
+}
+
+/// 16-bit SDWA destinations: WORD_0 with UNUSED_SEXT lowers (sign-extending
+/// the word); the reserved `dst_unused` 3 is refused.
+#[test]
+fn sdwa_16bit_destination_unused_modes() {
+    // v_cvt_i16_f16_sdwa v0, v1 dst_sel:WORD_0 src0_sel:WORD_0, with
+    // dst_unused UNUSED_PAD (0), UNUSED_SEXT (1), UNUSED_PRESERVE (2); then
+    // v_mov_b32 v2, 0; ds_write_b32 v2, v0, so the result is read.
+    let program = |ext: u32| {
+        [
+            0x7E00_A6F9,
+            ext,
+            0x7E04_0280,
+            0xD834_0000,
+            0x0000_0002,
+            S_ENDPGM,
+        ]
+    };
+    for unused in 0..3u32 {
+        lowers_lds(&program(0x0004_0401 | unused << 11))
+            .unwrap_or_else(|e| panic!("dst_unused {unused}: {e}"));
+    }
+    for dst_sel in [4u32, 5] {
+        let words = program(0x0004_0001 | dst_sel << 8 | 3 << 11);
+        assert!(
+            lowers_lds(&words).is_err(),
+            "dst_sel {dst_sel}, dst_unused 3"
+        );
+    }
+}
+
+/// `image_store` of some channels: the selected ones come from consecutive
+/// data registers, the others are stored as zero.
+#[test]
+fn image_stores_of_some_channels_zero_the_others() {
+    // image_store v[12:], v[2:3], s[12:19] dim:2D; v2-v15 set (the
+    // address, then distinct data in v12-v15).
+    let mut addr = vec![F_HALF, F_HALF];
+    addr.extend((4..12).map(|_| 0));
+    addr.extend([F_ONE, 0x4000_0000, 0x4040_0000, 0x4080_0000]);
+    for dmask in [0x1, 0x3, 0x5, 0x7, 0x9, 0xF] {
+        let words = image_words(0x08, dmask, 1, false, &addr);
+        let l = lower_image(&words).unwrap_or_else(|e| panic!("dmask {dmask:#x}: {e}"));
+        assert_eq!(calls(&l, "textureStore.f32").len(), 1, "dmask {dmask:#x}");
+    }
+    // No channel enabled: refused rather than writing the first register.
+    assert!(lower_image(&image_words(0x08, 0, 1, false, &addr)).is_err());
+}
+
+/// The VOP3P integer dot products lower in the form assemblers write
+/// (op_sel_hi all set); op_sel, neg_hi, clamp and constant packed sources
+/// are refused rather than computed wrongly. An LDS store keeps the result
+/// live.
+#[test]
+fn integer_dot_products_lower() {
+    // `op v0, v1, v2, v3` with op_sel_hi:[1,1,1].
+    let dot = |op: u32, w0: u32, src1: u32| {
+        let words = [
+            0x7E02_0285, // v_mov_b32 v1, 5
+            0x7E04_0287, // v_mov_b32 v2, 7
+            0x7E06_0281, // v_mov_b32 v3, 1
+            0xCC00_4000 | op << 16 | w0,
+            0x1800_0000 | 0x101 | src1 << 9 | 0x103 << 18,
+            0x7E06_0280, // v_mov_b32 v3, 0
+            0xD834_0000,
+            0x0000_0003, // ds_write_b32 v3, v0
+            S_ENDPGM,
+        ];
+        lowers_lds(&words)
+    };
+    for op in 0x14..=0x19u32 {
+        dot(op, 0, 0x102).unwrap_or_else(|e| panic!("VOP3P {op:#x}: {e}"));
+        assert!(dot(op, 1 << 8, 0x102).is_err(), "neg_hi, {op:#x}");
+        assert!(dot(op, 1 << 15, 0x102).is_err(), "clamp, {op:#x}");
+        // The byte forms (0x16, 0x17) ignore OPSEL, which the console
+        // compiler sets to a pattern, and take constants (see `valu_tests`).
+        if matches!(op, 0x16 | 0x17) {
+            continue;
+        }
+        assert!(dot(op, 1 << 11, 0x102).is_err(), "op_sel, {op:#x}");
+        // src1 the inline constant 1 instead of v2.
+        assert!(dot(op, 0, 0x81).is_err(), "constant, {op:#x}");
     }
 }

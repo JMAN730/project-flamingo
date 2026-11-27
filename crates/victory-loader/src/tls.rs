@@ -36,7 +36,14 @@ pub(crate) unsafe fn redirect(base: usize, info: &ImageInfo) -> Result<usize> {
     let index_at = unsafe {
         ((base + tls.directory_rva as usize + TLS64_ADDRESS_OF_INDEX) as *const usize).read()
     } as *mut u32;
-    // SAFETY: as above.
+    // The pointer is the image's own data: it must lie in the image before
+    // it is read and written.
+    let size = info.size_of_image as usize;
+    let at = index_at as usize;
+    if at < base || at - base > size.saturating_sub(size_of::<u32>()) {
+        bail!("_tls_index at {at:#x} is outside the image");
+    }
+    // SAFETY: in the image (checked above), where the OS wrote the index.
     let index = unsafe { index_at.read() };
     if index == 0 {
         return Ok(0);
@@ -50,6 +57,9 @@ pub(crate) unsafe fn redirect(base: usize, info: &ImageInfo) -> Result<usize> {
     {
         let start = base + section.rva as usize;
         let len = section.virtual_size as usize;
+        if len == 0 {
+            continue; // VirtualProtect refuses an empty range
+        }
         let mut old = 0;
         // SAFETY: the section is part of the mapped image.
         if unsafe { VirtualProtect(start as _, len, PAGE_EXECUTE_READWRITE, &mut old) } == 0 {
@@ -154,7 +164,11 @@ fn next_candidate(code: &[u8], from: usize) -> Option<usize> {
 /// Fills `block` with one thunk per register: `mov r, gs:[0x58];
 /// lea r, [r + index * 8]; ret` (flags untouched, like the load it replaces).
 fn thunks(block: *mut u8, index: u32) -> Result<usize> {
-    let disp = (index * 8).to_le_bytes();
+    // `&array[index]` as a signed 32-bit displacement.
+    let Some(disp) = index.checked_mul(8).filter(|&d| i32::try_from(d).is_ok()) else {
+        bail!("TLS index {index} is too large to redirect");
+    };
+    let disp = disp.to_le_bytes();
     for reg in 0..16u8 {
         let (r, low) = (reg >> 3, reg & 7);
         let mut code = vec![0x65, 0x48 | r << 2, 0x8B, low << 3 | 4, 0x25, 0x58, 0, 0, 0];

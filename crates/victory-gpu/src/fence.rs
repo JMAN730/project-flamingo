@@ -146,6 +146,10 @@ fn watch_loop() {
 static MEMORY_WAITERS: Mutex<Vec<(crate::timeline::MemoryWait, Instant, Weak<Timeline>)>> =
     Mutex::new(Vec::new());
 
+/// Fast-path count of entries in `MEMORY_WAITERS` so `Fence::signal` and
+/// bottom-of-pipe `written` avoid locking `MEMORY_WAITERS` when empty.
+static MEMORY_WAITER_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 #[cfg(any(feature = "diagnostics", test))]
 fn parse_wait_timeout(value: Option<&str>) -> Duration {
     let ms = value
@@ -177,8 +181,13 @@ pub(crate) fn wait_memory(
 ) -> bool {
     let mut waiters = MEMORY_WAITERS.lock().unwrap_or_else(|e| e.into_inner());
     let weak = Arc::downgrade(timeline);
+    // Publish a non-zero count with SeqCst before checking `wait.satisfied()`
+    // so a concurrent writer's SeqCst fence + load in `scan_memory_waiters`
+    // cannot miss a waiter that observed the pre-write value.
+    MEMORY_WAITER_COUNT.store(waiters.len() + 1, Ordering::SeqCst);
     if wait.satisfied() || Instant::now() >= deadline {
         waiters.retain(|(_, _, t)| !t.ptr_eq(&weak));
+        MEMORY_WAITER_COUNT.store(waiters.len(), Ordering::SeqCst);
         return true;
     }
     if let Some(existing) = waiters.iter_mut().find(|(_, _, t)| t.ptr_eq(&weak)) {
@@ -187,6 +196,7 @@ pub(crate) fn wait_memory(
     } else {
         waiters.push((wait, deadline, weak));
     }
+    MEMORY_WAITER_COUNT.store(waiters.len(), Ordering::SeqCst);
     drop(waiters);
     watch_notify();
     false
@@ -199,9 +209,13 @@ pub(crate) fn wait_memory(
 /// deadline expiry before the watcher scans), so `scan_memory_waiters` cannot
 /// later read a retired address after post-wait work reports completion.
 pub(crate) fn cancel_memory_wait(timeline: &Arc<Timeline>) {
+    if MEMORY_WAITER_COUNT.load(Ordering::Acquire) == 0 {
+        return;
+    }
     let weak = Arc::downgrade(timeline);
     let mut waiters = MEMORY_WAITERS.lock().unwrap_or_else(|e| e.into_inner());
     waiters.retain(|(_, _, t)| !t.ptr_eq(&weak));
+    MEMORY_WAITER_COUNT.store(waiters.len(), Ordering::SeqCst);
 }
 
 #[cfg(test)]
@@ -217,20 +231,20 @@ pub(crate) fn has_memory_waiter(timeline: &Arc<Timeline>) -> bool {
 /// Checks pending GPU memory waits, waking any live timeline whose condition is
 /// satisfied or whose deadline has passed.
 fn scan_memory_waiters() -> (Vec<Arc<Timeline>>, bool) {
+    // Pair with the SeqCst count publication in `wait_memory` after the
+    // caller's Release store to fence/target memory.
+    std::sync::atomic::fence(Ordering::SeqCst);
+    if MEMORY_WAITER_COUNT.load(Ordering::Acquire) == 0 {
+        return (Vec::new(), false);
+    }
     let mut waiters = MEMORY_WAITERS.lock().unwrap_or_else(|e| e.into_inner());
     let mut woken = Vec::new();
     waiters.retain(|(wait, deadline, timeline)| {
         let Some(live) = timeline.upgrade() else {
             return false;
         };
-        // A done write of a submission in flight that meets the wait lets
-        // the queue go on (`timeline::in_flight_meets`; never without
-        // `VICTORY_IN_FLIGHT`).
         let satisfied = wait.satisfied();
-        if satisfied
-            || Instant::now() >= *deadline
-            || crate::timeline::in_flight_meets(wait).is_some()
-        {
+        if satisfied || Instant::now() >= *deadline {
             #[cfg(feature = "diagnostics")]
             if satisfied {
                 crate::timeline::wait_stats::woke(&live, wait);
@@ -241,6 +255,7 @@ fn scan_memory_waiters() -> (Vec<Arc<Timeline>>, bool) {
             true
         }
     });
+    MEMORY_WAITER_COUNT.store(waiters.len(), Ordering::SeqCst);
     (woken, !waiters.is_empty())
 }
 
@@ -325,22 +340,10 @@ extern "system" fn release(this: This) -> u32 {
     object::release_boxed::<Fence>(this)
 }
 extern "system" fn completed(this: This) -> u64 {
-    // `VICTORY_ASYNC_SUBMIT`: a submission the GPU finished is completed
-    // here, on the asking thread (nothing otherwise).
-    #[cfg(windows)]
-    crate::host::run_pending_if_done();
     fence(this).value.load(Ordering::Acquire)
 }
 extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c_void) -> HRESULT {
     let fence = fence(this);
-    // `VICTORY_ASYNC_SUBMIT`: a wait not met yet completes the submission
-    // left pending first, on the waiting thread (nothing otherwise);
-    // `VICTORY_IN_FLIGHT`: submissions in flight are completed in order
-    // until the value is reached or none is left.
-    #[cfg(windows)]
-    if fence.value.load(Ordering::Acquire) < value {
-        crate::host::run_pending_until(&|| fence.value.load(Ordering::Acquire) >= value);
-    }
     let mut waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
     if fence.value.load(Ordering::Acquire) >= value {
         if !event.is_null() {
@@ -355,6 +358,18 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
         return S_OK;
     }
     // A null event: block until the value is reached, as D3D12 does.
+    // With asynchronous submissions (`crate::host::late`), the signal may be
+    // queued behind in-flight flights: drop `waiters` before settling so
+    // landing can signal this fence without deadlocking.
+    #[cfg(windows)]
+    if fence.value.load(Ordering::Acquire) < value && crate::host::late() {
+        drop(waiters);
+        crate::host::settle_for_fence();
+        waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
+        if fence.value.load(Ordering::Acquire) >= value {
+            return S_OK;
+        }
+    }
     let started = Instant::now();
     let mut warned = Duration::ZERO;
     while fence.value.load(Ordering::Acquire) < value {
@@ -448,9 +463,8 @@ fn run_held(queues: Vec<Arc<Timeline>>) {
 pub(crate) struct Woken(Vec<Arc<Timeline>>);
 
 impl Woken {
-    /// These queues, to run once no lock is held.
-    pub(crate) fn of(queues: Vec<Arc<Timeline>>) -> Woken {
-        Woken(queues)
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.is_empty()
     }
 
     pub(crate) fn add(&mut self, other: Woken) {
@@ -476,6 +490,19 @@ impl Held {
 
     pub(crate) fn signal(&self, value: u64) {
         signal(self.0.get(), value);
+    }
+
+    /// Moves the fence to `value` and wakes its event waiters, returning any
+    /// woken [`Timeline`]s for the caller to resume after releasing outer locks
+    /// (such as `Host::submitted`).
+    #[cfg(windows)]
+    pub(crate) fn signal_deferred(&self, value: u64) -> Woken {
+        let fence = fence(self.0.get());
+        let waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
+        fence.value.store(value, Ordering::Release);
+        let mut queues = wake(fence, waiters);
+        queues.extend(scan_memory_waiters().0);
+        Woken(queues)
     }
 
     /// Whether the value is reached; if not, `queue` is woken once it is.

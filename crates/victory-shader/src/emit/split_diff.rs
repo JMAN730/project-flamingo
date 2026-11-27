@@ -387,7 +387,7 @@ fn translate(
                 probe::with_loop_limit(Some(opts.loop_limit), || {
                     probe::with_knobs(waves, Some(opts.spin_limit), true, || {
                         super::with_host_wave64(wave64, || {
-                            super::translate_program(container, true, None)
+                            super::translate_program(container, true, "", None)
                         })
                     })
                 })

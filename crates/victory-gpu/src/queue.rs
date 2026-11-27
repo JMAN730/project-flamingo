@@ -121,7 +121,7 @@ extern "system" fn release(this: This) -> u32 {
 /// Pins a queued [`crate::host::HostList`] epoch until execution completes or
 /// the unrun closure is dropped on early queue teardown.
 #[cfg(windows)]
-struct InFlight(Option<Arc<crate::host::HostList>>);
+pub(crate) struct InFlight(Option<Arc<crate::host::HostList>>);
 
 #[cfg(windows)]
 impl InFlight {
@@ -130,16 +130,11 @@ impl InFlight {
         Self(Some(list))
     }
 
-    fn list(&self) -> &crate::host::HostList {
+    pub(crate) fn list(&self) -> &crate::host::HostList {
         self.0.as_deref().expect("in-flight host list")
     }
 
-    #[cfg(not(test))]
-    fn shared(&self) -> Arc<crate::host::HostList> {
-        self.0.clone().expect("in-flight host list")
-    }
-
-    fn take(mut self) -> Arc<crate::host::HostList> {
+    pub(crate) fn take(mut self) -> Arc<crate::host::HostList> {
         let list = self.0.take().expect("in-flight host list");
         list.end_submit();
         list
@@ -155,28 +150,78 @@ impl Drop for InFlight {
     }
 }
 
-/// Whether host submissions finish on the completion thread
-/// (`VICTORY_ASYNC_SUBMIT=1`, experimental).
-#[cfg(all(windows, not(test)))]
-fn async_submit() -> bool {
+/// Whether queue submissions run on a dedicated worker thread instead of on
+/// the title's calling thread (`VICTORY_ASYNC_SUBMIT=1`; off by default, and
+/// requires asynchronous GPU submissions `crate::host::late()`).
+#[cfg(windows)]
+pub(crate) fn async_submit() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_ASYNC_SUBMIT").is_some_and(|v| v != "0"))
+    *ON.get_or_init(|| {
+        crate::host::late() && std::env::var_os("VICTORY_ASYNC_SUBMIT").is_some_and(|v| v == "1")
+    })
 }
 
-/// Runs the pinned lists and waits for them on this thread.
+/// Enqueues `timeline` on the `"victory-submit"` worker thread when
+/// `VICTORY_ASYNC_SUBMIT=1` is active.
 #[cfg(windows)]
-fn run_now(in_flight: Vec<InFlight>) {
-    if let Some(host) = crate::host::host() {
-        crate::descriptor::sync_all_heaps();
-        let runs: Vec<_> = in_flight.iter().map(InFlight::list).collect();
-        host.execute(&runs);
-        for entry in in_flight {
-            let list = entry.take();
-            if let Ok(orphan) = Arc::try_unwrap(list) {
-                host.recycle_list(orphan);
-            }
+pub(crate) fn async_schedule(timeline: &Arc<Timeline>) {
+    use std::collections::VecDeque;
+    use std::sync::{Condvar, Mutex, Once, Weak};
+
+    static QUEUE: (Mutex<VecDeque<Weak<Timeline>>>, Condvar) =
+        (Mutex::new(VecDeque::new()), Condvar::new());
+    static WORKER: Once = Once::new();
+
+    WORKER.call_once(|| {
+        if let Err(e) = std::thread::Builder::new()
+            .name("victory-submit".into())
+            .spawn(|| {
+                loop {
+                    let next = {
+                        let mut q = QUEUE.0.lock().unwrap_or_else(|e| e.into_inner());
+                        loop {
+                            if let Some(weak) = q.pop_front() {
+                                break weak;
+                            }
+                            q = QUEUE.1.wait(q).unwrap_or_else(|e| e.into_inner());
+                        }
+                    };
+                    if let Some(tl) = next.upgrade() {
+                        tl.wake();
+                    }
+                }
+            })
+        {
+            tracing::warn!(error = %e, "could not spawn victory-submit thread");
         }
+    });
+    let mut q = QUEUE.0.lock().unwrap_or_else(|e| e.into_inner());
+    let weak = Arc::downgrade(timeline);
+    if !q.iter().any(|existing| existing.ptr_eq(&weak)) {
+        q.push_back(weak);
     }
+    QUEUE.1.notify_one();
+}
+
+/// Restores this thread's `watch` submission stamp to its prior value (`0` at
+/// top level) on scope exit, even on unwind.
+#[cfg(windows)]
+struct CurrentStampGuard(u64);
+
+#[cfg(windows)]
+impl Drop for CurrentStampGuard {
+    fn drop(&mut self) {
+        crate::watch::swap_current_stamp(self.0);
+    }
+}
+
+/// Runs `f` with this thread's `watch` submission stamp set to `stamp` and
+/// restores the prior stamp (`0` at top level) when `f` returns or unwinds.
+#[cfg(windows)]
+fn with_current_stamp<R>(stamp: u64, f: impl FnOnce() -> R) -> R {
+    let prev = crate::watch::swap_current_stamp(stamp);
+    let _guard = CurrentStampGuard(prev);
+    f()
 }
 
 /// Runs the lists' host lists and waits for them (decision 0007), once
@@ -190,11 +235,26 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
     if crate::host::host().is_some() {
         // SAFETY: the title passes `count` lists.
         let lists = unsafe { std::slice::from_raw_parts(lists, count as usize) };
+        if lists.is_empty() {
+            return;
+        }
         let segments: Vec<_> = lists
             .iter()
             .flat_map(|&l| crate::list::segments(l))
             .collect();
+        if segments.is_empty() {
+            return;
+        }
+        let stamp = crate::watch::TITLE_SUBMITS.fetch_add(1, Ordering::AcqRel) + 1;
         let timeline = &queue(this).timeline;
+        let async_mode = async_submit();
+        let submit_op = |op: Op| {
+            if async_mode {
+                timeline.submit_async(op);
+            } else {
+                timeline.submit(op);
+            }
+        };
         let mut batch = Vec::new();
         let flush = |batch: &mut Vec<InFlight>| {
             if batch.is_empty() {
@@ -203,77 +263,26 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
             // Held until they run: the title may reset its lists before.
             // Every flushed batch (including segments queued behind a fence or
             // mid-list memory wait) keeps its `InFlight` pin until execution
-            // completes.
+            // completes (or lands, when `host::late()` is active).
             let in_flight = std::mem::take(batch);
-            // `VICTORY_ASYNC_SUBMIT=1`: the GPU wait and copy-back finish on
-            // the completion thread; what the queue does next (fence
-            // signals) waits for them.
-            // shortcut: experimental; the title crashes during its loading
-            // with it on (work it records meanwhile may race the GPU).
-            // `VICTORY_IN_FLIGHT=<n>`: prepared and submitted now, completed
-            // later in submission order; the queue goes on with further
-            // submissions and holds what the title's CPU sees (fence
-            // signals) until it has completed (`host::in_flight_limit`).
-            #[cfg(not(test))]
-            if crate::host::in_flight_limit() > 1 {
-                timeline.submit(Op::RunInFlight(Box::new(move || {
-                    let Some(host) = crate::host::host() else {
-                        drop(in_flight);
-                        return 0;
-                    };
-                    crate::descriptor::sync_all_heaps();
-                    let runs: Vec<_> = in_flight.iter().map(InFlight::shared).collect();
-                    host.execute_in_flight(
-                        runs,
-                        Box::new(move || {
+            submit_op(Op::Run(Box::new(move || {
+                with_current_stamp(stamp, || {
+                    if let Some(host) = crate::host::host() {
+                        crate::descriptor::sync_all_heaps();
+                        if crate::host::late() {
+                            host.execute_late(in_flight);
+                        } else {
+                            let runs: Vec<_> = in_flight.iter().map(InFlight::list).collect();
+                            host.execute(&runs);
                             for entry in in_flight {
                                 let list = entry.take();
                                 if let Ok(orphan) = Arc::try_unwrap(list) {
                                     host.recycle_list(orphan);
                                 }
                             }
-                        }),
-                    )
-                })));
-            } else if async_submit() {
-                timeline.submit(Op::RunAsync(Box::new(move |resume| {
-                    let Some(host) = crate::host::host() else {
-                        drop(in_flight);
-                        resume();
-                        return;
-                    };
-                    crate::descriptor::sync_all_heaps();
-                    let runs: Vec<_> = in_flight.iter().map(InFlight::shared).collect();
-                    host.execute_async(
-                        runs,
-                        Box::new(move || {
-                            for entry in in_flight {
-                                let list = entry.take();
-                                if let Ok(orphan) = Arc::try_unwrap(list) {
-                                    host.recycle_list(orphan);
-                                }
-                            }
-                            resume();
-                        }),
-                    );
-                })));
-            } else {
-                timeline.submit(Op::Run(Box::new(move || run_now(in_flight))));
-            }
-            // Tests read results as soon as the queue call returns.
-            #[cfg(test)]
-            timeline.submit(Op::Run(Box::new(move || {
-                if let Some(host) = crate::host::host() {
-                    crate::descriptor::sync_all_heaps();
-                    let runs: Vec<_> = in_flight.iter().map(InFlight::list).collect();
-                    host.execute(&runs);
-                    for entry in in_flight {
-                        let list = entry.take();
-                        if let Ok(orphan) = Arc::try_unwrap(list) {
-                            host.recycle_list(orphan);
                         }
                     }
-                }
+                });
             })));
         };
         for seg in segments {
@@ -281,7 +290,7 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
                 crate::list::Segment::List(list) => batch.push(InFlight::new(list)),
                 crate::list::Segment::Wait(wait) => {
                     flush(&mut batch);
-                    timeline.submit(Op::WaitMemory(wait, None));
+                    submit_op(Op::WaitMemory(wait, None));
                 }
             }
         }
@@ -301,12 +310,6 @@ pub(crate) struct Plane {
     count: u32,
     resources: *const This,
 }
-
-/// Bytes from one present plane's description to the next: token, count,
-/// resources, source rectangles and placement, then 32 bytes (colour space,
-/// flags and more) this does not read. Measured: the second plane's token
-/// and count follow 9 words after the first's.
-const PLANE_BYTES: usize = 72;
 /// Submission tagged with the frame it belongs to `(count, lists, frame
 /// token, flags)`; frames are paced elsewhere, so it runs as a plain one.
 extern "system" fn execute_x(this: This, count: u32, lists: *const This, _token: u64, _flags: u32) {
@@ -331,9 +334,20 @@ extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
         return E_INVALIDARG;
     }
     let fence = Held::new(fence);
-    queue(this)
-        .timeline
-        .submit(Op::Run(Box::new(move || fence.signal(value))));
+    let op = Op::Run(Box::new(move || {
+        #[cfg(windows)]
+        if let Err(fence) = crate::host::late_signal(fence, value) {
+            fence.signal(value);
+        }
+        #[cfg(not(windows))]
+        fence.signal(value);
+    }));
+    #[cfg(windows)]
+    if async_submit() {
+        queue(this).timeline.submit_async(op);
+        return S_OK;
+    }
+    queue(this).timeline.submit(op);
     S_OK
 }
 /// Holds the queue's later work back until the fence reaches `value`; the
@@ -431,11 +445,9 @@ pub(crate) fn presented() -> u64 {
     FRAMES.load(Ordering::Relaxed)
 }
 
-/// Shows the first plane's first resource in our window, with the second
-/// plane's (an interface over the game, in Series S mode) blended over it.
+/// Shows the first plane's first resource in our window.
 ///
-/// shortcut: two planes at most, stretched to the window; source
-/// rectangles and placement are not read.
+/// shortcut: only the opt-in Series S two-plane layout adds an overlay.
 extern "system" fn present(
     this: This,
     planes: u32,
@@ -450,36 +462,71 @@ extern "system" fn present(
     } else {
         None
     };
-    let first = |plane: Option<&Plane>| {
-        plane
-            .filter(|plane| plane.count > 0 && !plane.resources.is_null())
-            // SAFETY: the plane lists `count` resources.
-            .map(|plane| unsafe { *plane.resources })
-            .filter(|resource| !resource.is_null())
-            .map(object::Held::new)
-    };
-    let resource = first(plane);
-    let overlay = if planes > 1 {
-        // SAFETY: the title passes `planes` descriptions, `PLANE_BYTES` apart.
-        first(unsafe {
-            plane_parameters
-                .cast::<u8>()
-                .add(PLANE_BYTES)
-                .cast::<Plane>()
+    let resource = plane
+        .filter(|plane| plane.count > 0 && !plane.resources.is_null())
+        // SAFETY: the plane lists `count` resources.
+        .map(|plane| unsafe { *plane.resources })
+        .filter(|resource| !resource.is_null())
+        .map(object::Held::new);
+    #[cfg(windows)]
+    let run = {
+        static TWO_PLANES: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let overlay = if planes == 2
+            && plane.is_some_and(|plane| plane.count == 1)
+            && crate::console::current() == crate::console::Console::SeriesS
+            && *TWO_PLANES.get_or_init(|| crate::switch::on("VICTORY_PRESENT_TWO_PLANES"))
+        {
+            resource
                 .as_ref()
-        })
-    } else {
-        None
+                .and_then(|primary| retain_present_overlay(plane_parameters, primary.get()))
+        } else {
+            None
+        };
+        move || show(resource, overlay)
     };
-    queue(this)
-        .timeline
-        .submit(Op::Run(Box::new(move || show(resource, overlay))));
+    #[cfg(not(windows))]
+    let run = move || show(resource);
+    queue(this).timeline.submit(Op::Run(Box::new(run)));
     S_OK
 }
 
-/// A present, once the queue's work before it has run: counts the frame
-/// and shows the first plane's resource, with the second plane's over it.
-fn show(resource: Option<object::Held>, overlay: Option<object::Held>) {
+/// Reads the second plane only for the observed Series S two-plane layout.
+/// Its stride is larger than the common prefix described by `Plane`.
+#[cfg(windows)]
+fn retain_present_overlay(
+    plane_parameters: *const Plane,
+    primary: This,
+) -> Option<crate::resource::PresentTarget> {
+    const SERIES_S_PLANE_STRIDE: usize = 0x48;
+    let plane = (plane_parameters as usize).checked_add(SERIES_S_PLANE_STRIDE)?;
+    let count_at = plane.checked_add(std::mem::offset_of!(Plane, count))?;
+    let mut count = [0; size_of::<u32>()];
+    if !crate::host::read_into(count_at as *const u8, &mut count) || u32::from_ne_bytes(count) != 1
+    {
+        return None;
+    }
+    let resources_at = plane.checked_add(std::mem::offset_of!(Plane, resources))?;
+    let mut resources = [0; size_of::<usize>()];
+    if !crate::host::read_into(resources_at as *const u8, &mut resources) {
+        return None;
+    }
+    let resources = usize::from_ne_bytes(resources);
+    let mut overlay = [0; size_of::<usize>()];
+    if resources == 0 || !crate::host::read_into(resources as *const u8, &mut overlay) {
+        return None;
+    }
+    let overlay = usize::from_ne_bytes(overlay);
+    if overlay == primary as usize {
+        return None;
+    }
+    crate::resource::PresentTarget::retain(overlay)
+}
+
+/// Counts and shows the frame once the queue's preceding work has run.
+fn show(
+    resource: Option<object::Held>,
+    #[cfg(windows)] overlay: Option<crate::resource::PresentTarget>,
+) {
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
     if frame.is_power_of_two() {
         let (draws, dispatches) = crate::list::take_counts();
@@ -514,15 +561,14 @@ fn show(resource: Option<object::Held>, overlay: Option<object::Held>) {
         crate::capture::dump_targets(frame);
     }
     #[cfg(windows)]
+    if crate::host::late() {
+        crate::host::settle_for_present();
+    }
+    #[cfg(windows)]
     if let Some(resource) = resource.as_ref().map(object::Held::get)
-        && let Some(texture) = crate::resource::host_resource(resource)
+        && let Some(copy) = crate::resource::host_copy_ref(resource)
         && let Some(host) = crate::host::host()
     {
-        const COPY_SOURCE: u32 = 0x800;
-        const READ: u32 = 0x40; // non-pixel shader resource
-        let state = crate::resource::host_transition(resource, COPY_SOURCE)
-            .map_or(COPY_SOURCE, |(_, before)| before);
-        // The overlay is read by the compose pass, and left as it was.
         // Diagnostics: `VICTORY_PLANES=base` shows the first plane alone.
         #[cfg(feature = "diagnostics")]
         let overlay = {
@@ -531,24 +577,34 @@ fn show(resource: Option<object::Held>, overlay: Option<object::Held>) {
                 .get_or_init(|| std::env::var("VICTORY_PLANES").is_ok_and(|v| v.trim() == "base"));
             if base_only { None } else { overlay }
         };
-        let overlay = overlay.as_ref().map(object::Held::get).and_then(|o| {
-            let texture = crate::resource::host_resource(o)?;
-            let state =
-                crate::resource::host_transition(o, READ).map_or(READ, |(_, before)| before);
-            Some((o, texture, state))
-        });
-        let shown = host.present(texture, state, overlay.map(|(_, t, s)| (t, s)), frame);
-        if let Some((o, _, state)) = overlay {
-            crate::resource::host_transition(o, state);
-        }
-        crate::resource::host_transition(resource, state);
+        let (state, shown) = if let Some(overlay) = overlay
+            .as_ref()
+            .and_then(crate::resource::PresentTarget::existing_host_copy)
+        {
+            let state = copy.state.load(Ordering::Relaxed);
+            let overlay_state = overlay.state.load(Ordering::Relaxed);
+            let shown =
+                host.present_overlay(&copy.texture, state, &overlay.texture, overlay_state, frame);
+            (state, shown)
+        } else {
+            const COPY_SOURCE: u32 = 0x800;
+            let state = crate::resource::host_transition(resource, COPY_SOURCE)
+                .map_or(COPY_SOURCE, |(_, before)| before);
+            let shown = host.present(&copy.texture, state, frame);
+            crate::resource::host_transition(resource, state);
+            (state, shown)
+        };
         #[cfg(feature = "diagnostics")]
         blinks(frame, resource, state, shown);
-        #[cfg(not(feature = "diagnostics"))]
-        let _ = shown;
+        #[cfg(not(windows))]
+        let _ = (state, shown);
+        #[cfg(all(windows, not(feature = "diagnostics")))]
+        let _ = (state, shown);
     }
+    #[cfg(all(windows, feature = "diagnostics"))]
+    crate::faultbook::frame();
     #[cfg(not(windows))]
-    let _ = (resource, overlay);
+    let _ = resource;
 }
 /// Diagnostics: logs a presented frame that is black after one that was
 /// not, with what was presented and how many draws ran since.
@@ -634,9 +690,11 @@ extern "system" fn copy_page_mappings(
     pool_pages: u32,
     _flags: u32,
 ) -> HRESULT {
-    let Some(map) = crate::resource::page_mapper() else {
+    let batch_map = crate::resource::page_batch_mapper();
+    let single_map = crate::resource::page_mapper();
+    if batch_map.is_none() && single_map.is_none() {
         return E_INVALIDARG;
-    };
+    }
     if batches.is_null() && count > 0 {
         return E_INVALIDARG;
     }
@@ -683,22 +741,68 @@ extern "system" fn copy_page_mappings(
         }
     }
     queue(this).timeline.submit(Op::Run(Box::new(move || {
-        apply_page_mappings(map, pool, &ops)
+        apply_page_mappings(batch_map, single_map, pool, &ops)
     })));
     S_OK
 }
 
-fn apply_page_mappings(map: crate::resource::PageMapper, pool: u64, ops: &[PageOp]) {
+fn apply_page_mappings(
+    batch_map: Option<crate::resource::PageBatchMapper>,
+    single_map: Option<crate::resource::PageMapper>,
+    pool: u64,
+    ops: &[PageOp],
+) {
+    use crate::resource::{
+        PageMapOp,
+        PageMapping::{Consecutive, Repeated},
+    };
     let mut ok = true;
-    for &op in ops {
-        ok &= match op {
-            PageOp::Copy { at, source, len } => map(at, source, len),
-            PageOp::Fill { at, source, count } => {
-                (0..count).all(|k| map(at + k * PAGE, source, PAGE))
+    if let Some(batch_map) = batch_map {
+        let mut batch_ops = Vec::with_capacity(ops.len());
+        for &op in ops {
+            match op {
+                PageOp::Copy { at, source, len } if len > 0 => batch_ops.push(PageMapOp {
+                    to: at,
+                    from: source,
+                    len,
+                    mapping: Consecutive,
+                }),
+                PageOp::Fill { at, source, count } if count > 0 => batch_ops.push(PageMapOp {
+                    to: at,
+                    from: source,
+                    len: count.saturating_mul(PAGE),
+                    mapping: Repeated,
+                }),
+                PageOp::Unmap { at, len } if len > 0 => batch_ops.push(PageMapOp {
+                    to: at,
+                    from: 0,
+                    len,
+                    mapping: Consecutive,
+                }),
+                PageOp::Copy { .. } | PageOp::Fill { .. } | PageOp::Unmap { .. } => {}
+                PageOp::Invalid => ok = false,
             }
-            PageOp::Unmap { at, len } => map(at, 0, len),
-            PageOp::Invalid => false,
-        };
+        }
+        if !batch_ops.is_empty() {
+            ok &= batch_map(&batch_ops);
+        }
+    } else if let Some(map) = single_map {
+        // The runtime's page mapper (`xmem::map_alias`) acquires `PHYSICAL`
+        // and `title_memory_remapping(touched_span)` itself; do not take
+        // `title_memory_remapping` here (it is non-reentrant and would invert
+        // lock order).
+        for &op in ops {
+            ok &= match op {
+                PageOp::Copy { at, source, len } => map(at, source, len, Consecutive),
+                PageOp::Fill { at, source, count } => {
+                    map(at, source, count.saturating_mul(PAGE), Repeated)
+                }
+                PageOp::Unmap { at, len } => map(at, 0, len, Consecutive),
+                PageOp::Invalid => false,
+            };
+        }
+    } else {
+        ok = false;
     }
     if !ok {
         static ONCE: std::sync::Once = std::sync::Once::new();
@@ -841,6 +945,10 @@ mod tests {
 
     #[test]
     fn queue_signals_complete_at_once() {
+        #[cfg(windows)]
+        if crate::host::late() {
+            crate::host::settle_for_fence();
+        }
         let null = std::ptr::null();
         let desc = QueueDesc {
             kind: 0,
@@ -871,6 +979,10 @@ mod tests {
     /// The first queue's signal after its wait must not complete before.
     #[test]
     fn work_after_a_wait_runs_once_the_other_queue_signals() {
+        #[cfg(windows)]
+        if crate::host::late() {
+            crate::host::settle_for_fence();
+        }
         type Call = extern "system" fn(This, This, u64) -> HRESULT;
         let null = std::ptr::null();
         let desc = QueueDesc {
@@ -909,11 +1021,71 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn series_s_overlay_uses_second_plane_stride_and_retains_the_target() {
+        #[repr(C)]
+        struct FullPlane {
+            prefix: Plane,
+            reserved: [u64; 6],
+        }
+
+        let backing = [0u64; 2];
+        let primary = crate::resource::test_target(std::ptr::from_ref(&backing[0]) as u64);
+        let overlay = crate::resource::test_target(std::ptr::from_ref(&backing[1]) as u64);
+        let retained = {
+            let primary_resources = [primary];
+            let overlay_resources = [overlay];
+            let mut planes = [
+                FullPlane {
+                    prefix: Plane {
+                        token: 1,
+                        count: 1,
+                        resources: primary_resources.as_ptr(),
+                    },
+                    reserved: [0; 6],
+                },
+                FullPlane {
+                    prefix: Plane {
+                        token: 1,
+                        count: 1,
+                        resources: overlay_resources.as_ptr(),
+                    },
+                    reserved: [0; 6],
+                },
+            ];
+            let retain = |planes: &[FullPlane; 2]| {
+                let parameters = std::hint::black_box(planes.as_ptr().cast::<Plane>());
+                retain_present_overlay(parameters, primary)
+            };
+            planes[1].prefix.count = 2;
+            assert!(retain(&planes).is_none());
+            planes[1].prefix.count = 1;
+            planes[1].prefix.resources = std::ptr::null();
+            assert!(retain(&planes).is_none());
+            planes[1].prefix.resources = primary_resources.as_ptr();
+            assert!(retain(&planes).is_none());
+            planes[1].prefix.resources = overlay_resources.as_ptr();
+            retain(&planes).expect("second plane retained")
+        };
+
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        assert_eq!(release(overlay), 1, "present retains its own reference");
+        assert!(retained.existing_host_copy().is_none());
+        drop(retained);
+        assert!(crate::resource::PresentTarget::retain(overlay as usize).is_none());
+        assert_eq!(release(primary), 0);
+    }
+
     /// A present submitted after a wait must not run until the wait is
     /// reached, must read its stack plane parameters at submission time and
     /// must keep its resource alive until it runs.
     #[test]
     fn present_runs_after_a_queues_wait() {
+        #[cfg(windows)]
+        if crate::host::late() {
+            crate::host::settle_for_fence();
+        }
         type Sync = extern "system" fn(This, This, u64) -> HRESULT;
         type Present = extern "system" fn(This, u32, *const Plane, *const u8) -> HRESULT;
         let null = std::ptr::null();
@@ -988,14 +1160,15 @@ mod tests {
     /// reached, and must capture caller-owned batch/range arrays at call time.
     #[test]
     fn page_mappings_run_after_a_queues_wait() {
+        use crate::resource::{PageMapOp, PageMapping};
         use std::sync::Mutex;
 
-        static CALLS: Mutex<Vec<(u64, u64, u64)>> = Mutex::new(Vec::new());
-        fn record(to: u64, from: u64, len: u64) -> bool {
+        static CALLS: Mutex<Vec<(u64, u64, u64, PageMapping)>> = Mutex::new(Vec::new());
+        fn record(to: u64, from: u64, len: u64, mapping: PageMapping) -> bool {
             CALLS
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .push((to, from, len));
+                .push((to, from, len, mapping));
             true
         }
         crate::resource::use_page_mapper(record);
@@ -1074,10 +1247,14 @@ mod tests {
         assert_eq!(
             *CALLS.lock().unwrap(),
             vec![
-                (dst, pool + PAGE, 2 * PAGE),
-                (dst + 2 * PAGE, pool + 3 * PAGE, PAGE),
-                (dst + 3 * PAGE, pool + 3 * PAGE, PAGE),
-                (dst + 4 * PAGE, 0, PAGE),
+                (dst, pool + PAGE, 2 * PAGE, PageMapping::Consecutive),
+                (
+                    dst + 2 * PAGE,
+                    pool + 3 * PAGE,
+                    2 * PAGE,
+                    PageMapping::Repeated
+                ),
+                (dst + 4 * PAGE, 0, PAGE, PageMapping::Consecutive),
             ]
         );
 
@@ -1094,7 +1271,65 @@ mod tests {
             ranges: &range,
         };
         assert_eq!(copy_pages(waits)(waits, 1, &batch, pool, 4, 0), S_OK);
-        assert_eq!(*CALLS.lock().unwrap(), vec![(dst, 0, PAGE)]);
+        assert_eq!(
+            *CALLS.lock().unwrap(),
+            vec![(dst, 0, PAGE, PageMapping::Consecutive)]
+        );
+
+        // Verify batched dispatch groups all non-empty ops into one batch callback.
+        static BATCH_OPS: Mutex<Vec<Vec<PageMapOp>>> = Mutex::new(Vec::new());
+        fn record_batch(ops: &[PageMapOp]) -> bool {
+            BATCH_OPS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(ops.to_vec());
+            true
+        }
+        BATCH_OPS.lock().unwrap().clear();
+        apply_page_mappings(
+            Some(record_batch),
+            None,
+            pool,
+            &[
+                PageOp::Copy {
+                    at: dst,
+                    source: pool + PAGE,
+                    len: 2 * PAGE,
+                },
+                PageOp::Fill {
+                    at: dst + 2 * PAGE,
+                    source: pool + 3 * PAGE,
+                    count: 2,
+                },
+                PageOp::Unmap {
+                    at: dst + 4 * PAGE,
+                    len: PAGE,
+                },
+            ],
+        );
+        assert_eq!(
+            *BATCH_OPS.lock().unwrap(),
+            vec![vec![
+                PageMapOp {
+                    to: dst,
+                    from: pool + PAGE,
+                    len: 2 * PAGE,
+                    mapping: PageMapping::Consecutive,
+                },
+                PageMapOp {
+                    to: dst + 2 * PAGE,
+                    from: pool + 3 * PAGE,
+                    len: 2 * PAGE,
+                    mapping: PageMapping::Repeated,
+                },
+                PageMapOp {
+                    to: dst + 4 * PAGE,
+                    from: 0,
+                    len: PAGE,
+                    mapping: PageMapping::Consecutive,
+                },
+            ]]
+        );
 
         for object in [waits, signals, ready, done] {
             assert_eq!(release(object), 0);
@@ -1281,8 +1516,23 @@ mod tests {
         );
 
         let lists = [list1, list2];
+        // Ensure any in-flight `Late::Write` targeting stack `out` lands before
+        // `out` leaves scope, even if an assertion unwinds under `VICTORY_RELAY`.
+        struct SettleOnDrop;
+        impl Drop for SettleOnDrop {
+            fn drop(&mut self) {
+                if crate::host::late() {
+                    crate::host::settle_for_fence();
+                }
+            }
+        }
+        let _settle = SettleOnDrop;
         execute(queue, 2, lists.as_ptr());
 
+        let limit = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while out[0].load(Ordering::Acquire) == 0 && std::time::Instant::now() < limit {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
         assert_eq!(out[0].load(Ordering::Acquire), 1);
         assert_eq!(out[1].load(Ordering::Acquire), 0);
         assert_eq!(out[2].load(Ordering::Acquire), 0);
@@ -1394,6 +1644,13 @@ mod tests {
         );
 
         assert_eq!(crate::fence::signal(ready, 1), S_OK);
+        if crate::host::late() {
+            crate::host::settle_for_fence();
+            let limit = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while drops.load(Ordering::SeqCst) == 0 && std::time::Instant::now() < limit {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
         assert_eq!(completed(done), 1);
         assert_eq!(
             drops.load(Ordering::SeqCst),
@@ -1449,6 +1706,9 @@ mod tests {
         assert_eq!(drops.load(Ordering::SeqCst), 0);
 
         assert_eq!(crate::fence::signal(f1, 1), S_OK);
+        if crate::host::late() {
+            crate::host::settle_for_fence();
+        }
         assert_eq!(completed(d1), 1);
         assert_eq!(
             drops.load(Ordering::SeqCst),
@@ -1457,6 +1717,13 @@ mod tests {
         );
 
         assert_eq!(crate::fence::signal(f2, 1), S_OK);
+        if crate::host::late() {
+            crate::host::settle_for_fence();
+            let limit = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while drops.load(Ordering::SeqCst) == 0 && std::time::Instant::now() < limit {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
         assert_eq!(completed(d2), 1);
         assert_eq!(drops.load(Ordering::SeqCst), 1);
 
@@ -1564,6 +1831,227 @@ mod tests {
         assert_eq!(drops.load(Ordering::SeqCst), 1);
 
         for object in [list, allocator, src, dst, ready] {
+            assert_eq!(release(object), 0);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn with_current_stamp_restores_zero_on_return_and_unwind() {
+        struct ResetStamp;
+        impl Drop for ResetStamp {
+            fn drop(&mut self) {
+                crate::watch::swap_current_stamp(0);
+            }
+        }
+        let _reset = ResetStamp;
+        crate::watch::swap_current_stamp(0);
+
+        let out = with_current_stamp(42, || {
+            assert_eq!(crate::watch::current_stamp(), 42);
+            let inner = with_current_stamp(77, || {
+                assert_eq!(crate::watch::current_stamp(), 77);
+                9u32
+            });
+            assert_eq!(inner, 9);
+            assert_eq!(
+                crate::watch::current_stamp(),
+                42,
+                "nested CurrentStampGuard must restore outer stamp"
+            );
+            7u32
+        });
+        assert_eq!(out, 7);
+        assert_eq!(crate::watch::current_stamp(), 0);
+
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            with_current_stamp(99, || {
+                assert_eq!(crate::watch::current_stamp(), 99);
+                panic!("simulated host execution panic");
+            });
+        }));
+        assert!(panicked.is_err());
+        assert_eq!(
+            crate::watch::current_stamp(),
+            0,
+            "CurrentStampGuard must reset current_stamp on unwind"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn with_current_stamp_is_thread_local_across_interleaved_guards() {
+        use std::sync::Barrier;
+
+        let b_entered = Arc::new(Barrier::new(2));
+        let b_a_dropped = Arc::new(Barrier::new(2));
+        let b_entered_t = b_entered.clone();
+        let b_a_dropped_t = b_a_dropped.clone();
+
+        // Interleave lifetimes: Thread A enters (stamp 101), Thread B enters
+        // (stamp 202), Thread A drops first, then Thread B drops second.
+        // With thread-local storage neither thread observes the other's stamp
+        // and neither leaks a non-zero stamp after drop.
+        let handle = std::thread::spawn(move || {
+            assert_eq!(crate::watch::current_stamp(), 0);
+            with_current_stamp(202, || {
+                assert_eq!(crate::watch::current_stamp(), 202);
+                b_entered_t.wait();
+                // Wait until Thread A has exited its guard.
+                b_a_dropped_t.wait();
+                assert_eq!(
+                    crate::watch::current_stamp(),
+                    202,
+                    "Thread A's guard drop must not disturb Thread B's stamp"
+                );
+            });
+            assert_eq!(crate::watch::current_stamp(), 0);
+        });
+
+        assert_eq!(crate::watch::current_stamp(), 0);
+        with_current_stamp(101, || {
+            assert_eq!(crate::watch::current_stamp(), 101);
+            b_entered.wait();
+            assert_eq!(
+                crate::watch::current_stamp(),
+                101,
+                "Thread B's guard entry must not overwrite Thread A's stamp"
+            );
+        });
+        assert_eq!(crate::watch::current_stamp(), 0);
+        b_a_dropped.wait();
+
+        handle.join().expect("thread B panicked");
+        assert_eq!(crate::watch::current_stamp(), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn execute_assigns_single_stamp_to_prefix_and_held_segments() {
+        if crate::host::host().is_none() || async_submit() {
+            return;
+        }
+        type Execute = extern "system" fn(This, u32, *const This);
+        type Write32 = extern "system" fn(This, u64, u32, u32, u32);
+        type Wait32 = extern "system" fn(This, u64, u32, u32, u32);
+
+        let null = std::ptr::null();
+        let (q, _) = test_queue();
+        let exec = slot::<Execute>(q, 0x50);
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+
+        let mut allocator = null;
+        assert_eq!(
+            crate::list::create_allocator(
+                null,
+                0,
+                &crate::resource::PAGEABLE_IIDS[0],
+                &mut allocator
+            ),
+            S_OK
+        );
+        let make_list = || {
+            let mut l = null;
+            let iid = guid(
+                0x5b160d0f,
+                0xac1b,
+                0x4185,
+                [0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x55],
+            );
+            assert_eq!(
+                crate::list::create_list(null, 0, 0, allocator, null, &iid, &mut l),
+                S_OK
+            );
+            l
+        };
+
+        let list1 = make_list();
+        let list2 = make_list();
+        let list_slot = crate::list::test_slot;
+
+        let gate1 = AtomicU32::new(0);
+        let gate2 = AtomicU32::new(0);
+        let out = [AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0)];
+
+        // list1 has a prefix segment (runs immediately), an unmet wait, and a held segment.
+        slot::<Write32>(list1, list_slot(list1, 69))(list1, (&raw const out[0]) as u64, 1, 0, 0);
+        slot::<Wait32>(list1, list_slot(list1, 71))(
+            list1,
+            (&raw const gate1) as u64,
+            3,
+            1,
+            u32::MAX,
+        );
+        slot::<Write32>(list1, list_slot(list1, 69))(list1, (&raw const out[1]) as u64, 2, 0, 0);
+        assert_eq!(
+            slot::<extern "system" fn(This) -> HRESULT>(list1, 0x48)(list1),
+            S_OK
+        );
+
+        // list2 has a second unmet wait and held segment.
+        slot::<Wait32>(list2, list_slot(list2, 71))(
+            list2,
+            (&raw const gate2) as u64,
+            3,
+            1,
+            u32::MAX,
+        );
+        slot::<Write32>(list2, list_slot(list2, 69))(list2, (&raw const out[2]) as u64, 3, 0, 0);
+        assert_eq!(
+            slot::<extern "system" fn(This) -> HRESULT>(list2, 0x48)(list2),
+            S_OK
+        );
+
+        struct SettleOnDrop;
+        impl Drop for SettleOnDrop {
+            fn drop(&mut self) {
+                if crate::host::late() {
+                    crate::host::settle_for_fence();
+                }
+            }
+        }
+        let _settle = SettleOnDrop;
+
+        // Empty submission must not mint a stamp.
+        let before = crate::watch::TITLE_SUBMITS.load(Ordering::Acquire);
+        exec(q, 0, &list1);
+        assert_eq!(crate::watch::TITLE_SUBMITS.load(Ordering::Acquire), before);
+        assert_eq!(crate::watch::current_stamp(), 0);
+
+        let lists = [list1, list2];
+        exec(q, 2, lists.as_ptr());
+        let after = crate::watch::TITLE_SUBMITS.load(Ordering::Acquire);
+        assert_eq!(
+            after,
+            before + 1,
+            "execute must mint one stamp across prefix and all held segments"
+        );
+        assert_eq!(crate::watch::current_stamp(), 0);
+        let limit = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while out[0].load(Ordering::Acquire) == 0 && std::time::Instant::now() < limit {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(out[0].load(Ordering::Acquire), 1);
+        assert_eq!(out[1].load(Ordering::Acquire), 0);
+        assert_eq!(out[2].load(Ordering::Acquire), 0);
+
+        // Release both gates and verify held segments complete without minting new stamps.
+        gate1.store(1, Ordering::Release);
+        gate2.store(1, Ordering::Release);
+        let limit = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while out[2].load(Ordering::Acquire) == 0 && std::time::Instant::now() < limit {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(out[1].load(Ordering::Acquire), 2);
+        assert_eq!(out[2].load(Ordering::Acquire), 3);
+        assert_eq!(
+            crate::watch::TITLE_SUBMITS.load(Ordering::Acquire),
+            after,
+            "draining held segments must reuse the original stamp without minting new ones"
+        );
+        assert_eq!(crate::watch::current_stamp(), 0);
+
+        for object in [list1, list2, allocator, q] {
             assert_eq!(release(object), 0);
         }
     }

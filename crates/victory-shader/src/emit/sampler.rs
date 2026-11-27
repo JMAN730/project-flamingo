@@ -34,6 +34,27 @@ pub struct StaticSampler {
 impl Eq for StaticSampler {}
 
 impl StaticSampler {
+    /// The filter supported by the host device. Anisotropic point-mip
+    /// filtering is optional (`D3D12_OPTIONS19`); older devices retain the
+    /// previous linear-mip approximation. Comparison/min/max reduction
+    /// bits and the sampler's LOD bounds are unchanged.
+    pub fn filter_for_host(&self, aniso_point_mip_supported: bool) -> u32 {
+        if !aniso_point_mip_supported && self.filter & !0x180 == 0x54 {
+            self.filter | 1
+        } else {
+            self.filter
+        }
+    }
+
+    /// Makes this a comparison sampler. D3D12 keeps the reduction in filter
+    /// bits 7-8 (0 standard, 1 comparison, 2 minimum, 3 maximum), so the
+    /// comparison replaces whatever reduction the words carried: OR-ing
+    /// 0x80 in would turn a minimum sampler (0x100) into a maximum one
+    /// (0x180).
+    pub fn make_comparison(&mut self) {
+        self.filter = self.filter & !0x180 | 0x80;
+    }
+
     /// Decodes the four sampler words.
     pub fn from_words(w: [u32; 4]) -> Self {
         let bits = |word: u32, at: u32, n: u32| word >> at & ((1 << n) - 1);
@@ -47,7 +68,7 @@ impl StaticSampler {
             _ => 0,
         };
         let filter = if mag >= 2 || min >= 2 {
-            0x55 | reduction << 7
+            0x54 | u32::from(mip == 2) | reduction << 7
         } else {
             (min & 1) << 4 | (mag & 1) << 2 | u32::from(mip == 2) | reduction << 7
         };
@@ -124,6 +145,24 @@ mod tests {
     }
 
     #[test]
+    fn comparison_replaces_the_reduction() {
+        // (decoded filter, after make_comparison): standard, minimum and
+        // maximum reductions, with point, linear and anisotropic filters.
+        for (filter, want) in [
+            (0x00, 0x80),
+            (0x14, 0x94),
+            (0x115, 0x95),
+            (0x1D5, 0xD5),
+            (0x95, 0x95),
+        ] {
+            let mut s = StaticSampler::from_words([0, 0, 0, 0]);
+            s.filter = filter;
+            s.make_comparison();
+            assert_eq!(s.filter, want, "filter {filter:#x}");
+        }
+    }
+
+    #[test]
     fn address_modes_map_all_eight_hardware_encodings() {
         let expected = [1, 2, 3, 5, 3, 5, 4, 5];
         for (raw, &d3d) in expected.iter().enumerate() {
@@ -194,10 +233,19 @@ mod tests {
             0x15
         );
 
-        // Either mag >= 2 or min >= 2 promotes to anisotropic filter 0x55.
-        assert_eq!(StaticSampler::from_words([0, 0, 2 << 20, 0]).filter, 0x55);
+        // Either mag >= 2 or min >= 2 promotes to anisotropic filter 0x54 (point mip)
+        // or 0x55 (linear mip, mip == 2).
+        assert_eq!(StaticSampler::from_words([0, 0, 2 << 20, 0]).filter, 0x54);
+        assert_eq!(
+            StaticSampler::from_words([0, 0, (2 << 26) | (2 << 20), 0]).filter,
+            0x55
+        );
         assert_eq!(
             StaticSampler::from_words([1 << 29, 0, 3 << 22, 0]).filter,
+            0x154
+        );
+        assert_eq!(
+            StaticSampler::from_words([1 << 29, 0, (2 << 26) | (3 << 22), 0]).filter,
             0x155
         );
 
@@ -205,6 +253,56 @@ mod tests {
         for (raw, expected) in [(0, 0), (1, 1), (2, 2), (3, 0)] {
             let s = StaticSampler::from_words([0, 0, 0, raw << 30]);
             assert_eq!(s.border, expected, "raw border {raw}");
+        }
+    }
+
+    #[test]
+    fn anisotropic_samplers_preserve_mip_point_filtering() {
+        for (reduction, base) in [(0u32, 0x54u32), (1, 0x154), (2, 0x1D4)] {
+            let w0 = reduction << 29;
+            for mip in [0u32, 1] {
+                let w2 = (mip << 26) | 0x00F0_0000; // mag = 3, min = 3
+                let s = StaticSampler::from_words([w0, 0x00FF_F000, w2, 0]);
+                assert_eq!(s.filter, base, "reduction={reduction} mip={mip}");
+            }
+            let w2 = (2 << 26) | 0x00F0_0000; // mip = 2 (linear)
+            let s = StaticSampler::from_words([w0, 0x00FF_F000, w2, 0]);
+            assert_eq!(s.filter, base | 1, "reduction={reduction} mip=2");
+        }
+        // Mixed anisotropic mag (2) with linear min (1) and point mip (1).
+        let mixed = StaticSampler::from_words([0, 0, (1 << 26) | (1 << 22) | (2 << 20), 0]);
+        assert_eq!(mixed.filter, 0x54);
+    }
+
+    #[test]
+    fn host_filter_falls_back_without_changing_reduction_or_lod() {
+        for (filter, fallback) in [(0x54, 0x55), (0xD4, 0xD5), (0x154, 0x155), (0x1D4, 0x1D5)] {
+            for mip in [0u32, 1] {
+                let s = StaticSampler {
+                    filter,
+                    ..StaticSampler::from_words([0, 0x0054_0100, (mip << 26) | 0x00F0_0000, 0])
+                };
+                assert_eq!(s.filter_for_host(false), fallback);
+                assert_eq!(s.filter_for_host(true), filter);
+                assert_eq!(
+                    (s.min_lod, s.max_lod),
+                    if mip == 0 { (0.0, 0.0) } else { (1.0, 5.25) }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn host_filter_keeps_other_filters_unchanged() {
+        for reduction in [0, 0x80, 0x100, 0x180] {
+            for base in [0, 1, 4, 5, 0x10, 0x11, 0x14, 0x15, 0x55] {
+                let s = StaticSampler {
+                    filter: base | reduction,
+                    ..StaticSampler::from_words([0; 4])
+                };
+                assert_eq!(s.filter_for_host(false), s.filter);
+                assert_eq!(s.filter_for_host(true), s.filter);
+            }
         }
     }
 }

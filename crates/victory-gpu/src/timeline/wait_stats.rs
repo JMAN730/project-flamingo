@@ -39,8 +39,6 @@ pub(crate) enum Scan {
     Completion {
         sub: u64,
     },
-    /// The scan after a host submission was handed to the host queue.
-    AfterSubmit,
     /// A fence signal (the title's CPU or a queue's signal).
     Signal,
     /// The fence watcher thread's poll.
@@ -107,18 +105,14 @@ enum Kind {
     WatchCpu,
     SignalCb,
     SignalCpu,
-    SubmitScanCb,
-    SubmitScanCpu,
     RecheckCb,
     RecheckCpu,
-    EarlyDone,
-    EarlyShaders,
     Timeout,
     OtherCb,
     OtherCpu,
 }
 
-const KINDS: usize = 16;
+const KINDS: usize = 12;
 const NAMES: [&str; KINDS] = [
     "done",
     "compl-cb",
@@ -127,12 +121,8 @@ const NAMES: [&str; KINDS] = [
     "watch-cpu",
     "signal-cb",
     "signal-cpu",
-    "subscan-cb",
-    "subscan-cpu",
     "recheck-cb",
     "recheck-cpu",
-    "early-done",
-    "early-shaders",
     "timeout",
     "other-cb",
     "other-cpu",
@@ -141,7 +131,6 @@ const NAMES: [&str; KINDS] = [
 /// How `Timeline::run` consumed a registered wait.
 pub(crate) enum How {
     Met,
-    Early { shaders: bool },
     Timeout,
 }
 
@@ -279,7 +268,6 @@ pub(crate) fn woke(timeline: &Arc<Timeline>, wait: &MemoryWait) {
                 Some(copied) => (Kind::ComplCb, copied),
                 None => (Kind::ComplCpu, sub),
             },
-            Scan::AfterSubmit => s.split(wait, Kind::SubmitScanCb, Kind::SubmitScanCpu),
             Scan::Signal => s.split(wait, Kind::SignalCb, Kind::SignalCpu),
             Scan::Watcher => {
                 let cause = s.split(wait, Kind::WatchCb, Kind::WatchCpu);
@@ -314,8 +302,6 @@ pub(crate) fn released(timeline: &Arc<Timeline>, wait: &MemoryWait, how: How) {
             return;
         };
         let (kind, sub) = match how {
-            How::Early { shaders: false } => (Kind::EarlyDone, 0),
-            How::Early { shaders: true } => (Kind::EarlyShaders, 0),
             How::Timeout => (Kind::Timeout, 0),
             How::Met => match cause {
                 Some(cause) => cause,

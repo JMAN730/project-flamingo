@@ -225,7 +225,14 @@ fn dispatch(command: Command) -> Result<()> {
             execute,
             console,
             title_args: _,
-        } => run::run(&exe, unimplemented, strict, execute, console),
+        } => {
+            let code = run::run(&exe, unimplemented, strict, execute, console)?;
+            if code != 0 {
+                // Preserve all 32 bits of the Windows process status.
+                std::process::exit(code as i32);
+            }
+            Ok(())
+        }
         Command::Config => show_config(),
     }
 }
@@ -259,6 +266,7 @@ fn show_config() -> Result<()> {
             o.test_titles
         );
     }
+    let mut violations = 0usize;
     for p in cfg
         .game_dir
         .iter()
@@ -267,8 +275,15 @@ fn show_config() -> Result<()> {
     {
         if let Err(e) = victory_core::ensure_outside_repo(p) {
             println!("POLICY VIOLATION: {e}");
+            violations += 1;
         }
     }
+    // A violation fails the command, so a script checking the configuration
+    // sees it in the exit status, not only in the text.
+    anyhow::ensure!(
+        violations == 0,
+        "{violations} configured path(s) violate the asset policy"
+    );
     Ok(())
 }
 

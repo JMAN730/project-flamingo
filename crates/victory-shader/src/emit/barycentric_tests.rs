@@ -141,6 +141,7 @@ fn pixel_shader_for(fallback: bool, words: &[u32]) -> Result<HostShader, crate::
                 row2: 0,
             }],
             input_addr: 1 << 1,
+            rsrc2: Default::default(),
             db_shader_control: 0,
             patches: vec![],
         },
@@ -712,4 +713,21 @@ fn listed_dumps_validate() {
     }
     eprintln!("validated {} of {total}", total - failed.len());
     assert!(failed.is_empty(), "{failed:#?}");
+}
+
+/// The first half of an interpolation read by an in-place instruction
+/// (`v_add_f32 v3, v3, v1`: v3 is an explicit source as well as the old
+/// destination every vector write reads) is read as data. The last chance
+/// must not take that read for the old destination alone and lower the
+/// first half as zero, which would export the wrong value.
+#[test]
+fn an_in_place_reader_of_an_interpolation_first_half_reads_it() {
+    let r = pixel_shader(&[
+        0xC80C_0000, // v_interp_p1_f32 v3, v0, attr0.x
+        0x0606_0303, // v_add_f32 v3, v3, v1
+        EXPORT[0],
+        0x0303_0303, // v3 in all four channels
+        S_ENDPGM,
+    ]);
+    assert!(r.is_err(), "lowered with the first half as zero");
 }

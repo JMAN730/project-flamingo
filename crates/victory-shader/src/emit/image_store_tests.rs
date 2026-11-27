@@ -1,6 +1,6 @@
 //! Synthetic image stores of some channels (`dmask` not 0xF) to an RGBA32F
-//! texture UAV. DXIL's typed UAV stores write all four components, so the
-//! texel's other channels are read back and written again.
+//! texture UAV. The channels `dmask` leaves out are written as zero, as
+//! RDNA2 MIMG stores do.
 
 use super::{HostShader, emit};
 use crate::native::{
@@ -119,7 +119,7 @@ fn a_store_of_one_inner_channel_translates() {
 }
 
 #[test]
-fn image_stores_of_some_channels_keep_the_others() {
+fn image_stores_of_some_channels_zero_the_others() {
     use super::host::{Dispatch, Host, Root, View};
     let shader = shader(&words()).expect("translate");
     validate(&shader);
@@ -146,9 +146,10 @@ fn image_stores_of_some_channels_keep_the_others() {
                 },
             )
             .unwrap();
-        // (1, 2, 3, 4), then y = 9, then x = 7 and z = 8.
+        // (1, 2, 3, 4), then y = 9 alone, then x = 7 and z = 8 alone: the
+        // last store's channels, the others zero.
         let want: Vec<u32> = (0..LANES)
-            .flat_map(|_| [7.0f32, 9.0, 8.0, 4.0].map(f32::to_bits))
+            .flat_map(|_| [7.0f32, 0.0, 8.0, 0.0].map(f32::to_bits))
             .collect();
         assert_eq!(output[0], want, "{name}");
         eprintln!("{name}: verified image stores of some channels");

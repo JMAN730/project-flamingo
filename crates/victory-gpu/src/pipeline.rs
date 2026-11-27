@@ -24,7 +24,9 @@ use std::mem::offset_of;
 use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
 
-use crate::object::{self, E_INVALIDARG, HRESULT, Iid, Object, PIPELINE, Table, This, guid};
+use crate::object::{
+    self, E_FAIL, E_INVALIDARG, E_NOTIMPL, HRESULT, Iid, Object, PIPELINE, S_OK, Table, This, guid,
+};
 use crate::resource::PAGEABLE_IIDS;
 
 const PIPELINE_IIDS: [Iid; 4] = [
@@ -113,6 +115,11 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
 pub(crate) struct Translated {
     pub(crate) host: victory_shader::emit::HostShader,
     pub(crate) used: Vec<victory_shader::UsedResource>,
+    /// Whether the shader's code can store to buffer memory ([`stores`]);
+    /// true when its code is not known.
+    pub(crate) stores: bool,
+    /// Whether it can store to title memory by address ([`stores_by_address`]).
+    pub(crate) address_stores: bool,
 }
 
 #[cfg(windows)]
@@ -123,6 +130,9 @@ impl Shader {
         hw_stage: victory_shader::HwStage,
         used: Vec<victory_shader::UsedResource>,
     ) -> Arc<Self> {
+        let stores = used
+            .iter()
+            .any(|u| u.kind == victory_shader::ResourceType::Uav);
         let translated = OnceLock::new();
         let _ = translated.set(Some(Translated {
             host: victory_shader::emit::HostShader {
@@ -137,6 +147,8 @@ impl Shader {
                 structured_srvs: Vec::new(),
             },
             used,
+            stores,
+            address_stores: false,
         }));
         Arc::new(Self {
             stage,
@@ -162,6 +174,8 @@ impl Shader {
         let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
         let io = io::raise(&p, &native).unwrap();
         let host = emit::emit(&c, &native, &p, &st, &io, &res).unwrap();
+        let does_store = stores(&native);
+        let addr_store = stores_by_address(&native);
         Arc::new(Self {
             stage: "compute",
             hash: blake3::hash(&host.dxil).to_hex()[..16].to_string(),
@@ -169,6 +183,8 @@ impl Shader {
             translated: OnceLock::from(Some(Translated {
                 host,
                 used: native.used,
+                stores: does_store,
+                address_stores: addr_store,
             })),
             mesh_fallback: OnceLock::new(),
             #[cfg(feature = "diagnostics")]
@@ -181,6 +197,17 @@ impl Shader {
     pub(crate) fn translated(&self) -> Option<&Translated> {
         self.translated
             .get_or_init(|| {
+                if let Some(fspx) = FspxSummary::of(&self.container) {
+                    tracing::warn!(
+                        stage = self.stage,
+                        hash = %self.hash,
+                        threads = ?fspx.threads,
+                        wave = fspx.wave(),
+                        code_size = fspx.code_size,
+                        container_size = self.container.len(),
+                        "FSPX compute module: it has no DXIL and its GFX10 code is not translated yet"
+                    );
+                }
                 let done = translate(&self.container);
                 #[cfg(feature = "diagnostics")]
                 {
@@ -220,10 +247,7 @@ impl Shader {
                     .map_err(|e| e.to_string())
                     .and_then(|f| {
                         Ok(MeshFallback {
-                            compute: Translated {
-                                host: f.compute,
-                                used: used_resources(&self.container)?,
-                            },
+                            compute: with_native_facts(f.compute, &self.container)?,
                             vertex: f.vertex,
                             buffer: f.buffer,
                         })
@@ -256,14 +280,20 @@ impl Shader {
         host: victory_shader::emit::HostShader,
         fallback: Option<victory_shader::emit::MeshFallback>,
     ) -> Arc<Shader> {
+        // No console code to look at: stores are assumed, as for code that
+        // is not known.
         let translated = Translated {
             host,
             used: Vec::new(),
+            stores: true,
+            address_stores: true,
         };
         let fallback = fallback.map(|f| MeshFallback {
             compute: Translated {
                 host: f.compute,
                 used: Vec::new(),
+                stores: true,
+                address_stores: true,
             },
             vertex: f.vertex,
             buffer: f.buffer,
@@ -293,30 +323,91 @@ pub(crate) struct MeshFallback {
 #[cfg(windows)]
 fn translate(container: &[u8]) -> Result<Translated, String> {
     let host = crate::shader_cache::host_shader(container)?;
-    let used = used_resources(container)?;
-    Ok(Translated { host, used })
+    with_native_facts(host, container)
 }
 
-/// The console resources a container's program reads.
+/// The translation `host` of a container with what the container's
+/// console program reads and whether it stores ([`stores`],
+/// [`stores_by_address`]).
 #[cfg(windows)]
-fn used_resources(container: &[u8]) -> Result<Vec<victory_shader::UsedResource>, String> {
+fn with_native_facts(
+    host: victory_shader::emit::HostShader,
+    container: &[u8],
+) -> Result<Translated, String> {
     use victory_shader::{Container, FourCC, HwStage, accc::ACCC};
     let c = Container::parse(container).map_err(|e| e.to_string())?;
-    let used = match c.part(FourCC::DXIL).or(c.part(ACCC)) {
-        Some(_) => victory_shader::container_programs(&c)
-            .map_err(|e| e.to_string())?
-            .into_iter()
-            .find(|p| {
-                matches!(
-                    p.stage,
-                    HwStage::Vs | HwStage::Ps | HwStage::Ms | HwStage::Cs
-                )
-            })
-            .map(|p| p.used)
-            .unwrap_or_default(),
+    let programs = match c.part(FourCC::DXIL).or(c.part(ACCC)) {
+        Some(_) => victory_shader::container_programs(&c).map_err(|e| e.to_string())?,
         None => Vec::new(),
     };
-    Ok(used)
+    let does_store = programs.is_empty() || programs.iter().any(stores);
+    let addr_store = programs.is_empty() || programs.iter().any(stores_by_address);
+    let used = programs
+        .into_iter()
+        .find(|p| {
+            matches!(
+                p.stage,
+                HwStage::Vs | HwStage::Ps | HwStage::Ms | HwStage::Cs
+            )
+        })
+        .map(|p| p.used)
+        .unwrap_or_default();
+    Ok(Translated {
+        host,
+        used,
+        stores: does_store,
+        address_stores: addr_store,
+    })
+}
+
+/// Whether a console program can store to buffer memory: a buffer, flat,
+/// global or scalar-memory store or atomic, or code that is not all known
+/// (an instruction of those kinds outside our table, an indirect jump, code
+/// that does not decode). Stores to textures (image instructions) and to the
+/// program's own scratch memory do not count: neither reaches a buffer's
+/// host copy.
+#[cfg(windows)]
+pub(crate) fn stores(program: &victory_shader::NativeProgram) -> bool {
+    use victory_shader::gfx10::{Encoding, decode};
+    let Ok(code) = decode(&program.code) else {
+        return true;
+    };
+    code.iter().any(|i| {
+        let name = i.name();
+        match i.encoding {
+            Encoding::Mubuf
+            | Encoding::Mtbuf
+            | Encoding::Smem
+            | Encoding::Flat
+            | Encoding::Global => name.is_none_or(|n| {
+                (n.contains("store") || n.contains("atomic")) && !n.contains("scratch")
+            }),
+            Encoding::Sop1 => name.is_none_or(|n| matches!(n, "s_setpc_b64" | "s_swappc_b64")),
+            _ => false,
+        }
+    })
+}
+
+/// Whether a console program can store to title memory by address
+/// (`crate::memory`): a flat, global or scalar-memory store or atomic (the
+/// accesses that take a raw address), or code that is not all known, as in
+/// [`stores`].
+#[cfg(windows)]
+pub(crate) fn stores_by_address(program: &victory_shader::NativeProgram) -> bool {
+    use victory_shader::gfx10::{Encoding, decode};
+    let Ok(code) = decode(&program.code) else {
+        return true;
+    };
+    code.iter().any(|i| {
+        let name = i.name();
+        match i.encoding {
+            Encoding::Smem | Encoding::Flat | Encoding::Global => name.is_none_or(|n| {
+                (n.contains("store") || n.contains("atomic")) && !n.contains("scratch")
+            }),
+            Encoding::Sop1 => name.is_none_or(|n| matches!(n, "s_setpc_b64" | "s_swappc_b64")),
+            _ => false,
+        }
+    })
 }
 
 #[repr(C)]
@@ -595,10 +686,41 @@ pub(crate) extern "system" fn create_compute(
     )
 }
 
-/// Device method 0x1f0: the plain compute description plus console
+/// What an FSPX compute module says about itself, for the logs.
+#[derive(Debug, PartialEq, Eq)]
+struct FspxSummary {
+    threads: [u32; 3],
+    wave32: bool,
+    /// Bytes of GFX10 code (kind 6).
+    code_size: usize,
+}
+
+impl FspxSummary {
+    /// The summary if `bytes` is an FSPX module, bare or in a DXBC container. Its thread group
+    /// is zero and its wave size 64 if its dispatch state is missing or short.
+    fn of(bytes: &[u8]) -> Option<Self> {
+        let fspx = victory_shader::inspect_fspx(bytes)?;
+        let info = fspx.dispatch_info();
+        Some(Self {
+            threads: info.map_or([0; 3], |i| i.threads),
+            wave32: info.is_some_and(|i| i.wave32),
+            code_size: fspx.program.map_or(0, <[u8]>::len),
+        })
+    }
+
+    fn wave(&self) -> &'static str {
+        if self.wave32 { "wave32" } else { "wave64" }
+    }
+}
+
+/// Device method 0x1f0 (slot 62): the plain compute description plus console
 /// extensions `(desc, extension count, extensions, iid, out)`.
 /// shortcut: the extensions (console shader settings) are ignored, as is
 /// the rest of the description.
+///
+/// An FSPX compute module in the description is logged. Diagnostics:
+/// `VICTORY_FSPX_REJECT_SLOT62=1` fails it with `E_FAIL` (and no pipeline), to see how
+/// the title reacts to a pipeline that is not made.
 pub(crate) extern "system" fn create_compute_x(
     this: This,
     desc: *const ComputeHead,
@@ -607,9 +729,148 @@ pub(crate) extern "system" fn create_compute_x(
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
+    // SAFETY: the title passes a description (null is tolerated).
+    let stage = unsafe { desc.as_ref() }.and_then(|d| bytecode(&d.stage));
+    if let Some(fspx) = stage.and_then(FspxSummary::of) {
+        let reject = fspx_reject_slot62();
+        tracing::info!(
+            threads = ?fspx.threads,
+            wave = fspx.wave(),
+            code_size = fspx.code_size,
+            reject,
+            "CreateComputePipelineStateX (slot 62) called with an FSPX compute module"
+        );
+        if reject {
+            return fail(E_FAIL, out);
+        }
+    }
     // SAFETY: as in `create_compute`; the extensions are only read.
     unsafe { note_without_dxil(desc, extensions, extended) };
     create_compute(this, desc, iid, out)
+}
+
+/// The code of `code`, if it has any. The title owns the bytes, so they last as long as the
+/// call that passed them.
+fn bytecode<'a>(code: &Bytecode) -> Option<&'a [u8]> {
+    if code.code.is_null() || code.size == 0 {
+        return None;
+    }
+    // SAFETY: the title passes `size` bytes of shader code.
+    Some(unsafe { std::slice::from_raw_parts(code.code, code.size) })
+}
+
+/// `hr` for a pipeline that was not made: the title's pointer is cleared so it holds no
+/// object.
+fn fail(hr: HRESULT, out: *mut This) -> HRESULT {
+    if !out.is_null() {
+        // SAFETY: the title passes room for the pipeline's pointer.
+        unsafe { out.write(std::ptr::null()) };
+    }
+    hr
+}
+
+/// Whether slot 62 refuses FSPX modules (diagnostics: `VICTORY_FSPX_REJECT_SLOT62`).
+fn fspx_reject_slot62() -> bool {
+    cfg!(feature = "diagnostics") && crate::switch::on("VICTORY_FSPX_REJECT_SLOT62")
+}
+
+/// The HRESULT slot 67 returns: `E_FAIL`, or what `VICTORY_SLOT67_HR` names in the
+/// diagnostics build.
+fn slot67_result() -> HRESULT {
+    #[cfg(feature = "diagnostics")]
+    {
+        static RESULT: std::sync::OnceLock<HRESULT> = std::sync::OnceLock::new();
+        *RESULT.get_or_init(|| {
+            let value = std::env::var("VICTORY_SLOT67_HR").ok();
+            parse_slot67_hr(value.as_deref()).unwrap_or_else(|| {
+                tracing::warn!(
+                    "VICTORY_SLOT67_HR expects E_FAIL, E_INVALIDARG, E_NOTIMPL or S_OK; using E_FAIL"
+                );
+                E_FAIL
+            })
+        })
+    }
+    #[cfg(not(feature = "diagnostics"))]
+    {
+        E_FAIL
+    }
+}
+
+/// The HRESULT a `VICTORY_SLOT67_HR` value names (`E_FAIL` if unset), `None` if unknown.
+#[cfg_attr(not(any(feature = "diagnostics", test)), allow(dead_code))]
+fn parse_slot67_hr(value: Option<&str>) -> Option<HRESULT> {
+    let Some(value) = value.map(str::trim).filter(|v| !v.is_empty()) else {
+        return Some(E_FAIL);
+    };
+    [
+        ("E_FAIL", E_FAIL),
+        ("E_INVALIDARG", E_INVALIDARG),
+        ("E_NOTIMPL", E_NOTIMPL),
+        ("S_OK", S_OK),
+    ]
+    .into_iter()
+    .find_map(|(name, hr)| value.eq_ignore_ascii_case(name).then_some(hr))
+}
+
+/// The description of device method 0x218 (slot 67), `DeserializeComputePipelineStateX`:
+/// the root signature, then the pieces of a precompiled compute module as pointer and size
+/// pairs, by FSPX kind 0, 1, 6 and 7.
+#[repr(C)]
+pub(crate) struct DeserializeHead {
+    root: This,
+    kind0: Bytecode,
+    kind1: Bytecode,
+    kind6: Bytecode,
+    kind7: Bytecode,
+}
+
+/// Device method 0x218 (slot 67): a compute pipeline from precompiled pieces
+/// `(desc, iid, out)`, which the AMD upscaler uses with GFX10 programs we do not translate.
+///
+/// The description is logged and the call fails with `E_FAIL` and no pipeline, so the title
+/// takes its own fallback. Diagnostics: `VICTORY_SLOT67_HR` (`E_FAIL`, `E_INVALIDARG`,
+/// `E_NOTIMPL` or `S_OK`) sets what it returns. `S_OK` hands out a pipeline holding the
+/// pieces as an FSPX module, whose dispatches are dropped.
+pub(crate) extern "system" fn deserialize_compute_x(
+    _: This,
+    desc: *const DeserializeHead,
+    iid: *const Iid,
+    out: *mut This,
+) -> HRESULT {
+    // SAFETY: the title passes a description (null is tolerated).
+    let Some(desc) = (unsafe { desc.as_ref() }) else {
+        return fail(E_INVALIDARG, out);
+    };
+    let piece = |code: &Bytecode| bytecode(code).unwrap_or_default();
+    let (kind0, kind1, kind6, kind7) = (
+        piece(&desc.kind0),
+        piece(&desc.kind1),
+        piece(&desc.kind6),
+        piece(&desc.kind7),
+    );
+    let info = victory_shader::dxbc::dispatch_info(kind0);
+    let hr = slot67_result();
+    tracing::info!(
+        threads = ?info.map(|i| i.threads),
+        wave = info.map(|i| if i.wave32 { "wave32" } else { "wave64" }),
+        kind0_size = kind0.len(),
+        kind1_size = kind1.len(),
+        code_size = kind6.len(),
+        kind7_size = kind7.len(),
+        hr = format_args!("{hr:#010x}"),
+        "DeserializeComputePipelineStateX (slot 67) called"
+    );
+    if hr != S_OK {
+        return fail(hr, out);
+    }
+    let module = victory_shader::Fspx::assemble(kind0, kind1, kind6, kind7);
+    hand_out(
+        vec![shader("compute", &module)],
+        #[cfg(windows)]
+        None,
+        iid,
+        out,
+    )
 }
 
 /// Logs, once per container, a compute container whose parts hold no DXIL (one this host cannot translate):
@@ -823,7 +1084,152 @@ mod tests {
     }
 
     use super::*;
-    use crate::object::{S_OK, slot};
+    use crate::object::slot;
+
+    #[test]
+    fn slot67_result_names_parse() {
+        assert_eq!(parse_slot67_hr(None), Some(E_FAIL));
+        assert_eq!(parse_slot67_hr(Some("  ")), Some(E_FAIL));
+        assert_eq!(parse_slot67_hr(Some("e_invalidarg")), Some(E_INVALIDARG));
+        assert_eq!(parse_slot67_hr(Some(" E_NOTIMPL ")), Some(E_NOTIMPL));
+        assert_eq!(parse_slot67_hr(Some("S_OK")), Some(S_OK));
+        assert_eq!(parse_slot67_hr(Some("E_NOPE")), None);
+    }
+
+    fn fspx_module(code: &[u8]) -> Vec<u8> {
+        let mut k0 = [0u8; 28];
+        k0[12..16].copy_from_slice(&(8u32 | 16 << 16).to_le_bytes());
+        k0[16..20].copy_from_slice(&(1u32 | 1 << 20).to_le_bytes());
+        victory_shader::Fspx::assemble(&k0, &[1; 20], code, &[0x77; 16])
+    }
+
+    #[test]
+    fn fspx_summary_reads_the_dispatch_state() {
+        let module = fspx_module(&[0x55; 64]);
+        let summary = FspxSummary::of(&module).unwrap();
+        assert_eq!(summary.threads, [8, 16, 1]);
+        assert!(summary.wave32);
+        assert_eq!(summary.code_size, 64);
+        assert_eq!(summary.wave(), "wave32");
+        assert!(FspxSummary::of(b"DXBC").is_none());
+        assert!(FspxSummary::of(&[]).is_none());
+        let bare = victory_shader::Fspx::assemble(&[], &[], &[], &[]);
+        let summary = FspxSummary::of(&bare).unwrap();
+        assert_eq!(
+            (summary.threads, summary.wave(), summary.code_size),
+            ([0; 3], "wave64", 0)
+        );
+    }
+
+    fn bytecode_of(bytes: &[u8]) -> Bytecode {
+        Bytecode {
+            code: bytes.as_ptr(),
+            size: bytes.len(),
+        }
+    }
+
+    #[test]
+    fn slot67_fails_without_a_pipeline_by_default() {
+        let module = fspx_module(&[0x55; 64]);
+        let fspx = victory_shader::inspect_fspx(&module).unwrap();
+        let desc = DeserializeHead {
+            root: std::ptr::null(),
+            kind0: bytecode_of(fspx.dispatch_state.unwrap()),
+            kind1: bytecode_of(fspx.kind1.unwrap()),
+            kind6: bytecode_of(fspx.program.unwrap()),
+            kind7: bytecode_of(fspx.records.unwrap()),
+        };
+        // A pointer the call must clear.
+        let mut p: This = &desc as *const DeserializeHead as This;
+        let hr = deserialize_compute_x(std::ptr::null(), &desc, &PIPELINE_IIDS[0], &mut p);
+        assert_eq!(hr, slot67_result());
+        assert_eq!(hr, E_FAIL);
+        assert!(p.is_null());
+    }
+
+    #[test]
+    fn slot67_refuses_no_description_and_tolerates_a_null_out() {
+        let mut p: This = std::ptr::null();
+        let hr = deserialize_compute_x(
+            std::ptr::null(),
+            std::ptr::null(),
+            &PIPELINE_IIDS[0],
+            &mut p,
+        );
+        assert_eq!(hr, E_INVALIDARG);
+        let empty = DeserializeHead {
+            root: std::ptr::null(),
+            kind0: Bytecode {
+                code: std::ptr::null(),
+                size: 0,
+            },
+            kind1: Bytecode {
+                code: std::ptr::null(),
+                size: 0,
+            },
+            kind6: Bytecode {
+                code: std::ptr::null(),
+                size: 0,
+            },
+            kind7: Bytecode {
+                code: std::ptr::null(),
+                size: 0,
+            },
+        };
+        let hr = deserialize_compute_x(
+            std::ptr::null(),
+            &empty,
+            &PIPELINE_IIDS[0],
+            std::ptr::null_mut(),
+        );
+        assert_eq!(hr, E_FAIL);
+    }
+
+    #[test]
+    fn slot67_s_ok_path_hands_out_an_fspx_pipeline() {
+        // The pipeline a successful slot 67 would give: its container is the assembled module.
+        let module = fspx_module(&[0x55; 64]);
+        let fspx = victory_shader::inspect_fspx(&module).unwrap();
+        let reassembled = victory_shader::Fspx::assemble(
+            fspx.dispatch_state.unwrap(),
+            fspx.kind1.unwrap(),
+            fspx.program.unwrap(),
+            fspx.records.unwrap(),
+        );
+        assert_eq!(reassembled, module);
+        let mut p = std::ptr::null();
+        let hr = hand_out(
+            vec![shader("compute", &reassembled)],
+            #[cfg(windows)]
+            None,
+            &PIPELINE_IIDS[0],
+            &mut p,
+        );
+        assert_eq!(hr, S_OK);
+        assert_eq!(shaders(p), [("compute", module)]);
+        object::release_boxed::<Pipeline>(p);
+    }
+
+    #[test]
+    fn slot62_passes_fspx_through_unless_rejected() {
+        let module = fspx_module(&[0x55; 8]);
+        let desc = ComputeHead {
+            root: std::ptr::null(),
+            stage: bytecode_of(&module),
+        };
+        let mut p = std::ptr::null();
+        let hr = create_compute_x(
+            std::ptr::null(),
+            &desc,
+            0,
+            std::ptr::null(),
+            &PIPELINE_IIDS[0],
+            &mut p,
+        );
+        assert_eq!(hr, S_OK);
+        assert_eq!(shaders(p), [("compute", module)]);
+        object::release_boxed::<Pipeline>(p);
+    }
 
     fn shaders(p: This) -> Vec<(&'static str, Vec<u8>)> {
         pipeline(p)
@@ -929,3 +1335,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(all(test, windows, feature = "diagnostics"))]
+mod placed_uav_tests;

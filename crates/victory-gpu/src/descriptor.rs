@@ -7,6 +7,8 @@
 //! leaves room for whatever stride a title assumes.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use crate::object::{self, DESCRIPTOR_HEAP, E_INVALIDARG, HRESULT, Iid, Object, Table, This, guid};
 use crate::resource::{Memory, PAGEABLE_IIDS};
 
@@ -18,8 +20,10 @@ pub(crate) mod check;
 pub(crate) mod host;
 #[cfg(windows)]
 pub(crate) mod table;
-#[cfg(windows)]
-pub use host::adjust_mips;
+
+/// Next creation id for [`Heap::id`]. `0` is reserved for "no heap";
+/// the renderer root-view heap key uses `u64::MAX`.
+static NEXT_HEAP_ID: AtomicU64 = AtomicU64::new(1);
 
 /// The first index of `n` (non-zero) consecutive free slots in `taken`,
 /// searching from `cursor` on and then from the start. A run may cross the
@@ -83,6 +87,9 @@ struct Placement {
 pub(crate) struct Heap {
     object: Object,
     desc: HeapDesc,
+    /// Monotonic creation id; distinguishes a new heap that reused a
+    /// released heap's address (ABA-safe bind checks in `draw::State`).
+    id: u64,
     /// The first descriptor: in `memory`, or in the title's own memory.
     pub(crate) start: u64,
     memory: Option<Memory>,
@@ -152,7 +159,7 @@ impl Heap {
             false,
         );
         let [tag, index, generation] = record;
-        let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+        let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
         let (view, current) = views.list.get(index as usize)?;
         if tag != VIEW_TAG || *current != generation {
             return None;
@@ -198,29 +205,75 @@ impl Heap {
         }
         let start = self.start as usize;
         let end = start.saturating_add(mirrored_count as usize * step as usize);
+        let desc_fast = host::descriptor_fast();
         let mut last_watch = self.sync_watch.lock().unwrap_or_else(|e| e.into_inner());
         // Guarded: a heap in mapped view memory is not write-watched, and
         // without guards every bind would compare every slot.
-        if let Some((now, pages)) = crate::watch::writes(start, end, true) {
+        let mirrored = if let Some((now, pages)) = crate::watch::writes(start, end, true) {
             let prev = *last_watch;
-            let mut mirrored = 0;
-            for (page, written_at) in pages {
-                if written_at <= prev {
-                    continue;
+            let mirrored = if desc_fast {
+                let mut page_ranges: Vec<(usize, usize)> = Vec::new();
+                for (page, written_at) in pages {
+                    if written_at <= prev {
+                        continue;
+                    }
+                    let page_start = page * crate::watch::PAGE;
+                    let page_end = page_start + crate::watch::PAGE;
+                    let from = page_start.max(start);
+                    let to = page_end.min(end);
+                    if from < to {
+                        page_ranges.push((from, to));
+                    }
                 }
-                let page_start = page * crate::watch::PAGE;
-                let page_end = page_start + crate::watch::PAGE;
-                let lo = page_start.max(start) - start;
-                let hi = page_end.min(end) - start;
-                let first_slot = (lo / step as usize) as u32;
-                let end_slot = hi.div_ceil(step as usize).min(mirrored_count as usize) as u32;
-                mirrored += host.sync_slots(self.start, step, first_slot, end_slot, for_draw);
-            }
+                if page_ranges.is_empty() {
+                    0
+                } else {
+                    host.mirror_copied_pages(
+                        self.start,
+                        step,
+                        mirrored_count,
+                        &page_ranges,
+                        for_draw,
+                    )
+                    .2 as usize
+                }
+            } else {
+                let mut mirrored = 0;
+                for (page, written_at) in pages {
+                    if written_at <= prev {
+                        continue;
+                    }
+                    let page_start = page * crate::watch::PAGE;
+                    let page_end = page_start + crate::watch::PAGE;
+                    let lo = page_start.max(start) - start;
+                    let hi = page_end.min(end) - start;
+                    let first_slot = (lo / step as usize) as u32;
+                    let end_slot = hi.div_ceil(step as usize).min(mirrored_count as usize) as u32;
+                    mirrored += host.sync_slots(self.start, step, first_slot, end_slot, for_draw);
+                }
+                mirrored
+            };
             *last_watch = now;
-            return mirrored;
-        }
-        drop(last_watch);
-        host.sync_slots(self.start, step, 0, mirrored_count, for_draw)
+            mirrored
+        } else {
+            drop(last_watch);
+            if desc_fast {
+                let mut page_ranges = Vec::new();
+                let mut cur = start;
+                while cur < end {
+                    let next = cur.saturating_add(crate::watch::PAGE).min(end);
+                    page_ranges.push((cur, next));
+                    cur = next;
+                }
+                host.mirror_copied_pages(self.start, step, mirrored_count, &page_ranges, for_draw)
+                    .2 as usize
+            } else {
+                host.sync_slots(self.start, step, 0, mirrored_count, for_draw)
+            }
+        };
+        // Streamed-mip SRVs can widen without a descriptor write; remake them
+        // even when write-watch only touched other pages (or none).
+        mirrored + host.remirror_widened_srvs(self.start, step, for_draw)
     }
 }
 
@@ -230,13 +283,17 @@ const SHADER_VISIBLE: u32 = 1;
 
 /// Shader-visible heaps by address range, for mirroring descriptor writes:
 /// start, end, heap.
+///
+/// Read by every lookup, sync, and release, written only when a heap is made
+/// or dropped. Readers do not block each other while concurrent recording
+/// threads resolve descriptor handles or sync heaps.
 #[cfg(windows)]
-static SHADER_HEAPS: std::sync::Mutex<Vec<(u64, u64, usize)>> = std::sync::Mutex::new(Vec::new());
+static SHADER_HEAPS: std::sync::RwLock<Vec<(u64, u64, usize)>> = std::sync::RwLock::new(Vec::new());
 
 /// The shader-visible heap holding `handle`, and the descriptor's index.
 #[cfg(windows)]
 fn shader_slot<'a>(handle: u64) -> Option<(&'a Heap, u32)> {
-    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
     let &(_, _, at) = heaps
         .iter()
         .find(|&&(start, end, _)| (start..end).contains(&handle))?;
@@ -268,6 +325,28 @@ fn mirror(handle: u64) {
 #[cfg(windows)]
 pub(crate) const ROOT_VIEW_HEAP: usize = usize::MAX;
 
+/// Identity of a bound heap key for ABA-safe comparison against prior binds.
+/// `0` = no heap; `u64::MAX` = renderer root-view heap; otherwise the title
+/// heap's creation id while it remains registered as shader-visible.
+/// A released (or never shader-visible) title key returns `0` so a later
+/// heap at the same address cannot match a remembered id.
+#[cfg(windows)]
+pub(crate) fn heap_bind_id(key: usize) -> u64 {
+    match key {
+        0 => 0,
+        ROOT_VIEW_HEAP => u64::MAX,
+        _ => {
+            let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+            heaps
+                .iter()
+                .find(|&&(_, _, h)| h == key)
+                // SAFETY: registered heaps are live (removed in `Drop`).
+                .map(|&(_, _, h)| unsafe { &*(h as *const Heap) }.id)
+                .unwrap_or(0)
+        }
+    }
+}
+
 /// Resolve one of the recording's bound heap keys. The renderer supplies a
 /// small view heap for bounded root descriptors if the title supplied none.
 #[cfg(windows)]
@@ -285,6 +364,7 @@ pub(crate) fn recording_heap(key: usize) -> Option<&'static host::HostHeap> {
 /// Gives back dynamic slots of the host heap behind the title heap at
 /// `heap`, if that heap still exists.
 #[cfg(windows)]
+#[allow(dead_code)]
 pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
     if heap == ROOT_VIEW_HEAP {
         if let Some(host) = recording_heap(heap) {
@@ -292,7 +372,7 @@ pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
         }
         return;
     }
-    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
     if heaps.iter().any(|&(_, _, h)| h == heap)
         // SAFETY: registered heaps are live (removed when dropped).
         && let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get()
@@ -301,12 +381,51 @@ pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
     }
 }
 
+/// Gives back a batch of dynamic slot ranges `(heap, first, n)` under at most
+/// one `SHADER_HEAPS` lock, one `HostHeap::next` lock per contiguous heap run,
+/// and a single `retire_executing_batch` call for all displaced resources.
+#[cfg(windows)]
+pub(crate) fn release_dynamic_batch(ranges: &[(usize, u32, u32)]) {
+    if ranges.is_empty() {
+        return;
+    }
+    let mut retired = Vec::new();
+    {
+        let mut heaps_guard = None;
+        let mut i = 0;
+        let mut run = Vec::new();
+        while i < ranges.len() {
+            let heap = ranges[i].0;
+            run.clear();
+            while i < ranges.len() && ranges[i].0 == heap {
+                run.push((ranges[i].1, ranges[i].2));
+                i += 1;
+            }
+            if heap == ROOT_VIEW_HEAP {
+                if let Some(host) = recording_heap(ROOT_VIEW_HEAP) {
+                    host.release_many(&run, &mut retired);
+                }
+            } else {
+                let heaps = heaps_guard
+                    .get_or_insert_with(|| SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner()));
+                if heaps.iter().any(|&(_, _, h)| h == heap)
+                    // SAFETY: registered heaps are live (removed when dropped).
+                    && let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get()
+                {
+                    host.release_many(&run, &mut retired);
+                }
+            }
+        }
+    }
+    crate::host::retire_executing_batch(retired);
+}
+
 /// Mirrors any descriptor slots the title copied directly in memory across all
 /// live, already-initialized shader-visible heaps (called before submission).
 #[cfg(windows)]
 pub(crate) fn sync_all_heaps() {
     let pinned: Vec<object::Held> = {
-        let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+        let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
         heaps
             .iter()
             .filter_map(|&(_, _, at)| {
@@ -325,7 +444,7 @@ pub(crate) fn sync_all_heaps() {
 impl Drop for Heap {
     fn drop(&mut self) {
         let at = std::ptr::from_ref::<Heap>(self) as usize;
-        let mut heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+        let mut heaps = SHADER_HEAPS.write().unwrap_or_else(|e| e.into_inner());
         heaps.retain(|&(_, _, h)| h != at);
     }
 }
@@ -355,13 +474,21 @@ const RTV_TAG: u32 = u32::from_le_bytes(*b"vRTV");
 const _: () = assert!(size_of::<RtvRecord>() <= 112);
 
 impl RtvRecord {
+    /// All the view it records is made from: records with equal keys have
+    /// equal views (of the same host texture).
+    #[cfg(windows)]
+    pub(crate) fn key(&self) -> (usize, [u32; 7]) {
+        let mut words = [self.described; 7];
+        words[1..].copy_from_slice(&self.desc);
+        (self.resource as usize, words)
+    }
+
     /// The view description in the host's type (the same layout).
     #[cfg(windows)]
     pub(crate) fn desc(
         &self,
     ) -> Option<windows::Win32::Graphics::Direct3D12::D3D12_RENDER_TARGET_VIEW_DESC> {
-        const TEXTURE_2D: u32 = 4;
-        self.host_desc(TEXTURE_2D)
+        self.host_desc(false)
     }
 
     /// The depth view description in the host's type (the same layout).
@@ -369,32 +496,65 @@ impl RtvRecord {
     pub(crate) fn depth_desc(
         &self,
     ) -> Option<windows::Win32::Graphics::Direct3D12::D3D12_DEPTH_STENCIL_VIEW_DESC> {
-        const TEXTURE_2D: u32 = 3;
-        self.host_desc(TEXTURE_2D)
+        self.host_desc(true)
     }
 
     /// The description words as a host type, the format as the host has it.
-    /// Without one, a typeless host copy gets a 2D view (`dimension`) in
-    /// the title's format, which the host needs spelled out.
+    /// Without one, a typeless host copy gets a view matching the title
+    /// resource's dimension / array size / sample count in the title's
+    /// format, which the host needs spelled out.
     #[cfg(windows)]
-    fn host_desc<T>(&self, dimension: u32) -> Option<T> {
+    fn host_desc<T>(&self, depth: bool) -> Option<T> {
         assert!(size_of::<T>() <= size_of::<[u32; 6]>());
         let mut words = if self.described != 0 {
             self.desc
         } else {
-            [
-                crate::resource::view_format(self.resource)?,
-                dimension,
-                0,
-                0,
-                0,
-                0,
-            ]
+            let format = crate::resource::view_format(self.resource)?;
+            let (dim, array, samples) = crate::resource::view_shape(self.resource)?;
+            null_target_words(format, dim, array, samples, depth)?
         };
         words[0] = crate::resource::target_format(words[0]);
         // SAFETY: both host view descriptions are 24 bytes in this layout.
         Some(unsafe { (&raw const words).cast::<T>().read_unaligned() })
     }
+}
+
+/// D3D12 resource dimensions (same values as the title resource description).
+const RES_TEXTURE_1D: u32 = 2;
+const RES_TEXTURE_2D: u32 = 3;
+const RES_TEXTURE_3D: u32 = 4;
+
+/// Words for a NULL-desc RTV (`depth == false`) or DSV (`depth == true`) on a
+/// typeless host copy: format, view dimension, and the union D3D12 expects
+/// for that resource shape (MSAA, array, 1D, 3D).
+fn null_target_words(
+    format: u32,
+    resource_dim: u32,
+    depth_or_array: u16,
+    samples: u32,
+    depth: bool,
+) -> Option<[u32; 6]> {
+    let array = u32::from(depth_or_array);
+    // RTV: Format, ViewDimension, then the union (no Flags).
+    // DSV: Format, ViewDimension, Flags, then the union — so array
+    // dimensions shift one word later than the matching RTV layout.
+    let (dim, w2, w3, w4, w5) = match (resource_dim, depth) {
+        (RES_TEXTURE_1D, false) if array > 1 => (3, 0, 0, array, 0), // RTV 1DARRAY
+        (RES_TEXTURE_1D, false) => (2, 0, 0, 0, 0),                  // RTV 1D
+        (RES_TEXTURE_1D, true) if array > 1 => (2, 0, 0, 0, array),  // DSV 1DARRAY
+        (RES_TEXTURE_1D, true) => (1, 0, 0, 0, 0),                   // DSV 1D
+        (RES_TEXTURE_2D, false) if samples > 1 && array > 1 => (7, 0, array, 0, 0), // RTV 2DMSARRAY
+        (RES_TEXTURE_2D, false) if samples > 1 => (6, 0, 0, 0, 0),   // RTV 2DMS
+        (RES_TEXTURE_2D, false) if array > 1 => (5, 0, 0, array, 0), // RTV 2DARRAY
+        (RES_TEXTURE_2D, false) => (4, 0, 0, 0, 0),                  // RTV 2D
+        (RES_TEXTURE_2D, true) if samples > 1 && array > 1 => (6, 0, 0, array, 0), // DSV 2DMSARRAY
+        (RES_TEXTURE_2D, true) if samples > 1 => (5, 0, 0, 0, 0),    // DSV 2DMS
+        (RES_TEXTURE_2D, true) if array > 1 => (4, 0, 0, 0, array),  // DSV 2DARRAY
+        (RES_TEXTURE_2D, true) => (3, 0, 0, 0, 0),                   // DSV 2D
+        (RES_TEXTURE_3D, false) => (8, 0, 0, array, 0),              // RTV 3D
+        _ => return None,
+    };
+    Some([format, dim, w2, w3, w4, w5])
 }
 
 /// Device method: records the view at `handle` (descriptor memory).
@@ -490,13 +650,54 @@ struct Views {
     free: Vec<u32>,
 }
 
-static VIEWS: std::sync::Mutex<Views> = std::sync::Mutex::new(Views {
+static VIEWS: std::sync::RwLock<Views> = std::sync::RwLock::new(Views {
     list: Vec::new(),
     index: std::collections::BTreeMap::new(),
     by_resource: std::collections::BTreeMap::new(),
     free: Vec::new(),
 });
 pub(crate) const VIEW_TAG: u32 = u32::from_le_bytes(*b"vVIE");
+
+/// Top 2 bits of the third descriptor word (`w2`) identify how the 62-bit
+/// payload is interpreted: `0` is a table entry `(index, generation)` in
+/// [`VIEWS`]; [`KIND_CONSTANT`] encodes a `View::Constant(address, size)`
+/// inline so ephemeral per-frame CBVs never contend on or grow `VIEWS`.
+/// `KIND_CONSTANT = 2` also guarantees `w2` never equals `VIEW_TAG`.
+const KIND_SHIFT: u32 = 30;
+const GENERATION_MASK: u32 = (1 << KIND_SHIFT) - 1;
+const KIND_CONSTANT: u32 = 2;
+/// 47 bits cover the x64 user-mode virtual address space; the upper 15 bits
+/// carry the byte size (exact below 16 KiB, or 256-byte units up to 4 MiB).
+const CONSTANT_ADDRESS_BITS: u32 = 47;
+
+fn encode_constant(address: u64, size: u32) -> Option<[u32; 2]> {
+    if address >> CONSTANT_ADDRESS_BITS != 0 {
+        return None;
+    }
+    let code = if size < (1 << 14) {
+        u64::from(size)
+    } else if size.is_multiple_of(256) && (size >> 8) < (1 << 14) {
+        (1 << 14) | u64::from(size >> 8)
+    } else {
+        return None;
+    };
+    let payload = (code << CONSTANT_ADDRESS_BITS) | address;
+    Some([
+        payload as u32,
+        (KIND_CONSTANT << KIND_SHIFT) | (payload >> 32) as u32,
+    ])
+}
+
+fn decode_constant(w1: u32, w2: u32) -> View {
+    let payload = (u64::from(w2 & GENERATION_MASK) << 32) | u64::from(w1);
+    let code = (payload >> CONSTANT_ADDRESS_BITS) as u32;
+    let size = if code >> 14 == 0 {
+        code
+    } else {
+        (code & 0x3fff) << 8
+    };
+    View::Constant(payload & ((1 << CONSTANT_ADDRESS_BITS) - 1), size)
+}
 
 impl View {
     /// The resource objects the view names.
@@ -513,38 +714,58 @@ fn record(handle: u64, view: View) {
     if handle == 0 {
         return;
     }
-    let mut views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
-    let i = match views.index.get(&view) {
-        Some(&i) => i,
+    if let View::Constant(address, size) = view
+        && let Some([w1, w2]) = encode_constant(address, size)
+    {
+        // SAFETY: the handle is a descriptor slot, at least 16 bytes.
+        unsafe { (handle as *mut [u32; 3]).write_unaligned([VIEW_TAG, w1, w2]) };
+        #[cfg(windows)]
+        mirror(handle);
+        return;
+    }
+    let hit = {
+        let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
+        views
+            .index
+            .get(&view)
+            .map(|&i| (i, views.list[i as usize].1))
+    };
+    let (i, generation) = match hit {
+        Some(pair) => pair,
         None => {
-            let i = match views.free.pop() {
-                Some(i) => {
-                    views.list[i as usize].0 = view.clone();
+            let mut views = VIEWS.write().unwrap_or_else(|e| e.into_inner());
+            let i = match views.index.get(&view) {
+                Some(&i) => i,
+                None => {
+                    let i = match views.free.pop() {
+                        Some(i) => {
+                            views.list[i as usize].0 = view.clone();
+                            i
+                        }
+                        None => {
+                            views.list.push((view.clone(), 1));
+                            views.list.len() as u32 - 1
+                        }
+                    };
+                    for r in view.resources().into_iter().filter(|&r| r != 0) {
+                        views.by_resource.entry(r).or_default().push(i);
+                    }
+                    views.index.insert(view, i);
                     i
                 }
-                None => {
-                    views.list.push((view.clone(), 1));
-                    views.list.len() as u32 - 1
-                }
             };
-            for r in view.resources().into_iter().filter(|&r| r != 0) {
-                views.by_resource.entry(r).or_default().push(i);
-            }
-            views.index.insert(view, i);
-            i
+            (i, views.list[i as usize].1)
         }
     };
-    let generation = views.list[i as usize].1;
     // SAFETY: the handle is a descriptor slot, at least 16 bytes.
     unsafe { (handle as *mut [u32; 3]).write_unaligned([VIEW_TAG, i, generation]) };
-    drop(views);
     #[cfg(windows)]
     mirror(handle);
 }
 
 /// The title released `resource`: the views naming it go stale.
 pub(crate) fn forget(resource: usize) {
-    let mut views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut views = VIEWS.write().unwrap_or_else(|e| e.into_inner());
     if let Some(entries) = views.by_resource.remove(&resource) {
         for i in entries {
             let (view, generation) = views.list[i as usize].clone();
@@ -554,7 +775,7 @@ pub(crate) fn forget(resource: usize) {
                 continue;
             }
             views.index.remove(&view);
-            views.list[i as usize].1 = generation.wrapping_add(1).max(1);
+            views.list[i as usize].1 = (generation.wrapping_add(1) & GENERATION_MASK).max(1);
             // The view's other resource (a counter) keeps a stale entry, which
             // `forget` of that resource skips.
             views.free.push(i);
@@ -572,7 +793,7 @@ pub(crate) fn forget(resource: usize) {
 /// `Heap::host()` publication so a freed resource cannot be published live.
 #[cfg(windows)]
 fn forget_host_resources(resource: usize) {
-    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
     for &(_, _, at) in heaps.iter() {
         // SAFETY: registered heaps are live (removed when dropped).
         let heap = unsafe { &*(at as *const Heap) };
@@ -592,12 +813,125 @@ fn forget_host_resources(resource: usize) {
     }
 }
 
-/// The view of entry `i` if `generation` is still its own.
-#[cfg(windows)]
+/// The view of entry `i` if `generation` is still its own (or an inline CBV),
+/// given an already-acquired read lock on [`VIEWS`].
+fn view_at_in(views: &Views, i: u32, generation: u32) -> Option<View> {
+    match generation >> KIND_SHIFT {
+        KIND_CONSTANT => Some(decode_constant(i, generation)),
+        0 => {
+            let (view, current) = views.list.get(i as usize)?;
+            (*current == generation).then(|| view.clone())
+        }
+        _ => None,
+    }
+}
+
+/// The view of entry `i` if `generation` is still its own (or an inline CBV).
 fn view_at(i: u32, generation: u32) -> Option<View> {
-    let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
-    let (view, current) = views.list.get(i as usize)?;
-    (*current == generation).then(|| view.clone())
+    match generation >> KIND_SHIFT {
+        KIND_CONSTANT => Some(decode_constant(i, generation)),
+        0 => view_at_in(
+            &VIEWS.read().unwrap_or_else(|e| e.into_inner()),
+            i,
+            generation,
+        ),
+        _ => None,
+    }
+}
+
+/// Whether `(i, generation)` still names a live view (or an inline CBV),
+/// without cloning the [`View`].
+#[cfg(windows)]
+pub(super) fn is_view_alive(i: u32, generation: u32) -> bool {
+    match generation >> KIND_SHIFT {
+        KIND_CONSTANT => true,
+        0 => {
+            let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
+            views
+                .list
+                .get(i as usize)
+                .is_some_and(|&(_, current)| current == generation)
+        }
+        _ => false,
+    }
+}
+
+/// Resolves a batch of `(i, generation)` records into `out` while locking
+/// `VIEWS` at most once (and skipping the lock entirely if every record is
+/// an inline constant or invalid kind).
+#[cfg(windows)]
+pub(super) fn resolve_views(records: &[[u32; 2]], out: &mut Vec<Option<View>>) {
+    out.clear();
+    out.reserve(records.len());
+    let needs_lock = records
+        .iter()
+        .any(|&[_, generation]| (generation >> KIND_SHIFT) == 0);
+    if !needs_lock {
+        for &[i, generation] in records {
+            out.push(
+                (generation >> KIND_SHIFT == KIND_CONSTANT).then(|| decode_constant(i, generation)),
+            );
+        }
+        return;
+    }
+    let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
+    for &[i, generation] in records {
+        out.push(view_at_in(&views, i, generation));
+    }
+}
+
+/// The words of the record at `handle`, if they are a view's.
+#[cfg(all(windows, test))]
+pub(crate) fn record_at(handle: u64) -> Option<[u32; 3]> {
+    if handle == 0 {
+        return None;
+    }
+    // SAFETY: the handle is a descriptor slot the title passes back.
+    let words = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+    (words[0] == VIEW_TAG).then_some(words)
+}
+
+/// Registers `view` in `VIEWS` (or encodes an inline CBV) and returns its
+/// `(w1, w2)` descriptor record words (tests).
+#[cfg(all(windows, test))]
+pub(super) fn words_for(view: View) -> [u32; 2] {
+    let mut slot = [0u32; 8];
+    record(slot.as_mut_ptr() as u64, view);
+    [slot[1], slot[2]]
+}
+
+/// For each raw descriptor header `[tag, w1, w2]`, sets `dead_out[idx]` to
+/// `true` iff `tag == VIEW_TAG` and the referenced view has gone stale.
+/// Checks an entire descriptor table with zero `View` clones and at most one
+/// shared `VIEWS` read lock (zero locks when every slot is untagged or inline).
+#[cfg(windows)]
+pub(crate) fn check_dead_slots(raws: &[[u32; 3]], dead_out: &mut Vec<bool>) {
+    dead_out.clear();
+    dead_out.resize(raws.len(), false);
+    let mut needs_table = false;
+    for (dead, &[tag, _, w2]) in dead_out.iter_mut().zip(raws) {
+        if tag != VIEW_TAG {
+            continue;
+        }
+        match w2 >> KIND_SHIFT {
+            0 => needs_table = true,
+            KIND_CONSTANT => {}
+            _ => *dead = true,
+        }
+    }
+    if !needs_table {
+        return;
+    }
+    let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
+    for (dead, &[tag, i, generation]) in dead_out.iter_mut().zip(raws) {
+        if tag == VIEW_TAG && (generation >> KIND_SHIFT) == 0 {
+            let alive = views
+                .list
+                .get(i as usize)
+                .is_some_and(|&(_, current)| current == generation);
+            *dead = !alive;
+        }
+    }
 }
 
 /// The view recorded at `handle`, if one is (and its resource is alive).
@@ -607,9 +941,10 @@ pub(crate) fn view(handle: u64) -> Option<View> {
     }
     // SAFETY: the handle is a descriptor slot the title passes back.
     let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
-    let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
-    let (view, current) = views.list.get(i as usize)?;
-    (tag == VIEW_TAG && *current == generation).then(|| view.clone())
+    if tag != VIEW_TAG {
+        return None;
+    }
+    view_at(i, generation)
 }
 
 /// A description of `N` words, if the title passes one.
@@ -618,10 +953,11 @@ fn words<const N: usize>(desc: *const [u32; N]) -> Option<[u32; N]> {
     (!desc.is_null()).then(|| unsafe { desc.read_unaligned() })
 }
 
-/// Device method.
+/// Device method: always records a CBV; a null desc is location 0, size 0.
 pub(crate) extern "system" fn create_cbv(_: This, desc: *const [u32; 4], handle: u64) {
-    let [lo, hi, size, _] = words(desc).unwrap_or_default();
-    let address = u64::from(lo) | u64::from(hi) << 32;
+    let (address, size) = words(desc).map_or((0, 0), |[lo, hi, size, _]| {
+        (u64::from(lo) | u64::from(hi) << 32, size)
+    });
     record(handle, View::Constant(address, size));
 }
 
@@ -703,17 +1039,101 @@ pub(crate) extern "system" fn create_sampler_x(_: This, desc: *const [u32; 27], 
     }
 }
 
+/// Mirrors `count` contiguous descriptors of stride `step` starting at `dst`
+/// with a single `SHADER_HEAPS` lookup when `[dst, dst + count * step)` lies
+/// inside one shader-visible heap (skipping CPU-only heaps immediately).
+#[cfg(windows)]
+fn mirror_range(dst: u64, count: u32, step: u64) {
+    if count == 0 || step == 0 {
+        return;
+    }
+    if !host::descriptor_fast() || count == 1 {
+        for i in 0..u64::from(count) {
+            mirror(dst + i * step);
+        }
+        return;
+    }
+    let Some(end_addr) = u64::from(count)
+        .checked_mul(step)
+        .and_then(|len| dst.checked_add(len))
+    else {
+        for i in 0..u64::from(count) {
+            mirror(dst + i * step);
+        }
+        return;
+    };
+    let (any_overlap, single) = {
+        let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+        let mut any_overlap = false;
+        let mut single: Option<(&Heap, u32)> = None;
+        for &(start, end, at) in heaps.iter() {
+            if dst < end && end_addr > start {
+                any_overlap = true;
+                if dst >= start && end_addr <= end {
+                    // SAFETY: registered heaps are live (removed when dropped).
+                    let heap = unsafe { &*(at as *const Heap) };
+                    if let Some(first) = heap.index(dst)
+                        && first.saturating_add(count) <= heap.desc.count
+                    {
+                        single = Some((heap, first));
+                    }
+                    break;
+                }
+            }
+        }
+        (any_overlap, single)
+    };
+    if !any_overlap {
+        return;
+    }
+    if let Some((heap, first)) = single {
+        let host = if let Some(host) = heap.host.get() {
+            host.as_ref()
+        } else {
+            let mut pending = heap.pending.lock().unwrap_or_else(|e| e.into_inner());
+            match heap.host.get() {
+                None => {
+                    pending.extend(first..first + count);
+                    return;
+                }
+                Some(host) => host.as_ref(),
+            }
+        };
+        if let Some(host) = host {
+            host.mirror_range(first, dst, step, count);
+        }
+        return;
+    }
+    for i in 0..u64::from(count) {
+        mirror(dst + i * step);
+    }
+}
+
+/// Whether [`copy_simple`] skips writing when `dst` already holds the exact
+/// bytes at `src` (avoiding write-watch dirtying and VEH faults on guarded
+/// heap pages). On by default; `VICTORY_SAME_RECORDS=0` writes every time.
+fn same_records() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SAME_RECORDS").is_none_or(|v| v != "0"))
+}
+
 /// Device method: `count` descriptors of `kind` from `src` to `dst`.
 pub(crate) extern "system" fn copy_simple(_: This, count: u32, dst: u64, src: u64, kind: u32) {
     let step = u64::from(increment(kind).unwrap_or(0));
     let len = u64::from(count) * step;
-    if dst != 0 && src != 0 {
+    if dst != 0 && src != 0 && len > 0 {
         // SAFETY: both ranges are descriptor slots the title owns.
-        unsafe { std::ptr::copy(src as *const u8, dst as *mut u8, len as usize) };
-        #[cfg(windows)]
-        for i in 0..u64::from(count) {
-            mirror(dst + i * step);
+        unsafe {
+            let same = same_records()
+                && (dst == src
+                    || std::slice::from_raw_parts(dst as *const u8, len as usize)
+                        == std::slice::from_raw_parts(src as *const u8, len as usize));
+            if !same {
+                std::ptr::copy(src as *const u8, dst as *mut u8, len as usize);
+            }
         }
+        #[cfg(windows)]
+        mirror_range(dst, count, step);
     }
 }
 
@@ -823,6 +1243,7 @@ pub(crate) extern "system" fn create_heap(
     let heap = Box::new(Heap {
         object: Object::new(&FUNCTIONS),
         desc,
+        id: NEXT_HEAP_ID.fetch_add(1, Ordering::Relaxed),
         start,
         memory,
         #[cfg(windows)]
@@ -835,7 +1256,7 @@ pub(crate) extern "system" fn create_heap(
     #[cfg(windows)]
     if visible {
         let at = std::ptr::from_ref::<Heap>(&heap) as usize;
-        let mut heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+        let mut heaps = SHADER_HEAPS.write().unwrap_or_else(|e| e.into_inner());
         heaps.push((start, start + size, at));
     }
     #[cfg(not(windows))]
@@ -911,13 +1332,77 @@ mod tests {
 
     #[test]
     fn a_null_cbv_overwrites_the_previous_descriptor() {
+        let this = std::ptr::null();
         let mut slot = [0u64; 4];
         let handle = slot.as_mut_ptr() as u64;
-        create_cbv(std::ptr::null(), &[0x1000, 0, 256, 0], handle);
+        create_cbv(this, &[0x1000, 0, 256, 0], handle);
         assert_eq!(view(handle), Some(View::Constant(0x1000, 256)));
 
-        create_cbv(std::ptr::null(), std::ptr::null(), handle);
+        create_cbv(this, std::ptr::null(), handle);
         assert_eq!(view(handle), Some(View::Constant(0, 0)));
+
+        // Same null-desc write clears a prior SRV, not only a prior CBV.
+        create_srv(this, this, std::ptr::null(), handle);
+        assert_eq!(view(handle), Some(View::Shader(0, None)));
+        create_cbv(this, std::ptr::null(), handle);
+        assert_eq!(view(handle), Some(View::Constant(0, 0)));
+    }
+
+    /// NULL-desc RTV/DSV words follow the resource shape (VIC-BT-012), not a
+    /// hardcoded TEXTURE2D. Formats are DXGI enum values used as inert labels.
+    #[test]
+    fn null_target_words_match_resource_shape() {
+        const RGBA8: u32 = 28;
+        const D32: u32 = 40;
+        // RTV: 2D, 2DMS, 2DARRAY, 2DMSARRAY, 1D, 1DARRAY, 3D.
+        assert_eq!(
+            null_target_words(RGBA8, RES_TEXTURE_2D, 1, 1, false),
+            Some([RGBA8, 4, 0, 0, 0, 0])
+        );
+        assert_eq!(
+            null_target_words(RGBA8, RES_TEXTURE_2D, 1, 4, false),
+            Some([RGBA8, 6, 0, 0, 0, 0])
+        );
+        assert_eq!(
+            null_target_words(RGBA8, RES_TEXTURE_2D, 4, 1, false),
+            Some([RGBA8, 5, 0, 0, 4, 0])
+        );
+        assert_eq!(
+            null_target_words(RGBA8, RES_TEXTURE_2D, 2, 4, false),
+            Some([RGBA8, 7, 0, 2, 0, 0])
+        );
+        assert_eq!(
+            null_target_words(RGBA8, RES_TEXTURE_1D, 1, 1, false),
+            Some([RGBA8, 2, 0, 0, 0, 0])
+        );
+        assert_eq!(
+            null_target_words(RGBA8, RES_TEXTURE_1D, 3, 1, false),
+            Some([RGBA8, 3, 0, 0, 3, 0])
+        );
+        assert_eq!(
+            null_target_words(RGBA8, RES_TEXTURE_3D, 5, 1, false),
+            Some([RGBA8, 8, 0, 0, 5, 0])
+        );
+        // DSV: Flags sits between ViewDimension and the union, so array
+        // sizes land one word later than the matching RTV layout.
+        assert_eq!(
+            null_target_words(D32, RES_TEXTURE_2D, 1, 4, true),
+            Some([D32, 5, 0, 0, 0, 0])
+        );
+        assert_eq!(
+            null_target_words(D32, RES_TEXTURE_2D, 6, 1, true),
+            Some([D32, 4, 0, 0, 0, 6])
+        );
+        assert_eq!(
+            null_target_words(D32, RES_TEXTURE_2D, 2, 4, true),
+            Some([D32, 6, 0, 0, 2, 0])
+        );
+        assert_eq!(
+            null_target_words(D32, RES_TEXTURE_1D, 3, 1, true),
+            Some([D32, 2, 0, 0, 0, 3])
+        );
+        assert_eq!(null_target_words(D32, RES_TEXTURE_3D, 5, 1, true), None);
+        assert_eq!(null_target_words(RGBA8, 1, 1, 1, false), None);
     }
 
     #[test]
@@ -1093,5 +1578,306 @@ mod tests {
         );
         assert!(get_desc(h, std::ptr::null_mut()).is_null());
         assert_eq!(slot::<extern "system" fn(This) -> u32>(h, 0x10)(h), 0);
+    }
+
+    #[test]
+    fn inline_cbvs_round_trip_without_growing_view_table() {
+        let null = std::ptr::null();
+        let mut slots = [0u64; 16];
+        let base = slots.as_mut_ptr() as u64;
+        let at = |i: usize| base + 32 * i as u64;
+
+        // Exact small size (< 16 KiB), 256-byte aligned larger size (up to 4 MiB - 256),
+        // and high 47-bit user-space address all encode inline without touching `VIEWS`.
+        let inline_cases = [
+            (0x0000_0000_0000_1000u64, 256u32),
+            (0x0000_7fff_ffff_f000u64, 16_383u32),
+            (0x0000_0200_1234_5600u64, 65_536u32),
+            (0x0000_0001_0000_0000u64, ((1 << 14) - 1) << 8),
+        ];
+        for (idx, &(addr, size)) in inline_cases.iter().enumerate() {
+            let desc = [addr as u32, (addr >> 32) as u32, size, 0];
+            create_cbv(null, &desc, at(idx));
+            assert_eq!(view(at(idx)), Some(View::Constant(addr, size)));
+            // SAFETY: slot `idx` lies inside `slots`.
+            let raw = unsafe { *(at(idx) as *const [u32; 3]) };
+            assert_eq!(raw[0], VIEW_TAG);
+            assert_eq!(raw[2] >> KIND_SHIFT, KIND_CONSTANT);
+            assert_ne!(raw[2], VIEW_TAG);
+        }
+        // Other tests add views to `VIEWS` at the same time, so its length
+        // proves nothing; the inline views themselves must not be in it.
+        let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
+        for &(addr, size) in &inline_cases {
+            assert!(
+                !views.index.contains_key(&View::Constant(addr, size)),
+                "inline CBVs must not insert into VIEWS"
+            );
+        }
+        drop(views);
+
+        // Unaligned size >= 16 KiB or address >= 2^47 falls back to the table.
+        let fallback_cases = [
+            (0x0000_0000_0000_2000u64, 16_385u32),
+            (0x0000_8000_0000_1000u64, 256u32),
+        ];
+        for &(addr, size) in &fallback_cases {
+            let desc = [addr as u32, (addr >> 32) as u32, size, 0];
+            create_cbv(null, &desc, at(0));
+            assert_eq!(view(at(0)), Some(View::Constant(addr, size)));
+            // SAFETY: slot 0 lies inside `slots`.
+            let raw = unsafe { *(at(0) as *const [u32; 3]) };
+            assert_eq!(raw[2] >> KIND_SHIFT, 0);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn check_dead_slots_matches_view_liveness_across_inline_live_stale_and_untagged() {
+        let null = std::ptr::null();
+        let mut slots = [0u64; 4 * 4];
+        let base = slots.as_mut_ptr() as u64;
+        let at = |i: usize| base + 32 * i as u64;
+        let res_live = 0x7777_1000usize as This;
+        let res_dead = 0x7777_2000usize as This;
+
+        // Slot 0: inline CBV (always alive).
+        create_cbv(null, &[0x1000, 0, 512, 0], at(0));
+        // Slot 1: live resource SRV.
+        create_srv(null, res_live, std::ptr::null(), at(1));
+        // Slot 2: resource SRV that will be forgotten (stale).
+        create_srv(null, res_dead, std::ptr::null(), at(2));
+        // Slot 3: untagged zero slot (not dead).
+        forget(res_dead as usize);
+
+        let raws: Vec<[u32; 3]> = (0..4)
+            // SAFETY: all four 32-byte slots lie inside `slots`.
+            .map(|i| unsafe { *(at(i) as *const [u32; 3]) })
+            .collect();
+        let mut dead = Vec::new();
+        check_dead_slots(&raws, &mut dead);
+        assert_eq!(dead, vec![false, false, true, false]);
+        forget(res_live as usize);
+    }
+
+    /// Creation ids are unique across heaps, including after a release that
+    /// may return the same allocation address to a later create (ABA).
+    #[test]
+    fn heap_creation_ids_are_unique_across_release() {
+        let desc = HeapDesc {
+            kind: 0,
+            count: 8,
+            flags: 1,
+            nodes: 1,
+        };
+        let none = Placement {
+            address: 0,
+            size: 0,
+        };
+        let mut first = std::ptr::null();
+        assert_eq!(create(desc, none, &mut first), S_OK);
+        let first_id = heap(first).id;
+        assert_ne!(first_id, 0);
+
+        let mut second = std::ptr::null();
+        assert_eq!(create(desc, none, &mut second), S_OK);
+        let second_id = heap(second).id;
+        assert_ne!(second_id, first_id);
+
+        // Drop the first heap, then create another; the new id must not match
+        // either prior id even if the allocator reuses `first`'s address.
+        assert_eq!(
+            slot::<extern "system" fn(This) -> u32>(first, 0x10)(first),
+            0
+        );
+        let mut recycled = std::ptr::null();
+        assert_eq!(create(desc, none, &mut recycled), S_OK);
+        assert_ne!(heap(recycled).id, first_id);
+        assert_ne!(heap(recycled).id, second_id);
+
+        assert_eq!(
+            slot::<extern "system" fn(This) -> u32>(second, 0x10)(second),
+            0
+        );
+        assert_eq!(
+            slot::<extern "system" fn(This) -> u32>(recycled, 0x10)(recycled),
+            0
+        );
+    }
+
+    /// `heap_bind_id` tracks live shader-visible heaps by creation id, not
+    /// address, so a recycled pointer cannot match a remembered bind.
+    #[cfg(windows)]
+    #[test]
+    fn heap_bind_id_rejects_address_reuse_after_release() {
+        let desc = HeapDesc {
+            kind: 0,
+            count: 8,
+            flags: 1, // shader-visible
+            nodes: 1,
+        };
+        let none = Placement {
+            address: 0,
+            size: 0,
+        };
+        let mut first = std::ptr::null();
+        assert_eq!(create(desc, none, &mut first), S_OK);
+        let key = first as usize;
+        let remembered = heap_bind_id(key);
+        assert_eq!(remembered, heap(first).id);
+        assert_ne!(remembered, 0);
+
+        assert_eq!(
+            slot::<extern "system" fn(This) -> u32>(first, 0x10)(first),
+            0
+        );
+        assert_eq!(heap_bind_id(key), 0, "released heap is no longer bound");
+
+        let mut recycled = std::ptr::null();
+        assert_eq!(create(desc, none, &mut recycled), S_OK);
+        let recycled_key = recycled as usize;
+        let new_id = heap_bind_id(recycled_key);
+        assert_eq!(new_id, heap(recycled).id);
+        assert_ne!(new_id, remembered, "ABA: same address must not keep old id");
+        if recycled_key == key {
+            assert_ne!(new_id, remembered);
+        }
+        assert_eq!(
+            slot::<extern "system" fn(This) -> u32>(recycled, 0x10)(recycled),
+            0
+        );
+        assert_eq!(heap_bind_id(0), 0);
+        assert_eq!(heap_bind_id(ROOT_VIEW_HEAP), u64::MAX);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn copy_simple_batched_mirrors_shader_visible_range_and_resolve_views_matches_view_at() {
+        let null = std::ptr::null();
+        let mut memory = vec![0u8; 8 * 32];
+        let address = memory.as_mut_ptr() as u64;
+        let desc = HeapDesc {
+            kind: VIEWS_KIND,
+            count: 8,
+            flags: SHADER_VISIBLE,
+            nodes: 1,
+        };
+        let mut h: This = null;
+        assert_eq!(
+            create(
+                desc,
+                Placement {
+                    address,
+                    size: 8 * 32,
+                },
+                &mut h
+            ),
+            S_OK
+        );
+        let Some(host) = heap(h).host() else {
+            slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
+            return;
+        };
+
+        // Source staging slots (CPU-only memory, not in SHADER_HEAPS).
+        let mut src_mem = vec![0u8; 4 * 32];
+        let src_base = src_mem.as_mut_ptr() as u64;
+        create_srv(null, null, std::ptr::null(), src_base);
+        create_cbv(null, &[0x2000, 1, 256, 0], src_base + 32);
+        create_srv(null, null, std::ptr::null(), src_base + 64);
+        create_cbv(null, &[0x4000, 1, 512, 0], src_base + 96);
+
+        // Copy 4 descriptors into the shader-visible heap via `copy_simple`.
+        copy_simple(null, 4, address + 2 * 32, src_base, VIEWS_KIND);
+        assert!(host.made(2), "SRV slot 2 must be mirrored");
+        assert!(!host.made(3), "CBV slot 3 stays deferred");
+        assert!(host.made(4), "SRV slot 4 must be mirrored");
+        assert!(!host.made(5), "CBV slot 5 stays deferred");
+
+        // Verify `resolve_views` matches `view_at` for inline CBV, table entry, and invalid records.
+        let mut records = Vec::new();
+        for k in 0..4u64 {
+            // SAFETY: slots 2..6 lie inside `memory`.
+            let [tag, i, generation] = unsafe { *((address + (2 + k) * 32) as *const [u32; 3]) };
+            assert_eq!(tag, VIEW_TAG);
+            records.push([i, generation]);
+        }
+        records.push([0, 3 << KIND_SHIFT]); // invalid kind
+        let mut resolved = Vec::new();
+        resolve_views(&records, &mut resolved);
+        for (rec, got) in records.iter().zip(&resolved) {
+            assert_eq!(got, &view_at(rec[0], rec[1]));
+        }
+
+        // Non-shader-visible `copy_simple` completes cleanly without touching `host`.
+        let mut cpu_dst = vec![0u8; 4 * 32];
+        copy_simple(null, 4, cpu_dst.as_mut_ptr() as u64, src_base, VIEWS_KIND);
+        assert_eq!(view(cpu_dst.as_ptr() as u64 + 32), view(src_base + 32));
+
+        slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn rtv_key_and_record_at_and_same_records_copy_simple() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        let null = std::ptr::null();
+
+        // `RtvRecord::key` distinguishes resource, described flag, and desc words.
+        let mut rtv_slots = [[0u64; 16]; 3];
+        let r0 = rtv_slots[0].as_mut_ptr() as u64;
+        let r1 = rtv_slots[1].as_mut_ptr() as u64;
+        let r2 = rtv_slots[2].as_mut_ptr() as u64;
+        let res = 0x4444_0000usize as This;
+        let d_a = [28, 4, 0, 0, 0, 0];
+        let d_b = [28, 4, 1, 0, 0, 0];
+        create_rtv(null, res, &d_a, r0);
+        create_rtv(null, res, &d_a, r1);
+        create_rtv(null, res, &d_b, r2);
+        assert_eq!(rtv_record(r0).unwrap().key(), rtv_record(r1).unwrap().key());
+        assert_ne!(rtv_record(r0).unwrap().key(), rtv_record(r2).unwrap().key());
+
+        // `record_at` returns Some for valid view records and None for zero/untagged.
+        let mut slots = [0u64; 8];
+        let s0 = slots.as_mut_ptr() as u64;
+        assert_eq!(record_at(0), None);
+        assert_eq!(record_at(s0), None);
+        create_cbv(null, &[0x1000, 0, 256, 0], s0);
+        assert!(record_at(s0).is_some());
+
+        // `copy_simple` skips writing when `dst` bytes already equal `src` bytes,
+        // leaving a write-watched destination page clean (`VICTORY_SAME_RECORDS=1`).
+        // SAFETY: allocates a single write-watched page owned by this test.
+        let memory = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                crate::watch::PAGE,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        };
+        assert!(!memory.is_null());
+        let dst = memory as u64;
+        // First copy writes bytes and dirties the page.
+        copy_simple(null, 1, dst, s0, VIEWS_KIND);
+        let (t1, pages1) =
+            crate::watch::writes(dst as usize, dst as usize + crate::watch::PAGE, false).unwrap();
+        assert!(!pages1.is_empty());
+        // Second identical copy skips writing when `same_records()` is active.
+        if same_records() {
+            copy_simple(null, 1, dst, s0, VIEWS_KIND);
+            let (_, pages2) =
+                crate::watch::writes(dst as usize, dst as usize + crate::watch::PAGE, false)
+                    .unwrap();
+            assert!(
+                pages2.iter().all(|&(_, at)| at <= t1),
+                "identical copy_simple must not dirty write-watched page"
+            );
+        }
+        // SAFETY: allocation belongs to this test.
+        unsafe { VirtualFree(memory, 0, MEM_RELEASE) };
     }
 }

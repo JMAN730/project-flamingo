@@ -35,6 +35,7 @@
 //!             mask, u8 attribute (v_interp `attr`), u8 default, u8 second
 //!             row (of a packed pair), u8 parameter slot, u8 flags (bit 0
 //!             flat, 1 linear, 3 fp16, 4 fp16 packed); E+0x124 u32 count
+//!     E+0x128 u32 SPI_SHADER_PGM_RSRC2_PS
 //!     E+0x134 u32 SPI_PS_INPUT_ADDR, E+0x138 u32 DB_SHADER_CONTROL
 //!     E+0x148 u32 export patch size (dwords), E+0x14c 8 patches, one per
 //!             MRT: u32 code offset (dwords, -1 none), then the export code
@@ -104,6 +105,7 @@ const SGPRS: u32 = 106;
 const MAX_SEMANTICS: u32 = 32;
 const PS_INPUTS: usize = 0x24;
 const PS_INPUT_COUNT: usize = 0x124;
+const PS_RSRC2: usize = 0x128;
 const PS_INPUT_ADDR: usize = 0x134;
 const PS_DB_SHADER_CONTROL: usize = 0x138;
 const PS_PATCH_SIZE: usize = 0x148;
@@ -288,6 +290,8 @@ pub enum StageIo {
         inputs: Vec<PsInput>,
         /// `SPI_PS_INPUT_ADDR`: which system values arrive in VGPRs.
         input_addr: u32,
+        /// `SPI_SHADER_PGM_RSRC2_PS`: which values arrive in SGPRs.
+        rsrc2: PsRsrc2,
         /// `DB_SHADER_CONTROL`: depth export, kill.
         db_shader_control: u32,
         patches: Vec<ExportPatch>,
@@ -323,6 +327,44 @@ pub struct ComputeIo {
     pub rsrc2: u32,
     /// Thread-group size (`numthreads`).
     pub threads: [u32; 3],
+}
+
+/// `SPI_SHADER_PGM_RSRC2_PS` of a pixel program: after the user SGPRs the
+/// hardware loads the primitive mask, then (with `LOAD_COLLISION_WAVEID`)
+/// the POPS collision wave id, then the scratch wave offset (`SCRATCH_EN`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PsRsrc2(pub u32);
+
+impl PsRsrc2 {
+    /// User SGPRs before the system ones.
+    pub fn user_sgprs(self) -> u8 {
+        (self.0 >> 1 & 0x1F) as u8
+    }
+
+    /// The primitive mask: the LDS offset of the primitive's parameters,
+    /// M0 for `v_interp`.
+    pub fn prim_mask_sgpr(self) -> u8 {
+        self.user_sgprs()
+    }
+
+    /// The SGPR the POPS collision wave id arrives in (`LOAD_COLLISION_WAVEID`,
+    /// bit 25), after the primitive mask: bits 0-9 this wave's id, 16-25 the
+    /// newest earlier wave it overlaps, 28-29 the packer, 31 whether it overlaps
+    /// any. A program that reads it waits for the earlier waves that cover its
+    /// pixels (primitive-ordered pixel shading).
+    pub fn collision_wave_id_sgpr(self) -> Option<u8> {
+        (self.0 >> 25 & 1 != 0).then(|| self.prim_mask_sgpr() + 1)
+    }
+
+    /// SGPRs the hardware initializes: the user SGPRs, the system ones,
+    /// then the scratch wave offset when scratch is enabled (bit 0). The
+    /// ones above hold whatever the previous wave left.
+    pub fn initialized_sgprs(self) -> u8 {
+        let system = self
+            .collision_wave_id_sgpr()
+            .unwrap_or(self.prim_mask_sgpr());
+        system + 1 + (self.0 & 1) as u8
+    }
 }
 
 impl ComputeIo {
@@ -884,23 +926,15 @@ fn ps_io(data: &[u8], code_len: usize) -> Result<StageIo, ShaderError> {
     Ok(StageIo::Ps {
         inputs,
         input_addr: u32_at(data, PS_INPUT_ADDR)?,
+        rsrc2: PsRsrc2(u32_at(data, PS_RSRC2)?),
         db_shader_control: u32_at(data, PS_DB_SHADER_CONTROL)?,
         patches,
     })
 }
 
-fn vs_io(data: &[u8]) -> Result<StageIo, ShaderError> {
-    let inputs = semantics(data, VS_INPUTS, 5, VS_INPUT_COUNT)?
-        .as_chunks::<5>()
-        .0
-        .iter()
-        .map(|e| VsInput {
-            usage: Usage::from_raw(e[0]),
-            row: e[1],
-            mask: e[2] & 0xf,
-            vgpr: e[3],
-        })
-        .collect();
+/// A vertex or mesh program's outputs. Mesh stage data uses the same
+/// output table but has no vertex inputs, so this reads only the outputs.
+fn vs_outputs(data: &[u8]) -> Result<Vec<VsOutput>, ShaderError> {
     let outputs = semantics(data, VS_OUTPUTS, 6, VS_OUTPUT_COUNT)?
         .as_chunks::<6>()
         .0
@@ -933,6 +967,22 @@ fn vs_io(data: &[u8]) -> Result<StageIo, ShaderError> {
     if !distinct(rows(false)) || !distinct(rows(true)) {
         return Err(Malformed("vertex outputs share a row"));
     }
+    Ok(outputs)
+}
+
+fn vs_io(data: &[u8]) -> Result<StageIo, ShaderError> {
+    let inputs = semantics(data, VS_INPUTS, 5, VS_INPUT_COUNT)?
+        .as_chunks::<5>()
+        .0
+        .iter()
+        .map(|e| VsInput {
+            usage: Usage::from_raw(e[0]),
+            row: e[1],
+            mask: e[2] & 0xf,
+            vgpr: e[3],
+        })
+        .collect();
+    let outputs = vs_outputs(data)?;
     Ok(StageIo::Vs { inputs, outputs })
 }
 
@@ -1003,9 +1053,7 @@ fn vs_outputs_per_vertex(io: StageIo) -> Result<StageIo, ShaderError> {
 }
 
 fn ms_io(data: &[u8], lds_bytes: u32) -> Result<StageIo, ShaderError> {
-    let StageIo::Vs { outputs, .. } = vs_io(data)? else {
-        unreachable!()
-    };
+    let outputs = vs_outputs(data)?;
     let info = data
         .get(MS_INFO..MS_INFO + 8)
         .ok_or(Malformed("stage data out of bounds"))?;
@@ -1191,6 +1239,7 @@ mod tests {
                     io: StageIo::Ps {
                         inputs: vec![],
                         input_addr: 0,
+                        rsrc2: PsRsrc2::default(),
                         db_shader_control: 0,
                         patches: vec![],
                     },
@@ -1513,6 +1562,16 @@ mod tests {
     }
 
     #[test]
+    fn mesh_stage_io_ignores_unused_vs_input_count() {
+        let mut blob = fssm(&[(HwStage::Ms, &VS_CODE)]);
+        let e = stage_data_at(&blob, HwStage::Ms);
+        // Mesh stage data has no vertex inputs; E+0xc4 is unused by MS.
+        blob[e + VS_INPUT_COUNT..][..4].copy_from_slice(&u32::MAX.to_le_bytes());
+        let p = &native_programs(&part(&[(KIND_NATIVE, &xbch(&blob))])).unwrap()[0];
+        assert!(matches!(p.io, StageIo::Ms(_)));
+    }
+
+    #[test]
     fn compute_dispatch_settings() {
         // 5 user SGPRs, group id x and y, thread ids in v0-v1, 1 KiB LDS.
         let cs = ComputeIo {
@@ -1587,6 +1646,23 @@ mod tests {
             threads: [4, 4, 4],
         };
         assert_eq!(cs.thread_id_vgprs(), 3);
+    }
+
+    #[test]
+    fn ps_rsrc2_places_the_primitive_mask_and_the_collision_wave_id() {
+        // 17 user SGPRs (bits 1-5), LOAD_COLLISION_WAVEID (bit 25).
+        let pops = PsRsrc2(17 << 1 | 1 << 25);
+        assert_eq!(pops.user_sgprs(), 17);
+        assert_eq!(pops.prim_mask_sgpr(), 17);
+        assert_eq!(pops.collision_wave_id_sgpr(), Some(18));
+        assert_eq!(pops.initialized_sgprs(), 19);
+        let plain = PsRsrc2(4 << 1);
+        assert_eq!(plain.prim_mask_sgpr(), 4);
+        assert_eq!(plain.collision_wave_id_sgpr(), None);
+        assert_eq!(plain.initialized_sgprs(), 5);
+        // Scratch (bit 0) adds the wave offset after the system SGPRs.
+        assert_eq!(PsRsrc2(4 << 1 | 1).initialized_sgprs(), 6);
+        assert_eq!(PsRsrc2(17 << 1 | 1 << 25 | 1).initialized_sgprs(), 20);
     }
 
     #[test]

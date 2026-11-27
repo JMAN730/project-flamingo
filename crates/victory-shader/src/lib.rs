@@ -8,6 +8,7 @@
 
 pub mod accc;
 pub mod agility;
+pub mod bvh;
 pub mod dxbc;
 pub mod dxil;
 pub mod emit;
@@ -19,7 +20,7 @@ pub mod resource;
 pub mod structure;
 pub mod switch;
 
-pub use dxbc::{Container, FourCC, Part};
+pub use dxbc::{Container, DispatchInfo, FourCC, Fspx, Part, inspect_fspx};
 pub use dxil::{DxilProgram, ShaderKind, XboxExtras};
 pub use native::{
     HwStage, NativeProgram, ResourceType, RootParam, RootType, UsedResource, container_programs,

@@ -118,8 +118,14 @@ fn process_memory() -> Option<ProcessMemory> {
 }
 
 /// Logs the counters per frame over `frames` frames, and the ranges that
-/// took most bytes.
+/// took most bytes. No frames (or a nonsense count) logs totals instead of
+/// NaN and infinity.
 pub(crate) fn log(frames: f64) {
+    let frames = if frames.is_finite() && frames > 0.0 {
+        frames
+    } else {
+        1.0
+    };
     static FAULTS: AtomicU64 = AtomicU64::new(0);
     let memory = process_memory();
     // Keep the previous successful sample when the OS query fails; otherwise

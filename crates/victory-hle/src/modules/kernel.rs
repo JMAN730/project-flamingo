@@ -17,7 +17,7 @@ pub extern "system" fn GetModuleHandleW(name: *const u16) -> *mut c_void {
     if name.is_null() {
         return runtime::main_image().unwrap_or(0) as *mut c_void;
     }
-    find_module(&wide(name), false).unwrap_or_else(|| host::get_module_handle_w(name))
+    find_module(&wide(name), Lookup::Query).unwrap_or_else(|| host::get_module_handle_w(name))
 }
 
 /// See [`GetModuleHandleW`].
@@ -25,7 +25,7 @@ pub extern "system" fn GetModuleHandleA(name: *const u8) -> *mut c_void {
     if name.is_null() {
         return runtime::main_image().unwrap_or(0) as *mut c_void;
     }
-    find_module(&narrow(name), false).unwrap_or_else(|| host::get_module_handle_a(name))
+    find_module(&narrow(name), Lookup::Query).unwrap_or_else(|| host::get_module_handle_a(name))
 }
 
 /// A NUL-terminated string from the title.
@@ -116,7 +116,7 @@ pub extern "system" fn LoadLibraryExA(
     flags: u32,
 ) -> *mut c_void {
     if !name.is_null()
-        && let Some(handle) = find_module(&narrow(name), runs_code(flags))
+        && let Some(handle) = find_module(&narrow(name), load_kind(flags))
     {
         return handle;
     }
@@ -130,18 +130,34 @@ pub extern "system" fn LoadLibraryExW(
     flags: u32,
 ) -> *mut c_void {
     if !name.is_null()
-        && let Some(handle) = find_module(&wide(name), runs_code(flags))
+        && let Some(handle) = find_module(&wide(name), load_kind(flags))
     {
         return handle;
     }
     host::load_library_ex_w(name, file, flags)
 }
 
-/// False for loads as data or resources (`DONT_RESOLVE_DLL_REFERENCES`,
+/// What a module lookup is for.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Lookup {
+    /// `GetModuleHandle`: only what is loaded already.
+    Query,
+    /// A load that runs the DLL's code.
+    Code,
+    /// A load as data or resources, which runs no code.
+    Data,
+}
+
+/// Data for loads as data or resources (`DONT_RESOLVE_DLL_REFERENCES`,
 /// `LOAD_LIBRARY_AS_DATAFILE(_EXCLUSIVE)`, `AS_IMAGE_RESOURCE`): those run
-/// no code, so a title DLL we have not mapped can go to the host.
-fn runs_code(flags: u32) -> bool {
-    flags & (0x1 | 0x2 | 0x20 | 0x40) == 0
+/// no code, so a title DLL we have not mapped, or a host DLL outside the
+/// host policy, can go to the host.
+fn load_kind(flags: u32) -> Lookup {
+    if flags & (0x1 | 0x2 | 0x20 | 0x40) == 0 {
+        Lookup::Code
+    } else {
+        Lookup::Data
+    }
 }
 
 pub extern "system" fn LoadLibraryA(name: *const u8) -> *mut c_void {
@@ -172,6 +188,7 @@ pub extern "system" fn GetProcAddress(module: *mut c_void, name: *const u8) -> *
             Some(e) => e.address as *mut c_void,
             None => {
                 tracing::warn!(module = m.name, %ordinal, "GetProcAddress: not implemented");
+                host::set_last_error(ERROR_PROC_NOT_FOUND);
                 std::ptr::null_mut()
             }
         };
@@ -182,6 +199,7 @@ pub extern "system" fn GetProcAddress(module: *mut c_void, name: *const u8) -> *
         Some(e) => e.address as *mut c_void,
         None => {
             tracing::warn!(module = m.name, %name, "GetProcAddress: not implemented");
+            host::set_last_error(ERROR_PROC_NOT_FOUND);
             std::ptr::null_mut()
         }
     }
@@ -304,9 +322,10 @@ fn handle(m: &HleModule) -> *mut c_void {
 
 /// The title's images and our console modules by name; `None` leaves the
 /// name to the host, which only DLLs `HostPolicy` passes through get (as at
-/// import binding); others fail. With `load`, a title DLL not mapped yet is
-/// mapped now.
-fn find_module(path: &str, load: bool) -> Option<*mut c_void> {
+/// import binding), and loads as data; others fail. A code load maps a
+/// title DLL not mapped yet.
+fn find_module(path: &str, kind: Lookup) -> Option<*mut c_void> {
+    let load = kind == Lookup::Code;
     let file = path.rsplit(['\\', '/']).next().unwrap_or(path);
     // As the Windows loader does, a name without extension means a DLL.
     let file = if file.contains('.') {
@@ -339,7 +358,9 @@ fn find_module(path: &str, load: bool) -> Option<*mut c_void> {
         }
         return Some(handle(m));
     }
-    if host_dll {
+    // A load as data maps the file without running any of it, so the
+    // policy, which guards code, has nothing to refuse.
+    if host_dll || kind == Lookup::Data {
         return None;
     }
     // Any other host DLL (wininet, urlmon, ...) is beyond what we guard, and
@@ -363,6 +384,34 @@ fn refuse(file: &str) {
 }
 
 const ERROR_MOD_NOT_FOUND: u32 = 126;
+const ERROR_PROC_NOT_FOUND: u32 = 127;
+
+/// The title's thread priorities, except the lowest two (`IDLE..=LOWEST`),
+/// which become `BELOW_NORMAL`. Title streaming/pager threads often request
+/// idle priority; on a desktop with other programs and shader workers busy,
+/// idle threads starve. `VICTORY_TITLE_PRIORITIES=0`: pass priorities as set.
+fn title_priority(asked: i32) -> i32 {
+    const IDLE: i32 = -15;
+    const LOWEST: i32 = -2;
+    const BELOW_NORMAL: i32 = -1;
+    match asked {
+        IDLE..=LOWEST => BELOW_NORMAL,
+        other => other,
+    }
+}
+
+/// [`title_priority`].
+pub extern "system" fn SetThreadPriority(thread: *mut c_void, priority: i32) -> i32 {
+    static AS_SET: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let as_set = *AS_SET
+        .get_or_init(|| std::env::var_os("VICTORY_TITLE_PRIORITIES").is_some_and(|v| v == "0"));
+    let priority = if as_set {
+        priority
+    } else {
+        title_priority(priority)
+    };
+    host::set_thread_priority(thread, priority)
+}
 
 pub(crate) fn module() -> HleModule {
     HleModule {
@@ -396,6 +445,7 @@ pub(crate) fn module() -> HleModule {
             hle_export!(_invalid_parameter_noinfo_noreturn),
             hle_export!(TerminateProcess),
             hle_export!(SetUnhandledExceptionFilter),
+            hle_export!(SetThreadPriority),
         ],
     }
 }
@@ -500,6 +550,11 @@ mod host {
         unsafe { TerminateProcess(process, code) }
     }
 
+    pub(super) fn set_thread_priority(thread: *mut c_void, priority: i32) -> i32 {
+        // SAFETY: the title passes a thread handle.
+        unsafe { windows_sys::Win32::System::Threading::SetThreadPriority(thread, priority) }
+    }
+
     pub(super) fn set_unhandled_exception_filter(filter: extern "system" fn(*const c_void) -> i32) {
         // SAFETY: our filter takes the exception pointers as an opaque pointer.
         unsafe {
@@ -595,6 +650,10 @@ mod host {
         std::process::exit(code as i32)
     }
 
+    pub(super) fn set_thread_priority(_: *mut c_void, _: i32) -> i32 {
+        1
+    }
+
     pub(super) fn set_unhandled_exception_filter(_: extern "system" fn(*const c_void) -> i32) {}
 
     pub(super) fn report_unhandled(_: *const c_void) {}
@@ -609,6 +668,30 @@ mod host {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The title's idle and lowest threads run below normal; the others as
+    /// it sets them.
+    #[test]
+    fn no_title_thread_waits_for_idle_processors() {
+        let given: Vec<i32> = [-15, -2, -1, 0, 1, 2, 15]
+            .into_iter()
+            .map(title_priority)
+            .collect();
+        assert_eq!(given, [-1, -1, -1, 0, 1, 2, 15]);
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::System::Threading::{GetCurrentThread, GetThreadPriority};
+            std::thread::spawn(|| {
+                // SAFETY: plain calls on this thread.
+                let thread = unsafe { GetCurrentThread() };
+                assert_eq!(SetThreadPriority(thread, -15), 1);
+                // SAFETY: as above.
+                assert_eq!(unsafe { GetThreadPriority(thread) }, -1);
+            })
+            .join()
+            .unwrap();
+        }
+    }
 
     #[test]
     fn title_images_report_their_original_path() {
@@ -716,6 +799,27 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn a_missing_export_of_our_modules_sets_the_last_error() {
+        use windows_sys::Win32::Foundation::{GetLastError, SetLastError};
+        let module = LoadLibraryA(c"xgameruntime.dll".as_ptr().cast());
+        assert!(
+            !module.is_null(),
+            "xgameruntime is one of our pseudo modules"
+        );
+        // SAFETY: sets this thread's last error.
+        unsafe { SetLastError(0) };
+        assert!(GetProcAddress(module, c"NotAnExport".as_ptr().cast()).is_null());
+        // SAFETY: reads this thread's last error.
+        assert_eq!(unsafe { GetLastError() }, ERROR_PROC_NOT_FOUND);
+        // SAFETY: sets this thread's last error.
+        unsafe { SetLastError(0) };
+        assert!(GetProcAddress(module, 9999 as *const u8).is_null());
+        // SAFETY: reads this thread's last error.
+        assert_eq!(unsafe { GetLastError() }, ERROR_PROC_NOT_FOUND);
+    }
+
     #[test]
     fn pseudo_module_ordinals_resolve() {
         let module = LoadLibraryA(c"gameinput.dll".as_ptr().cast());
@@ -765,6 +869,26 @@ mod tests {
         let runtime = LoadLibraryA(c"xgameruntime.dll".as_ptr().cast());
         assert!(!runtime.is_null());
         assert_eq!(GetModuleHandleW(w("XGameRuntime.dll").as_ptr()), runtime);
+    }
+
+    #[test]
+    fn a_dll_outside_the_host_policy_loads_as_data_only() {
+        // Beyond the host policy: refused as code and to `GetModuleHandle`.
+        assert_eq!(
+            find_module("wininet.dll", Lookup::Code),
+            Some(std::ptr::null_mut())
+        );
+        assert_eq!(
+            find_module("wininet.dll", Lookup::Query),
+            Some(std::ptr::null_mut())
+        );
+        // As data (no code runs) it is the host's to load.
+        assert_eq!(find_module("wininet.dll", Lookup::Data), None);
+        for flags in [0x1, 0x2, 0x20, 0x40, 0x22] {
+            assert_eq!(load_kind(flags), Lookup::Data, "{flags:#x}");
+        }
+        assert_eq!(load_kind(0), Lookup::Code);
+        assert_eq!(load_kind(0x800), Lookup::Code);
     }
 
     /// No buffer: nothing written, the error says it was too small.

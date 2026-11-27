@@ -25,6 +25,8 @@ mod capture;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod faultbook;
 /// Diagnostics: counters raised by this crate's callers (the title's page
 /// scatters), which ride the frame line with the copy statistics.
 #[cfg(all(windows, feature = "diagnostics"))]
@@ -45,11 +47,21 @@ mod hlsl;
 mod host;
 #[cfg(windows)]
 mod indirect;
+// CPU model of the GPU budget: only referenced from unit tests.
+#[cfg(test)]
+mod indirect_budget;
+#[cfg(windows)]
+mod inplace;
+#[cfg(windows)]
+pub(crate) mod lazy_back;
 pub mod list;
+#[cfg(windows)]
+mod memory;
 pub mod object;
 pub mod pipeline;
 #[cfg(windows)]
-mod planes;
+#[cfg(windows)]
+mod present_compositor;
 #[cfg(windows)]
 mod primitive;
 #[cfg(all(windows, feature = "diagnostics"))]
@@ -59,6 +71,8 @@ pub mod queue;
 #[cfg(windows)]
 mod rectangles;
 pub mod resource;
+#[cfg(windows)]
+pub(crate) mod retire;
 pub mod root;
 #[cfg(windows)]
 mod sampler;
@@ -69,12 +83,22 @@ mod shadow;
 pub mod signature;
 mod switch;
 #[cfg(windows)]
+mod texback;
+#[cfg(windows)]
 mod texture;
 mod timeline;
+#[cfg(windows)]
+mod upload_pool;
 #[cfg(windows)]
 mod watch;
 
 #[cfg(windows)]
 pub use host::{HdrDisplayInfo, display_hdr_info, on_failure, write_title_memory};
 #[cfg(windows)]
-pub use watch::{kernel_will_write, kernel_wrote, title_memory_remapped};
+pub use inplace::{title_memory_freeing, title_memory_section, title_memory_view};
+#[cfg(windows)]
+pub use watch::{
+    Reading, Remapping, kernel_will_write, kernel_wrote, mapped_pages_written,
+    title_memory_alias_rebound, title_memory_reading, title_memory_reading_now,
+    title_memory_remapped, title_memory_remapping, title_memory_written,
+};

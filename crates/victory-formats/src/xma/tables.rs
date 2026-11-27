@@ -872,3 +872,63 @@ pub(super) const VEC1: [(u16, u8); 101] = [
     (24, 6),
     (12, 4),
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every code book as (symbol, length) pairs in canonical order.
+    fn books() -> [(&'static str, Vec<(u16, u8)>); 7] {
+        let zip = |s: &[u16], l: &[u8]| s.iter().copied().zip(l.iter().copied()).collect();
+        [
+            ("scale", SCALE.to_vec()),
+            ("scale_rl", SCALE_RL.to_vec()),
+            ("coef0", zip(&COEF0_SYMS, &COEF0_LENS)),
+            ("coef1", COEF1.to_vec()),
+            ("vec4", zip(&VEC4_SYMS, &VEC4_LENS)),
+            ("vec2", VEC2.to_vec()),
+            ("vec1", VEC1.to_vec()),
+        ]
+    }
+
+    /// Each book is a complete prefix code: its lengths fill the code
+    /// space exactly (Kraft sum of 1), so the decoder's codes neither
+    /// overlap nor leave a bit pattern without a symbol.
+    #[test]
+    fn code_books_are_complete_prefix_codes() {
+        for (name, book) in books() {
+            let mut kraft = 0u64;
+            for &(_, len) in &book {
+                assert!((1..=32).contains(&len), "{name}: length {len}");
+                kraft += 1 << (32 - len);
+            }
+            assert_eq!(kraft, 1 << 32, "{name}");
+        }
+    }
+
+    /// No book names a symbol twice, and run-level symbols index their
+    /// run and level tables.
+    #[test]
+    fn code_book_symbols_are_distinct_and_in_range() {
+        for (name, book) in books() {
+            let mut seen: Vec<u16> = book.iter().map(|&(s, _)| s).collect();
+            seen.sort_unstable();
+            seen.dedup();
+            assert_eq!(seen.len(), book.len(), "{name}: a symbol repeats");
+        }
+        for &(s, _) in &SCALE_RL {
+            assert!(usize::from(s) < SCALE_RL_RUN.len());
+        }
+        for &s in &COEF0_SYMS {
+            assert!(usize::from(s) < COEF0_RUN.len());
+        }
+        for &(s, _) in &COEF1 {
+            assert!(usize::from(s) < COEF1_RUN.len());
+        }
+    }
+
+    #[test]
+    fn critical_frequencies_ascend() {
+        assert!(CRITICAL_FREQ.windows(2).all(|w| w[0] < w[1]));
+    }
+}

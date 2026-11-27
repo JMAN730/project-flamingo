@@ -358,6 +358,8 @@ pub(super) const VOP2: &[(u16, &str)] = &[
     (0x01f, "v_mac_f32"),
     (0x020, "v_madmk_f32"),
     (0x021, "v_madak_f32"),
+    // GFX8/GFX9 only in Mesa; Scarlett titles still emit it (VIC-BT-042).
+    (0x023, "v_mac_f16"),
     (0x025, "v_add_nc_u32"),
     (0x026, "v_sub_nc_u32"),
     (0x027, "v_subrev_nc_u32"),
@@ -713,6 +715,12 @@ pub(super) const VOP3: &[(u16, &str)] = &[
     (0x176, "v_mad_u64_u32"),
     (0x177, "v_mad_i64_i32"),
     (0x178, "v_xor3_b32"),
+    // The VOP3 (`_e64`) forms of the VINTRP interpolations.
+    (0x200, "v_interp_p1_f32"),
+    (0x201, "v_interp_p2_f32"),
+    (0x202, "v_interp_mov_f32"),
+    // GFX9 opcode (Mesa); not in the public GFX10 column, but titles emit it.
+    (0x203, "v_mad_f16"),
     (0x2ff, "v_lshlrev_b64"),
     (0x300, "v_lshrrev_b64"),
     (0x301, "v_ashrrev_i64"),
@@ -802,6 +810,7 @@ pub(super) const VOP3P: &[(u16, &str)] = &[
     (0x015, "v_dot2_u32_u16"),
     (0x016, "v_dot4_i32_i8"),
     (0x017, "v_dot4_u32_u8"),
+    (0x018, "v_dot8_i32_i4"),
     (0x019, "v_dot8_u32_u4"),
     (0x020, "v_fma_mix_f32"),
     (0x021, "v_fma_mixlo_f16"),
@@ -1153,6 +1162,7 @@ pub(super) const MIMG: &[(u16, &str)] = &[
     (0x05e, "image_gather4_c_b_cl_o"),
     (0x05f, "image_gather4_c_lz_o"),
     (0x060, "image_get_lod"),
+    (0x061, "image_gather4h"),
     (0x068, "image_sample_cd"),
     (0x069, "image_sample_cd_cl"),
     (0x06a, "image_sample_c_cd"),
@@ -1172,6 +1182,14 @@ pub(super) const MIMG: &[(u16, &str)] = &[
     (0x0bb, "image_sample_c_d_cl_o_g16"),
     (0x0e6, "image_bvh_intersect_ray"),
     (0x0e7, "image_bvh64_intersect_ray"),
+    (0x0e8, "image_sample_cd_g16"),
+    (0x0e9, "image_sample_cd_cl_g16"),
+    (0x0ea, "image_sample_c_cd_g16"),
+    (0x0eb, "image_sample_c_cd_cl_g16"),
+    (0x0ec, "image_sample_cd_o_g16"),
+    (0x0ed, "image_sample_cd_cl_o_g16"),
+    (0x0ee, "image_sample_c_cd_o_g16"),
+    (0x0ef, "image_sample_c_cd_cl_o_g16"),
 ];
 
 pub(super) const FLAT: &[(u16, &str)] = &[

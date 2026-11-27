@@ -6,9 +6,10 @@
 //! * Connects (also by name, by list, `ConnectEx` from `WSAIoctl`) and
 //!   datagram sends to anything but 127.0.0.0/8 and ::1 fail with
 //!   `WSAENETUNREACH`.
-//! * Forward lookups other than `localhost` and IP literals fail with
-//!   `WSAHOST_NOT_FOUND`; reverse lookups of other addresses come back
-//!   numeric, or fail if a name is required, as with no network.
+//! * Forward lookups other than `localhost`, the local hostname
+//!   (`gethostname`), and IP literals fail with `WSAHOST_NOT_FOUND`;
+//!   reverse lookups of other addresses come back numeric, or fail if a
+//!   name is required, as with no network.
 //! * `WinHttpConnect` to a host that is not loopback fails with
 //!   `ERROR_WINHTTP_CANNOT_CONNECT`, so no request (or WebSocket) handle can
 //!   exist for one. Automatic redirects are disabled, including redirects
@@ -584,6 +585,8 @@ pub extern "system" fn bind(s: Socket, name: *const u8, len: i32) -> i32 {
 
 // Forward lookups.
 
+/// Winsock sets `*ppResult` to null on failure (`getaddrinfo` and friends);
+/// titles that free only on success still read that out-pointer (VIC-BT-023).
 fn blocked_lookup(result: *mut *mut c_void) -> i32 {
     if !result.is_null() {
         // SAFETY: a non-null result points to the caller's output slot.
@@ -1038,8 +1041,11 @@ mod tests {
         let wide = wide.as_ptr();
         let null = std::ptr::null();
         let null_mut = std::ptr::null_mut();
+        // Poison matches the VIC-BT-023 synthetic reproducer: failure must
+        // overwrite an uninitialized / garbage out-pointer with null.
+        let poison = 0xDEAD_BEEF as *mut c_void;
         let check = |lookup: &dyn Fn(*mut *mut c_void) -> i32| {
-            let mut result = std::ptr::dangling_mut::<c_void>();
+            let mut result = poison;
             assert_eq!(lookup(&mut result), WSAHOST_NOT_FOUND);
             assert!(result.is_null());
             assert_eq!(lookup(std::ptr::null_mut()), WSAHOST_NOT_FOUND);
@@ -1151,7 +1157,7 @@ mod tests {
         close(u);
 
         // Forward and reverse lookups.
-        let mut result = null;
+        let mut result = 0xDEAD_BEEF as *mut c_void;
         assert_eq!(
             getaddrinfo(
                 c"example.com".as_ptr(),
@@ -1161,6 +1167,8 @@ mod tests {
             ),
             WSAHOST_NOT_FOUND
         );
+        assert!(result.is_null());
+        result = 0xDEAD_BEEF as *mut c_void;
         let name: Vec<u16> = "example.com\0".encode_utf16().collect();
         assert_eq!(
             GetAddrInfoW(
@@ -1171,6 +1179,7 @@ mod tests {
             ),
             WSAHOST_NOT_FOUND
         );
+        assert!(result.is_null());
 
         // Local machine hostname is resolvable.
         if let Some(host) = local_hostname() {
@@ -1399,6 +1408,13 @@ mod tests {
         let _winsock = start_winsock();
         for ok in [None, Some(""), Some("localhost"), Some("192.0.2.1")] {
             assert!(resolvable(ok.map(String::from)), "{ok:?}");
+        }
+        // Local hostname from gethostname — no DNS; compare against the cache.
+        if let Some(host) = local_hostname() {
+            assert!(resolvable(Some(host.clone())), "{host}");
+            assert!(resolvable(Some(host.to_ascii_uppercase())), "{host}");
+            assert!(reachable_name(Some(host.clone())), "{host}");
+            assert!(!resolvable(Some(format!("{host}.example"))), "{host}");
         }
         assert!(!resolvable(Some("blocked.invalid".into())));
         assert_eq!(wsa_last_error(), WSAHOST_NOT_FOUND);

@@ -8,12 +8,23 @@ use std::path::PathBuf;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
-/// The folder frames go to, if capturing.
+/// The folder frames go to, if capturing: made (with its parents) the first
+/// time it is asked for, so a folder that does not exist yet still gets
+/// frames.
 pub(crate) fn folder() -> Option<&'static PathBuf> {
     static FOLDER: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
     FOLDER
-        .get_or_init(|| std::env::var_os("VICTORY_CAPTURE").map(PathBuf::from))
+        .get_or_init(|| std::env::var_os("VICTORY_CAPTURE").map(|f| made(PathBuf::from(f))))
         .as_ref()
+}
+
+/// `folder`, after creating it if it is missing; a failure is logged and
+/// the path kept (saving each frame then reports why it could not).
+fn made(folder: PathBuf) -> PathBuf {
+    if let Err(e) = std::fs::create_dir_all(&folder) {
+        tracing::warn!(folder = %folder.display(), "capture folder not made: {e}");
+    }
+    folder
 }
 
 /// Frames listed in `VICTORY_CAPTURE_FRAMES` (comma-separated): saved
@@ -27,6 +38,12 @@ pub(crate) fn listed(n: u64) -> bool {
             .collect()
     })
     .contains(&n)
+}
+
+/// Whether to report the two source planes of an explicitly selected present.
+pub(crate) fn plane_stats_wanted(frame: u64) -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| crate::switch::on("VICTORY_PLANE_STATS")) && listed(frame)
 }
 
 /// Whether frame `n` is saved.
@@ -215,7 +232,7 @@ fn dump_on() -> bool {
 
 /// `VICTORY_SHOW_TARGET=<w>x<h>-f<format>` (e.g. `2560x1440-f28`): the size and format of
 /// the render target to show in place of the title's frame.
-fn show_spec() -> Option<(u64, u32, i32)> {
+pub(crate) fn show_spec() -> Option<(u64, u32, i32)> {
     static SPEC: std::sync::OnceLock<Option<(u64, u32, i32)>> = std::sync::OnceLock::new();
     *SPEC.get_or_init(|| parse_show_spec(&std::env::var("VICTORY_SHOW_TARGET").ok()?))
 }
@@ -638,29 +655,99 @@ pub(crate) fn probe(
     }
 }
 
-/// Whether every pixel [`probe`] read is (near) black.
-pub(crate) fn black(buffer: &ID3D12Resource) -> Option<bool> {
-    let mut data = std::ptr::null_mut();
-    // SAFETY: the copies finished (every submission is waited for).
+/// Probe a live PresentX source before composition, restoring its recorded state.
+pub(crate) fn probe_plane(
+    device: &ID3D12Device,
+    list: &ID3D12GraphicsCommandList,
+    texture: &ID3D12Resource,
+    state: D3D12_RESOURCE_STATES,
+) -> Option<ID3D12Resource> {
+    let copy = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    // SAFETY: the caller owns this open list and keeps the source alive through
+    // submission. The compositor will see the same state the caller supplied.
     unsafe {
-        if buffer.Map(0, None, Some(&mut data)).is_err() {
-            return None;
+        if state != copy {
+            list.ResourceBarrier(&[crate::host::transition(texture, state, copy)]);
         }
+        let buffer = probe(device, list, texture);
+        if state != copy {
+            list.ResourceBarrier(&[crate::host::transition(texture, copy, state)]);
+        }
+        buffer
+    }
+}
+
+const BLACK_THRESHOLD: u8 = 8;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct GridSamples {
+    pub(crate) samples: u32,
+    pub(crate) nonzero: u32,
+    pub(crate) above_black: u32,
+    pub(crate) peak: u8,
+}
+
+impl GridSamples {
+    fn from_slots(bytes: &[u8]) -> Self {
+        let mut result = Self::default();
+        for slot in bytes.as_chunks::<{ SLOT as usize }>().0 {
+            // Ignore alpha and placement padding. The channel order of RGB and
+            // BGR yields the same maximum.
+            let level = slot[0].max(slot[1]).max(slot[2]);
+            result.samples += 1;
+            result.nonzero += u32::from(level > 0);
+            result.above_black += u32::from(level >= BLACK_THRESHOLD);
+            result.peak = result.peak.max(level);
+        }
+        result
+    }
+}
+
+/// Read the samples after the copy fence. A mapping failure remains unmeasured.
+pub(crate) fn grid_samples(buffer: &ID3D12Resource) -> Option<GridSamples> {
+    let mut data = std::ptr::null_mut();
+    // SAFETY: probe allocated SLOT bytes per grid position and the caller waited
+    // for the list that filled it. The slice is consumed before Unmap.
+    unsafe {
+        buffer.Map(0, None, Some(&mut data)).ok()?;
         let bytes =
             std::slice::from_raw_parts(data.cast::<u8>(), (SLOT * u64::from(GRID * GRID)) as usize);
-        let level = bytes
-            .chunks(SLOT as usize)
-            .flat_map(|pixel| pixel[..3].iter().copied())
-            .max()
-            .unwrap_or(0);
+        let samples = GridSamples::from_slots(bytes);
         buffer.Unmap(0, None);
-        let mut levels = LEVELS.lock().unwrap_or_else(|e| e.into_inner());
-        if levels.len() == 12 {
-            levels.pop_front();
-        }
-        levels.push_back(level);
-        Some(level < 8)
+        Some(samples)
     }
+}
+
+pub(crate) fn report_grid(frame: u64, plane: &str, grid: Option<GridSamples>) {
+    if let Some(GridSamples {
+        samples,
+        nonzero,
+        above_black,
+        peak,
+    }) = grid
+    {
+        tracing::info!(
+            frame,
+            plane,
+            samples,
+            nonzero,
+            above_black,
+            peak,
+            "PresentX plane RGB samples"
+        );
+    } else {
+        tracing::info!(frame, plane, "PresentX plane RGB sample unavailable");
+    }
+}
+
+/// Retain the presented composite's brightness for the existing fade detector.
+pub(crate) fn note_presented(grid: GridSamples) -> bool {
+    let mut levels = LEVELS.lock().unwrap_or_else(|e| e.into_inner());
+    if levels.len() == 12 {
+        levels.pop_front();
+    }
+    levels.push_back(grid.peak);
+    grid.peak < BLACK_THRESHOLD
 }
 
 /// The brightest probed channel of the last frames, oldest first: a fade
@@ -675,6 +762,37 @@ pub(crate) fn recent_levels() -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn sampled_rgb_ignores_alpha_and_padding_and_keeps_the_black_threshold() {
+        let mut slots = vec![255; super::SLOT as usize * 4];
+        for (i, rgb) in [[0, 0, 0], [0, 7, 0], [8, 0, 0], [0, 0, 19]]
+            .iter()
+            .enumerate()
+        {
+            let start = i * super::SLOT as usize;
+            slots[start..start + 3].copy_from_slice(rgb);
+        }
+        assert_eq!(
+            super::GridSamples::from_slots(&slots),
+            super::GridSamples {
+                samples: 4,
+                nonzero: 3,
+                above_black: 2,
+                peak: 19,
+            }
+        );
+    }
+
+    #[test]
+    fn a_missing_capture_folder_is_made() {
+        let root = tempfile::tempdir().unwrap();
+        let nested = root.path().join("not").join("yet");
+        assert_eq!(super::made(nested.clone()), nested);
+        assert!(nested.is_dir());
+        // An existing folder is kept as it is.
+        assert_eq!(super::made(nested.clone()), nested);
+    }
+
     #[test]
     fn crc_matches_the_png_check_value() {
         assert_eq!(super::crc32(b"IEND"), 0xae42_6082);

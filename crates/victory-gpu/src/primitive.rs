@@ -70,10 +70,13 @@ fn expand_position_color(src: &[u8], dst: &mut [u8], elements: &[(u32, u32)]) {
 }
 
 fn expand_rects_generic(src: &[u8], dst: &mut [u8], stride: usize, elements: &[(u32, u32)]) {
-    for (rect, out) in src
-        .chunks_exact(3 * stride)
-        .zip(dst.chunks_exact_mut(6 * stride))
-    {
+    // A zero stride has no vertices to expand (and `chunks_exact(0)`
+    // panics); one too large to hold six vertices has none either.
+    let Some(six) = stride.checked_mul(6).filter(|&six| six != 0) else {
+        return;
+    };
+    let three = six / 2;
+    for (rect, out) in src.chunks_exact(three).zip(dst.chunks_exact_mut(six)) {
         let v = |i: usize| &rect[i * stride..(i + 1) * stride];
         for (slot, i) in [0, 1, 2, 0, 2].into_iter().enumerate() {
             out[slot * stride..(slot + 1) * stride].copy_from_slice(v(i));
@@ -285,6 +288,17 @@ mod tests {
         let mut dst = vec![0u8; 6 * 2];
         expand_rects(&src, &mut dst, 2, &[(0, 54)]);
         assert_eq!(dst[10..], 0x4000_u16.to_le_bytes());
+    }
+
+    /// A zero or overflowing stride expands nothing instead of panicking.
+    #[test]
+    fn zero_or_overflowing_stride_is_ignored() {
+        let src = [0x11u8; 36];
+        let mut dst = [0x22u8; 72];
+        expand_rects(&src, &mut dst, 0, &[(0, 16)]);
+        expand_rects(&src, &mut dst, usize::MAX / 4, &[(0, 16)]);
+        expand_rects(&src, &mut dst, usize::MAX, &[(0, 16)]);
+        assert_eq!(dst, [0x22u8; 72]);
     }
 
     /// An element that reaches past the stride (float4 at 4 in 8-byte

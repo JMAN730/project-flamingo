@@ -14,6 +14,7 @@ pub(crate) const E_NOTIMPL: HRESULT = 0x8000_4001_u32 as i32;
 pub(crate) const E_NOINTERFACE: HRESULT = 0x8000_4002_u32 as i32;
 pub(crate) const E_POINTER: HRESULT = 0x8000_4003_u32 as i32;
 pub(crate) const E_INVALIDARG: HRESULT = 0x8007_0057_u32 as i32;
+pub(crate) const E_FAIL: HRESULT = 0x8000_4005_u32 as i32;
 pub(crate) const E_OUTOFMEMORY: HRESULT = 0x8007_000E_u32 as i32;
 /// What D3D and DXGI return for a missing item (adapter, output, private
 /// data).
@@ -116,7 +117,13 @@ unsafe impl<const N: usize> Sync for Table<N> {}
 
 pub(crate) extern "system" fn add_ref(this: This) -> u32 {
     // SAFETY: `this` is one of our objects.
-    unsafe { &*this }.refs.fetch_add(1, Ordering::Relaxed) + 1
+    let refs = &unsafe { &*this }.refs;
+    // Saturates instead of wrapping to 0, which would make the object look
+    // unreferenced while callers still hold it (as `release` floors at 0).
+    match refs.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1)) {
+        Ok(n) => n + 1,
+        Err(n) => n,
+    }
 }
 
 pub(crate) extern "system" fn release(this: This) -> u32 {
@@ -455,6 +462,17 @@ mod tests {
             S_OK
         );
         this
+    }
+
+    #[test]
+    fn add_ref_saturates_instead_of_wrapping() {
+        static TABLE: Table<3> = Table([std::ptr::null(); 3]);
+        let object = Object::new(&TABLE);
+        object.refs.store(u32::MAX - 1, Ordering::Relaxed);
+        assert_eq!(add_ref(&object), u32::MAX);
+        assert_eq!(add_ref(&object), u32::MAX);
+        assert_eq!(object.refs.load(Ordering::Relaxed), u32::MAX);
+        assert_eq!(release(&object), u32::MAX - 1);
     }
 
     #[test]

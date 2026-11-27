@@ -68,10 +68,13 @@ these shader changes still needs a Windows D3D12 run.
 ## Getting started
 
 Requirements: Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with
-shader model 6.6 (and mesh shaders for the world), Rust (pinned in
+shader model 6.6 (the world uses mesh shaders where the GPU has them, else a
+compute and vertex fallback), Rust (pinned in
 `rust-toolchain.toml`). On Linux, see
 [docs/linux-proton.md](docs/linux-proton.md) for which crates build and test
 natively today, cross-building `victory.exe` and running it under Proton.
+For Windows 10 runtime setup, adapter selection, and GPU troubleshooting, see
+[docs/windows-gpu-support.md](docs/windows-gpu-support.md).
 
 Windows 10's own Direct3D 12 stops at shader model 6.5, so there
 `victory.exe` needs the runtime of Microsoft's Agility SDK. Take
@@ -147,6 +150,10 @@ window or every render target 1080p. Changing the DXGI mode list alone does
 not change the scene resolution ([issue #203](https://github.com/Marvisak/VIctory/issues/203));
 Series S multi-plane presentation is covered separately by
 [PR #211](https://github.com/Marvisak/VIctory/pull/211).
+The experimental `VICTORY_PRESENT_TWO_PLANES=1` setting enables composition
+for the two full-screen RGBA8 planes used by the Series S menu. It uses the
+base plane when the overlay is unavailable or the compositor cannot start.
+The diagnostic render-target override takes precedence.
 
 The same report measured about 3.9 GB less committed process memory in the
 menus/intro and about 3.6 GB less at the world peak with Series S enabled.
@@ -213,6 +220,20 @@ If a hash differs, restore that file from your verified backup and rerun with
 the same build of VIctory and the same options. A breakpoint can have other
 causes. Include the archive verification outcome in your test report.
 
+Set `VICTORY_WAVE64_DOUBLE=1` to let a 32-lane host run a straight-line
+64-thread compute group that reads indexed lanes across the two halves.
+The initial form handles integer register operations, dword LDS reads and
+writes, and raw UAV stores. It uses no extra LDS. Other programs retain
+their usual translation. The option has separate shader cache entries.
+
+The experimental `VICTORY_WAVE64_CONSOLE_FLOW=1` option lowers eligible
+single-wave compute groups for a host that supports 32-lane waves. It
+handles some groups that share local data or exchange values across halves.
+The cross-half console-flow retry is limited to groups of at most 64 threads.
+Larger groups can use the split-wave path when their operations stay within
+each half. Unsupported cases retry the ordinary lowering. The option is off
+by default and keys the shader cache separately.
+
 A release build has no debugging aids. Build them in with
 
 ```powershell
@@ -226,11 +247,14 @@ The on/off switches below (`...=1`) are off when unset or set to `0`.
 | `VICTORY_LOG=<target>=debug,...` | debug and trace output |
 | `VICTORY_STACKS=20,60` | every thread's stack at those seconds |
 | `VICTORY_WATCH=<rva>,...` | logs a title u32 when it changes |
+| `VICTORY_XMEM_REUSE_PLACEHOLDER_BOUNDS=1` | experimental reuse of exact placeholder bounds within an XMem mapping call |
 | `VICTORY_KEYS=30:Enter,35:X` | presses keys at those seconds, focus or not |
+| `VICTORY_KEYS_FILE=<path>` | presses the keys named one per line in that file (same names), read while the title runs: each held 0.2 s, 0.2 s apart; append lines as screens appear (the legal-notices screen takes `Down`, `Down`, `Enter` a few seconds apart) |
 | `VICTORY_CRASH_BREAKPOINTS=1` | appends first-chance breakpoints to `crashes.log`, including ones a handler may recover from |
 | `VICTORY_CRASH_SAVE=<rva>:<len>,...` | saves title memory to the cache folder on a crash |
 | `VICTORY_CAPTURE=<dir>` | saves presented frames (powers of two, or `VICTORY_CAPTURE_FRAMES=<list>`) |
-| `VICTORY_DUMP_TARGETS=1` | with the two above, saves every render target of those frames |
+| `VICTORY_PLANE_STATS=1` | with `VICTORY_PRESENT_TWO_PLANES=1`, logs RGB statistics for successful two-plane presents listed in `VICTORY_CAPTURE_FRAMES` |
+| `VICTORY_DUMP_TARGETS=1` | with `VICTORY_CAPTURE` and `VICTORY_CAPTURE_FRAMES`, saves every render target of those frames |
 | `VICTORY_SHOW_TARGET=2560x1440-f28` | shows the last render target of that size and DXGI format each frame instead of the title's frame (copied 1:1 to the top left, only when its format matches the window's), e.g. the world's geometry while its lit image is black |
 | `VICTORY_D3D12_DEBUG=1` | host debug layer |
 | `VICTORY_D3D12_GBV=1` | with the above, GPU-based validation (bad descriptor use reported, not faulted; slow) |
@@ -246,6 +270,8 @@ The on/off switches below (`...=1`) are off when unset or set to `0`.
 | `VICTORY_SKIP_HOST_PSOS=<name>,...` | omit a host pipeline whose 32-digit library name matches exactly; get names and worker thread IDs with `VICTORY_TRACE_PIPELINES=1` |
 | `VICTORY_SKIP_WAVE64=mesh,compute` | omit draws and dispatches whose pipeline has a program of a listed stage written for 64-lane waves (on hosts with 32-lane waves, such as NVIDIA's, these can hang the GPU) |
 | `VICTORY_NO_BARYCENTRICS=1` | pixel shaders that need barycentrics run the way they do on a host without them (translated without `SV_Barycentrics` and `GetAttributeAtVertex`, behind a geometry shader that gives them the values at each vertex and the weights), to compare the two on a host that has them |
+| `VICTORY_SLOT67_HR=<name>` | what the device's `DeserializeComputePipelineStateX` (slot 67, used by the AMD upscaler with GFX10 compute programs we do not translate) returns: `E_FAIL` (the default, also without this build), `E_INVALIDARG`, `E_NOTIMPL` or `S_OK` (a pipeline whose dispatches are dropped); the title's reaction to each shows whether it has a fallback |
+| `VICTORY_FSPX_REJECT_SLOT62=1` | fail `CreateComputePipelineStateX` (slot 62) with `E_FAIL` for FSPX compute modules instead of making a pipeline whose dispatches are dropped |
 | `VICTORY_GPU_TIMING=1` | with the above, each list of a submission run and timed on its own; slow lists logged with their slowest commands |
 | `VICTORY_WAIT_TIMEOUT_MS=<ms>` | override the 2000 ms fail-open timeout for mid-list GPU memory waits |
 | `VICTORY_D3D12_WARP=1` | host device on the software adapter (slow; cannot reset the driver) |
@@ -257,6 +283,7 @@ The on/off switches below (`...=1`) are off when unset or set to `0`.
 | `VICTORY_SHADER_NO_BUFFER_TABLE=1` | works in release builds too (own shader cache entries): buffer loads whose element stride only the view knows (a descriptor picked at run time, such as each lane's own in a waterfall loop) are refused instead of read through the host's buffer view table |
 | `VICTORY_NO_ACCC=1` | works in release builds too: `ACCC` containers have no programs |
 | `VICTORY_ALIAS_COPY=0` | views the title places in the memory of a texture the host writes are filled from title memory again instead of copied from that texture on the host |
+| `VICTORY_REBAR=0` | disable `D3D12_HEAP_TYPE_GPU_UPLOAD` (Resizable BAR) placement for scratch and shadow buffers, keeping them in system memory |
 | `VICTORY_AUDIO_CAPTURE=<file.wav>` | records what the title plays (our process only) |
 | `VICTORY_XMA_DUMP=<dir>` | saves the first 32 XMA voices' context and input |
 | `VICTORY_NO_WATCHDOG=1` | apply the opt-in title watchdog disarm hooks (Series 1.0.2.1) |
@@ -265,6 +292,18 @@ The on/off switches below (`...=1`) are off when unset or set to `0`.
 | `VICTORY_COPY_MODE=plain` | copy title GPU memory without the timed/stats path used for the frame-rate line |
 | `VICTORY_WARP=1` | force the shader-test host device onto WARP (distinct from `VICTORY_D3D12_WARP`) |
 | `VICTORY_SAVE_STOP=<n>` | test helper: hang the process at save step `n` (used by crash-survival tests) |
+
+For Series S two-plane diagnostics, set `VICTORY_PRESENT_TWO_PLANES=1`,
+`VICTORY_PLANE_STATS=1` and an explicit comma-separated `VICTORY_CAPTURE_FRAMES`
+list. `VICTORY_CAPTURE` is optional. Each selected two-plane present that
+succeeds logs a `PresentX plane RGB samples` record for `primary`, `overlay`
+and `composite`. Each record counts 16 positions in a 4×4 grid across that
+texture's own extent. `nonzero` counts positions with any nonzero RGB,
+`above_black` counts those with any RGB channel at least 8, and `peak` gives
+the highest sampled RGB channel. The probes ignore alpha and can miss detail
+between sample positions. A failed readback logs `PresentX plane RGB sample
+unavailable`. Single-plane fallbacks and failed presents produce no plane
+records. The fade detector uses the presented image's samples.
 
 Every build appends unhandled exceptions, panics, and host GPU failures to
 `crashes.log` in the title's data folder.

@@ -2,7 +2,7 @@
 //! is covered on every host. The unit tests in `src/prepare.rs` use the test
 //! binary itself, which is a PE image only on Windows.
 
-use victory_loader::prepare;
+use victory_loader::{prepare, prepare_owned};
 use victory_pe::ImageInfo;
 use victory_pe::layout::{self, dir, dll_flags, file_flags};
 
@@ -1199,4 +1199,55 @@ fn bytes_after_the_last_whole_block_end_the_walk_but_not_the_patch() {
             "{what}: the bytes past the last block are left as they were"
         );
     }
+}
+
+#[test]
+fn prepare_owned_matches_prepare_without_cloning_the_buffer() {
+    let original = image();
+    let borrowed = prepare(&original).unwrap();
+
+    let owned_input = original.clone();
+    let input_ptr = owned_input.as_ptr();
+    let owned = prepare_owned(owned_input).unwrap();
+
+    assert_eq!(owned.bytes.as_ptr(), input_ptr);
+    assert_eq!(owned.bytes, borrowed.bytes);
+    assert_eq!(owned.original_hash, borrowed.original_hash);
+    assert_eq!(owned.file_name(), borrowed.file_name());
+    assert_eq!(owned.info.entry_rva, borrowed.info.entry_rva);
+    assert_eq!(owned.info.characteristics, borrowed.info.characteristics);
+    assert_eq!(
+        owned.info.dll_characteristics,
+        borrowed.info.dll_characteristics
+    );
+    assert_eq!(owned.info.imports.len(), borrowed.info.imports.len());
+    assert_eq!(
+        owned
+            .info
+            .tls
+            .as_ref()
+            .map(|t| (t.directory_rva, t.callbacks_va, &t.callback_rvas)),
+        borrowed
+            .info
+            .tls
+            .as_ref()
+            .map(|t| (t.directory_rva, t.callbacks_va, &t.callback_rvas)),
+    );
+    assert_eq!(owned.info.has_relocations, borrowed.info.has_relocations);
+}
+
+#[test]
+fn prepare_owned_rejects_malformed_inputs_like_prepare() {
+    assert!(prepare_owned(Vec::new()).is_err());
+    assert!(prepare_owned(b"MZ".to_vec()).is_err());
+
+    let original = image();
+    for len in [0x40, 0x60, 0x100] {
+        assert!(prepare_owned(original[..len].to_vec()).is_err());
+    }
+
+    let mut x86 = image();
+    put16(&mut x86, FILE_HEADER, 0x014C);
+    put16(&mut x86, OPT, 0x010B);
+    assert!(prepare_owned(x86).is_err());
 }

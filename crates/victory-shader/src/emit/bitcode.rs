@@ -99,6 +99,9 @@ pub(crate) enum Cast {
 
 /// Compare predicates: floats 0-15, integers 32-41.
 pub(crate) mod pred {
+    // Not emitted (nor TRUE): WARP removes its device at a dispatch of
+    // `fcmp false`/`fcmp true`, so `v_cmp_f`/`v_cmp_tru` lower as constants.
+    #[allow(dead_code)]
     pub const FALSE: u8 = 0;
     pub const OEQ: u8 = 1;
     pub const OGT: u8 = 2;
@@ -410,6 +413,22 @@ impl Module {
         };
         self.push(block, ty, Op::Extract(agg, index))
     }
+    pub(super) fn remap_input_loads(&mut self, ids: &HashMap<V, V>) {
+        if ids.is_empty() {
+            return;
+        }
+        for inst in &mut self.insts {
+            if let Op::Call(function, args) = &mut inst.op
+                && self.funcs[*function as usize]
+                    .name
+                    .starts_with("dx.op.loadInput.")
+                && let Some(&id) = ids.get(&args[1])
+            {
+                args[1] = id;
+            }
+        }
+    }
+
     pub fn call(&mut self, block: usize, f: V, args: Vec<V>) -> V {
         let V::Func(i) = f else {
             panic!("call of a non-function")
@@ -502,11 +521,44 @@ impl Module {
         })
     }
 
+    /// Test builds: every call of a `dx.op` function with its arguments
+    /// that are integer constants (the opcode first), as 32-bit values.
+    #[cfg(test)]
+    pub(crate) fn dx_op_calls(&self) -> Vec<(String, Vec<Option<i32>>)> {
+        let constant = |v: &V| match v {
+            V::Const(cid) => match self.consts[*cid as usize].1 {
+                Const::Int(n) => Some(n as i32),
+                _ => None,
+            },
+            _ => None,
+        };
+        self.insts
+            .iter()
+            .filter_map(|inst| match &inst.op {
+                Op::Call(fid, args) => Some((
+                    self.funcs[*fid as usize].name.clone(),
+                    args.iter().map(constant).collect(),
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
     #[cfg(test)]
     pub(crate) fn has_cmp(&self, predicate: u8) -> bool {
         self.insts
             .iter()
             .any(|inst| matches!(inst.op, Op::Cmp(p, _, _) if p == predicate))
+    }
+
+    /// Whether any module constant is a 32-bit integer with value `v`
+    /// (the signed form [`Module::i32`] stores).
+    #[cfg(test)]
+    pub(crate) fn has_i32_const(&self, v: i64) -> bool {
+        self.consts.iter().any(|(ty, c)| {
+            matches!(self.types[ty.0 as usize], TypeDef::Int(32))
+                && matches!(c, Const::Int(n) if *n == v)
+        })
     }
 
     /// Start from instructions that must execute and from externally used
@@ -734,7 +786,7 @@ impl Module {
             let blk = &self.blocks[b];
             if let (Some(Term::Br(h)), true, [p]) = (
                 blk.term,
-                blk.phis.is_empty() && blk.body.is_empty(),
+                blk.phis.iter().all(|&i| !live[i as usize]) && blk.body.is_empty(),
                 &preds[b][..],
             ) && pos[h] < pos[b]
                 && !succs(*p).contains(&h)
@@ -1242,6 +1294,45 @@ mod tests {
             .count();
         assert!(removed_phis >= 56);
         assert!(m.write(true).len() < m.write(false).len());
+    }
+
+    #[test]
+    fn empty_latch_with_dead_phis_is_folded() {
+        // Two identical loops except one has an unread phi in its empty latch;
+        // both must fold the latch and emit identical bitcode.
+        let build = |with_dead_phi: bool| {
+            let mut m = Module::default();
+            let i32t = m.int(32);
+            let void = m.void();
+            let fty = m.func_ty(void, vec![i32t]);
+            let f = m.function("sink", fty, Some(Attr::NoUnwind), false);
+            let main_ty = m.func_ty(void, vec![]);
+            m.function("main", main_ty, None, true);
+            let (entry, head, body, latch, exit) = (
+                m.new_block(),
+                m.new_block(),
+                m.new_block(),
+                m.new_block(),
+                m.new_block(),
+            );
+            let (z, one, ten) = (m.i32(0), m.i32(1), m.i32(10));
+            m.terminate(entry, Term::Br(head));
+            let i = m.phi(head, i32t);
+            m.terminate(head, Term::Br(body));
+            let next = m.bin(body, Bin::Add, i, one);
+            let cond = m.cmp(body, pred::IULT, next, ten);
+            m.terminate(body, Term::CondBr(cond, latch, exit));
+            if with_dead_phi {
+                let dead = m.phi(latch, i32t);
+                m.set_phi(dead, vec![(next, body)]);
+            }
+            m.terminate(latch, Term::Br(head));
+            m.set_phi(i, vec![(z, entry), (next, latch)]);
+            let _ = m.call(exit, f, vec![next]);
+            m.terminate(exit, Term::Ret);
+            m.write(true)
+        };
+        assert_eq!(build(false), build(true));
     }
 
     #[test]

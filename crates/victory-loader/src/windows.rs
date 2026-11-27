@@ -19,7 +19,7 @@ use windows_sys::Win32::System::Memory::{
 use crate::thunks::{ImportSite, ThunkBlock, UnimplementedPolicy};
 use crate::{
     DLL_PROCESS_ATTACH, DLL_PROCESS_DETACH, ImportResolver, PreparedImage, Provenance, Resolution,
-    prepare,
+    prepare_owned,
 };
 
 /// A title image mapped into this process. A clone names the same mapping
@@ -84,7 +84,11 @@ pub fn load(prepared: &PreparedImage, dir: &Path) -> Result<LoadedImage> {
     // A DLL indexes its TLS properly; only an exe assumes index 0.
     if !loaded.info.is_dll() {
         // SAFETY: just mapped, and no title code has run.
-        unsafe { crate::tls::redirect(loaded.base(), &loaded.info) }?;
+        if let Err(e) = unsafe { crate::tls::redirect(loaded.base(), &loaded.info) } {
+            // SAFETY: nothing ran from the image, and nothing points into it.
+            unsafe { loaded.unload() };
+            return Err(e);
+        }
     }
     if std::env::var_os(crate::hooks::NO_WATCHDOG_ENV).is_some() {
         // SAFETY: just mapped, and no title code has run.
@@ -158,13 +162,17 @@ fn map_dll(
     seen: &mut HashSet<String>,
     loaded: &mut Vec<(String, LoadedImage)>,
 ) -> Result<()> {
+    let written = name;
     let name = name.to_ascii_lowercase();
-    let path = dirs.0.join(&name);
-    if !seen.insert(name.clone()) || !wanted(&name) || !path.is_file() {
+    if !seen.insert(name.clone()) || !wanted(&name) {
         return Ok(());
     }
+    let Some(path) = crate::files::file_in(dirs.0, written) else {
+        return Ok(());
+    };
     let original = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
-    let prepared = prepare(&original).with_context(|| format!("preparing {}", path.display()))?;
+    let prepared =
+        prepare_owned(original).with_context(|| format!("preparing {}", path.display()))?;
     let image = load(&prepared, dirs.1).with_context(|| format!("loading {}", path.display()))?;
     map_imports(&image.info, dirs, wanted, seen, loaded)?;
     loaded.push((name, image));

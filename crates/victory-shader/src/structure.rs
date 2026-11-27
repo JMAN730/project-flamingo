@@ -433,6 +433,11 @@ pub struct Structured {
     /// such lane reaches the writing block, so a ballot there gives the
     /// mask as data.
     pub active: HashSet<Value>,
+    /// Per block and instruction: the lane's EXEC bit at each vector
+    /// instruction, whatever path the lane took (`None` for scalar ones).
+    /// What a program run as the console runs it, every lane through every
+    /// block, guards its vector instructions with ([`structure_console`]).
+    pub execs: Vec<Vec<Option<Bool>>>,
     /// Masks (low dwords) set in every lane that does not run where they
     /// are written (EXEC clear there, or not reaching a join): a ballot
     /// there, with every lane it leaves out set, gives the mask as data.
@@ -474,7 +479,20 @@ impl Bools {
 
 /// Builds the per-lane form of `program`.
 pub fn structure(program: &Program) -> Result<Structured, ShaderError> {
-    let mut l = Lanes::new(program)?;
+    run(Lanes::new(program, false)?)
+}
+
+/// The same for a program run as the console runs it: every lane of the
+/// console wave through every block, the branches taken wave-wide. Masks
+/// joined at a block are never resolved from what the lanes arriving there
+/// know, since lanes outside EXEC arrive too: each join that differs
+/// between edges is a phi ([`Atom::Phi`]). Guard vector instructions with
+/// [`Structured::execs`] and ignore [`Structured::exits`]' conditions.
+pub fn structure_console(program: &Program) -> Result<Structured, ShaderError> {
+    run(Lanes::new(program, true)?)
+}
+
+fn run(mut l: Lanes) -> Result<Structured, ShaderError> {
     loop {
         let execs = l.masks_in_order();
         let cond = l.paths()?;
@@ -493,6 +511,8 @@ type Key = (Value, Value);
 
 struct Lanes<'a> {
     p: &'a Program,
+    /// See [`structure_console`].
+    console: bool,
     order: Vec<usize>,
     /// Reverse-postorder index per block.
     index: Vec<usize>,
@@ -547,7 +567,7 @@ struct SopMasks {
 const MAX_ROUNDS: usize = 256;
 
 impl<'a> Lanes<'a> {
-    fn new(p: &'a Program) -> Result<Self, ShaderError> {
+    fn new(p: &'a Program, console: bool) -> Result<Self, ShaderError> {
         let blocks = &p.blocks;
         let order = crate::ir::reverse_postorder(blocks);
         let mut index = vec![usize::MAX; blocks.len()];
@@ -572,6 +592,7 @@ impl<'a> Lanes<'a> {
         }
         Ok(Lanes {
             p,
+            console,
             order,
             index,
             incoming,
@@ -845,6 +866,7 @@ impl<'a> Lanes<'a> {
             exits,
             guards,
             reach: cond.to_vec(),
+            execs: execs.to_vec(),
         })
     }
 
@@ -893,6 +915,54 @@ impl<'a> Lanes<'a> {
         value
     }
 
+    /// The scalar a `v_readlane_b32` of a constant lane gives back: the one
+    /// a `v_writelane_b32` of the same lane put into that VGPR (the console
+    /// compiler spills scalars, lane masks among them, into VGPR lanes).
+    fn spilled(&self, v: Value) -> Option<Value> {
+        let at = |v: Value| {
+            let &(b, i) = self.defs.get(&v)?;
+            Some(&self.p.blocks[b].insts[i])
+        };
+        // The lane wraps to the wave, as `v_readlane_b32` and `v_writelane_b32`
+        // do (`& 31`, `& 63` in wave64): lanes 0 and 32 are one in wave32.
+        let wrap = if self.p.wave64 { 63 } else { 31 };
+        let lane = |op: Option<&Operand>| match op {
+            Some(&Operand::Const(c @ 128..=192)) => Some((c - 128) & wrap),
+            _ => None,
+        };
+        let read = at(v)?;
+        let Fields::Valu(r) = &read.fields else {
+            return None;
+        };
+        let k = lane(r.src.get(1)).filter(|_| read.name() == "v_readlane_b32")?;
+        let Some(&Operand::Vector { reg, .. }) = r.src.first() else {
+            return None;
+        };
+        let mut vgpr = read.read(Reg::V(reg))?;
+        // shortcut: only a straight chain of lane writes; a phi or any other
+        // write of the VGPR ends the search (the mask stays opaque).
+        for _ in 0..64 {
+            let w = at(vgpr)?;
+            let Fields::Valu(w) = &w.fields else {
+                return None;
+            };
+            if at(vgpr)?.name() != "v_writelane_b32" {
+                return None;
+            }
+            let (Some(&Operand::Scalar { code, .. }), Some(&Operand::Vector { reg, .. })) =
+                (w.src.first(), w.dst.as_ref())
+            else {
+                return None;
+            };
+            let inst = at(vgpr)?;
+            if lane(w.src.get(1))? == k {
+                return inst.read(Reg::S(code));
+            }
+            vgpr = inst.read(Reg::V(reg))?;
+        }
+        None
+    }
+
     /// The mask a value pair holds, and whether it derives from EXEC or a
     /// VALU result.
     fn mask(&mut self, k: Key) -> (Bool, bool) {
@@ -902,8 +972,25 @@ impl<'a> Lanes<'a> {
         if let Some(&m) = self.other.get(&k) {
             return (m, false);
         }
+        // A scalar pair can be parked in two VGPR lanes and restored one
+        // dword at a time. The spill pass turns these into scalar moves.
+        // Recover the original lane predicate only when the two words
+        // still come from the same known mask, in their original order.
+        if self.p.wave64 {
+            let source = (self.move_source(k.0), self.move_source(k.1));
+            if source != k
+                && let Some(&m) = self.masks.get(&source)
+            {
+                self.masks.insert(k, m);
+                return (m, true);
+            }
+        }
         let p = self.p;
-        let (m, derived) = match self.join(k) {
+        let spilled = self
+            .spilled(k.0)
+            .zip(self.spilled(k.1))
+            .filter(|&(a, b)| (a, b) != k);
+        let (m, derived) = match spilled.map(|s| self.mask(s)).or_else(|| self.join(k)) {
             Some(join) => join,
             None => {
                 let (lo, hi) = (self.defs.get(&k.0).copied(), self.defs.get(&k.1).copied());
@@ -936,6 +1023,21 @@ impl<'a> Lanes<'a> {
         };
         cache.insert(k, m);
         (m, derived)
+    }
+
+    /// The value `value` was copied from through a chain of `s_mov_b32`.
+    fn move_source(&self, mut value: Value) -> Value {
+        while let Some(&(b, i)) = self.defs.get(&value) {
+            let inst = &self.p.blocks[b].insts[i];
+            let [(Reg::S(_), source)] = inst.reads.as_slice() else {
+                break;
+            };
+            if inst.name() != "s_mov_b32" {
+                break;
+            }
+            value = *source;
+        }
+        value
     }
 
     /// A mask joined by phis at a block entry, and whether a mask coming in
@@ -976,7 +1078,7 @@ impl<'a> Lanes<'a> {
         {
             return Some((m, derived));
         }
-        if !self.unresolved.contains(&id) {
+        if !self.console && !self.unresolved.contains(&id) {
             for value in [true, false] {
                 let b = &mut self.b;
                 let holds = forward.iter().all(|&(e, m)| {
@@ -1178,26 +1280,8 @@ impl<'a> Lanes<'a> {
                         self.scc_lane.insert(scc, m);
                     }
                 }
-                // `s_cmp_eq/lg` of a mask: "no lane differs" per lane.
-                let width = if self.p.wave64 { "64" } else { "32" };
-                if takes_mask
-                    && let (Some(rest), Some(scc)) =
-                        (name.strip_prefix("s_cmp_"), inst.write(Reg::Scc))
-                    && rest
-                        .strip_suffix(width)
-                        .is_some_and(|r| r == "eq_u" || r == "lg_u")
-                    && let [a, c] = &src[..]
-                    && let (Some((a, _)), Some((c, _))) =
-                        (self.operand(inst, a), self.operand(inst, c))
-                {
-                    let ne = self.b.xor(a, c);
-                    let m = if rest.starts_with("eq") {
-                        self.b.not(ne)
-                    } else {
-                        ne
-                    };
-                    self.scc_lane.insert(scc, m);
-                }
+                // Do not put `s_cmp_eq/lg` of lane masks into `scc_lane`: SCC is
+                // wave-wide (eq iff no bit differs), not a per-lane XNOR/XOR.
             }
             Fields::Valu(v) => {
                 let exec = self.exec(inst);
@@ -1410,6 +1494,32 @@ mod tests {
     }
 
     #[test]
+    fn split_scalar_copies_across_a_branch_preserve_both_words_of_a_wave64_mask() {
+        for (high, intact) in [(0xBE83_036B, true), (0xBE83_036A, false)] {
+            let p = build(
+                &[
+                    0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+                    0xBE84_046A, // s_mov_b64 s[4:5], vcc
+                    0xBF06_0100, // s_cmp_eq_u32 s0, s1
+                    0xBF85_0004, // s_cbranch_scc1 -> join at 32
+                    0xBE82_036A, // s_mov_b32 s2, vcc_lo
+                    high,        // s_mov_b32 s3, vcc_hi (or vcc_lo)
+                    0xBE84_0302, // s_mov_b32 s4, s2
+                    0xBE85_0303, // s_mov_b32 s5, s3
+                    0xBEFE_0404, // s_mov_b64 exec, s[4:5]
+                    0x7E02_0280, // v_mov_b32 v1, 0
+                    S_ENDPGM,
+                ],
+                true,
+            );
+            let s = structure(&p).unwrap();
+            let compare = p.blocks[0].insts[0].write(Reg::S(VCC)).unwrap();
+            let restored = p.blocks[2].insts[0].write(Reg::S(EXEC)).unwrap();
+            assert_eq!(s.masks[&restored] == s.masks[&compare], intact);
+        }
+    }
+
+    #[test]
     fn exec_narrowed_without_a_branch_leaves_a_guard() {
         let p = build(
             &[
@@ -1513,6 +1623,43 @@ mod tests {
         }
     }
 
+    /// In wave32 lane 32 of `v_writelane_b32` is lane 0, so a mask spilled
+    /// to lane 32 replaces the one spilled to lane 0, and either lane's
+    /// `v_readlane_b32` restores the later one.
+    #[test]
+    fn spilled_lane_indices_wrap_to_the_wave() {
+        for read_lane in [0u32, 32] {
+            let p = build(
+                &[
+                    0xD401_000B, // v_cmp_lt_f32_e64 s11, v0, 0 (A)
+                    0x0001_0100,
+                    0xD405_000A, // v_cmp_lg_f32_e64 s10, v0, 0 (B)
+                    0x0001_0100,
+                    0xD761_0001, // v_writelane_b32 v1, s11, 0
+                    0x0001_000B,
+                    0xD761_0001, // v_writelane_b32 v1, s10, 32
+                    0x0001_400A,
+                    0xD760_0002, // v_readlane_b32 s2, v1, lane 0 or 32
+                    0x0001_0101 | ((128 + read_lane) << 9),
+                    0xD501_0001,
+                    258 | (259 << 9) | (2 << 18), // v_cndmask_b32 v1, v2, v3, s2
+                    S_ENDPGM,
+                ],
+                false,
+            );
+            let s = structure(&p).unwrap();
+            let mask_of =
+                |i: usize, reg| s.masks[&p.blocks[0].insts[i].write(Reg::S(reg)).unwrap()];
+            let select = p.blocks[0].insts[5].write(Reg::V(1)).unwrap();
+            assert_eq!(
+                s.select_masks.get(&select),
+                Some(&mask_of(1, 10)),
+                "read of lane {read_lane}"
+            );
+            assert_ne!(mask_of(0, 11), mask_of(1, 10));
+        }
+    }
+
     /// The `v_cndmask_b32 v1, v2, v3, s2` or `s[2:3]` after `prefix`, and
     /// the select's destination value and mask.
     fn select_after(prefix: &[u32], wave64: bool) -> (Structured, Option<Bool>) {
@@ -1600,6 +1747,66 @@ mod tests {
         };
         assert!(matches!(s.bools.support(when)[..], [Atom::Uniform(_)]));
         assert_eq!(guarded(&s), 0);
+    }
+
+    /// VIC-BT-006: `s_cmp_eq/lg` of two lane masks sets a wave-wide SCC
+    /// (masks equal iff no bit differs), not a per-lane XNOR/XOR.
+    #[test]
+    fn mask_s_cmp_eq_lg_leaves_scc_uniform() {
+        for (words, wave64) in [
+            (
+                [
+                    0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+                    0xBF06_7E6A, // s_cmp_eq_u32 vcc_lo, exec_lo
+                    0xBF84_0001, // s_cbranch_scc0 -> end
+                    0x7E02_0280, // v_mov_b32 v1, 0
+                    S_ENDPGM,
+                ],
+                false,
+            ),
+            (
+                [
+                    0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+                    0xBF07_7E6A, // s_cmp_lg_u32 vcc_lo, exec_lo
+                    0xBF85_0001, // s_cbranch_scc1 -> end
+                    0x7E02_0280, // v_mov_b32 v1, 0
+                    S_ENDPGM,
+                ],
+                false,
+            ),
+            (
+                [
+                    0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+                    0xBF12_7E6A, // s_cmp_eq_u64 vcc, exec
+                    0xBF84_0001, // s_cbranch_scc0 -> end
+                    0x7E02_0280, // v_mov_b32 v1, 0
+                    S_ENDPGM,
+                ],
+                true,
+            ),
+            (
+                [
+                    0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+                    0xBF13_7E6A, // s_cmp_lg_u64 vcc, exec
+                    0xBF85_0001, // s_cbranch_scc1 -> end
+                    0x7E02_0280, // v_mov_b32 v1, 0
+                    S_ENDPGM,
+                ],
+                true,
+            ),
+        ] {
+            let p = build(&words, wave64);
+            let s = structure(&p).unwrap();
+            let LaneExit::Branch { when, .. } = s.exits[0] else {
+                panic!("{words:x?} wave64={wave64}: {:?}", s.exits)
+            };
+            assert!(
+                matches!(s.bools.support(when)[..], [Atom::Uniform(_)]),
+                "{words:x?} wave64={wave64}: {:?}",
+                s.bools.support(when)
+            );
+            assert_eq!(guarded(&s), 0, "{words:x?} wave64={wave64}");
+        }
     }
 
     #[test]

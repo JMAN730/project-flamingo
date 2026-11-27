@@ -303,11 +303,13 @@ fn operands(inst: &Instruction, name: &str, fields: &Fields) -> String {
             lds,
             cache,
         } => {
-            let addr = addr.map_or("off".into(), |a| a.to_string());
+            // The `addtid` forms address by lane: they have no VGPR operand.
+            let addr =
+                (!name.contains("addtid")).then(|| addr.map_or("off".into(), |a| a.to_string()));
             out = join(
                 dst.iter()
                     .map(|o| o.to_string())
-                    .chain([addr])
+                    .chain(addr)
                     .chain(data.iter().map(|o| o.to_string()))
                     .chain(saddr.map(|o| match o {
                         Operand::Scalar { code: NULL, .. } => "off".into(),
@@ -532,7 +534,12 @@ fn valu(name: &str, v: &Valu, encoding: Encoding) -> String {
     let mix = name.starts_with("v_fma_mix");
     let src = |i: usize| {
         let o = v.src[i];
-        let mut s = o.to_string();
+        let mut s = match (name, i, o) {
+            ("v_interp_mov_f32", 1, Operand::Const(p)) => ["p10", "p20", "p0"]
+                .get(usize::from(p))
+                .map_or("p?".into(), |p| p.to_string()),
+            _ => o.to_string(),
+        };
         if let Some(sdwa) = v.sdwa
             && bit(sdwa.sext, i)
         {
@@ -740,6 +747,74 @@ mod tests {
         );
     }
 
+    /// VOP3P 0x18 is `v_dot8_i32_i4`, between `v_dot4_u32_u8` and
+    /// `v_dot8_u32_u4` (RDNA2 ISA). Words and text from
+    /// `llvm-mc -triple=amdgcn -mcpu=gfx1030 --disassemble`.
+    #[test]
+    fn signed_nibble_dot_product_has_its_name() {
+        assert_eq!(
+            one(&[0xCC18_4000, 0x1C0E_0501], true),
+            "v_dot8_i32_i4 v0, v1, v2, v3"
+        );
+        assert_eq!(
+            one(&[0xCC19_4000, 0x1C0E_0501], true),
+            "v_dot8_u32_u4 v0, v1, v2, v3"
+        );
+    }
+
+    /// The VOP3 forms of the f32 interpolations (VOP3 0x200-0x202): the
+    /// attribute, then the i/j VGPR or `v_interp_mov_f32`'s parameter. Words
+    /// and text from `llvm-mc -triple=amdgcn -mcpu=gfx1030`, which adds
+    /// `_e64` to the names.
+    #[test]
+    fn vop3_f32_interpolations_have_their_names_and_operands() {
+        assert_eq!(
+            one(&[0xD600_0001, 0x0202_0644], true),
+            "v_interp_p1_f32 v1, v3, attr4.y"
+        );
+        assert_eq!(
+            one(&[0xD601_8005, 0x0202_06C1], true),
+            "v_interp_p2_f32 v5, v3, attr1.w clamp"
+        );
+        assert_eq!(
+            one(&[0xD602_0001, 0x0200_0482], true),
+            "v_interp_mov_f32 v1, p0, attr2.z"
+        );
+        let code: Vec<u8> = [0xD602_0001u32, 0x0200_0482, 0xBF81_0000]
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
+        let Fields::Valu(v) = decode(&code).unwrap()[0].fields(true) else {
+            panic!("not VALU");
+        };
+        assert_eq!(v.src.len(), 2);
+        assert_eq!(v.src[1], Operand::Const(2));
+    }
+
+    /// MIMG 0x061 is `image_gather4h` and 0x0e8-0x0ef the `_cd_g16` samples
+    /// (RDNA2 ISA). Words from `llvm-mc -triple=amdgcn -mcpu=gfx1030`, which
+    /// gives the same address ranges (it also prints `dmask:0x1`).
+    #[test]
+    fn coarse_g16_samples_and_gather4h_have_their_names() {
+        let cases = [
+            (0xF1A0_0109, "image_sample_cd_g16 v4, v[2:5]"),
+            (0xF1A4_0109, "image_sample_cd_cl_g16 v4, v[2:6]"),
+            (0xF1A8_0109, "image_sample_c_cd_g16 v4, v[2:6]"),
+            (0xF1AC_0109, "image_sample_c_cd_cl_g16 v4, v[2:7]"),
+            (0xF1B0_0109, "image_sample_cd_o_g16 v4, v[2:6]"),
+            (0xF1B4_0109, "image_sample_cd_cl_o_g16 v4, v[2:7]"),
+            (0xF1B8_0109, "image_sample_c_cd_o_g16 v4, v[2:7]"),
+            (0xF1BC_0109, "image_sample_c_cd_cl_o_g16 v4, v[2:8]"),
+            (0xF184_0108, "image_gather4h v[4:7], v[2:3]"),
+        ];
+        for (w0, want) in cases {
+            assert_eq!(
+                one(&[w0, 0x0082_0402], true),
+                format!("{want}, s[8:15], s[16:19] dim:SQ_RSRC_IMG_2D")
+            );
+        }
+    }
+
     /// `s_atc_probe` / `s_atc_probe_buffer`: SDATA is a 7-bit immediate, the
     /// buffer resource is 4 dwords, and GLC/DLC are not operands.
     ///
@@ -831,6 +906,19 @@ mod tests {
             one(&[0xD54B_8004, 0x2BC0_0501], true),
             "v_fma_f32 v4, -v1, s2, 0.5 mul:2 clamp"
         );
+        // VOP3 v_add_f32 (VOP2-in-VOP3 opcode 0x103) with each omod.
+        assert_eq!(
+            one(&[0xD503_0000, 0x0802_0501], true),
+            "v_add_f32 v0, v1, v2 mul:2"
+        );
+        assert_eq!(
+            one(&[0xD503_0000, 0x1002_0501], true),
+            "v_add_f32 v0, v1, v2 mul:4"
+        );
+        assert_eq!(
+            one(&[0xD503_0000, 0x1802_0501], true),
+            "v_add_f32 v0, v1, v2 div:2"
+        );
         assert_eq!(
             one(&[0x7E02_16F9, 0x0605_0602], true),
             "v_cvt_f32_f16 v1, v2 src0_sel:WORD_1"
@@ -909,6 +997,15 @@ mod tests {
     }
 
     #[test]
+    fn ds_wrap_reads_both_data_operands() {
+        // llvm-mc -mcpu=gfx1030: DATA0 is subtracted, DATA1 added.
+        assert_eq!(
+            one(&[0xD8D0_0010, 0x0806_0402], true),
+            "ds_wrap_rtn_b32 v8, v2, v4, v6 offset:16"
+        );
+    }
+
+    #[test]
     fn image_d16_data_is_packed() {
         // Three f16 channels occupy two VGPRs; NSA lists the addresses.
         let words = [0xF09C_070A, 0x8024_0801, 0x0000_0005];
@@ -926,5 +1023,29 @@ mod tests {
         };
         assert_eq!(data, Operand::Vector { reg: 8, dwords: 2 });
         assert_eq!(addr.len(), 2);
+    }
+
+    /// `global_load_dword_addtid` / `global_store_dword_addtid` address the
+    /// SGPR base plus the lane's id: the VADDR field is no operand. Words
+    /// and operands from `llvm-mc -triple=amdgcn -mcpu=gfx1030`, which calls
+    /// the offset `offset:`.
+    #[test]
+    fn global_addtid_reads_no_address_vgpr() {
+        assert_eq!(
+            one(&[0xDC58_8010, 0x060A_0000], true),
+            "global_load_dword_addtid v6, s[10:11] inst_offset:16"
+        );
+        assert_eq!(
+            one(&[0xDC5C_8010, 0x000A_0400], true),
+            "global_store_dword_addtid v4, s[10:11] inst_offset:16"
+        );
+        let code: Vec<u8> = [0xDC58_8010u32, 0x060A_0000, 0xBF81_0000]
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
+        let Fields::Flat { addr, .. } = decode(&code).unwrap()[0].fields(true) else {
+            panic!("not FLAT");
+        };
+        assert_eq!(addr, None, "v0 is not read");
     }
 }

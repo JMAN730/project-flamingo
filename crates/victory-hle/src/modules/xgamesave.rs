@@ -26,7 +26,7 @@ use std::sync::Mutex;
 
 use super::xasync::{self, AsyncBlock, E_INVALIDARG};
 use super::xgameruntime::{
-    Guid, HRESULT, Interface, Methods, Object, S_OK, add_ref, missing, put, text,
+    Guid, HRESULT, Interface, Methods, Object, S_OK, add_ref, missing, put, query_interface, text,
 };
 use super::{storage, xuser};
 use crate::runtime;
@@ -47,7 +47,7 @@ pub const IID_2026: Guid = Guid::new(
     [0x8e, 0x35, 0x9a, 0xda, 0x90, 0x65, 0x93, 0xf9],
 );
 
-pub static OBJECT: Object = Object::new("game save", &VTABLE);
+pub static OBJECT: Object = Object::with_iids("game save", &VTABLE, &[PROVIDER, IID_2026]);
 pub const INTERFACES: &[Interface] =
     &[(PROVIDER, PROVIDER, &OBJECT), (PROVIDER, IID_2026, &OBJECT)];
 
@@ -270,8 +270,10 @@ fn commit(
         match source {
             Source::Data(data) => write(path, data)?,
             // Files are never changed in place, so sharing one is safe.
+            // A copy (past the file system's link limit) is flushed like a
+            // new blob before the version is committed.
             Source::Kept(from) => {
-                std::fs::hard_link(from, &path).or_else(|_| std::fs::copy(from, &path).map(drop))?
+                std::fs::hard_link(from, &path).or_else(|_| write(path, &std::fs::read(from)?))?
             }
         }
         step();
@@ -953,7 +955,7 @@ extern "system" fn submit_result(_: This, block: *mut AsyncBlock) -> HRESULT {
 }
 
 static VTABLE: Methods<30> = Methods([
-    missing::<0> as *const (),
+    query_interface as *const (),
     add_ref as *const (),
     add_ref as *const (),
     missing::<3> as *const (),         // 0x18 initialize (blocking)
@@ -1251,6 +1253,37 @@ mod tests {
             vec![("a".into(), "new a".into()), ("b".into(), "old b".into())],
         );
         assert_eq!(state(root), Some(new));
+    }
+
+    /// A kept blob that cannot be hard-linked (NTFS allows 1024 links to a
+    /// file) is copied into the new version with its exact bytes.
+    #[cfg(windows)]
+    #[test]
+    fn a_kept_blob_past_the_link_limit_is_copied() {
+        let dir = tempfile::tempdir().unwrap();
+        let links = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        assert_eq!(
+            update(root, "one", &[("a", Some("old a")), ("b", Some("old b"))]),
+            S_OK
+        );
+        const NTFS: &str = "the temp folder must be on NTFS, which allows 1024 links to a file";
+        let old_b = container_dir(root, "Slot").join("v1").join("1");
+        for i in 0..1023 {
+            std::fs::hard_link(&old_b, links.path().join(i.to_string())).expect(NTFS);
+        }
+        let full = std::fs::hard_link(&old_b, links.path().join("full")).expect_err(NTFS);
+        assert_eq!(full.kind(), std::io::ErrorKind::TooManyLinks, "{NTFS}");
+
+        assert_eq!(update(root, "two", &[("a", Some("new a"))]), S_OK);
+
+        let new = (
+            "two".into(),
+            vec![("a".into(), "new a".into()), ("b".into(), "old b".into())],
+        );
+        assert_eq!(state(root), Some(new));
+        assert!(!old_b.exists());
+        assert_eq!(std::fs::read(links.path().join("0")).unwrap(), b"old b");
     }
 
     #[test]

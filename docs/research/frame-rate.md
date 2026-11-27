@@ -642,3 +642,22 @@ Intro pool crash bisection (runs 133-145, `VICTORY_WAVE64_SPLIT_ONLY`):
   value makes every first use wait, so no dispatch of a chain is dropped
   while the rest of it runs. Loading is much slower with it on a cold
   cache, because some programs take minutes to translate.
+
+## After merging main (2026-11-27)
+
+Three things described above no longer exist in the tree; the notes are kept
+as a record of what was tried.
+
+- `planes.rs` and `shaders/plane_compose.hlsl` are gone. Main's present
+  overlay shows the second plane (`VICTORY_PRESENT_TWO_PLANES=1`, opt-in).
+- `VICTORY_IN_FLIGHT` and this branch's asynchronous submission are gone.
+  Main's relay path is the default, and `VICTORY_ASYNC_SUBMIT` is now main's
+  switch of that name.
+- The in-place indirect clamp is replaced by main's clamp into a scratch
+  buffer, which leaves title memory alone.
+
+Kept and carried onto main's code: the three-way copy-back rule (the CPU
+wins when title memory changed since the submission's snapshot;
+`VICTORY_COPY_BACK_GPU_WINS=1` restores the old rule) at every place GPU
+writes are merged back, and `VICTORY_TEXTURE_MIP_DROP` on top of main's mip
+pressure mechanism.

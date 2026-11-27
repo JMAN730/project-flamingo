@@ -7,9 +7,9 @@
 //! barycentrics; `v_interp_mov` reads one vertex's value. After the 32-bit
 //! export patch ([`NativeProgram::patched_code`]) exports carry plain
 //! 32-bit values: `mrt<n>` is render target n, `mrtz` depth, stencil and
-//! sample mask, `null` nothing. A lane whose EXEC bit is clear at the
-//! export that ends the program (`done`) is discarded: that export's guard
-//! after structurisation.
+//! sample mask, `null` nothing. Pixel survival follows the EXEC mask of the
+//! last export with `vm` (Valid Mask) set; colour writes are masked by EXEC
+//! per MRT. `done` only marks the program's final export.
 //!
 //! Vertex shaders that run as the hardware VS get the vertex id in v0, the
 //! primitive id in v2 and the instance id in v3; the fetch shader loads
@@ -18,6 +18,10 @@
 //!
 //! Attributes and outputs are named by their row: a register of the
 //! container's signature part.
+//!
+//! Pixel shaders also get the primitive mask in the SGPR after the user data
+//! and, with `LOAD_COLLISION_WAVEID` (POPS), the collision wave id after it,
+//! as `SPI_SHADER_PGM_RSRC2_PS` enables them.
 //!
 //! Compute programs get the thread id in the group in v0-v2 and the group
 //! id in the SGPRs after the user data, as `COMPUTE_PGM_RSRC2` enables them.
@@ -72,6 +76,12 @@ pub enum Input {
     MeshGroup,
     /// Mesh: s3, the wave's index in the group in bits 24-27.
     MergedWaveInfo,
+    /// Pixel: the SGPR after the user data, the LDS offset of the
+    /// primitive's parameters (M0 for `v_interp`).
+    PrimMask,
+    /// Pixel: the POPS collision wave id SGPR after the primitive mask
+    /// ([`PsRsrc2::collision_wave_id_sgpr`](crate::native::PsRsrc2::collision_wave_id_sgpr)).
+    CollisionWaveId,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -179,8 +189,11 @@ pub struct Export {
     pub values: [Option<Value>; 4],
     /// Two f16 values per dword.
     pub compressed: bool,
-    /// The program's last export (for pixels: kills the lanes not in EXEC).
+    /// The program's last export.
     pub done: bool,
+    /// Valid Mask: when set on a pixel export, EXEC becomes the survival mask
+    /// (last `vm` wins). Independent of [`Export::done`].
+    pub vm: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -190,8 +203,9 @@ pub struct Io {
     pub inputs: Vec<(Value, Input)>,
     pub interps: Vec<(Site, Interp)>,
     pub exports: Vec<Export>,
-    /// Compute: how many SGPRs the hardware initializes
-    /// ([`ComputeIo::initialized_sgprs`](crate::native::ComputeIo::initialized_sgprs)).
+    /// Compute and pixel: how many SGPRs the hardware initializes
+    /// ([`ComputeIo::initialized_sgprs`](crate::native::ComputeIo::initialized_sgprs),
+    /// [`PsRsrc2::initialized_sgprs`](crate::native::PsRsrc2::initialized_sgprs)).
     pub initialized_sgprs: Option<u8>,
 }
 
@@ -202,15 +216,25 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
     let (loaded, ps_inputs, params) = match (&native.io, native.stage) {
         (
             StageIo::Ps {
-                inputs, input_addr, ..
+                inputs,
+                input_addr,
+                rsrc2,
+                ..
             },
             HwStage::Ps,
         ) => {
             // A pixel shader exports no parameters; `[]` never reaches `Unread`.
-            let loaded = ps_vgprs(*input_addr)
+            let mut loaded: Vec<(Reg, Input)> = ps_vgprs(*input_addr)
                 .into_iter()
                 .map(|(r, i)| (Reg::V(r), i))
                 .collect();
+            // The SGPRs after the user data.
+            loaded.push((Reg::S(rsrc2.prim_mask_sgpr()), Input::PrimMask));
+            loaded.extend(
+                rsrc2
+                    .collision_wave_id_sgpr()
+                    .map(|s| (Reg::S(s), Input::CollisionWaveId)),
+            );
             (loaded, &inputs[..], &[][..])
         }
         (StageIo::Vs { inputs, outputs }, HwStage::Vs) => {
@@ -339,6 +363,7 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
         inputs: inputs.clone(),
         initialized_sgprs: match &native.io {
             StageIo::Cs(cs) => Some(cs.initialized_sgprs()),
+            StageIo::Ps { rsrc2, .. } => Some(rsrc2.initialized_sgprs()),
             _ => None,
         },
         ..Io::default()
@@ -405,7 +430,7 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                     src,
                     compr,
                     done,
-                    ..
+                    vm,
                 } => {
                     let target = match *target {
                         t @ 0..=7 => Target::Color(t),
@@ -438,6 +463,7 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                         values,
                         compressed: *compr,
                         done: *done,
+                        vm: *vm,
                     });
                 }
                 _ => {}
@@ -674,6 +700,7 @@ mod tests {
             io: StageIo::Ps {
                 inputs,
                 input_addr,
+                rsrc2: Default::default(),
                 db_shader_control: 0,
                 patches: Vec::<ExportPatch>::new(),
             },
@@ -733,8 +760,8 @@ mod tests {
             panic!("{:?}", io.exports)
         };
         assert_eq!(
-            (e.target, e.done, e.compressed),
-            (Target::Color(0), true, false)
+            (e.target, e.done, e.vm, e.compressed),
+            (Target::Color(0), true, true, false)
         );
         assert_eq!(e.values[0], p.blocks[0].insts[1].write(Reg::V(2)));
     }

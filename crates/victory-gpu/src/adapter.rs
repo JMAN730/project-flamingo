@@ -131,6 +131,47 @@ pub(crate) fn shortfall(candidates: &[Candidate], choice: &Choice) -> Option<Sho
     })
 }
 
+/// Tracks probed adapters in preference order while retaining only the current
+/// winner's live payload (such as its probe `ID3D12Device`), dropping payloads
+/// for candidates that are no longer in contention.
+pub(crate) struct Selector<T> {
+    candidates: Vec<Candidate>,
+    best: Option<(usize, T)>,
+}
+
+impl<T> Selector<T> {
+    pub(crate) fn new() -> Self {
+        Self {
+            candidates: Vec::new(),
+            best: None,
+        }
+    }
+
+    /// Records a probed candidate and its live payload. Drops any payload that
+    /// cannot win under [`choose`]. Returns `true` once a fully capable
+    /// candidate has been found and no later candidate can beat it.
+    pub(crate) fn push(&mut self, candidate: Candidate, payload: T) -> bool {
+        let index = self.candidates.len();
+        self.candidates.push(candidate);
+        let choice = choose(&self.candidates);
+        if choice.as_ref().is_some_and(|c| c.index == index) {
+            // Replacing `self.best` drops the superseded candidate's payload immediately.
+            self.best = Some((index, payload));
+        }
+        choice.is_some_and(|c| c.lacks.is_empty())
+    }
+
+    /// Returns the winning payload and any capability shortfall warning across
+    /// all probed candidates, or `None` if no candidate was added.
+    pub(crate) fn finish(self) -> Option<(T, Option<Shortfall>)> {
+        let choice = choose(&self.candidates)?;
+        let warning = shortfall(&self.candidates, &choice);
+        let (best_index, payload) = self.best?;
+        debug_assert_eq!(best_index, choice.index);
+        Some((payload, warning))
+    }
+}
+
 fn join(lacks: &[Lack]) -> String {
     lacks
         .iter()
@@ -219,5 +260,137 @@ mod tests {
     #[test]
     fn an_empty_list_chooses_nothing() {
         assert_eq!(choose(&[]), None);
+        assert!(Selector::<()>::new().finish().is_none());
+    }
+
+    #[test]
+    fn selector_retains_only_the_winning_payload_and_drops_losers_immediately() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        struct Probe {
+            id: usize,
+            dropped: Rc<RefCell<Vec<usize>>>,
+        }
+        impl Drop for Probe {
+            fn drop(&mut self) {
+                self.dropped.borrow_mut().push(self.id);
+            }
+        }
+
+        let dropped = Rc::new(RefCell::new(Vec::new()));
+        let make = |id: usize| Probe {
+            id,
+            dropped: Rc::clone(&dropped),
+        };
+
+        // NONE (0) -> NONE tie (1, dropped immediately) -> MENUS (2, supersedes 0) -> MENUS tie (3, dropped).
+        let mut sel = Selector::new();
+        assert!(!sel.push(
+            Candidate {
+                name: "gpu0".into(),
+                caps: NONE
+            },
+            make(0),
+        ));
+        assert_eq!(*dropped.borrow(), Vec::<usize>::new());
+
+        assert!(!sel.push(
+            Candidate {
+                name: "gpu1".into(),
+                caps: NONE
+            },
+            make(1),
+        ));
+        assert_eq!(*dropped.borrow(), vec![1], "tied loser dropped immediately");
+
+        assert!(!sel.push(
+            Candidate {
+                name: "gpu2".into(),
+                caps: MENUS
+            },
+            make(2),
+        ));
+        assert_eq!(
+            *dropped.borrow(),
+            vec![1, 0],
+            "superseded candidate dropped immediately"
+        );
+
+        assert!(!sel.push(
+            Candidate {
+                name: "gpu3".into(),
+                caps: MENUS
+            },
+            make(3),
+        ));
+        assert_eq!(*dropped.borrow(), vec![1, 0, 3]);
+
+        let (winner, warning) = sel.finish().unwrap();
+        assert_eq!(winner.id, 2);
+        let warning = warning.expect("no fully capable adapter");
+        assert_eq!(warning.chosen, "gpu2");
+        assert_eq!(warning.lacks, "mesh shaders");
+        assert!(warning.adapters.contains("gpu0"));
+        assert!(warning.adapters.contains("gpu3"));
+        drop(winner);
+        assert_eq!(*dropped.borrow(), vec![1, 0, 3, 2]);
+    }
+
+    #[test]
+    fn selector_signals_completion_on_first_fully_capable_adapter() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        struct Probe {
+            id: usize,
+            dropped: Rc<RefCell<Vec<usize>>>,
+        }
+        impl Drop for Probe {
+            fn drop(&mut self) {
+                self.dropped.borrow_mut().push(self.id);
+            }
+        }
+
+        let dropped = Rc::new(RefCell::new(Vec::new()));
+        let make = |id: usize| Probe {
+            id,
+            dropped: Rc::clone(&dropped),
+        };
+
+        let mut sel = Selector::new();
+        assert!(!sel.push(
+            Candidate {
+                name: "igpu".into(),
+                caps: MENUS
+            },
+            make(0),
+        ));
+        assert!(sel.push(
+            Candidate {
+                name: "dgpu".into(),
+                caps: FULL
+            },
+            make(1),
+        ));
+        assert_eq!(
+            *dropped.borrow(),
+            vec![0],
+            "superseded menus-only probe dropped as soon as full adapter wins"
+        );
+
+        // Even if a caller keeps pushing after completion, the earlier full adapter stays winner.
+        assert!(sel.push(
+            Candidate {
+                name: "dgpu2".into(),
+                caps: FULL
+            },
+            make(2),
+        ));
+        assert_eq!(*dropped.borrow(), vec![0, 2]);
+
+        let (winner, warning) = sel.finish().unwrap();
+        assert_eq!(winner.id, 1);
+        assert_eq!(warning, None);
     }
 }

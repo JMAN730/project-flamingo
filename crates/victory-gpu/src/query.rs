@@ -30,8 +30,7 @@ pub(crate) struct Desc {
 struct Heap {
     object: Object,
     desc: Desc,
-    /// The host occlusion heap (made on first use) and, per query, whether
-    /// one was ended on the host since it was made.
+    /// The host occlusion heap, made on first use.
     #[cfg(windows)]
     host: std::sync::OnceLock<Option<HostQueries>>,
 }
@@ -39,7 +38,6 @@ struct Heap {
 #[cfg(windows)]
 struct HostQueries {
     heap: windows::Win32::Graphics::Direct3D12::ID3D12QueryHeap,
-    ended: std::sync::Mutex<Vec<bool>>,
 }
 
 /// `D3D12_QUERY_HEAP_TYPE_OCCLUSION`.
@@ -77,12 +75,41 @@ fn host_queries(this: This) -> Option<&'static HostQueries> {
                 tracing::warn!(error = %e, count = heap.desc.count, "no host occlusion query heap");
                 return None;
             }
-            Some(HostQueries {
-                heap: made?,
-                ended: std::sync::Mutex::new(vec![false; heap.desc.count as usize]),
-            })
+            let made = made?;
+            if let Err(e) = end_every_query(&made, heap.desc.count) {
+                tracing::warn!(error = %e, count = heap.desc.count, "host occlusion queries not set up");
+                return None;
+            }
+            Some(HostQueries { heap: made })
         })
         .as_ref()
+}
+
+/// Begins and ends each of the `count` queries of a new host occlusion heap
+/// in a list of its own, run before any list that names the heap: every
+/// query then has a result (0) before the title's first one ends, so a
+/// resolve recorded or run before that is valid and needs no record of
+/// which queries ended, which recording order cannot tell (lists run in the
+/// order they are submitted, not recorded).
+#[cfg(windows)]
+fn end_every_query(
+    heap: &windows::Win32::Graphics::Direct3D12::ID3D12QueryHeap,
+    count: u32,
+) -> windows::core::Result<()> {
+    use windows::Win32::Graphics::Direct3D12::D3D12_QUERY_TYPE_OCCLUSION;
+    let host = crate::host::host().ok_or_else(windows::core::Error::empty)?;
+    let list = host.new_list()?;
+    for index in 0..count {
+        // SAFETY: an open list; the index is inside the heap.
+        unsafe {
+            list.list
+                .BeginQuery(heap, D3D12_QUERY_TYPE_OCCLUSION, index);
+            list.list.EndQuery(heap, D3D12_QUERY_TYPE_OCCLUSION, index);
+        }
+    }
+    list.close();
+    host.execute(&[&list]);
+    Ok(())
 }
 
 /// The host occlusion heap behind the title's query heap `this`, if it is an
@@ -94,38 +121,13 @@ pub(crate) fn occlusion_heap(
     host_queries(this).map(|q| q.heap.clone())
 }
 
-/// Notes that query `index` of `this` was ended on the host: its result
-/// can be resolved from then on.
+/// Queries begun on the host and not yet ended: (host list, heap, index).
+/// Each recording list pairs its own `BeginQuery` and `EndQuery`, so lists
+/// recording the same query at once do not end each other's.
+// shortcut: a list reset between a title's begin and end keeps the entry,
+// which an end in its next recording would then match.
 #[cfg(windows)]
-pub(crate) fn set_ended(this: This, index: u32) {
-    if let Some(q) = host_queries(this)
-        && let Some(e) = q
-            .ended
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get_mut(index as usize)
-    {
-        *e = true;
-    }
-}
-
-/// Whether query `index` of `this` was ever ended on the host.
-#[cfg(windows)]
-pub(crate) fn ended(this: This, index: u32) -> bool {
-    host_queries(this).is_some_and(|q| {
-        q.ended
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(index as usize)
-            .copied()
-            .unwrap_or(false)
-    })
-}
-
-/// Queries begun on the host and not yet ended: by (heap, index), the host
-/// list they were begun in (an end must be recorded in the same list).
-#[cfg(windows)]
-static OPEN: std::sync::Mutex<Option<std::collections::HashMap<(usize, u32), usize>>> =
+static OPEN: std::sync::Mutex<Option<std::collections::HashSet<(usize, usize, u32)>>> =
     std::sync::Mutex::new(None);
 
 /// Notes query `index` of `this` begun in host list `list`.
@@ -134,16 +136,17 @@ pub(crate) fn begun(this: This, index: u32, list: usize) {
     OPEN.lock()
         .unwrap_or_else(|e| e.into_inner())
         .get_or_insert_with(Default::default)
-        .insert((this as usize, index), list);
+        .insert((list, this as usize, index));
 }
 
-/// The host list query `index` of `this` was begun in, forgetting it.
+/// Whether query `index` of `this` was begun in host list `list` and not
+/// ended there since, forgetting it.
 #[cfg(windows)]
-pub(crate) fn take_begun(this: This, index: u32) -> Option<usize> {
+pub(crate) fn take_begun(this: This, index: u32, list: usize) -> bool {
     OPEN.lock()
         .unwrap_or_else(|e| e.into_inner())
-        .as_mut()?
-        .remove(&(this as usize, index))
+        .as_mut()
+        .is_some_and(|open| open.remove(&(list, this as usize, index)))
 }
 
 /// Device method.
@@ -272,5 +275,70 @@ mod tests {
         for left in [5, 4, 3, 2, 1, 0] {
             assert_eq!(release(heap), left);
         }
+    }
+
+    /// Two lists recording the same query interleaved (A begins, B begins,
+    /// A ends, B ends) each end their own.
+    #[cfg(windows)]
+    #[test]
+    fn each_list_pairs_its_own_begin_and_end() {
+        // A heap address no other test uses; never dereferenced.
+        let heap = 0x5157_0000_usize as This;
+        let (a, b) = (0xa000_usize, 0xb000_usize);
+        begun(heap, 3, a);
+        begun(heap, 3, b);
+        assert!(take_begun(heap, 3, a));
+        assert!(take_begun(heap, 3, b));
+        // Each end is taken once, and an end without a begin is not.
+        assert!(!take_begun(heap, 3, a));
+        assert!(!take_begun(heap, 3, b));
+        assert!(!take_begun(heap, 4, a));
+        // Another index of the same list is its own query.
+        begun(heap, 5, a);
+        assert!(!take_begun(heap, 6, a));
+        assert!(take_begun(heap, 5, a));
+    }
+
+    /// A new host occlusion heap has a result for every query before the
+    /// title ends one: resolving a query no list ended gives 0.
+    #[cfg(windows)]
+    #[test]
+    fn host_occlusion_queries_resolve_before_any_ends() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let desc = Desc {
+            kind: OCCLUSION_HEAP,
+            count: 4,
+            nodes: 0,
+        };
+        let mut title = std::ptr::null();
+        assert_eq!(
+            create(std::ptr::null(), &desc, &HEAP_IIDS[0], &mut title),
+            S_OK
+        );
+        let Some(heap) = occlusion_heap(title) else {
+            let _ = release(title);
+            return; // the host made no occlusion heap
+        };
+        let list = host.new_list().expect("host command list");
+        let (staging, data) = list.readback(host, 32).expect("readback memory");
+        // SAFETY: an open list, a live heap and a readback buffer of 32 bytes.
+        unsafe {
+            list.list.ResolveQueryData(
+                &heap,
+                windows::Win32::Graphics::Direct3D12::D3D12_QUERY_TYPE_OCCLUSION,
+                0,
+                4,
+                &staging,
+                0,
+            );
+        }
+        list.close();
+        host.execute(&[&list]);
+        // SAFETY: the list ran; the readback buffer is mapped.
+        let results = unsafe { data.cast::<[u64; 4]>().read_unaligned() };
+        assert_eq!(results, [0; 4]);
+        assert_eq!(release(title), 0);
     }
 }

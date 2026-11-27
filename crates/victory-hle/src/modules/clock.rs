@@ -187,7 +187,7 @@ fn scaled_ticks(now: u64) -> u64 {
     }
 }
 
-pub extern "system" fn QueryPerformanceCounter(count: *mut i64) -> i32 {
+pub(crate) extern "system" fn QueryPerformanceCounter(count: *mut i64) -> i32 {
     let now = scaled_counter(host::counter());
     if !count.is_null() {
         // SAFETY: the title passes where the count goes.

@@ -276,13 +276,19 @@ impl GraphicsState {
             .map(|e| {
                 let slot = e.InputSlot.min(31) as usize;
                 let format = e.Format.0 as u32;
+                let bytes = crate::resource::element(format).map_or(0, |(b, _)| b as u32);
+                // An appended element starts at the next multiple of
+                // min(4, its size) after the previous one, where D3D12 (and
+                // vkd3d) place it; the host pipeline gets the title's
+                // descriptions, so the offsets read here must match.
                 let offset = if e.AlignedByteOffset == D3D12_APPEND_ALIGNED_ELEMENT {
                     next[slot]
+                        .checked_next_multiple_of(bytes.clamp(1, 4))
+                        .unwrap_or(u32::MAX)
                 } else {
                     e.AlignedByteOffset
                 };
-                let bytes = crate::resource::element(format).map_or(0, |(b, _)| b as u32);
-                next[slot] = offset + bytes;
+                next[slot] = offset.saturating_add(bytes);
                 Input {
                     slot: slot as u32,
                     offset,
@@ -365,6 +371,8 @@ impl Shader {
         else {
             return Ok(self.clone());
         };
+        let does_store = super::stores(&native);
+        let addr_store = super::stores_by_address(&native);
         Ok(Arc::new(Self {
             stage: self.stage,
             hash: self.hash.clone(),
@@ -374,6 +382,8 @@ impl Shader {
             translated: Some(Translated {
                 host,
                 used: native.used,
+                stores: does_store,
+                address_stores: addr_store,
             })
             .into(),
             mesh_fallback: std::sync::OnceLock::new(),
@@ -397,16 +407,20 @@ impl Shader {
             return Err("a pixel shader specialised for bound views".into());
         }
         let host = crate::shader_cache::host_shader_without_barycentrics(&self.container)?;
-        let used = self
+        let plain = self
             .translated()
-            .ok_or("the pixel shader does not translate")?
-            .used
-            .clone();
+            .ok_or("the pixel shader does not translate")?;
+        let translated = Translated {
+            host,
+            used: plain.used.clone(),
+            stores: plain.stores,
+            address_stores: plain.address_stores,
+        };
         Ok(Arc::new(Self {
             stage: self.stage,
             hash: self.hash.clone(),
             container: Vec::new(),
-            translated: Some(Translated { host, used }).into(),
+            translated: Some(translated).into(),
             mesh_fallback: std::sync::OnceLock::new(),
             #[cfg(feature = "diagnostics")]
             wave64: std::sync::OnceLock::new(),
@@ -488,6 +502,11 @@ pub(crate) struct HostPipeline {
     pub(crate) mesh: bool,
     /// The geometry stage completes rectangle-list primitives after vertex shading.
     pub(crate) rects: bool,
+    /// For a mesh pipeline, the same with our amplification stage before
+    /// it ([`amplifier`]), and the root parameters of the argument buffer
+    /// (a root UAV) and of the record's byte offset in it (one constant).
+    /// A pipeline of its own: other mesh draws keep the plain one.
+    pub(crate) amplify: Option<(ID3D12PipelineState, u32, u32)>,
     pub(crate) pso: ID3D12PipelineState,
     pub(crate) root: ID3D12RootSignature,
     /// Vertex, then pixel stage, or the compute stage.
@@ -503,10 +522,29 @@ pub(crate) struct HostPipeline {
     pub(crate) fallback: Option<MeshFallbackPipeline>,
 }
 
+/// Whether `device` takes anisotropic filters with point mip filtering
+/// (`AnisoFilterWithPointMipSupported`).
+fn aniso_point_mip_supported(device: &ID3D12Device) -> bool {
+    let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS19::default();
+    // SAFETY: the feature query writes the structure of the given size.
+    // Older runtimes may not recognize OPTIONS19; that means no support.
+    unsafe {
+        device.CheckFeatureSupport(
+            D3D12_FEATURE_D3D12_OPTIONS19,
+            (&raw mut options).cast(),
+            size_of_val(&options) as u32,
+        )
+    }
+    .is_ok()
+        && options.AnisoFilterWithPointMipSupported.as_bool()
+}
+
 /// Adds what the translation `t` of `shader` binds to the root parameters,
 /// the ranges its table parameters point at and the static samplers, for
 /// the stages `visibility` names. `fallback`: a mesh stage run as a compute
-/// shader. `None` if a range could not be kept.
+/// shader. `aniso_point_mip`: whether the host takes anisotropic filters
+/// with point mip filtering ([`aniso_point_mip_supported`]). `None` if a
+/// range could not be kept.
 // Boxed: the table parameters point at the ranges, which must not move as
 // the list grows.
 #[allow(clippy::vec_box)]
@@ -516,6 +554,7 @@ fn stage_bindings(
     params: &mut Vec<D3D12_ROOT_PARAMETER1>,
     ranges: &mut Vec<Box<D3D12_DESCRIPTOR_RANGE1>>,
     samplers: &mut Vec<D3D12_STATIC_SAMPLER_DESC>,
+    aniso_point_mip: bool,
 ) -> Option<Stage> {
     let mut stage = Stage {
         shader: shader.clone(),
@@ -621,7 +660,7 @@ fn stage_bindings(
     }
     for (n, s) in t.static_samplers.iter().enumerate() {
         samplers.push(D3D12_STATIC_SAMPLER_DESC {
-            Filter: D3D12_FILTER(s.filter as i32),
+            Filter: D3D12_FILTER(s.filter_for_host(aniso_point_mip) as i32),
             AddressU: D3D12_TEXTURE_ADDRESS_MODE(s.address[0] as i32),
             AddressV: D3D12_TEXTURE_ADDRESS_MODE(s.address[1] as i32),
             AddressW: D3D12_TEXTURE_ADDRESS_MODE(s.address[2] as i32),
@@ -763,6 +802,8 @@ impl HostPipeline {
             }
         }
 
+        let aniso_point_mip = aniso_point_mip_supported(&host.device);
+
         // The root signature the translated shaders' bindings define.
         let mut params: Vec<D3D12_ROOT_PARAMETER1> = Vec::new();
         // Ranges the table parameters point at, alive until the root
@@ -780,7 +821,35 @@ impl HostPipeline {
                 &mut params,
                 &mut ranges,
                 &mut samplers,
+                aniso_point_mip,
             )?);
+        }
+        // Our amplification stage's two (`amplifier`), for a mesh pipeline.
+        let mut amplify: Option<(u32, u32)> = None;
+        if mesh.is_some() && compute.is_none() && amplifier().is_some() {
+            amplify = Some((params.len() as u32, params.len() as u32 + 1));
+            params.push(D3D12_ROOT_PARAMETER1 {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_UAV,
+                Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                    Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                        ShaderRegister: 0,
+                        RegisterSpace: AMPLIFY_SPACE,
+                        Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
+                    },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_AMPLIFICATION,
+            });
+            params.push(D3D12_ROOT_PARAMETER1 {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+                Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                    Constants: D3D12_ROOT_CONSTANTS {
+                        ShaderRegister: 0,
+                        RegisterSpace: AMPLIFY_SPACE,
+                        Num32BitValues: 1,
+                    },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_AMPLIFICATION,
+            });
         }
         let (root, root_blob) =
             match root_signature(&host.device, &params, &samplers, compute.is_some(), heaps) {
@@ -842,6 +911,7 @@ impl HostPipeline {
                 structured_strides: structured_strides.to_vec(),
                 name: format!("{shaders:?}"),
                 rects: false,
+                amplify: None,
                 slots: 0,
                 inputs: Vec::new(),
                 fallback: None,
@@ -862,7 +932,47 @@ impl HostPipeline {
                 &[&code_bytes(&code(0)), &code_bytes(&code(1))],
                 &state,
             );
-            let pso = match mesh_pipeline(&host.device, &root, code(0), code(1), g, &name) {
+            let made = mesh_pipeline(&host.device, &root, None, code(0), code(1), g, &name);
+            let amplify = match (amplify, amplifier()) {
+                (Some((buffer_at, offset_at)), Some(stage)) if made.is_ok() => {
+                    let with = super::library::name(
+                        "mesh triangles amplified",
+                        &root_blob,
+                        &[stage, &code_bytes(&code(0)), &code_bytes(&code(1))],
+                        &state,
+                    );
+                    let stage = D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: stage.as_ptr().cast(),
+                        BytecodeLength: stage.len(),
+                    };
+                    match mesh_pipeline(
+                        &host.device,
+                        &root,
+                        Some(stage),
+                        code(0),
+                        code(1),
+                        g,
+                        &with,
+                    ) {
+                        Ok(pso) => Some((pso, buffer_at, offset_at)),
+                        Err(e) => {
+                            static SAID: std::sync::atomic::AtomicU32 =
+                                std::sync::atomic::AtomicU32::new(0);
+                            if SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
+                                tracing::warn!(
+                                    error = %e,
+                                    ?shaders,
+                                    "host mesh pipeline refused with the amplification stage: the plain one alone"
+                                );
+                                host.log_messages();
+                            }
+                            None
+                        }
+                    }
+                }
+                _ => None,
+            };
+            let pso = match made {
                 Ok(pso) => pso,
                 Err(e) => {
                     tracing::warn!(error = %e, ?shaders, "host mesh pipeline refused");
@@ -881,6 +991,7 @@ impl HostPipeline {
                 structured_strides: structured_strides.to_vec(),
                 name: format!("{shaders:?}"),
                 rects: false,
+                amplify,
                 slots: 0,
                 inputs: Vec::new(),
                 fallback: None,
@@ -1031,6 +1142,7 @@ impl HostPipeline {
             structured_strides: structured_strides.to_vec(),
             name: format!("{shaders:?}"),
             rects: rect_gs.is_some(),
+            amplify: None,
             slots: g.slots(),
             inputs: g.elements(),
             fallback: None,
@@ -1105,6 +1217,7 @@ impl HostPipeline {
             &mut params,
             &mut ranges,
             &mut samplers,
+            aniso_point_mip_supported(&host.device),
         )?;
         let uav = params.len() as u32;
         params.push(mesh_buffer_parameter(
@@ -1167,6 +1280,7 @@ impl HostPipeline {
                 &mut params,
                 &mut ranges,
                 &mut samplers,
+                aniso_point_mip_supported(&host.device),
             )?);
         }
         let srv = params.len() as u32;
@@ -1246,6 +1360,7 @@ impl HostPipeline {
             structured_strides: structured_strides.to_vec(),
             name: format!("{shaders:?}"),
             rects: false,
+            amplify: None,
             slots: 0,
             inputs: Vec::new(),
             fallback: Some(MeshFallbackPipeline {
@@ -1276,6 +1391,7 @@ impl HostPipeline {
 fn mesh_pipeline(
     device: &ID3D12Device,
     root: &ID3D12RootSignature,
+    amplification: Option<D3D12_SHADER_BYTECODE>,
     ms: D3D12_SHADER_BYTECODE,
     ps: D3D12_SHADER_BYTECODE,
     g: &GraphicsState,
@@ -1288,6 +1404,7 @@ fn mesh_pipeline(
     #[repr(C)]
     struct Stream {
         root: Sub<*mut std::ffi::c_void>,
+        amplification: Sub<D3D12_SHADER_BYTECODE>,
         ms: Sub<D3D12_SHADER_BYTECODE>,
         ps: Sub<D3D12_SHADER_BYTECODE>,
         blend: Sub<D3D12_BLEND_DESC>,
@@ -1303,6 +1420,11 @@ fn mesh_pipeline(
         root: Sub(
             D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE,
             root.as_raw(),
+        ),
+        // (No code: no such stage.)
+        amplification: Sub(
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS,
+            amplification.unwrap_or_default(),
         ),
         ms: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms),
         ps: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps),
@@ -1342,6 +1464,84 @@ fn mesh_pipeline(
         // SAFETY: as above.
         || unsafe { device.CreatePipelineState(&desc) },
     )
+}
+
+/// The register space of our amplification stage's buffer and constant.
+const AMPLIFY_SPACE: u32 = 31245;
+
+/// On by default (`VICTORY_INDIRECT_AMPLIFY=0` disables): the amplification
+/// stage that stands for `ExecuteIndirect` on one-record indirect mesh draws.
+/// It reads the record (three group counts) from the title's argument buffer
+/// at the byte offset a root constant gives, bounds it as the argument
+/// clamp does (65,535 groups by 1 by 1) and dispatches the mesh shader
+/// that many times. The draw is then a direct `DispatchMesh(1, 1, 1)`:
+/// no clamp pass and no `ExecuteIndirect`, and the card reads the record
+/// when it runs the draw, whoever wrote it.
+///
+/// Compiled once with the PC `dxc.exe` (`VICTORY_PC_DXC`, else the newest
+/// Windows SDK's); `None` when disabled or without a compiler.
+pub(crate) fn amplifier() -> Option<&'static [u8]> {
+    const SOURCE: &str = "struct Nothing { uint none; };
+RWByteAddressBuffer records : register(u0, space31245);
+cbuffer Record : register(b0, space31245) { uint at; };
+[numthreads(1, 1, 1)]
+void main() {
+    Nothing nothing;
+    nothing.none = 0;
+    uint3 g = records.Load3(at);
+    g = uint3(min(g.x, 65535u), min(g.y, 1u), min(g.z, 1u));
+    DispatchMesh(g.x, g.y, g.z, nothing);
+}
+";
+    static CODE: std::sync::OnceLock<Option<Vec<u8>>> = std::sync::OnceLock::new();
+    CODE.get_or_init(|| {
+        if !victory_shader::emit::indirect_amplify_enabled() {
+            return None;
+        }
+        let dxc = match std::env::var_os("VICTORY_PC_DXC") {
+            Some(p) => std::path::PathBuf::from(p),
+            None => victory_shader::emit::validator::Validator::default_path()?
+                .with_file_name("dxc.exe"),
+        };
+        let dir = std::env::temp_dir();
+        let (hlsl, out) = (
+            dir.join(format!("victory-amplify-{}.hlsl", std::process::id())),
+            dir.join(format!("victory-amplify-{}.dxil", std::process::id())),
+        );
+        std::fs::write(&hlsl, SOURCE).ok()?;
+        let ran = std::process::Command::new(&dxc)
+            .args(["-nologo", "-T", "as_6_5", "-E", "main", "-Fo"])
+            .arg(&out)
+            .arg(&hlsl)
+            .output();
+        let code = match ran {
+            Ok(o) if o.status.success() => std::fs::read(&out).ok(),
+            Ok(o) => {
+                tracing::warn!(
+                    "VICTORY_INDIRECT_AMPLIFY: dxc failed: {}",
+                    String::from_utf8_lossy(&o.stderr)
+                );
+                None
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    dxc = %dxc.display(),
+                    "VICTORY_INDIRECT_AMPLIFY: no dxc"
+                );
+                None
+            }
+        };
+        let _ = (std::fs::remove_file(&hlsl), std::fs::remove_file(&out));
+        if let Some(code) = &code {
+            tracing::info!(
+                bytes = code.len(),
+                "the amplification stage for one-record indirect mesh draws is compiled (VICTORY_INDIRECT_AMPLIFY=0 disables)"
+            );
+        }
+        code
+    })
+    .as_deref()
 }
 
 /// The bytes of shader code (none for an absent stage).
@@ -1418,6 +1618,65 @@ mod tests {
 
     use super::*;
 
+    fn element(format: DXGI_FORMAT, offset: u32) -> D3D12_INPUT_ELEMENT_DESC {
+        D3D12_INPUT_ELEMENT_DESC {
+            SemanticName: PCSTR(c"TEXCOORD".as_ptr().cast()),
+            SemanticIndex: 0,
+            Format: format,
+            InputSlot: 0,
+            AlignedByteOffset: offset,
+            InputSlotClass: D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,
+            InstanceDataStepRate: 0,
+        }
+    }
+
+    fn offsets(inputs: &[D3D12_INPUT_ELEMENT_DESC]) -> Vec<u32> {
+        let state = GraphicsState {
+            inputs: inputs.to_vec(),
+            ..GraphicsState::default()
+        };
+        state.elements().iter().map(|e| e.offset).collect()
+    }
+
+    /// An appended element after one of 1 or 2 bytes started right after
+    /// it; D3D12 aligns it to min(4, its size), so the rectangle expansion
+    /// read its vertices from the wrong bytes.
+    #[test]
+    fn appended_elements_are_aligned() {
+        const APPEND: u32 = D3D12_APPEND_ALIGNED_ELEMENT;
+        // RG8 (2 bytes) then RG32 float: 4, not 2.
+        let a = [
+            element(DXGI_FORMAT_R8G8_UNORM, 0),
+            element(DXGI_FORMAT_R32G32_FLOAT, APPEND),
+        ];
+        assert_eq!(offsets(&a), [0, 4]);
+        // R8 then R16 float: 2, not 1; then R8 packs right after it.
+        let b = [
+            element(DXGI_FORMAT_R8_UNORM, 0),
+            element(DXGI_FORMAT_R16_FLOAT, APPEND),
+            element(DXGI_FORMAT_R8_UNORM, APPEND),
+        ];
+        assert_eq!(offsets(&b), [0, 2, 4]);
+        // Already aligned layouts are unchanged.
+        let c = [
+            element(DXGI_FORMAT_R8G8B8A8_UNORM, 0),
+            element(DXGI_FORMAT_R32G32_FLOAT, APPEND),
+            element(DXGI_FORMAT_R32G32B32_FLOAT, APPEND),
+        ];
+        assert_eq!(offsets(&c), [0, 4, 12]);
+    }
+
+    /// An explicit offset near 4 GiB overflowed the next appended offset
+    /// (a panic in debug builds).
+    #[test]
+    fn a_huge_explicit_offset_does_not_overflow() {
+        let inputs = [
+            element(DXGI_FORMAT_R32G32B32A32_FLOAT, u32::MAX - 8),
+            element(DXGI_FORMAT_R32_FLOAT, D3D12_APPEND_ALIGNED_ELEMENT),
+        ];
+        let _ = offsets(&inputs);
+    }
+
     /// A triangle mesh shader of our own and a pixel shader for it.
     const MS: &str = "struct V { float4 p : SV_Position; };
         [outputtopology(\"triangle\")] [numthreads(1, 1, 1)]
@@ -1482,9 +1741,10 @@ mod tests {
         g.targets.NumRenderTargets = 1;
         g.targets.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
         let name = super::super::library::name("mesh test", &root_blob, &[&ms, &ps], &g.describe());
-        mesh_pipeline(&host.device, &root, code(&ms), code(&ps), &g, &name).expect("made");
+        mesh_pipeline(&host.device, &root, None, code(&ms), code(&ps), &g, &name).expect("made");
         let loaded = super::super::library::LOADED.load(Ordering::Relaxed);
-        mesh_pipeline(&host.device, &root, code(&ms), code(&ps), &g, &name).expect("made again");
+        mesh_pipeline(&host.device, &root, None, code(&ms), code(&ps), &g, &name)
+            .expect("made again");
         assert!(
             super::super::library::LOADED.load(Ordering::Relaxed) > loaded,
             "the mesh pipeline was compiled again instead of loaded from the library"
@@ -1572,5 +1832,24 @@ mod tests {
         let mut t = targets(&[DXGI_FORMAT_R8G8B8A8_UNORM]);
         t.RTFormats[1] = DXGI_FORMAT_R8_UINT;
         assert_eq!(host_blend(&blending(false), &t), blending(false));
+    }
+
+    #[test]
+    fn indirect_amplify_defaults_on_and_disables_with_zero() {
+        use std::ffi::OsStr;
+        use victory_shader::emit::parse_indirect_amplify;
+
+        assert!(parse_indirect_amplify(None));
+        assert!(parse_indirect_amplify(Some(OsStr::new("1"))));
+        assert!(parse_indirect_amplify(Some(OsStr::new("true"))));
+        assert!(parse_indirect_amplify(Some(OsStr::new("on"))));
+        assert!(parse_indirect_amplify(Some(OsStr::new(""))));
+
+        assert!(!parse_indirect_amplify(Some(OsStr::new("0"))));
+        assert!(!parse_indirect_amplify(Some(OsStr::new(" 0 "))));
+        assert!(!parse_indirect_amplify(Some(OsStr::new("false"))));
+        assert!(!parse_indirect_amplify(Some(OsStr::new("FALSE"))));
+        assert!(!parse_indirect_amplify(Some(OsStr::new("no"))));
+        assert!(!parse_indirect_amplify(Some(OsStr::new("off"))));
     }
 }

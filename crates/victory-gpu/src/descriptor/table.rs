@@ -100,7 +100,7 @@ impl BufferTable {
         // SAFETY: the mapping covers `bytes`.
         unsafe { std::ptr::write_bytes(data, 0, bytes as usize) };
         let slot = heap.dynamic(1)?;
-        heap.raw_at(slot, &buffer, 0, bytes);
+        heap.raw_resource_at(slot, &buffer, 0, bytes);
         Some(Self {
             buffer,
             data: data as usize,
@@ -135,7 +135,7 @@ impl BufferTable {
             return Some((slot, w.bias));
         }
         let slot = heap.dynamic(1)?;
-        heap.raw_at(slot, &shadow.buffer, w.start, w.len);
+        heap.raw_at(slot, shadow, w.start, w.len);
         self.aliases.insert(key, (slot, shadow.clone()));
         Some((slot, w.bias))
     }

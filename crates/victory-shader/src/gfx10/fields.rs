@@ -311,7 +311,12 @@ impl Instruction {
                             | "ds_gws_sema_release_all"
                     ) {
                     0
-                } else if pair || name.contains("cmpst") || name.contains("mskor") {
+                } else if pair
+                    || name.contains("cmpst")
+                    || name.contains("mskor")
+                    || name == "ds_wrap_rtn_b32"
+                {
+                    // ds_wrap_rtn_b32: DATA0 is subtracted, DATA1 added.
                     2
                 } else {
                     1
@@ -353,12 +358,15 @@ impl Instruction {
                     bit(w1, 31),
                 );
                 let (r128, tfe, lwe) = (bit(w0, 15), bit(w0, 16), bit(w0, 17));
-                let mut data = if name.starts_with("image_gather4") {
+                // A ray query always returns four dwords and reads a four-dword
+                // descriptor, whatever its `dmask` and `r128` bits say.
+                let bvh = name.starts_with("image_bvh");
+                let mut data = if name.starts_with("image_gather4") || bvh {
                     4
                 } else {
                     dmask.count_ones().max(1) as u8
                 };
-                if d16 {
+                if d16 && !bvh {
                     data = data.div_ceil(2);
                 }
                 let count = image_addr_dwords(name, dim, a16);
@@ -380,7 +388,10 @@ impl Instruction {
                 Fields::Image {
                     data: vector(w1 >> 8 & 0xFF, data + u8::from(tfe || lwe)),
                     addr,
-                    rsrc: scalar(((w1 >> 16 & 0x1F) << 2) as u8, if r128 { 4 } else { 8 }),
+                    rsrc: scalar(
+                        ((w1 >> 16 & 0x1F) << 2) as u8,
+                        if r128 || bvh { 4 } else { 8 },
+                    ),
                     sampler: sampled.then(|| scalar(((w1 >> 21 & 0x1F) << 2) as u8, 4)),
                     dmask,
                     dim,
@@ -399,6 +410,8 @@ impl Instruction {
                 let n = data_dwords(name);
                 let (load, atomic) = (name.contains("_load_"), name.contains("_atomic_"));
                 let addr = match self.encoding {
+                    // The address is the SGPR base plus the lane's id: no VGPR.
+                    _ if name.contains("addtid") => None,
                     Encoding::Flat => Some(vector(w1 & 0xFF, 2)),
                     Encoding::Global => Some(vector(w1 & 0xFF, 1 + u8::from(saddr == NULL))),
                     // With an SGPR base, scratch takes no VGPR.
@@ -577,6 +590,10 @@ impl Instruction {
                                 chan: (code >> 6 & 3) as u8,
                                 high: code >> 8 & 1 == 1,
                             }
+                        } else if i == 1 && name == "v_interp_mov_f32" {
+                            // The parameter (0 `p10`, 1 `p20`, 2 `p0`), as in
+                            // the VINTRP form.
+                            Operand::Const(u8::try_from(code).unwrap_or(u8::MAX))
                         } else if i == 2 && carry_in {
                             source(code, lanes, w(2))
                         } else {
@@ -646,6 +663,9 @@ const VOP3_TWO_SOURCES: &[&str] = &[
     "v_cvt_pknorm_u16_f16",
     "v_lshlrev_b16",
     "v_interp_p1ll_f16",
+    "v_interp_p1_f32",
+    "v_interp_p2_f32",
+    "v_interp_mov_f32",
     "v_readlane_b32",
     "v_writelane_b32",
     "v_ldexp_f32",

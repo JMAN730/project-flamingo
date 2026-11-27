@@ -310,10 +310,7 @@ extern "system" fn check_feature_support(
         FORMAT_SUPPORT => {
             // SAFETY: checked size and non-null.
             let q = unsafe { &mut *data.cast::<[u32; 3]>() };
-            // shortcut: every use of every format; answer from the host
-            // device once there is one.
-            q[1] = 0x7fff_ffff;
-            q[2] = 0xffff;
+            (q[1], q[2]) = format_support(q[0]);
             S_OK
         }
         MULTISAMPLE => {
@@ -347,6 +344,24 @@ extern "system" fn check_feature_support(
 /// The planes of the depth/stencil format families; everything else has
 /// one. These are the DXGI format numbers, including the typeless and
 /// read-only views of the same two planes.
+/// `D3D12_FORMAT_SUPPORT1` and `2` for a DXGI format. Block-compressed
+/// formats (BC1-BC7) are sampled only: no render target, blending, depth,
+/// UAV or buffer use, as D3D12 reports them (`0x0090_13E0`, and only
+/// `TILED` of the second set).
+// shortcut: every other format claims every use; answer from the host
+// device once there is one.
+fn format_support(format: u32) -> (u32, u32) {
+    const TEXTURE: u32 = 0x20 | 0x40 | 0x80; // 2D, 3D, cube
+    const SAMPLED: u32 = 0x100 | 0x200 | 0x1000 | 0x0080_0000; // load, sample, mip, gather
+    const CAST_WITHIN_BIT_LAYOUT: u32 = 0x0010_0000;
+    if matches!(format, 70..=84 | 94..=99) {
+        const TILED: u32 = 0x200;
+        (TEXTURE | SAMPLED | CAST_WITHIN_BIT_LAYOUT, TILED)
+    } else {
+        (0x7fff_ffff, 0xffff)
+    }
+}
+
 fn plane_count(format: u32) -> u32 {
     1 + u32::from(matches!(format, 19..=22 | 44..=47))
 }
@@ -371,6 +386,18 @@ fn feature_levels(data: *mut c_void) -> HRESULT {
         }
         None => UNSUPPORTED,
     }
+}
+
+/// The host device's state: the console's device is removed when the host's is.
+extern "system" fn removed_reason(_: This) -> HRESULT {
+    #[cfg(windows)]
+    if let Some(host) = crate::host::host() {
+        // SAFETY: a plain query.
+        if let Err(e) = unsafe { host.device.GetDeviceRemovedReason() } {
+            return e.code().0;
+        }
+    }
+    S_OK
 }
 
 /// IUnknown 3, object methods 4, device methods 76 (0x18-0x290), then the
@@ -405,12 +432,14 @@ static FUNCTIONS: Table<160> = {
     f[28] = resource::create_heap as *const (); // 0xe0
     f[29] = resource::create_placed as *const (); // 0xe8
     f[36] = fence::create as *const (); // 0x120
+    f[37] = removed_reason as *const (); // 0x128
     f[38] = resource::copyable_footprints as *const (); // 0x130
     f[39] = query::create as *const (); // 0x138
     f[41] = signature::create as *const (); // 0x148
     f[48] = queue::create_x as *const (); // 0x180
     f[61] = descriptor::create_sampler_x as *const (); // 0x1e8
     f[62] = pipeline::create_compute_x as *const (); // 0x1f0
+    f[67] = pipeline::deserialize_compute_x as *const (); // 0x218
     f[69] = object::ignore as *const (); // 0x228 debug error filter
     f[70] = descriptor::create_placed_srv as *const (); // 0x230
     f[71] = descriptor::create_placed_uav as *const (); // 0x238
@@ -458,12 +487,10 @@ mod tests {
         );
         let missing = slot::<extern "system" fn() -> HRESULT>(device, 0xf0);
         assert_eq!(missing(), E_NOTIMPL);
-        // Not written yet, so they fail: the title takes S_OK from them as success, goes on
-        // to use what they should have produced and faults in its own code.
+        // Not written yet, so it fails: the title takes S_OK from it as success, goes on
+        // to use what it should have produced and faults in its own code.
         let s1c8 = slot::<extern "system" fn() -> HRESULT>(device, 0x1c8);
         assert_eq!(s1c8(), E_NOTIMPL);
-        let s218 = slot::<extern "system" fn() -> HRESULT>(device, 0x218);
-        assert_eq!(s218(), E_NOTIMPL);
     }
 
     #[test]
@@ -581,6 +608,30 @@ mod tests {
     }
 
     #[test]
+    fn block_compressed_formats_are_not_render_targets() {
+        type Check = extern "system" fn(This, u32, *mut c_void, u32) -> HRESULT;
+        let check = slot::<Check>(device(), 0x68);
+        let query = |format: u32| {
+            let mut support = [format, 0, 0];
+            assert_eq!(check(device(), 3, (&raw mut support).cast(), 12), S_OK);
+            assert_eq!(support[0], format, "the format is left as given");
+            (support[1], support[2])
+        };
+        const RENDER_TARGET: u32 = 0x4000;
+        const SHADER_SAMPLE: u32 = 0x200;
+        for bc in [71, 74, 77, 80, 83, 95, 98] {
+            let (one, two) = query(bc);
+            assert_eq!(one & RENDER_TARGET, 0, "format {bc}");
+            assert_ne!(one & SHADER_SAMPLE, 0, "format {bc}");
+            assert_eq!(two & 0xFF, 0, "format {bc}: no UAV use");
+            assert_ne!(two & 0x200, 0, "format {bc}: tiled");
+        }
+        assert_ne!(query(28).0 & RENDER_TARGET, 0, "R8G8B8A8_UNORM");
+        let mut short = [71u32, 0];
+        assert_eq!(check(device(), 3, (&raw mut short).cast(), 8), E_INVALIDARG);
+    }
+
+    #[test]
     fn virtual_address_support_matches_the_reported_address_space() {
         type Check = extern "system" fn(This, u32, *mut c_void, u32) -> HRESULT;
         let check = slot::<Check>(device(), 0x68);
@@ -589,5 +640,12 @@ mod tests {
         assert_eq!(info[0], OPTIONS[9], "resource bits agree with OPTIONS");
         assert_eq!(info[1], 48);
         assert_eq!(check(device(), 6, (&raw mut info).cast(), 4), E_INVALIDARG);
+    }
+
+    #[test]
+    fn a_healthy_device_reports_no_removal() {
+        let device = device();
+        let reason = slot::<extern "system" fn(This) -> HRESULT>(device, 0x128);
+        assert_eq!(reason(device), S_OK);
     }
 }

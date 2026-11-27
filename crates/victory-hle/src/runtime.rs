@@ -120,6 +120,32 @@ impl Title {
     }
 }
 
+/// The trimmed text of one element: comments inside it are skipped, not
+/// treated as the end of its value. A manifest generator can write
+/// `<TitleId><!-- generated -->639AA8DD</TitleId>`, which must still give
+/// the title's id rather than an empty field.
+fn field_text(rest: &str) -> String {
+    let mut out = String::new();
+    let mut rest = rest;
+    loop {
+        let Some(open) = rest.find('<') else {
+            out.push_str(rest);
+            break;
+        };
+        out.push_str(&rest[..open]);
+        if rest[open..].starts_with("<!--") {
+            let Some(end) = rest[open..].find("-->") else {
+                break;
+            };
+            rest = &rest[open + end + 3..];
+        } else {
+            // A child element, a closing tag or anything else ends the text.
+            break;
+        }
+    }
+    out.trim().to_owned()
+}
+
 /// Each element of an XML text as its path from the root (`Game/TitleId`)
 /// and its trimmed text up to the first child, the predefined entities
 /// decoded (a self-closing element has an empty body); comments, CDATA
@@ -157,9 +183,9 @@ fn elements(text: &str) -> Vec<(String, String)> {
             .unwrap_or("");
         path.push(name);
         let body = if closed {
-            ""
+            String::new()
         } else {
-            rest[..rest.find('<').unwrap_or(rest.len())].trim()
+            field_text(rest)
         };
         let body = [
             ("&lt;", "<"),
@@ -169,7 +195,7 @@ fn elements(text: &str) -> Vec<(String, String)> {
             ("&amp;", "&"),
         ]
         .iter()
-        .fold(body.to_owned(), |b, (entity, c)| b.replace(entity, c));
+        .fold(body, |b, (entity, c)| b.replace(entity, c));
         out.push((path.join("/"), body));
         if closed {
             path.pop();
@@ -228,12 +254,22 @@ pub fn use_console_timers() {
     use windows_sys::Win32::Media::timeBeginPeriod;
     use windows_sys::Win32::System::Threading::{
         GetCurrentProcess, PROCESS_POWER_THROTTLING_CURRENT_VERSION,
-        PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION, PROCESS_POWER_THROTTLING_STATE,
-        ProcessPowerThrottling, SetProcessInformation,
+        PROCESS_POWER_THROTTLING_EXECUTION_SPEED, PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION,
+        PROCESS_POWER_THROTTLING_STATE, ProcessPowerThrottling, SetProcessInformation,
+    };
+    // Also: the system does not run this process at reduced speed (its
+    // "efficiency mode": lower clock, the slow cores of a hybrid processor)
+    // when its window is not the one in front, as while its owner works in
+    // another window or streams. The console has eight cores alike and no
+    // such mode. `VICTORY_EFFICIENCY_MODE=1` leaves the system its choice.
+    let execution = if std::env::var_os("VICTORY_EFFICIENCY_MODE").is_some_and(|v| v == "1") {
+        0
+    } else {
+        PROCESS_POWER_THROTTLING_EXECUTION_SPEED
     };
     let keep = PROCESS_POWER_THROTTLING_STATE {
         Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
-        ControlMask: PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION,
+        ControlMask: PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION | execution,
         StateMask: 0,
     };
     // SAFETY: plain process settings; `keep` outlives the call.
@@ -246,6 +282,28 @@ pub fn use_console_timers() {
         );
         timeBeginPeriod(1);
     }
+    ahead_of_other_programs();
+}
+
+/// The title's streaming thread runs below normal priority (on the console
+/// nobody else wants its core) and does all of the title's loading: a
+/// program that keeps the processors busy at normal priority (a build, a
+/// virus scan) can starve it. The process runs above normal while active.
+/// `VICTORY_PROCESS_PRIORITY=normal` (or `0`): leave priority as started.
+#[cfg(windows)]
+fn ahead_of_other_programs() {
+    use windows_sys::Win32::System::Threading::{
+        ABOVE_NORMAL_PRIORITY_CLASS, GetCurrentProcess, SetPriorityClass,
+    };
+    if std::env::var_os("VICTORY_PROCESS_PRIORITY").is_some_and(|v| v == "normal" || v == "0") {
+        return;
+    }
+    // SAFETY: a plain process setting.
+    let set = unsafe { SetPriorityClass(GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS) } != 0;
+    tracing::info!(
+        set,
+        "the process runs above normal priority (VICTORY_PROCESS_PRIORITY=normal: not)"
+    );
 }
 
 #[cfg(test)]
@@ -312,5 +370,18 @@ mod tests {
             max_mb + 1
         );
         assert_eq!(Title::from_manifest(&above_limit).storage_bytes, u64::MAX);
+    }
+
+    #[test]
+    fn inline_comments_do_not_truncate_a_field() {
+        let text = "<Game>\
+            <TitleId><!-- generated -->639AA8DD</TitleId>\
+            <StoreId>9&amp;<!-- keep -->C</StoreId>\
+            <PersistentLocalStorage><SizeMB><!-- n -->1024</SizeMB></PersistentLocalStorage>\
+            </Game>";
+        let t = Title::from_manifest(text);
+        assert_eq!(t.id, 0x639A_A8DD);
+        assert_eq!(t.store_id, "9&C");
+        assert_eq!(t.storage_bytes, 1024 << 20);
     }
 }
