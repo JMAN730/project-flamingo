@@ -246,6 +246,10 @@ thread_local! {
     /// thread ([`with_wave_wide_only`]).
     static ONLY_HERE: std::cell::RefCell<Option<Vec<String>>> =
         const { std::cell::RefCell::new(None) };
+    /// Hashes standing in for the built-in allowlist on this thread
+    /// ([`with_wave_wide_allowlist`]).
+    static ALLOW_HERE: std::cell::RefCell<Option<Vec<String>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 fn parse_wave_wide_only(value: Option<&str>) -> Vec<String> {
@@ -308,6 +312,19 @@ pub fn with_wave_wide_only<T>(value: Option<&str>, f: impl FnOnce() -> T) -> T {
     r
 }
 
+/// Runs `f` on this thread with `hashes` (16-hex-digit container prefixes)
+/// in place of the built-in allowlist of [`WAVE_WIDE_ALLOWLIST`], which only
+/// the title's containers match: how a test of a caller (`victory
+/// translate`) sees that list choose the lowering by container hash. The
+/// disk cache key ([`wave_wide_cache_key`]) follows it.
+pub fn with_wave_wide_allowlist<T>(hashes: &[&str], f: impl FnOnce() -> T) -> T {
+    let list = hashes.iter().map(|h| h.to_ascii_lowercase()).collect();
+    let before = ALLOW_HERE.replace(Some(list));
+    let r = f();
+    ALLOW_HERE.set(before);
+    r
+}
+
 /// Runs `f` (a translation on this thread) with Wave32 console-flow lowering
 /// enabled when `on` (unless opted out via `VICTORY_WAVE_WIDE=0`).
 pub fn with_wave_wide<T>(on: bool, f: impl FnOnce() -> T) -> T {
@@ -331,6 +348,12 @@ pub fn wave_wide_cache_key() -> Vec<u8> {
         for prefix in only {
             out.extend_from_slice(prefix.as_bytes());
             out.push(b',');
+        }
+    });
+    ALLOW_HERE.with_borrow(|here| {
+        for hash in here.iter().flatten() {
+            out.push(b'+');
+            out.extend_from_slice(hash.as_bytes());
         }
     });
     out
@@ -358,9 +381,14 @@ fn wide_lowering_enabled(
     if wide_here {
         return true;
     }
-    WAVE_WIDE_ALLOWLIST
-        .iter()
-        .any(|&allowed| hash.eq_ignore_ascii_case(allowed))
+    ALLOW_HERE.with_borrow(|here| match here {
+        Some(list) => list
+            .iter()
+            .any(|allowed| hash.eq_ignore_ascii_case(allowed)),
+        None => WAVE_WIDE_ALLOWLIST
+            .iter()
+            .any(|&allowed| hash.eq_ignore_ascii_case(allowed)),
+    })
 }
 
 fn console_flow_for_hash(hash: &str) -> bool {

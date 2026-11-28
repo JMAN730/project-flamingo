@@ -1657,13 +1657,9 @@ mod tests {
         (at(20), at(24))
     }
 
-    /// Two containers sharing their program part lower differently when
-    /// `VICTORY_WAVE_WIDE_ONLY` names only one of them: the tool hands the
-    /// lowering each container's own digest. Were containers told apart by
-    /// their program part, the second would be a duplicate (or lower as the
-    /// first does).
-    #[test]
-    fn the_lowering_is_chosen_by_each_containers_own_hash() {
+    /// Two containers that share their program part (and differ in a `STAT`
+    /// part), and the 16-digit hash prefix of the first.
+    fn two_containers_sharing_a_program() -> (Vec<u8>, Vec<u8>, String) {
         let (a, b) = (wave64_compute_container(1), wave64_compute_container(2));
         let program = |bytes| {
             Container::parse(bytes)
@@ -1674,8 +1670,13 @@ mod tests {
                 .to_vec()
         };
         assert_eq!(program(&a), program(&b));
-        let prefix = &blake3::hash(&a).to_hex()[..16];
+        let prefix = blake3::hash(&a).to_hex()[..16].to_owned();
+        (a, b, prefix)
+    }
 
+    /// `a` then `b` through [`translate`]: both are tallied and emitted, and
+    /// the wave sizes each declares come back in that order.
+    fn wave_sizes_of(a: &[u8], b: &[u8]) -> Vec<(u32, u32)> {
         let seen = Mutex::new(HashSet::new());
         let mut t = Tally::default();
         let kept = Kept::default();
@@ -1683,20 +1684,47 @@ mod tests {
             keep: Some(kept.clone()),
             ..no_checks()
         };
-        emit::with_wave_wide_only(Some(prefix), || {
-            for (offset, data) in [(0, &a), (0x100, &b)] {
-                let source = Source::Raw { offset, data };
-                translate(&source, Path::new("synth.bin"), &seen, &mut t, &mut checks);
-            }
-        });
+        for (offset, data) in [(0, a), (0x100, b)] {
+            let source = Source::Raw { offset, data };
+            translate(&source, Path::new("synth.bin"), &seen, &mut t, &mut checks);
+        }
         assert_eq!((t.containers, t.duplicates), (2, 0));
         assert_eq!(t.cs_emitted, 2, "{:#?}", t.failure_lines());
         let kept = lock(&kept);
-        let sizes: Vec<_> = kept.iter().map(|(_, s)| wave_sizes(s)).collect();
-        // The named container lowers with Wave32 console flow; the other
-        // as for a 64-lane host, which declares no wave size.
         let labels: Vec<_> = kept.iter().map(|k| &k.0).collect();
-        assert_eq!(sizes, [(32, 32), (0, u32::MAX)], "{labels:?}");
+        assert_eq!(labels, ["synth.bin@0x0 Cs", "synth.bin@0x100 Cs"]);
+        kept.iter().map(|(_, s)| wave_sizes(s)).collect()
+    }
+
+    /// The named container lowers with Wave32 console flow; the other as for
+    /// a 64-lane host, which declares no wave size.
+    const ONLY_THE_FIRST_WIDE: [(u32, u32); 2] = [(32, 32), (0, u32::MAX)];
+
+    /// Two containers sharing their program part lower differently when
+    /// `VICTORY_WAVE_WIDE_ONLY` names only one of them: the tool hands the
+    /// lowering each container's own digest. Were containers told apart by
+    /// their program part, the second would be a duplicate (or lower as the
+    /// first does).
+    #[test]
+    fn the_lowering_is_chosen_by_each_containers_own_hash() {
+        let (a, b, prefix) = two_containers_sharing_a_program();
+        let sizes = emit::with_wave_wide_only(Some(&prefix), || wave_sizes_of(&a, &b));
+        assert_eq!(sizes, ONLY_THE_FIRST_WIDE);
+    }
+
+    /// As [`the_lowering_is_chosen_by_each_containers_own_hash`], with
+    /// `VICTORY_WAVE_WIDE_ONLY` unset and the built-in allowlist naming the
+    /// first container (it names only the title's, so the test sets it).
+    #[test]
+    fn the_built_in_allowlist_chooses_by_each_containers_own_hash() {
+        let (a, b, prefix) = two_containers_sharing_a_program();
+        let sizes = emit::with_wave_wide_only(None, || {
+            emit::with_wave_wide_allowlist(&[&prefix], || wave_sizes_of(&a, &b))
+        });
+        assert_eq!(sizes, ONLY_THE_FIRST_WIDE);
+        // Without it, neither is on the list.
+        let sizes = emit::with_wave_wide_only(None, || wave_sizes_of(&a, &b));
+        assert_eq!(sizes, [(0, u32::MAX); 2]);
     }
 
     /// A pixel shader as the emitter hands it over, whose feature flags
