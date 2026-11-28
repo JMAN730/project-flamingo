@@ -212,16 +212,71 @@ pub fn report_crashes() {
 mod overflow {
     use super::{CONTEXT, EXCEPTION_POINTERS};
     use std::cell::UnsafeCell;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+    use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
     use windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_RECORD;
 
-    /// The exception handed over: written by the one thread that holds
-    /// [`BUSY`], read by the reporting thread between the two events.
+    /// The exception handed over: written by the one thread that moved
+    /// [`STATE`] from [`IDLE`] to [`CLAIMED`], read by the reporting thread
+    /// until it leaves [`CLAIMED`]/[`ABANDONED`].
     struct Handed(UnsafeCell<Option<(EXCEPTION_RECORD, super::Aligned16)>>);
-    // SAFETY: access is serialised by `BUSY` and the two events.
+    // SAFETY: access is serialised by `STATE`: only the claiming thread
+    // writes it (before setting `ASKED`), only the reporting thread reads
+    // it (between `ASKED` and the state leaving `CLAIMED`/`ABANDONED`),
+    // and nobody can claim again until the reporting thread is done.
     unsafe impl Sync for Handed {}
     static HANDED: Handed = Handed(UnsafeCell::new(None));
-    static BUSY: AtomicBool = AtomicBool::new(false);
+
+    /// Who owns the handoff. A thread that overflowed claims it; the
+    /// reporting thread hands it back once its report is written, also when
+    /// the thread that asked stopped waiting, so [`HANDED`] is never written
+    /// while it is being reported and a late `WRITTEN` never releases a
+    /// later caller.
+    static STATE: AtomicU8 = AtomicU8::new(IDLE);
+    /// Free to claim.
+    const IDLE: u8 = 0;
+    /// Claimed; the claiming thread waits for `WRITTEN`.
+    const CLAIMED: u8 = 1;
+    /// Report written; `WRITTEN` is (about to be) set for the claimer,
+    /// which returns the state to [`IDLE`] once it has consumed it.
+    const DONE: u8 = 2;
+    /// The claimer stopped waiting; the reporting thread returns the state
+    /// to [`IDLE`] when done, without setting `WRITTEN`.
+    const ABANDONED: u8 = 3;
+
+    /// The overflowed thread takes the handoff: true if it was free.
+    fn claim(state: &AtomicU8) -> bool {
+        state
+            .compare_exchange(IDLE, CLAIMED, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    /// The reporting thread is done with [`HANDED`]: true if the claimer
+    /// is still waiting and must be sent `WRITTEN`.
+    fn finish(state: &AtomicU8) -> bool {
+        match state.compare_exchange(CLAIMED, DONE, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => true,
+            Err(_) => {
+                // Abandoned: nobody waits, so the handoff is free again.
+                state.store(IDLE, Ordering::Release);
+                false
+            }
+        }
+    }
+
+    /// The claimer's wait timed out: true if it may leave now (the
+    /// reporting thread will free the handoff); false if the report was
+    /// finished in the meantime and `WRITTEN` must still be consumed.
+    fn give_up(state: &AtomicU8) -> bool {
+        state
+            .compare_exchange(CLAIMED, ABANDONED, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    /// The claimer received `WRITTEN`: the handoff is free again.
+    fn release(state: &AtomicU8) {
+        state.store(IDLE, Ordering::Release);
+    }
     /// Event handles: one asks for a report, the other says it is written.
     static ASKED: AtomicUsize = AtomicUsize::new(0);
     static WRITTEN: AtomicUsize = AtomicUsize::new(0);
@@ -249,8 +304,9 @@ mod overflow {
                 loop {
                     // SAFETY: a live event handle.
                     unsafe { super::WaitForSingleObject(asked as _, u32::MAX) };
-                    // SAFETY: the thread that set the event wrote the
-                    // exception and waits for `written`.
+                    // SAFETY: the thread that set the event claimed `STATE`
+                    // and wrote the exception; nobody else touches it until
+                    // `finish` below.
                     if let Some((record, context)) = unsafe { &mut *HANDED.0.get() }.as_mut() {
                         let pointers = EXCEPTION_POINTERS {
                             ExceptionRecord: record,
@@ -259,8 +315,12 @@ mod overflow {
                         // SAFETY: both point at the copies above.
                         unsafe { super::report("stack overflow", &pointers, true) };
                     }
-                    // SAFETY: a live event handle.
-                    unsafe { super::SetEvent(written as _) };
+                    LIMITS[0].store(0, Ordering::Release);
+                    LIMITS[1].store(0, Ordering::Release);
+                    if finish(&STATE) {
+                        // SAFETY: a live event handle.
+                        unsafe { super::SetEvent(written as _) };
+                    }
                 }
             });
         if spawned.is_ok() {
@@ -271,7 +331,8 @@ mod overflow {
 
     /// Hands the stack overflow `info` describes to the reporting thread
     /// and waits for its report (at most 20 s). False if there is no such
-    /// thread or another overflow is being reported.
+    /// thread or another overflow is being reported (also one whose
+    /// claimer stopped waiting).
     ///
     /// # Safety
     /// `info` comes from the system, for an exception being dispatched on
@@ -281,13 +342,14 @@ mod overflow {
             ASKED.load(Ordering::Acquire),
             WRITTEN.load(Ordering::Acquire),
         );
-        if asked == 0 || BUSY.swap(true, Ordering::AcqRel) {
+        if asked == 0 || !claim(&STATE) {
             return false;
         }
         let (mut low, mut high) = (0, 0);
         // SAFETY: writes the calling thread's stack bounds; the system
-        // passes valid exception pointers; `BUSY` makes this thread the
-        // only writer of `HANDED`.
+        // passes valid exception pointers; the claim makes this thread the
+        // only writer of `HANDED`, and the reporting thread reads it only
+        // after `asked` is set below.
         unsafe {
             super::GetCurrentThreadStackLimits(&mut low, &mut high);
             let context: CONTEXT = *(*info).ContextRecord;
@@ -296,14 +358,60 @@ mod overflow {
         LIMITS[0].store(low, Ordering::Release);
         LIMITS[1].store(high, Ordering::Release);
         // SAFETY: live event handles.
-        unsafe {
+        let woken = unsafe {
             super::SetEvent(asked as _);
-            super::WaitForSingleObject(written as _, 20_000);
+            super::WaitForSingleObject(written as _, 20_000)
+        };
+        if woken == WAIT_OBJECT_0 || !give_up(&STATE) {
+            if woken != WAIT_OBJECT_0 {
+                // Finished between the timeout and `give_up`: `WRITTEN`
+                // is set right after, and must not wake a later caller.
+                // SAFETY: a live event handle.
+                unsafe { super::WaitForSingleObject(written as _, u32::MAX) };
+            }
+            release(&STATE);
         }
-        LIMITS[0].store(0, Ordering::Release);
-        LIMITS[1].store(0, Ordering::Release);
-        BUSY.store(false, Ordering::Release);
         true
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn report_in_time_frees_the_handoff() {
+            let state = AtomicU8::new(IDLE);
+            assert!(claim(&state));
+            assert!(!claim(&state), "a second overflow waits its turn");
+            assert!(finish(&state), "the waiting claimer is signalled");
+            assert!(
+                !claim(&state),
+                "free only once the claimer consumed the signal"
+            );
+            release(&state);
+            assert!(claim(&state));
+        }
+
+        #[test]
+        fn timed_out_claim_stays_taken_until_the_report_ends() {
+            let state = AtomicU8::new(IDLE);
+            assert!(claim(&state));
+            assert!(give_up(&state), "the claimer may leave");
+            assert!(!claim(&state), "storage still in use by the report");
+            assert!(!finish(&state), "nobody waits: no late signal");
+            assert!(claim(&state), "free again after the report");
+        }
+
+        #[test]
+        fn report_finishing_during_the_timeout_is_still_consumed() {
+            let state = AtomicU8::new(IDLE);
+            assert!(claim(&state));
+            assert!(finish(&state));
+            assert!(!give_up(&state), "the claimer must consume the signal");
+            assert!(!claim(&state));
+            release(&state);
+            assert!(claim(&state));
+        }
     }
 }
 

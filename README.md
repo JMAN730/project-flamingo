@@ -255,6 +255,7 @@ The on/off switches below (`...=1`) are off when unset or set to `0`.
 | `VICTORY_COPY_BACK_GPU_WINS=1` | copy-back with a submission takes every byte the GPU changed, also where the title wrote the same dword since (the rule before the three-way merge) |
 | `VICTORY_COPY_BACK_LATE_RULE=1` | the three-way merge also on the copy-back that runs after a submission (relay, card copies, lazy readback), where it is off: the title's world stops on it |
 | `VICTORY_CAPTURE=<dir>` | saves presented frames (powers of two, or `VICTORY_CAPTURE_FRAMES=<list>`) |
+| `VICTORY_CAPTURE_SECONDS=<from>-<to>` | with `VICTORY_CAPTURE`, also saves every frame presented in that span of seconds after the first presented frame |
 | `VICTORY_PLANE_STATS=1` | with `VICTORY_PRESENT_TWO_PLANES=1`, logs RGB statistics for successful two-plane presents listed in `VICTORY_CAPTURE_FRAMES` |
 | `VICTORY_DUMP_TARGETS=1` | with `VICTORY_CAPTURE` and `VICTORY_CAPTURE_FRAMES`, saves every render target of those frames |
 | `VICTORY_SHOW_TARGET=2560x1440-f28` | shows the last render target of that size and DXGI format each frame instead of the title's frame (copied 1:1 to the top left, only when its format matches the window's), e.g. the world's geometry while its lit image is black |
@@ -326,6 +327,100 @@ To compare hardware and software rendering, repeat with
 `host device on the software adapter (WARP)` to confirm the WARP device was
 created. Compare the exception's module and offset, stack frames, and
 preceding messages across the two runs.
+
+### World runs: `cargo xtask run-world`
+
+World runs share one GPU between sessions, and a run is only worth comparing
+with another when both were started the same way. One command starts them:
+
+```powershell
+cargo xtask run-world --session <name>                       # build, claim the card, run, write the manifest
+cargo xtask run-world --session <name> --capture-frames 1500-1560:20 --capture-seconds 300-330
+cargo xtask run-world --session <name> --keys 40:Enter,60:Enter,80:Enter --max-seconds 1800
+cargo xtask run-world status                                  # who holds the card
+cargo xtask run-world stop                                    # end the run that holds it
+cargo xtask run-world list                                    # runs so far: commit, build, length, exit code
+```
+
+A run:
+
+1. builds `victory.exe` (`--build diag`, the default, or `release`; `--no-build`
+   uses the one already in the target folder, `--exe <path>` another one) and
+   checks that the Agility SDK's `D3D12` folder sits beside it;
+2. claims the card by creating `C:\victory-data\card.lock` (`--lock`), which
+   holds the session name, the run id, the start time and the process ids of
+   the launcher and the title. While those processes run, another
+   `run-world` refuses to start and says who holds the card. A lock whose
+   processes are gone is stale and is cleared. Reading, clearing and writing
+   the lock happen while a second file, `card.lock.guard`, exists for a
+   moment, so two runs that start together cannot both get the card;
+3. copies the exe as `victory-<run id>.exe`, with its `D3D12` folder, to a
+   folder of its own under `victory-data\runs` in your user folder
+   (`--bin-dir`), and starts the title from `game_dir` of `victory.toml`
+   (`--config <file>` names another config; `--title-exe <name>` when the
+   folder has several executables);
+4. reads the adapter line of the title's output. If the adapter lacks shader
+   model 6.6, the title got the system's D3D12 instead of the Agility SDK:
+   the run is ended at once and the command fails;
+5. waits for the title, then writes how it ended and gives the card back. A
+   run is ended after 45 minutes unless `--max-seconds` says otherwise
+   (`0`: no limit), so a forgotten run does not hold the card.
+
+The exe copy goes to the user folder because of where Windows looks for the
+Agility SDK: run from a folder other users may write to (`C:\victory-data`
+was one), the exe did not load the `D3D12` folder beside it and ran on the
+system's D3D12, without shader model 6.6, and the title crashed a minute in.
+
+Everything a run writes goes to `C:\victory-data\runs\<run id>\` (`--runs-dir`),
+which must be outside the repository like every other output folder:
+`victory.log` (the title's output), `frames\` (captured frames),
+`crashes.log` (what the run appended to the title's `crashes.log`, if
+anything) and `manifest.json`: the commit and whether the tree had changes,
+the build, the arguments, every variable that was set, the start and end
+times, the exit code, what ended the run and where the crash report is.
+
+The defaults are the environment world runs are known to work with on an 8 GB
+card: `--console series-s`, `VICTORY_SKIP_PIPELINES=5d113aa6830760b6,caa78b8ca62bc3d6,5552dac6a2b7a1fd`,
+`VICTORY_TEXTURE_MIP_DROP=2`, `VICTORY_TEXTURE_MIP_DROP_MIN_SIZE=256`,
+`VICTORY_WAVE64_SPLIT=1` and `VICTORY_TIME_SCALE=auto`. The skip list, capture
+and scripted keys only exist in the diagnostics build, which is why `diag` is
+the default; `--build release` refuses to start while any of them is set.
+`--env NAME=VALUE` changes or adds a variable and `--env NAME=` removes a
+default. Other `VICTORY_*` variables of the calling shell are **not** passed
+on (only the path variables are), so the manifest is the whole story. A
+profile file (`--profile <file>`) holds the same settings; flags win over it:
+
+```toml
+build = "diag"
+console = "series-s"
+keys = "40:Enter,60:Enter,80:Enter"   # as VICTORY_KEYS takes them
+max_seconds = 1800
+
+[env]
+VICTORY_LOG = "victory_gpu::draw=debug,info"
+VICTORY_SKIP_PIPELINES = ""            # empty: remove the default
+
+[capture]
+frames = "1500-1560:20"                # presented frames, every 20th
+seconds = "300-330"                    # seconds after the first presented frame
+```
+
+Frames whose number is a power of two are always saved. Presented-frame
+numbers do not land on the same scene from run to run (the intro's length
+varies), so capture a range of frames or a span of seconds and pick by eye.
+
+`run-world stop` ends the title by the process id in the lock, after checking
+that the id still belongs to that run's exe. Never end a run by image name:
+other sessions run `victory.exe` tools of their own. Windows can take a
+minute to tear down an ended title; `stop` waits for it. `--dry-run` prints
+what would run without claiming the card.
+
+Anything else that uses the card (GPU tests, a script of your own) shares it
+by writing the same lock file while it runs and deleting it afterwards: JSON
+with at least `pid`, and `session` and `run_id` to say whose it is, or one
+line `<pid> <session>`. `run-world` treats such a lock as live while that
+process runs. With `--exe`, the commit in the manifest is that of the tree
+the command ran in, not necessarily the one the exe was built from.
 
 ### Reporting a GPU failure
 

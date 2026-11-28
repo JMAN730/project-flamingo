@@ -109,6 +109,10 @@ pub(crate) struct Lowered {
     /// Test builds: d16 format loads that kept the destination's high half.
     #[cfg(test)]
     pub d16_kept_high_halves: u32,
+    /// Test builds: returning LDS atomics whose old value is 0 outside the
+    /// program's LDS (split halves).
+    #[cfg(test)]
+    pub lds_atomics_zero_outside: u32,
     /// Test builds: constant byte offsets of `s_buffer_load_dword*`.
     #[cfg(test)]
     pub smem_buffer_bytes: Vec<u32>,
@@ -473,6 +477,9 @@ struct Lower<'a> {
     /// of registers the program reuses (a lane mask's dword where data is
     /// joined, a mesh program's counts of masks, a raw view's size).
     leftovers: bool,
+    /// Heap indices are being computed for a lookup in the host's buffer
+    /// view table, which lists the title's slots ([`Self::title_slot`]).
+    title_slots: bool,
     /// A console wave64 compute program run as two 32-lane host waves
     /// (each lane's reads stay in its half; see `Lower::new`), under a
     /// [`WaveMode`] other than the original. Not [`Self::split`], which
@@ -1221,6 +1228,7 @@ impl<'a> Lower<'a> {
             numeric_selects,
             second,
             leftovers,
+            title_slots: false,
             halves,
             wave_mode,
             console_cf: wave_mode == WaveMode::ConsoleFlow,
@@ -1938,6 +1946,8 @@ impl<'a> Lower<'a> {
             unaligned_typed_loads: self.s.unaligned_typed_loads,
             #[cfg(test)]
             d16_kept_high_halves: self.s.d16_kept_high_halves,
+            #[cfg(test)]
+            lds_atomics_zero_outside: self.s.lds_atomics_zero_outside,
             #[cfg(test)]
             smem_buffer_bytes: std::mem::take(&mut self.s.smem_buffer_bytes),
             #[cfg(test)]
@@ -4463,7 +4473,20 @@ impl<'a> Lower<'a> {
             Some((_, v)) => self.i32_of(v).unwrap_or(self.s.m.i32(0)),
             None => self.s.m.i32(0),
         };
-        let p = dword(self, offset);
+        let at_byte = byte_addr(self, offset);
+        // Split, an atomic outside the program's LDS works on the dword
+        // writes drop into (see `split_lds_index`); the old value it
+        // returns is the console's out-of-bounds read, 0, not that dword's.
+        let inside = match self.split.as_ref().map(|sp| sp.lds_bound) {
+            Some(bound) if dst_reg.is_some() => {
+                let (c, two) = (self.cur, self.s.m.i32(2));
+                let index = self.s.m.bin(c, Bin::LShr, at_byte, two);
+                let n = self.s.m.i32(bound);
+                Some(self.s.m.cmp(c, pred::IULT, index, n))
+            }
+            _ => None,
+        };
+        let p = dword_at(self, at_byte);
         let at = self.begin_guarded(guard);
         let r = match rmw {
             Some(op) => self.s.m.atomic(self.cur, op, p, v0),
@@ -4472,6 +4495,17 @@ impl<'a> Lower<'a> {
                 .s
                 .m
                 .cmpxchg(self.cur, p, v0, v1.ok_or("an LDS compare")?),
+        };
+        let r = match inside {
+            Some(inside) => {
+                #[cfg(test)]
+                {
+                    self.s.lds_atomics_zero_outside += 1;
+                }
+                let zero = self.s.m.i32(0);
+                self.s.m.select(self.cur, inside, r, zero)
+            }
+            None => r,
         };
         let r = self.end_guarded(at, &[(r, outside)])[0];
         if let Some(reg) = dst_reg {
@@ -5508,18 +5542,6 @@ impl<'a> Lower<'a> {
         (index, elem_off)
     }
 
-    /// A descriptor load (`s_load_dword*` from a table or heap) whose dwords
-    /// the code also reads as numbers: the console compiler computes sizes
-    /// from descriptor bits (an image's width, height, depth, levels; a
-    /// buffer's record count) instead of querying them. Those fields are
-    /// rebuilt from the host view's dimensions in the GFX10 layout (image
-    /// dword 1 bits 30-31 and dword 2 bits 0-13 width - 1, dword 2 bits
-    /// 14-29 height - 1, dword 3 identity swizzle, last level at 16, type at
-    /// 28, dword 4 depth or layers - 1; buffer dword 2 the record count).
-    // shortcut: the base level reads 0 (the host view starts at its own
-    // level 0, so sizes the code shifts by it come out right) and the other
-    // dwords (addresses, formats, tiling) have no host value: reading them
-    // stops the program.
     /// Two scalar loads of the same dwords: same opcode and immediate
     /// offset, base read from the same values, and the same or an
     /// equivalent register offset.
@@ -5634,6 +5656,21 @@ impl<'a> Lower<'a> {
         reads > 0
     }
 
+    /// A descriptor load (`s_load_dword*` from a table or heap) whose dwords
+    /// the code also reads as numbers: the console compiler computes sizes
+    /// from descriptor bits (an image's width, height, depth, levels; a
+    /// buffer's record count) instead of querying them. Those fields are
+    /// rebuilt from the host view's dimensions in the GFX10 layout (image
+    /// dword 1 bits 30-31 and dword 2 bits 0-13 width - 1, dword 2 bits
+    /// 14-29 height - 1, dword 3 identity swizzle, last level at 16, type at
+    /// 28, dword 4 depth or layers - 1; buffer dword 2 the record count).
+    /// A buffer descriptor no memory instruction takes is read for its base
+    /// address too, from the host's view address list
+    /// ([`Self::view_address_data`]).
+    // shortcut: the base level reads 0 (the host view starts at its own
+    // level 0, so sizes the code shifts by it come out right) and the other
+    // dwords (an image's address, formats, tiling) have no host value:
+    // reading them stops the program.
     fn descriptor_data(&mut self, inst: &Inst, site: Site) -> Result<(), Why> {
         if self.atomic_descriptor_loads.contains(&site) {
             return Ok(());
@@ -5773,6 +5810,24 @@ impl<'a> Lower<'a> {
             } else if count == 8 && used.is_none_or(|u| u.kind == ResourceType::Srv) {
                 // shortcut: a size-only image descriptor is taken as a 2D texture.
                 (0, src, (2, 0x409), Some(2), false)
+            } else if count <= 4
+                && self.leftovers
+                // Not a sampler's descriptor, which a sample takes whole.
+                && !self.x.res.descriptors.iter().any(|d| {
+                    d.source
+                        .leaves()
+                        .into_iter()
+                        .any(|l| matches!(*l, Source::Loaded { load, .. } if load == site))
+                })
+                && (0..count.min(3))
+                    .filter_map(|k| inst.write(Reg::S(code + k as u8)))
+                    .any(|v| self.demanded_bits(v) != 0)
+            {
+                // A buffer descriptor read for its base address or record
+                // count. In the last chance only, and only when those words
+                // reach something, so that every other program keeps its
+                // user data as it was.
+                return self.view_address_data(inst, code, count, &src);
             } else {
                 return Err("a descriptor read only as data");
             }
@@ -7579,7 +7634,8 @@ impl<'a> Lower<'a> {
             .i32((offset as i32 as u32).wrapping_add(4 * u32::from(first)));
         at = self.s.m.bin(c, Bin::Add, at, k);
         let shift = self.s.m.i32(if sampler { 4 } else { 5 });
-        Ok(self.s.m.bin(c, Bin::LShr, at, shift))
+        let index = self.s.m.bin(c, Bin::LShr, at, shift);
+        Ok(self.title_slot(a.param, index))
     }
 
     /// The heap index of the descriptor at dword `first` of what the scalar
@@ -7619,7 +7675,28 @@ impl<'a> Lower<'a> {
             addr = self.s.m.bin(c, Bin::Add, addr, so);
         }
         let shift = self.s.m.i32(if sampler { 4 } else { 5 });
-        Ok(self.s.m.bin(c, Bin::LShr, addr, shift))
+        let index = self.s.m.bin(c, Bin::LShr, addr, shift);
+        Ok(self.title_slot(a.param, index))
+    }
+
+    /// `index`, a heap slot found through root parameter `param`, as the
+    /// slot of the title's own heap where a record of the host's buffer view
+    /// table is looked up ([`Self::title_slots`]): the host may bind its own
+    /// copy of a root table in other slots, and the table lists the title's
+    /// (see [`super::USER_TABLE_SLOTS`]).
+    fn title_slot(&mut self, param: usize, index: V) -> V {
+        let table = self
+            .x
+            .native
+            .layout
+            .get(param)
+            .filter(|p| self.title_slots && p.root == RootType::Table)
+            .map(|p| p.slot);
+        let Some(slot) = table else {
+            return index;
+        };
+        let ahead = self.host_word(RootType::Other(super::USER_TABLE_SLOTS), slot, 0);
+        self.s.m.bin(self.cur, Bin::Add, index, ahead)
     }
 
     fn valu(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {

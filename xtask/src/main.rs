@@ -2,6 +2,7 @@
 
 mod diagnostics;
 mod policy;
+mod run_world;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -32,6 +33,10 @@ enum Cmd {
         /// File created by victory --diagnostic-jsonl.
         input: PathBuf,
     },
+    /// Launch a world run of the title: claims the card with a lock file,
+    /// starts the title with the known-good environment, and writes the
+    /// run's output, frames and manifest to a folder outside the repo.
+    RunWorld(Box<run_world::Args>),
 }
 
 fn main() -> Result<()> {
@@ -39,6 +44,7 @@ fn main() -> Result<()> {
     match Cli::parse().command {
         Cmd::Policy { staged } => policy::run(&root, staged),
         Cmd::Diagnostics { input } => diagnostics::run(&input),
+        Cmd::RunWorld(args) => run_world::run(&root, *args),
         Cmd::InstallHooks => {
             let status = Command::new("git")
                 .args(["config", "core.hooksPath", ".githooks"])
