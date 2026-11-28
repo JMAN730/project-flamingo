@@ -1304,7 +1304,7 @@ impl HostPipeline {
             GS: barycentric_gs
                 .as_deref()
                 .map_or(D3D12_SHADER_BYTECODE::default(), bytecode),
-            BlendState: g.blend,
+            BlendState: host_blend(&g.blend, &g.targets),
             SampleMask: g.sample_mask,
             RasterizerState: g.rasterizer,
             DepthStencilState: g.depth,

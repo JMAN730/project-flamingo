@@ -2248,6 +2248,10 @@ impl State {
         if !self.bind_stage(list, &f.stage, &p.structured_strides, (false, true)) {
             return false;
         }
+        // A depth texture the mesh program writes through unordered access:
+        // its colour twin holds what it lacks from here on. (The pipeline's
+        // own stages were bound, and their twins noted, before this one.)
+        list.twins_written();
         self.ensure_depth_state(list);
         let count = counter.map(|(s, at)| (&s.buffer, s.offset(at)));
         let (unordered, read) = (
@@ -2365,6 +2369,10 @@ impl State {
         if !self.bind_stage(list, &f.stage, &p.structured_strides, (false, true)) {
             return false;
         }
+        // A depth texture the mesh program writes through unordered access:
+        // its colour twin holds what it lacks from here on. (The pipeline's
+        // own stages were bound, and their twins noted, before this one.)
+        list.twins_written();
         self.ensure_depth_state(list);
         let (unordered, read) = (
             D3D12_RESOURCE_STATE_UNORDERED_ACCESS,

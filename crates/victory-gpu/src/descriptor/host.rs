@@ -3340,12 +3340,15 @@ fn narrow_to_resident(
     }
     // Prefer the window the last staging refresh noted; fall back to a live
     // mapped-prefix query so the first view before any upload is still clamped.
-    let resident =
-        crate::texture::resident(resource).or_else(|| crate::texture::live_resident(resource))?;
+    // The noted window names the host copy's levels (the refresh that
+    // notes it counts them so); the live query reads the title's layout
+    // and names the title's, which the copy may lack the top ones of.
+    let resident = crate::texture::resident(resource).or_else(|| {
+        crate::texture::live_resident(resource).map(|window| resident_on_host(resource, window))
+    })?;
     if resident.1 == 0 {
         return None;
     }
-    let resident = resident_on_host(resource, resident);
     // SAFETY: a live resource.
     let mips = u32::from(unsafe { texture.GetDesc() }.MipLevels);
     let asked = match desc.ViewDimension {
@@ -3397,9 +3400,11 @@ fn narrow_to_resident(
     Some((first, count))
 }
 
-/// The resident levels `window` (first, count) of title texture `resource`,
-/// which name the title's levels, as its host copy numbers them: the copy
-/// may lack the title's top levels (`resource::dropped_mips`).
+/// The resident levels `window` (first, count) of title texture `resource`
+/// as read from the title's own layout (`texture::live_resident`), which
+/// name the title's levels, as its host copy numbers them: the copy may
+/// lack the title's top levels (`resource::dropped_mips`). A window noted
+/// by a refresh (`texture::resident`) is in the copy's numbers already.
 fn resident_on_host(resource: crate::object::This, window: (u32, u32)) -> (u32, u32) {
     crate::resource::rebase_mip_range(window.0, window.1, crate::resource::dropped_mips(resource))
 }
@@ -3468,11 +3473,8 @@ fn residency_widened(view: &View, title: usize, host_mips: (u32, u32)) -> bool {
         }
     } else {
         match crate::texture::resident(title as crate::object::This) {
-            Some(window) if window.1 > 0 => crate::texture::narrowed(
-                asked,
-                resident_on_host(title as crate::object::This, window),
-                mips,
-            ),
+            // The noted window already names the host copy's levels.
+            Some(window) if window.1 > 0 => crate::texture::narrowed(asked, window, mips),
             // Fully mapped (or no longer tracked as partial): the title's range.
             _ if host_mips != asked => asked,
             _ => return false,
