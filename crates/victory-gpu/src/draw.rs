@@ -2106,7 +2106,10 @@ impl State {
                     continue;
                 }
                 #[cfg(feature = "diagnostics")]
-                crate::capture::note_target(held.get());
+                {
+                    crate::capture::note_target(held.get());
+                    crate::capture::note_op_write(held.get());
+                }
                 crate::list::ensure_bindless_state(list, held.get(), UNORDERED_ACCESS);
                 if uses_heap_srv {
                     uav_transitioned.insert(r);
@@ -2595,6 +2598,8 @@ impl State {
     /// was looked at (else the pipeline's).
     #[cfg(feature = "diagnostics")]
     fn frame_op_why(&self, kind: &str, compute: bool, ran: bool, why: Option<&str>) {
+        // Taken even when not logged, so one op's writes never reach the next.
+        let writes = crate::capture::take_op_writes();
         if !tracing::enabled!(tracing::Level::DEBUG)
             || !crate::capture::listed(crate::queue::presented() + 1)
         {
@@ -2605,6 +2610,7 @@ impl State {
         } else {
             self.targets.iter().map(|t| format!("{t:#x}")).collect()
         };
+        let writes: Vec<String> = writes.iter().map(|t| format!("{t:#x}")).collect();
         let outcome = if ran {
             "ran".to_owned()
         } else {
@@ -2618,7 +2624,7 @@ impl State {
         };
         let text = self.op_text(kind.to_owned(), compute);
         tracing::debug!(
-            "frame {} op: pipeline {:#x} topology {} targets {targets:?} depth {:#x} -> {outcome} || {text}",
+            "frame {} op: pipeline {:#x} topology {} targets {targets:?} depth {:#x} writes {writes:?} -> {outcome} || {text}",
             crate::queue::presented() + 1,
             self.pipeline,
             self.topology,
@@ -4199,7 +4205,10 @@ fn readable(
                 crate::texture::host_written(*resource as This);
             }
             #[cfg(feature = "diagnostics")]
-            crate::capture::note_target(*resource as This);
+            {
+                crate::capture::note_target(*resource as This);
+                crate::capture::note_op_write(*resource as This);
+            }
             // Read by the title's CPU code: copied back into title memory.
             list.texture_written(*resource as This, desc.as_ref());
             // Unordered access to a depth texture is its colour twin's: the

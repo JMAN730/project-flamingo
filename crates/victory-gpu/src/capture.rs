@@ -382,6 +382,30 @@ pub(crate) fn note_target(resource: crate::object::This) {
     }
 }
 
+/// In frames listed for capture: a texture bound for unordered access since
+/// the last frame op line, which [`take_op_writes`] hands to it, so a
+/// dispatch's line names what it writes.
+pub(crate) fn note_op_write(resource: crate::object::This) {
+    if resource.is_null() || !listed(crate::queue::presented() + 1) {
+        return;
+    }
+    OP_WRITES.with(|w| {
+        let mut w = w.borrow_mut();
+        if !w.contains(&(resource as usize)) {
+            w.push(resource as usize);
+        }
+    });
+}
+
+/// The textures [`note_op_write`] noted on this thread since the last call.
+pub(crate) fn take_op_writes() -> Vec<usize> {
+    OP_WRITES.with(|w| std::mem::take(&mut *w.borrow_mut()))
+}
+
+thread_local! {
+    static OP_WRITES: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 /// At the present of frame `frame`: saves the noted targets.
 pub(crate) fn dump_targets(frame: u64) {
     use std::sync::atomic::Ordering::Relaxed;

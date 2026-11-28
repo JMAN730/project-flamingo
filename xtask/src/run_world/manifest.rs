@@ -36,15 +36,23 @@ pub struct Manifest {
     /// Where presented frames were saved, if the build can capture.
     pub capture_dir: Option<PathBuf>,
     pub pid: Option<u32>,
-    /// UTC, RFC 3339.
+    /// When the run was asked for: the time in the run id (UTC, RFC 3339).
+    /// The build and the copy of the exe come after it.
     pub started: String,
+    /// When the title process was started. The length of the run counts
+    /// from here. Absent in manifests written before this was recorded.
+    #[serde(default)]
+    pub title_started: Option<String>,
     /// Absent while the run is going (or if its launcher was killed).
     pub end: Option<End>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct End {
+    /// When the title process was found to have ended.
     pub ended: String,
+    /// How long the title ran: from its start to its end, without the
+    /// build and the copy before it.
     pub seconds: u64,
     /// The process exit code; absent when it could not be read.
     pub exit_code: Option<i64>,
@@ -117,8 +125,9 @@ impl Manifest {
 }
 
 impl End {
+    /// The end of a title that ran from `title_started` to `ended`.
     pub fn new(
-        started: SystemTime,
+        title_started: SystemTime,
         ended: SystemTime,
         exit_code: Option<i64>,
         ended_by: EndedBy,
@@ -126,7 +135,10 @@ impl End {
     ) -> Self {
         Self {
             ended: rfc3339(ended),
-            seconds: ended.duration_since(started).unwrap_or_default().as_secs(),
+            seconds: ended
+                .duration_since(title_started)
+                .unwrap_or_default()
+                .as_secs(),
             exit_code,
             // Windows exit codes are 32 bits; a crash shows as an NTSTATUS.
             exit_code_hex: exit_code.map(|code| format!("0x{:08X}", code as u32)),
@@ -260,6 +272,7 @@ mod tests {
             capture_dir: Some(run_dir.join("frames")),
             pid: Some(4242),
             started: rfc3339(at(1_795_662_245)),
+            title_started: Some(rfc3339(at(1_795_662_545))),
             end: None,
         }
     }
@@ -303,6 +316,40 @@ mod tests {
         assert_eq!(ended.seconds, 1_800);
         assert_eq!(ended.exit_code_hex.as_deref(), Some("0xC0000005"));
         assert_eq!(ended.ended_by, EndedBy::Title);
+    }
+
+    #[test]
+    fn the_length_of_a_run_counts_from_the_title_start_not_from_the_run_id() {
+        let dir = tempfile::tempdir().unwrap();
+        // Asked for at 02:00:00, title started five minutes later (the
+        // build), ended twenty minutes after that.
+        let (asked, launched, ended) = (at(7_200), at(7_500), at(8_700));
+        let mut m = manifest(dir.path());
+        m.run_id = run_id(asked, "card");
+        m.started = rfc3339(asked);
+        m.title_started = Some(rfc3339(launched));
+        m.end = Some(End::new(
+            launched,
+            ended,
+            Some(0),
+            EndedBy::Title,
+            Vec::new(),
+        ));
+        assert_eq!(m.run_id, "19700101-020000-card");
+        assert_eq!(m.started, "1970-01-01T02:00:00Z");
+        assert_eq!(m.title_started.as_deref(), Some("1970-01-01T02:05:00Z"));
+        let end = m.end.as_ref().unwrap();
+        assert_eq!(end.ended, "1970-01-01T02:25:00Z");
+        assert_eq!(end.seconds, 1_200);
+    }
+
+    #[test]
+    fn a_manifest_without_the_title_start_still_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut value = serde_json::to_value(manifest(dir.path())).unwrap();
+        value.as_object_mut().unwrap().remove("title_started");
+        let old: Manifest = serde_json::from_value(value).unwrap();
+        assert_eq!(old.title_started, None);
     }
 
     #[test]

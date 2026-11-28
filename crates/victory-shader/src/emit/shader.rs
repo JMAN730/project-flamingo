@@ -128,7 +128,7 @@ pub(crate) struct Shader {
     pub d16_kept_high_halves: u32,
     /// Test builds: returning LDS atomics whose old value is 0 outside the
     /// program's LDS (split halves).
-    #[cfg(test)]
+    #[cfg(all(test, windows))]
     pub lds_atomics_zero_outside: u32,
     /// Test builds: constant byte offsets of `s_buffer_load_dword*`.
     #[cfg(test)]
@@ -215,7 +215,7 @@ impl Shader {
             unaligned_typed_loads: 0,
             #[cfg(test)]
             d16_kept_high_halves: 0,
-            #[cfg(test)]
+            #[cfg(all(test, windows))]
             lds_atomics_zero_outside: 0,
             #[cfg(test)]
             smem_buffer_bytes: Vec::new(),
