@@ -252,11 +252,22 @@ fn build(
         .max()
         .map_or(0, |r| r + 1);
     for (id, o) in vs_outputs.iter().enumerate() {
-        if !matches!(o.kind, 3..=7)
-            || outputs
-                .iter()
-                .any(|e| e.kind == o.kind && e.index == o.index)
+        if !matches!(o.kind, 3..=7) {
+            continue;
+        }
+        if let Some(k) = outputs
+            .iter()
+            .position(|e| e.kind == o.kind && e.index == o.index)
         {
+            // Clip and cull distances the pixel shader reads only some of
+            // still all clip or cull: this stage is the last before the
+            // rasterizer, so it passes every component the vertex shader
+            // wrote (the pixel input reads its subset of the same row).
+            if matches!(o.kind, 6 | 7) && outputs[k].cols < o.cols {
+                outputs[k].cols = o.cols;
+                outputs[k].usage = (1 << o.cols) - 1;
+                sources[k] = (0..o.cols).map(|col| Source::Own { id, col }).collect();
+            }
             continue;
         }
         outputs.push(SigElement {
@@ -454,6 +465,23 @@ mod tests {
         ) {
             v.validate(&mut gs.clone()).unwrap();
         }
+    }
+
+    /// Clip distances the pixel shader reads only two of still pass all
+    /// four the vertex shader writes: the stage is the last before the
+    /// rasterizer, which clips by every one of them.
+    #[test]
+    fn the_barycentric_stage_passes_every_clip_distance_the_vertex_shader_writes() {
+        let mut vs = vs_outputs();
+        vs.push(element("SV_ClipDistance", 0, 6, 9, 2, 4));
+        let mut ps = ps_inputs();
+        ps.push(element("SV_ClipDistance", 0, 6, 9, 8, 2));
+        let gs = build(vs, &ps).unwrap();
+        let c = Container::parse(&gs).unwrap();
+        let outs = super::super::signature(c.part(FourCC::OSG1).unwrap().data).unwrap();
+        let clip = outs.iter().find(|o| o.kind == 6).unwrap();
+        assert_eq!(clip.cols, 4);
+        assert_eq!(clip.row, Some(8));
     }
 
     /// Refused with a reason: a copy of something the vertex shader does

@@ -167,10 +167,14 @@ impl Lower<'_> {
         let product_wrapped = self.s.m.cmp(c, pred::NE, high, zero);
         let offset_wrapped = self.s.m.cmp(c, pred::IULT, within, start);
         // A raw view (stride 0) is not indexed: the index moves nothing,
-        // and the count is of bytes, not of elements.
-        let past = self.s.m.cmp(c, pred::IUGE, index, t.elements);
+        // and the count is of bytes, not of elements, so the byte offset is
+        // what it bounds. A slot with no record (a null view, an index past
+        // the table) reads as stride 0 and count 0: every byte is past it,
+        // so the load reads zeros, never the table's own record.
+        let past_element = self.s.m.cmp(c, pred::IUGE, index, t.elements);
+        let past_byte = self.s.m.cmp(c, pred::IUGE, within, t.elements);
         let structured = self.s.m.cmp(c, pred::NE, t.stride, zero);
-        let past = self.s.m.bin(c, Bin::And, past, structured);
+        let past = self.s.m.select(c, structured, past_element, past_byte);
         let wrapped = self.s.m.bin(c, Bin::Or, product_wrapped, offset_wrapped);
         let outside = self.s.m.bin(c, Bin::Or, wrapped, past);
         let byte = self.s.m.bin(c, Bin::Add, within, t.bias);

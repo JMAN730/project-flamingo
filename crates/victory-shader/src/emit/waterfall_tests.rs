@@ -663,6 +663,49 @@ fn lanes_load_a_raw_view_the_host_table_lists_without_the_index() {
     }
 }
 
+/// A slot the host table has no record for (all zeros: a null view, or an
+/// index past the table) reads zeros, not the table's own record.
+#[test]
+fn lanes_at_a_slot_with_no_table_record_read_zeros() {
+    let (shader, _) = build_with_view(&indexed_buffer_waterfall(), Some(0));
+    // Entry 0 as before; entry 1 empty.
+    let mut table = vec![0u32; 4 * 8];
+    table[..4].copy_from_slice(&[4, 8, 0, 32]);
+    let first: Vec<u32> = (0..64)
+        .map(|i| if i % 2 == 0 { 100 + i / 2 } else { 0xDEAD })
+        .collect();
+    let unread = [0u32; 4];
+    let views = [
+        View::Buffer {
+            data: &unread,
+            stride: Stride::Raw,
+        },
+        View::Buffer {
+            data: &unread,
+            stride: Stride::Raw,
+        },
+        View::RawUav(32),
+        View::Buffer {
+            data: &table,
+            stride: Stride::Raw,
+        },
+        View::Buffer {
+            data: &first,
+            stride: Stride::Raw,
+        },
+    ];
+    let results = run_with_table(&shader, &views, Some(3));
+    if !device_ran(&results) {
+        return;
+    }
+    for (label, got) in results {
+        let want: Vec<u32> = (0..32)
+            .map(|l| if l % 2 == 0 { 100 + l } else { 0 })
+            .collect();
+        assert_eq!(got, want, "{label}");
+    }
+}
+
 #[test]
 fn a_buffer_of_known_stride_reads_no_host_table() {
     let (shader, _) = build_with_view(&indexed_buffer_waterfall(), Some(4));
