@@ -256,6 +256,7 @@ The on/off switches below (`...=1`) are off when unset or set to `0`.
 | `VICTORY_CRASH_BREAKPOINTS=1` | appends first-chance breakpoints to `crashes.log`, including ones a handler may recover from |
 | `VICTORY_CRASH_SAVE=<rva>:<len>,...` | saves title memory to the cache folder on a crash |
 | `VICTORY_COPY_BACK_GPU_WINS=1` | copy-back with a submission takes every byte the GPU changed, also where the title wrote the same dword since (the rule before the three-way merge) |
+| `VICTORY_TEXTURE_CPU_REFRESH=1` | (any build) a texture the host GPU copied or resolved into is uploaded from title memory again when a sampled fingerprint of that memory changed since (the CPU wrote it after the GPU); `=0` only logs it. Each texture logs once at debug: `texture written by the GPU, then by the CPU: re-uploaded` or `…: kept GPU copy` |
 | `VICTORY_COPY_BACK_LATE_RULE=1` | the three-way merge also on the copy-back that runs after a submission (relay, card copies, lazy readback), where it is off: the title's world stops on it |
 | `VICTORY_CAPTURE=<dir>` | saves presented frames (powers of two, or `VICTORY_CAPTURE_FRAMES=<list>`) |
 | `VICTORY_CAPTURE_SECONDS=<from>-<to>` | with `VICTORY_CAPTURE`, also saves every frame presented in that span of seconds after the first presented frame |
