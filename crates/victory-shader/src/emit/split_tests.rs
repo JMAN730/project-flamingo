@@ -483,6 +483,28 @@ fn every_wave_of_a_group_counts_its_own_lanes() {
     }
 }
 
+/// A lane mask a select takes as data (`v_cndmask_b32` of the mask's low
+/// dword, its own lane mask all lanes): every lane holds the number, in
+/// every wave of the group (plus the mask's lane count, which splits the
+/// program).
+#[test]
+fn a_mask_a_select_takes_as_data_is_its_number_in_every_wave() {
+    let body = [
+        0x3604_00BF, // v_and_b32 v2, 63, v0: the lane
+        0x7D88_048A, // v_cmp_gt_u32 vcc, 10, v2
+        0xBE84_046A, // s_mov_b64 s[4:5], vcc
+        0xBE8C_04C1, // s_mov_b64 s[12:13], -1
+        0xD501_0001,
+        0x0030_0880, // v_cndmask_b32_e64 v1, 0, s4, s[12:13]
+        s_bcnt1_i32_b64(6, VCC),
+        0x4A02_0206, // v_add_nc_u32 v1, s6, v1
+    ];
+    for threads in [128, 256] {
+        let shader = build(&program(&body), threads, 0);
+        check(&shader, &vec![0x3FF + 10; threads as usize]);
+    }
+}
+
 /// Waves of one group going round a loop different numbers of times, each
 /// round reading a lane of the upper half: wave w goes round w + 1 times,
 /// adding its lane 40's thread id (64 w + 40) each time. Group barriers
@@ -1144,4 +1166,84 @@ fn lds_reads_out_of_bounds_read_0() {
         });
         check(&shader, &group(threads, |t| t / 64 * 64 + 40));
     }
+}
+
+/// Title memory by address (`resource::MEMORY`) in a wave64 program split
+/// into halves: a buffer load and store through a descriptor built around
+/// a pointer the program loads, and a global load and store at that
+/// pointer plus each lane's offset, lower with `WaveSize(32)` and validate.
+#[test]
+fn accesses_to_title_memory_by_address_lower_in_halves() {
+    let mut words = vec![
+        0xF404_0101, // s_load_dwordx2 s[4:5], s[2:3], 0
+        0xFA00_0000,
+        0xBE86_03C1, // s_mov_b32 s6, -1
+        0xBE87_03FF, // s_mov_b32 s7, 0x31014fac
+        0x3101_4FAC,
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x3420_0082, // v_lshlrev_b32 v16, 2, v0
+        0xE030_1000, // buffer_load_dword v1, v16, s[4:7], 0 offen
+        0x8001_0110,
+        0xDC30_8000, // global_load_dword v2, v16, s[4:5]
+        0x0204_0010,
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0x4A02_0501, // v_add_nc_u32 v1, v1, v2
+    ];
+    // Lane 40's sum, from the upper half.
+    words.extend(v_readlane_b32(9, 1, 40));
+    words.extend([
+        0x4A02_0209, // v_add_nc_u32 v1, s9, v1
+        0xE070_1100, // buffer_store_dword v1, v16, s[4:7], 0 offen offset:256
+        0x8001_0110,
+        0xDC70_8200, // global_store_dword v16, v1, s[4:5] offset:512
+        0x0004_0110,
+        0xBF81_0000, // s_endpgm
+    ]);
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: true,
+        vgprs: 32,
+        layout: vec![RootParam {
+            root: RootType::Constants,
+            table_offset_dwords: 0,
+            sgprs: 4,
+            base_register: 0,
+            user_data: 0,
+            slot: 0,
+        }],
+        used: Vec::new(),
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 4 << 1,
+            threads: [64, 1, 1],
+        }),
+        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let lowered = with_host_wave64(false, || {
+        lower::lower(&lower::Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            prims: Vec::new(),
+            mesh_stride: 0,
+            mesh_buffer: false,
+        })
+    })
+    .expect("lower");
+    assert!(lowered.root_srvs.contains(&super::SLOT_MEMORY));
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut lowered.dxil.clone())
+            .expect("DXIL validation failed");
+    }
+    let c = Container::parse(&lowered.dxil).unwrap();
+    let psv = c.part(FourCC::PSV0).unwrap().data;
+    let min = u32::from_le_bytes(psv[20..24].try_into().unwrap());
+    assert_eq!(min, 32, "the lowering must declare WaveSize(32)");
 }

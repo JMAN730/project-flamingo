@@ -166,7 +166,11 @@ impl Lower<'_> {
         let zero = self.s.m.i32(0);
         let product_wrapped = self.s.m.cmp(c, pred::NE, high, zero);
         let offset_wrapped = self.s.m.cmp(c, pred::IULT, within, start);
+        // A raw view (stride 0) is not indexed: the index moves nothing,
+        // and the count is of bytes, not of elements.
         let past = self.s.m.cmp(c, pred::IUGE, index, t.elements);
+        let structured = self.s.m.cmp(c, pred::NE, t.stride, zero);
+        let past = self.s.m.bin(c, Bin::And, past, structured);
         let wrapped = self.s.m.bin(c, Bin::Or, product_wrapped, offset_wrapped);
         let outside = self.s.m.bin(c, Bin::Or, wrapped, past);
         let byte = self.s.m.bin(c, Bin::Add, within, t.bias);

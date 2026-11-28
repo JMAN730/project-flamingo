@@ -39,13 +39,22 @@ pub(super) fn demanded(p: &Program, guarded: &dyn Fn(usize, usize) -> bool) -> H
         .blocks
         .iter()
         .map(|block| match block.exit {
-            Exit::End => block
-                .insts
-                .iter()
-                .rposition(|i| {
-                    i.write(Reg::S(EXEC)).is_some() || i.write(Reg::S(EXEC + 1)).is_some()
-                })
-                .map_or(0, |k| k + 1),
+            Exit::End => {
+                let after = block
+                    .insts
+                    .iter()
+                    .rposition(|i| {
+                        i.write(Reg::S(EXEC)).is_some() || i.write(Reg::S(EXEC + 1)).is_some()
+                    })
+                    .map_or(0, |k| k + 1);
+                // Unless a later instruction reads other lanes: those the
+                // write left out are read there.
+                if block.insts[after..].iter().any(reads_other_lanes) {
+                    usize::MAX
+                } else {
+                    after
+                }
+            }
             _ => usize::MAX,
         })
         .collect();
@@ -112,11 +121,21 @@ pub(super) fn demanded(p: &Program, guarded: &dyn Fn(usize, usize) -> bool) -> H
 }
 
 /// Whether an operand of `inst` names register `r` (a vector instruction's
-/// sources; any read of another kind of instruction).
+/// sources; any read of another kind of instruction). The accumulator a MAC
+/// or `dot*c` adds to and the old value DPP keeps in lanes its masks leave
+/// out are operands too, though only as the register written.
 fn named(inst: &Inst, r: Reg) -> bool {
     let Fields::Valu(v) = &inst.fields else {
         return true;
     };
+    let name = inst.name();
+    if inst.write(r).is_some()
+        && (v.dpp.is_some()
+            || name.contains("mac")
+            || name.starts_with("v_dot") && name.contains("c_"))
+    {
+        return true;
+    }
     v.src.iter().any(|o| match (*o, r) {
         (Operand::Vector { reg, dwords }, Reg::V(x))
         | (Operand::Scalar { code: reg, dwords }, Reg::S(x)) => {
@@ -124,6 +143,18 @@ fn named(inst: &Inst, r: Reg) -> bool {
         }
         _ => false,
     })
+}
+
+/// Whether `inst` may read lanes other than its own, whatever EXEC holds
+/// (a lane read, a permute, DPP).
+fn reads_other_lanes(inst: &Inst) -> bool {
+    let name = inst.name();
+    matches!(&inst.fields, Fields::Valu(v) if v.dpp.is_some())
+        || name.starts_with("v_readlane")
+        || name.starts_with("v_permlane")
+        || name.starts_with("ds_swizzle")
+        || name.starts_with("ds_permute")
+        || name.starts_with("ds_bpermute")
 }
 
 /// Adds `bits` to what `v` demands; whether that changed it.
@@ -158,14 +189,17 @@ fn through(inst: &Inst, out: &dyn Fn(Reg) -> u32) -> Option<Vec<(Value, u32)>> {
         return None;
     };
     let lo = out(Reg::V(dst));
-    let hi = out(Reg::V(dst + 1));
+    // v255 has no register above it.
+    let hi = dst.checked_add(1).map_or(0, |d| out(Reg::V(d)));
     let k = |n: usize| constant(v, n);
     let mut reads = Vec::new();
     let mut op = |n: usize, dword: u8, bits: u32| -> Option<()> {
         match *v.src.get(n)? {
-            Operand::Vector { reg, .. } => reads.push((inst.read(Reg::V(reg + dword))?, bits)),
+            Operand::Vector { reg, .. } => {
+                reads.push((inst.read(Reg::V(reg.checked_add(dword)?))?, bits))
+            }
             Operand::Scalar { code, .. } => {
-                if let Some(x) = inst.read(Reg::S(code + dword)) {
+                if let Some(x) = code.checked_add(dword).and_then(|c| inst.read(Reg::S(c))) {
                     reads.push((x, bits));
                 }
             }
@@ -301,5 +335,62 @@ mod tests {
         // nothing (lowering gives such lanes 0); what it is copied to does.
         let d = demanded(&p, &|_, _| true);
         assert_eq!(d.get(&v0).copied().unwrap_or(0), 0);
+    }
+
+    /// The accumulator a MAC adds to is read as an operand, though only
+    /// named as the register written: an input in it demands every bit.
+    #[test]
+    fn a_mac_accumulator_is_demanded() {
+        let p = program(&[
+            0x3E00_0702, // v_mac_f32 v0, v2, v3
+            0xE070_1000,
+            0x8000_0000, // buffer_store_dword v0, v0, s[0:3], 0 offen
+        ]);
+        let d = demanded(&p, &|_, _| false);
+        assert_eq!(d.get(&input(&p, Reg::V(0))).copied(), Some(ALL));
+    }
+
+    /// The old value a DPP move keeps in the lanes its row mask leaves out
+    /// is read as an operand too.
+    #[test]
+    fn the_old_value_dpp_keeps_is_demanded() {
+        let p = program(&[
+            0x7E00_02FA,
+            0x1F01_1102, // v_mov_b32_dpp v0, v2 row_shr:1 row_mask:0x1 bank_mask:0xf
+            0xE070_1000,
+            0x8000_0000, // buffer_store_dword v0, v0, s[0:3], 0 offen
+        ]);
+        let d = demanded(&p, &|_, _| false);
+        assert_eq!(d.get(&input(&p, Reg::V(0))).copied(), Some(ALL));
+    }
+
+    /// A move into v255 has no register above it to look up.
+    #[test]
+    fn a_write_of_the_last_vgpr_is_followed() {
+        let code: Vec<u8> = [0x7FFE_0300u32, 0xBF81_0000] // v_mov_b32 v255, v0
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        demanded(&p, &|_, _| false);
+    }
+
+    /// A guarded write after the program's last EXEC write leaves lanes
+    /// out that a later lane read still reads: what they keep (here a sum)
+    /// is demanded.
+    #[test]
+    fn a_lane_read_after_the_last_exec_write_keeps_old_values() {
+        let p = program(&[
+            0x4A00_0702, // v_add_nc_u32 v0, v2, v3
+            0xBEFE_0381, // s_mov_b32 exec_lo, 1
+            0x7E00_0304, // v_mov_b32 v0, v4 (lane 0 only)
+            0xD760_0004,
+            0x0001_0B00, // v_readlane_b32 s4, v0, 5: lane 5 kept the sum
+            0x7E02_0204, // v_mov_b32 v1, s4
+            0xE070_1000,
+            0x8000_0101, // buffer_store_dword v1, v1, s[0:3], 0 offen
+        ]);
+        let d = demanded(&p, &|_, i| i == 2);
+        assert_eq!(d.get(&input(&p, Reg::V(2))).copied(), Some(ALL));
     }
 }

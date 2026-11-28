@@ -97,3 +97,139 @@ fn a_global_atomic_whose_address_is_loaded_from_memory_reads_the_directory() {
     assert!(lowered.root_srvs.contains(&SLOT_MEMORY));
     assert_eq!(lowered.root_uavs, [SLOT_FAULTS]);
 }
+
+/// Lowers `words` as [`lower_compute`] does and validates the DXIL with
+/// `dxil.dll` when there is one; checks it reads the page directory.
+fn lowered_by_address(words: &[u32]) -> lower::Lowered {
+    let mut native = native_compute(words);
+    // Four root constants at s0: s[2:3] holds a title address (s[0:1]
+    // would be the spill table of root arguments).
+    native.layout[0] = RootParam {
+        root: RootType::Constants,
+        table_offset_dwords: 0,
+        sgprs: 4,
+        base_register: 0,
+        user_data: 0,
+        slot: 0,
+    };
+    native.used.clear();
+    let lowered = lower_compute(&native);
+    assert!(lowered.root_srvs.contains(&SLOT_MEMORY));
+    assert_eq!(lowered.root_uavs, [SLOT_FAULTS]);
+    match super::validator::Validator::load(super::validator::Validator::default_path().as_deref())
+    {
+        Ok(mut v) => v
+            .validate(&mut lowered.dxil.clone())
+            .expect("DXIL validation failed"),
+        Err(e) => eprintln!("{e}; validation skipped"),
+    }
+    lowered
+}
+
+/// `s_load_dwordx2 s[4:5], s[2:3], 0`: a pointer read from title memory
+/// (at the address root constants 2 and 3 hold), then dwords 2 and 3 of a raw buffer
+/// descriptor around it (`OOB_SELECT` 3: raw).
+const POINTER_DESCRIPTOR: [u32; 6] = [
+    0xF404_0101, // s_load_dwordx2 s[4:5], s[2:3], 0
+    0xFA00_0000,
+    0xBE86_03C1, // s_mov_b32 s6, -1
+    0xBE87_03FF, // s_mov_b32 s7, 0x31014fac
+    0x3101_4FAC,
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+];
+
+fn with_descriptor(body: &[u32]) -> Vec<u32> {
+    let mut w = POINTER_DESCRIPTOR.to_vec();
+    w.extend_from_slice(body);
+    w.push(0xBF81_0000); // s_endpgm
+    w
+}
+
+#[test]
+fn buffer_accesses_through_a_descriptor_around_a_loaded_pointer_read_the_directory() {
+    lowered_by_address(&with_descriptor(&[
+        0xE030_1000, // buffer_load_dword v1, v0, s[4:7], 0 offen
+        0x8001_0100,
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0xE070_1010, // buffer_store_dword v1, v0, s[4:7], 0 offen offset:16
+        0x8001_0100,
+    ]));
+}
+
+#[test]
+fn a_buffer_atomic_through_a_descriptor_around_a_loaded_pointer_reads_the_directory() {
+    lowered_by_address(&with_descriptor(&[
+        0xE0C8_5000, // buffer_atomic_add v1, v0, s[4:7], 0 offen glc
+        0x8001_0100,
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0xE070_1010, // buffer_store_dword v1, v0, s[4:7], 0 offen offset:16
+        0x8001_0100,
+    ]));
+}
+
+#[test]
+fn a_scalar_buffer_load_through_a_descriptor_around_a_loaded_pointer_reads_the_directory() {
+    lowered_by_address(&with_descriptor(&[
+        0xF420_0202, // s_buffer_load_dword s8, s[4:7], 0x10
+        0xFA00_0010,
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x7E02_0208, // v_mov_b32 v1, s8
+        0xE070_1010, // buffer_store_dword v1, v0, s[4:7], 0 offen offset:16
+        0x8001_0100,
+    ]));
+}
+
+#[test]
+fn a_descriptor_whose_size_the_code_loads_is_bounded_at_run_time() {
+    let words = [
+        0xF404_0101, // s_load_dwordx2 s[4:5], s[2:3], 0
+        0xFA00_0000,
+        0xF400_0181, // s_load_dword s6, s[2:3], 8: the size
+        0xFA00_0008,
+        0xBE87_03FF, // s_mov_b32 s7, 0x31014fac
+        0x3101_4FAC,
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xE030_1000, // buffer_load_dword v1, v0, s[4:7], 0 offen
+        0x8001_0100,
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0xE070_1010, // buffer_store_dword v1, v0, s[4:7], 0 offen offset:16
+        0x8001_0100,
+        0xBF81_0000, // s_endpgm
+    ];
+    lowered_by_address(&words);
+}
+
+#[test]
+fn a_global_access_at_a_loaded_scalar_base_plus_a_lane_offset_reads_the_directory() {
+    let words = [
+        0xF404_0101, // s_load_dwordx2 s[4:5], s[2:3], 0
+        0xFA00_0000,
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xDC30_8000, // global_load_dword v1, v0, s[4:5]
+        0x0104_0000,
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0xDC70_8010, // global_store_dword v0, v1, s[4:5] offset:16
+        0x0004_0100,
+        0xBF81_0000, // s_endpgm
+    ];
+    lowered_by_address(&words);
+}
+
+#[test]
+fn a_scalar_load_at_a_first_lane_read_of_a_lane_pointer_reads_the_directory() {
+    let words = [
+        0xDC34_8000, // global_load_dwordx2 v[2:3], v0, s[4:5]
+        0x027D_0000, //   (off: v[0:1] is the address)
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0x7E08_0502, // v_readfirstlane_b32 s4, v2
+        0x7E0A_0503, // v_readfirstlane_b32 s5, v3
+        0xF400_0202, // s_load_dword s8, s[4:5], 0
+        0xFA00_0000,
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x7E02_0208, // v_mov_b32 v1, s8
+        0xDC70_8000, // global_store_dword v[2:3], v1, off
+        0x007D_0102,
+        0xBF81_0000, // s_endpgm
+    ];
+    lowered_by_address(&words);
+}

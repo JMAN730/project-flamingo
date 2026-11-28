@@ -242,7 +242,13 @@ fn dpp_lane(d: Dpp, l: u32) -> Option<(u32, bool, bool)> {
 
 fn combine(op: Op, a: Sym, b: Sym) -> Sym {
     match (a, b) {
-        (Sym::K(k), x) | (x, Sym::K(k)) if op.identity(k) => x,
+        // An f16 add writes the low half only: a value from before the
+        // section passes through it only in that half.
+        (Sym::K(k), x) | (x, Sym::K(k))
+            if op.identity(k) && !(op == Op::AddH && matches!(x, Sym::Own(_) | Sym::Uni(_))) =>
+        {
+            x
+        }
         (
             Sym::Red {
                 op: oa,
@@ -375,6 +381,12 @@ fn simulate(insts: &[Inst], tail: &[Inst], wave: u32, saved: Value) -> HashMap<V
                 let s = l
                     .and_then(|l| x.get((l & mask) as usize).copied())
                     .unwrap_or(Sym::Unknown);
+                // A lane's own value from before the section is that lane's,
+                // not every lane's: read into an SGPR it is not known here.
+                let s = match s {
+                    Sym::Own(_) => Sym::Unknown,
+                    s => s,
+                };
                 uni.insert(w, s);
             }
             continue;
@@ -1040,6 +1052,54 @@ mod tests {
         // The half-reduced value itself has no shape.
         let half = insts[insts.len() - 4].write(Reg::V(4)).unwrap();
         assert_eq!(section.shapes.get(&half), None);
+    }
+
+    /// A lane read of a VGPR from before the section is that one lane's
+    /// value, which differs between lanes: the section must not say every
+    /// lane holds its own.
+    #[test]
+    fn a_readlane_of_a_per_lane_value_is_not_each_lanes_own() {
+        let p = build_wave64(&[
+            0xBE80_25C1, // s_or_saveexec_b64 s[0:1], -1
+            0xD760_0002,
+            0x0001_0B00, // v_readlane_b32 s2, v0, 5
+            0x7E08_0202, // v_mov_b32 v4, s2
+            0xBEFE_0400, // s_mov_b64 exec, s[0:1]
+            S_ENDPGM,
+        ]);
+        let insts = &p.blocks[0].insts;
+        let read = insts[1].write(Reg::S(2)).unwrap();
+        let moved = insts[2].write(Reg::V(4)).unwrap();
+        for found in [sections_with(&p, 0, false), sections_with(&p, 0, true)] {
+            let shapes = found.get(&0).map(|s| &s.shapes);
+            for v in [read, moved] {
+                let x = insts[1].read(Reg::V(0)).unwrap();
+                assert_ne!(
+                    shapes.and_then(|s| s.get(&v)),
+                    Some(&Shape::Value(x)),
+                    "lane 5's value taken for every lane's own"
+                );
+            }
+        }
+    }
+
+    /// An f16 add of 0 keeps only the low half of a value from before the
+    /// section: it is not that value.
+    #[test]
+    fn an_f16_add_of_zero_is_not_its_operand() {
+        assert_eq!(
+            combine(Op::AddH, Sym::K(0), Sym::Own(Value(7))),
+            Sym::Unknown
+        );
+        assert_eq!(
+            combine(Op::AddH, Sym::Uni(Value(7)), Sym::K(0x8000)),
+            Sym::Unknown
+        );
+        assert_eq!(combine(Op::AddH, Sym::K(0), Sym::K(5)), Sym::K(5));
+        assert_eq!(
+            combine(Op::AddU, Sym::K(0), Sym::Own(Value(7))),
+            Sym::Own(Value(7))
+        );
     }
 
     /// Without the lane read the section ends at its restore.

@@ -51,6 +51,9 @@ const RESOURCES_SIZE_BASE: usize = 0x14;
 const RECORDS: usize = 0x18;
 const RECORD: usize = 32;
 const TAG_USED: u32 = 0x41;
+/// Distinct used-resource records an `ACCC` part may list (far more than
+/// any root signature's ranges name).
+const MAX_USED: usize = 4096;
 const TAG_DIMENSION: u32 = 0x42;
 const TAG_HASH: u32 = 0x43;
 /// The user-data dword the first root parameter arrives in; dwords 0-3 are
@@ -155,7 +158,15 @@ fn used_resources(table: &[u8]) -> Result<Vec<crate::UsedResource>, ShaderError>
     for r in records {
         match u32::from_le_bytes([r[0], r[1], r[2], r[3]]) {
             TAG_USED => {
-                used.push(used_entry(r[4..24].try_into().expect("20 bytes")));
+                // The same entry again adds nothing (and the checks of
+                // `check_resources` compare every pair).
+                let entry = used_entry(r[4..24].try_into().expect("20 bytes"));
+                if !used.contains(&entry) {
+                    if used.len() == MAX_USED {
+                        return Err(Malformed("implausible ACCC used-resource count"));
+                    }
+                    used.push(entry);
+                }
             }
             TAG_DIMENSION | TAG_HASH => {}
             _ => return Err(Malformed("unknown ACCC resource record")),
@@ -361,6 +372,31 @@ mod tests {
 
     /// `s_endpgm`.
     const ENDPGM: u32 = 0xBF81_0000;
+
+    /// A resource table of `bodies` as used-resource records.
+    fn used_table(bodies: impl Iterator<Item = [u8; 20]>) -> Vec<u8> {
+        let mut resources = Vec::new();
+        for b in bodies {
+            record(&mut resources, TAG_USED, &b);
+        }
+        let mut table = Vec::new();
+        let size = (RECORDS + resources.len() - RESOURCES_SIZE_BASE) as u32;
+        words(&mut table, &[RESOURCES_MAGIC, size, 0, 0, 0, 0]);
+        table.extend_from_slice(&resources);
+        table
+    }
+
+    #[test]
+    fn repeated_used_records_count_once_and_too_many_are_refused() {
+        let uav = used_body([3, 3], [0x10, 5, 4], [8, 4, 0]);
+        let used = used_resources(&used_table(std::iter::repeat_n(uav, 50_000))).unwrap();
+        assert_eq!(used.len(), 1);
+        let distinct = (0..=MAX_USED as u32).map(|k| used_body([3, 3], [k, 5, 4], [8, 4, 0]));
+        assert_eq!(
+            used_resources(&used_table(distinct)).unwrap_err(),
+            Malformed("implausible ACCC used-resource count")
+        );
+    }
 
     #[test]
     fn reads_a_compute_program() {

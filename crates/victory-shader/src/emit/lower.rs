@@ -355,6 +355,13 @@ fn buffer_format(format: u8) -> Option<(&'static [u32], Numeric)> {
     None
 }
 
+/// Whether handle properties `props` are a structured SRV's: kind 12 in
+/// the low byte, whatever its alignment bits (bits 8 and up, as
+/// `buffer_props` sets for strides other than 4); not a UAV's (bit 12).
+fn structured_srv(props: (u32, u32)) -> bool {
+    props.0 & 0xFF == 12 && props.0 & 0x1000 == 0
+}
+
 /// How far a float channel of `width` bits (16, or the unsigned 11- and
 /// 10-bit floats of the packed formats) shifts up to be a half:
 /// the small floats are a half's exponent (5 bits, biased 15) and the top
@@ -1351,6 +1358,7 @@ impl<'a> Lower<'a> {
                 address: a,
                 bits: 0,
                 words: [0, 0],
+                records: None,
             };
             Some(self.handle((b, i), &src, false, (11, 0))?)
         };
@@ -2621,7 +2629,7 @@ impl<'a> Lower<'a> {
     /// DXIL block for a ballot of a mask written in loop block `def` and
     /// first read at `use_b` after leaving that loop: the earliest (RPO)
     /// loop-exit target that reaches the use, so the ballot sees the
-    /// reconverged wave and dominates later reads.
+    /// reconverged wave, if it dominates the read (none otherwise).
     fn after_loop_ballot_site(&self, def: usize, use_b: usize) -> Option<usize> {
         let p = self.x.p;
         if !Self::in_cycle(p, def) || Self::reaches(p, use_b, def) {
@@ -2646,6 +2654,21 @@ impl<'a> Lower<'a> {
             }
         }
         let exit = best?;
+        // With several exits that reach the read, the earliest need not be
+        // on every path to it: the ballot must dominate the read.
+        let order = crate::ir::reverse_postorder(&p.blocks);
+        let mut index = vec![usize::MAX; p.blocks.len()];
+        for (n, &b) in order.iter().enumerate() {
+            index[b] = n;
+        }
+        let idom = crate::ir::idoms(&p.blocks, &order, &index);
+        let mut d = use_b;
+        while d != exit {
+            if idom[d] == d || idom[d] == usize::MAX {
+                return None;
+            }
+            d = idom[d];
+        }
         if exit == self.cur_ir {
             Some(self.cur)
         } else {
@@ -5246,6 +5269,9 @@ impl<'a> Lower<'a> {
             .get(&(site, false))
             .copied()
             .ok_or("an untracked descriptor")?;
+        if matches!(src, Source::Built { address, .. } if address.param == MEMORY) {
+            return self.memory_sbuffer(inst, src);
+        }
         let kind = self.used_kind(src);
         let c = self.cur;
         let (base, extra) = self.built_offset(src)?;
@@ -7174,7 +7200,7 @@ impl<'a> Lower<'a> {
         props: (u32, u32),
     ) -> Result<V, Why> {
         // A structured SRV (kind 12, stride in the second word).
-        if !sampler && props.0 == 12 {
+        if !sampler && structured_srv(props) {
             self.note_structured(src, props.1);
         }
         self.note_heap_read(src, sampler, props);
@@ -7199,6 +7225,9 @@ impl<'a> Lower<'a> {
             }
             Source::Constant(words) if sampler => self.static_sampler(words, props),
             Source::Constant(_) => Err("a constant resource descriptor"),
+            Source::Built { address, .. } if address.param == MEMORY => {
+                Err("a descriptor built around title memory chosen by control flow")
+            }
             Source::Built { address, .. } => {
                 let rp = *self
                     .x

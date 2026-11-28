@@ -230,10 +230,27 @@ fn number_reads(
                         })
                         .flat_map(|(code, dwords)| (0..dwords.max(1)).map(move |k| code + k))
                         .collect();
+                    // A select's lane mask (its third operand, or VCC when it
+                    // has two) is read per lane; its data operands are
+                    // numbers like any other instruction's.
+                    let data: Vec<u8> = if selects {
+                        let n = if name.starts_with("v_div_fmas") { 3 } else { 2 };
+                        v.src
+                            .iter()
+                            .take(n)
+                            .filter_map(|o| match *o {
+                                Operand::Scalar { code, dwords } => Some((code, dwords)),
+                                _ => None,
+                            })
+                            .flat_map(|(code, dwords)| (0..dwords.max(1)).map(move |k| code + k))
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
                     for &(r, val) in &i.reads {
                         let Reg::S(c) = r else { continue };
                         let lane_set = (c == EXEC || c == EXEC + 1) && !explicit.contains(&c);
-                        if !lane_set && !selects {
+                        if (!lane_set && !selects) || data.contains(&c) {
                             out.insert(val);
                         }
                     }

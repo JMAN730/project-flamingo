@@ -148,8 +148,9 @@ impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Tra
         "shader.dxil"
     }
     fn version(&self) -> u32 {
-        // The build fingerprint in the input does the versioning.
-        1
+        // The build fingerprint in the input does the versioning; 2: buffer
+        // accesses and first-lane addresses on title memory by address.
+        2
     }
     fn convert(&self, input: &[u8]) -> anyhow::Result<Vec<u8>> {
         self.ran.store(true, Ordering::Relaxed);

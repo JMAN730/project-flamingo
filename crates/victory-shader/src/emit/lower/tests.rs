@@ -1,6 +1,8 @@
 //! Unit tests of `lower`, a child module so `lower.rs` stays under the asset policy's size limit.
 
-use super::{Lowered, Numeric, Parts, buffer_format, f16_nan_widen_bits, half_shift, lower};
+use super::{
+    Lowered, Numeric, Parts, buffer_format, f16_nan_widen_bits, half_shift, lower, structured_srv,
+};
 use crate::native::{
     ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
 };
@@ -3286,5 +3288,51 @@ fn integer_dot_products_lower() {
         assert!(dot(op, 1 << 11, 0x102).is_err(), "op_sel, {op:#x}");
         // src1 the inline constant 1 instead of v2.
         assert!(dot(op, 0, 0x81).is_err(), "constant, {op:#x}");
+    }
+}
+
+/// A structured SRV of a stride other than 4 carries alignment bits in its
+/// kind word and is still one; a structured UAV is not.
+#[test]
+fn structured_srvs_are_told_by_kind_whatever_their_alignment() {
+    assert!(structured_srv(super::Lower::buffer_props(Some(4), false)));
+    assert!(structured_srv(super::Lower::buffer_props(Some(12), false)));
+    assert_eq!(super::Lower::buffer_props(Some(12), false).0, 0x020C);
+    assert!(!structured_srv(super::Lower::buffer_props(Some(12), true)));
+    assert!(!structured_srv(super::Lower::buffer_props(None, false)));
+}
+
+/// A loop with two exits, a uniform break and the lanes running out, that
+/// join before the mask is counted: neither exit is on every path to the
+/// count, so the ballot is not placed at either (it would not dominate
+/// the read).
+#[test]
+fn a_mask_read_after_two_loop_exits_is_not_balloted_at_one() {
+    let words: &[u32] = &[
+        0x4A02_0081, // v_add_nc_u32 v1, 1, v0
+        0xBE8A_0380, // s_mov_b32 s10, 0
+        0xBE8B_0380, // s_mov_b32 s11, 0
+        0x4E02_0281, // loop: v_subrev_nc_u32 v1, 1, v1
+        0x7D84_0280, // v_cmp_eq_u32 vcc_lo, 0, v1
+        0x880A_0A6A, // s_or_b32 s10, vcc_lo, s10
+        0x800B_810B, // s_add_u32 s11, s11, 1
+        0xBF06_830B, // s_cmp_eq_u32 s11, 3
+        0xBF85_0003, // s_cbranch_scc1 break
+        0x8A7E_0A7E, // s_andn2_b32 exec_lo, exec_lo, s10
+        0xBF89_FFF8, // s_cbranch_execnz loop
+        0xBF82_0001, // s_branch join
+        0x7E06_0280, // break: v_mov_b32 v3, 0
+        0x887E_0A7E, // join: s_or_b32 exec_lo, exec_lo, s10
+        0xBE89_0F0A, // s_bcnt1_i32_b32 s9, s10
+        0x7E04_0209, // v_mov_b32 v2, s9
+        S_ENDPGM,
+    ];
+    let lowered = lower_words(words, 1 << 1).expect("lower");
+    assert_eq!(lowered.mask_ballots_after_loop, 0);
+    if let Ok(mut v) = super::super::validator::Validator::load(
+        super::super::validator::Validator::default_path().as_deref(),
+    ) {
+        v.validate(&mut lowered.dxil.clone())
+            .expect("DXIL validation failed");
     }
 }

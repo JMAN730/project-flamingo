@@ -705,9 +705,10 @@ pub const BUFFER_TABLE_RECORD: u32 = 16;
 /// view heap, for buffer loads whose element stride only the view knows (a
 /// descriptor chosen at run time, such as each lane's own in a waterfall
 /// loop). A record is four dwords: the heap index of a raw SRV holding the
-/// view's bytes, the element stride in bytes (1 for a raw view), the byte
-/// at which the view starts in that SRV, and the view's element count (0
-/// when the slot holds no buffer view the host can read this way).
+/// view's bytes, the element stride in bytes (0 for a raw view, which an
+/// index does not move through), the byte at which the view starts in that
+/// SRV, and the view's element count (its bytes for a raw view; 0 when the
+/// slot holds no buffer view the host can read this way).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UserData {
     /// The root constant selects a heap buffer. At `index` the host supplies

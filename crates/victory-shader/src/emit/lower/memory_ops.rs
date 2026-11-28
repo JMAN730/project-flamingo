@@ -1134,6 +1134,9 @@ impl Lower<'_> {
             .get(&(site, false))
             .copied()
             .ok_or("an untracked buffer")?;
+        if matches!(src, Source::Built { address, .. } if address.param == MEMORY) {
+            return self.memory_buffer(inst, b, i, src);
+        }
         // A descriptor made raw has no stride: only byte addressing reads it
         // as the console does.
         if (index.is_some() || typed) && self.x.res.raw.contains(&site) {
@@ -1301,14 +1304,36 @@ impl Lower<'_> {
                 ),
             };
             let at = self.begin_guarded(guard);
-            let i32t = self.s.t.i32;
-            for (op, value) in [(1, keep), (2, x)] {
-                let mut args = vec![h, self.s.m.i32(op)];
-                args.extend(coords);
-                args.push(value);
-                self.s
-                    .op(self.cur, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &args);
-            }
+            // One compare-exchange per try, merged with the dword it found,
+            // so that lanes storing into the same dword keep each other's
+            // bytes and no byte ends up with two lanes' bits.
+            let start = self.cur;
+            let (retry, latch, done) = (
+                self.s.m.new_block(),
+                self.s.m.new_block(),
+                self.s.m.new_block(),
+            );
+            let zero = self.s.m.i32(0);
+            self.s.m.terminate(start, Term::Br(retry));
+            let old = self.s.m.phi(retry, self.s.t.i32);
+            let rest = self.s.m.bin(retry, Bin::And, old, keep);
+            let new = self.s.m.bin(retry, Bin::Or, rest, x);
+            self.s.m.terminate(retry, Term::Br(latch));
+            let mut args = vec![h];
+            args.extend(coords);
+            args.extend([old, new]);
+            let seen = self.s.op(
+                latch,
+                "atomicCompareExchange.i32",
+                Attr::NoUnwind,
+                self.s.t.i32,
+                79,
+                &args,
+            );
+            self.s.m.set_phi(old, vec![(zero, start), (seen, latch)]);
+            let stored = self.s.m.cmp(latch, pred::EQ, old, seen);
+            self.s.m.terminate(latch, Term::CondBr(stored, done, retry));
+            self.cur = done;
             self.end_guarded(at, &[]);
             return Ok(());
         }

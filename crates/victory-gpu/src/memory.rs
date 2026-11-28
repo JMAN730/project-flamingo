@@ -103,6 +103,19 @@ fn page_index(address: u64) -> Option<u64> {
     (page < u64::from(MEMORY_PAGES) - 1).then_some(page)
 }
 
+/// The directory pages a copy of the `len` bytes at title address `first`
+/// holds whole, each with its byte offset in the copy; none at or past the
+/// sentinel entry.
+fn fill_pages(first: u64, len: u64) -> impl Iterator<Item = (u64, u32)> {
+    let end = first.saturating_add(len);
+    let start = first.checked_next_multiple_of(PAGE).unwrap_or(end);
+    (start..end)
+        .step_by(PAGE as usize)
+        .take_while(move |&at| at.checked_add(PAGE).is_some_and(|e| e <= end))
+        .take_while(|&at| page_index(at).is_some())
+        .map(move |at| (at / PAGE, (at - first) as u32))
+}
+
 /// The next 4 MiB cell boundary after `address`.
 fn next_cell(address: u64) -> u64 {
     (address & !(CELL - 1)).wrapping_add(CELL)
@@ -196,18 +209,17 @@ impl Memory {
                 // shortcut: a page of a title buffer inside this one that
                 // has a copy of its own is given this copy too.
                 let (first, len) = shadow.span();
-                let mut at = first.next_multiple_of(PAGE);
-                while at + PAGE <= first + len && at / PAGE < u64::from(MEMORY_PAGES) - 1 {
-                    // SAFETY: inside the directory's mapping.
-                    let other = unsafe { self.directory.1.add((at / PAGE) as usize * 2) };
+                for (page, offset) in fill_pages(first, len) {
+                    // SAFETY: inside the directory's mapping
+                    // ([`fill_pages`] stops before the sentinel).
+                    let other = unsafe { self.directory.1.add(page as usize * 2) };
                     // SAFETY: as above; the offset first, as below.
                     unsafe {
                         if other.read() == 0 {
-                            other.add(1).write_volatile((at - first) as u32);
+                            other.add(1).write_volatile(offset);
                             other.write_volatile(n as u32 + 1);
                         }
                     }
-                    at += PAGE;
                 }
                 n
             }
@@ -380,6 +392,23 @@ mod tests {
         let sentinel = (u64::from(MEMORY_PAGES) - 1) * PAGE;
         assert_eq!(page_index(sentinel), None);
         assert_eq!(page_index(u64::MAX), None);
+    }
+
+    #[test]
+    fn fill_pages_lists_the_whole_pages_a_copy_holds() {
+        // Aligned: every page, offsets from the copy's start.
+        let got: Vec<_> = fill_pages(0x20_0000, 3 * PAGE).collect();
+        assert_eq!(got, [(0x20, 0), (0x21, 0x1_0000), (0x22, 0x2_0000)]);
+        // Unaligned: the partial pages at both ends are left out.
+        let got: Vec<_> = fill_pages(0x20_0100, 3 * PAGE).collect();
+        assert_eq!(got, [(0x21, 0xFF00), (0x22, 0x1_FF00)]);
+        // Smaller than a page: none.
+        assert_eq!(fill_pages(0x20_0100, PAGE).count(), 0);
+        // Never the sentinel entry, nor past the directory.
+        let last = (u64::from(MEMORY_PAGES) - 2) * PAGE;
+        let got: Vec<_> = fill_pages(last, 4 * PAGE).collect();
+        assert_eq!(got, [(u64::from(MEMORY_PAGES) - 2, 0)]);
+        assert_eq!(fill_pages(u64::MAX - PAGE, PAGE).count(), 0);
     }
 
     #[test]

@@ -6,10 +6,11 @@
 //! The console reads the stride from the descriptor. Here a slot holds our
 //! own record of the view instead, and the host slot behind it is a view of
 //! one kind, so a shader cannot take the stride from either. The table
-//! gives it, per slot, a raw view holding the view's bytes, the stride, the
-//! view's first byte in that raw view and its element count. Raw views are
-//! made per window of a title buffer's host copy ([`Shadow`]), shared by
-//! every slot whose view lies in it, and kept for the heap's life.
+//! gives it, per slot, a raw view holding the view's bytes, the stride (0
+//! for a raw view), the view's first byte in that raw view and its element
+//! count. Raw views are made per window of a title buffer's host copy
+//! ([`Shadow`]), shared by every slot whose view lies in it, and kept for
+//! the heap's life.
 //!
 //! shortcut: only shader resource views of buffers get records (a slot with
 //! another view reads zeros). As for other buffers read through directly
@@ -180,6 +181,7 @@ impl BufferTable {
                 let offset = read.shadow.offset(read.address);
                 let left = read.shadow.left(read.address);
                 let (alias, bias) = self.alias(heap, &read.shadow, (offset, read.bytes, left))?;
+                // A raw view (stride 0) counts bytes; the shader drops its index.
                 let elements = u32::try_from(read.bytes / u64::from(read.stride.max(1))).ok()?;
                 self.fresh
                     .push((read.shadow.clone(), read.address, read.bytes));

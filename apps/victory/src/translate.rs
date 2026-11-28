@@ -1052,6 +1052,7 @@ fn tally_resources(p: &NativeProgram, r: &resource::Resources, t: &mut Tally) {
         // tables are no root parameter.
         if let Some(a) = a
             && a.param != resource::CODE
+            && a.param != resource::MEMORY
             && !matches!(
                 p.layout[a.param].root,
                 RootType::ResourceHeap | RootType::SamplerHeap

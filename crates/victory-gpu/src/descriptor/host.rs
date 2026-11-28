@@ -3763,6 +3763,8 @@ pub(crate) struct BufferRead {
     pub(crate) shadow: Arc<crate::shadow::Shadow>,
     pub(crate) address: u64,
     pub(crate) bytes: u64,
+    /// Bytes per element; 0 for a raw view, which an index does not move
+    /// through (the console's zero-stride buffer).
     pub(crate) stride: u32,
 }
 
@@ -3777,7 +3779,7 @@ pub(crate) fn selected_buffer(view: &View) -> Option<BufferRead> {
     let b = unsafe { desc.Anonymous.Buffer };
     let element = element_size(&desc);
     let stride = if b.Flags == D3D12_BUFFER_SRV_FLAG_RAW {
-        1
+        0
     } else {
         element.try_into().ok()?
     };

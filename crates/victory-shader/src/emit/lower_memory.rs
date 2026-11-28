@@ -29,6 +29,17 @@ impl<'a> Lower<'a> {
         (sum, hi)
     }
 
+    /// `lo`, `hi` plus the unsigned 32-bit `x`, with the carry.
+    pub(super) fn address_add(&mut self, lo: V, hi: V, x: V) -> (V, V) {
+        let c = self.cur;
+        let i32t = self.s.t.i32;
+        let sum = self.s.m.bin(c, Bin::Add, lo, x);
+        let carry = self.s.m.cmp(c, pred::IULT, sum, lo);
+        let carry = self.s.m.cast(c, Cast::ZExt, carry, i32t);
+        let hi = self.s.m.bin(c, Bin::Add, hi, carry);
+        (sum, hi)
+    }
+
     /// Title memory at the 40-bit address `lo`, `hi` (`shader.rs`
     /// `SLOT_MEMORY`): the handle of the raw view of the host copy holding
     /// it and the byte in that view. A page without a copy reads zeros
@@ -116,8 +127,8 @@ impl<'a> Lower<'a> {
         else {
             unreachable!()
         };
-        if *lds || !matches!(saddr, None | Some(Operand::Scalar { code: NULL, .. })) {
-            return Err("a global address with a scalar base");
+        if *lds {
+            return Err("a global access to LDS");
         }
         let Some(Operand::Vector { reg: areg, .. }) = *addr else {
             return Err("a global address not in VGPRs");
@@ -126,7 +137,22 @@ impl<'a> Lower<'a> {
             let v = inst.read(Reg::V(areg + k)).ok_or("a global address")?;
             l.i32_of(v)
         };
-        let (lo, hi) = (word(self, 0)?, word(self, 1)?);
+        let (lo, hi) = match *saddr {
+            None | Some(Operand::Scalar { code: NULL, .. }) => (word(self, 0)?, word(self, 1)?),
+            // An SGPR pair plus each lane's 32-bit offset, zero-extended.
+            Some(Operand::Scalar { code, .. }) => {
+                let sword = |l: &mut Self, k: u8| -> Result<V, Why> {
+                    let v = inst
+                        .read(Reg::S(code + k))
+                        .ok_or("an address not in SGPRs")?;
+                    l.i32_of(v)
+                };
+                let (lo, hi) = (sword(self, 0)?, sword(self, 1)?);
+                let voff = word(self, 0)?;
+                self.address_add(lo, hi, voff)
+            }
+            Some(_) => return Err("a global address with a scalar base"),
+        };
         let (lo, hi) = self.address_plus(lo, hi, i32::from(*offset));
         let guard = self.guard(b, i)?;
         let c = self.cur;
@@ -201,6 +227,32 @@ impl<'a> Lower<'a> {
             None => self.s.m.i32(0),
         };
         let (h, byte) = self.memory(lo, hi, guard);
+        let was = self.memory_atomic(name, op, h, byte, v, guard, old)?;
+        if let Some(reg) = back {
+            self.write(inst, Reg::V(reg), was, None);
+        }
+        Ok(())
+    }
+
+    /// A `global_atomic_*` or `buffer_atomic_*` operation `op` (the name's
+    /// suffix) of `v` on the dword at `byte` of the view `h` (title memory,
+    /// [`Self::memory`]), in the lanes `guard` leaves; the dword from before
+    /// (`old` in other lanes).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn memory_atomic(
+        &mut self,
+        name: &'static str,
+        op: &str,
+        h: V,
+        byte: V,
+        v: V,
+        guard: Option<V>,
+        old: V,
+    ) -> Result<V, Why> {
+        let c = self.cur;
+        let (i32t, res) = (self.s.t.i32, self.s.t.res_ret);
+        let iu = self.s.m.undef(i32t);
+        let align = self.s.m.i32(4);
         // DXIL's atomic operations: add 0, and 1, or 2, xor 3, signed
         // minimum 4 and maximum 5, unsigned 6 and 7, exchange 8.
         let simple = match op {
@@ -286,9 +338,318 @@ impl<'a> Lower<'a> {
                 found
             }
         };
-        let was = self.end_guarded(at, &[(was, old)])[0];
-        if let Some(reg) = back {
-            self.write(inst, Reg::V(reg), was, None);
+        Ok(self.end_guarded(at, &[(was, old)])[0])
+    }
+
+    /// The descriptor `rsrc` of `inst` built around title memory
+    /// (`resource::MEMORY`, [`Source::Built`]): its 48-bit base (dword 0,
+    /// dword 1 bits 0-15), its stride (dword 1 bits 16-29) and its size in
+    /// bytes or records (dword 2, a constant or the value the code
+    /// computes), from the registers the access reads.
+    fn memory_descriptor(
+        &mut self,
+        inst: &Inst,
+        rsrc: &Operand,
+        src: &Source,
+    ) -> Result<[V; 4], Why> {
+        let Operand::Scalar { code, .. } = *rsrc else {
+            return Err("a descriptor not in SGPRs");
+        };
+        let Source::Built {
+            bits,
+            words,
+            records,
+            ..
+        } = *src
+        else {
+            unreachable!("a descriptor built around title memory")
+        };
+        // GFX10 dword 1 bits 30 and 31 swizzle; dword 3 bit 23 adds the
+        // thread id to the index.
+        if bits >> 30 != 0 || words[1] & 1 << 23 != 0 {
+            return Err("a swizzled buffer in title memory");
+        }
+        let word = |l: &mut Self, k: u8| -> Result<V, Why> {
+            let v = inst
+                .read(Reg::S(code + k))
+                .ok_or("a descriptor not in SGPRs")?;
+            l.i32_of(v)
+        };
+        let (lo, w1) = (word(self, 0)?, word(self, 1)?);
+        let c = self.cur;
+        let k = |l: &mut Self, v: u32| l.s.m.i32(v);
+        let low16 = k(self, 0xFFFF);
+        let hi = self.s.m.bin(c, Bin::And, w1, low16);
+        let k16 = k(self, 16);
+        let stride = self.s.m.bin(c, Bin::LShr, w1, k16);
+        let bits14 = k(self, 0x3FFF);
+        let stride = self.s.m.bin(c, Bin::And, stride, bits14);
+        let records = match records {
+            Some(v) => self.i32_of(v)?,
+            None => k(self, words[0]),
+        };
+        Ok([lo, hi, stride, records])
+    }
+
+    /// `buffer_load_dword*`, `buffer_store_dword*` and `buffer_atomic_*`
+    /// through a descriptor built around title memory (`resource::MEMORY`):
+    /// the base plus `soffset`, the immediate, the offset VGPR and, with
+    /// `idxen`, the index times the stride; bounded as dword 3 selects
+    /// (GFX10 `OOB_SELECT`: an access out of range reads 0 and writes
+    /// nothing).
+    pub(super) fn memory_buffer(
+        &mut self,
+        inst: &Inst,
+        b: usize,
+        i: usize,
+        src: &Source,
+    ) -> Result<(), Why> {
+        let Fields::Buffer {
+            data,
+            addr,
+            rsrc,
+            soffset,
+            offset,
+            offen,
+            idxen,
+            format,
+            cache,
+            ..
+        } = &inst.fields
+        else {
+            unreachable!()
+        };
+        let name = inst.name();
+        if format.is_some() || name.contains("_format_") {
+            return Err("a typed access to title memory by address");
+        }
+        let Source::Built { words, .. } = *src else {
+            unreachable!("a descriptor built around title memory")
+        };
+        let count = |rest: &str| match rest {
+            "dword" => Ok(1u8),
+            "dwordx2" => Ok(2),
+            "dwordx3" => Ok(3),
+            "dwordx4" => Ok(4),
+            _ => Err("a byte or halfword access to title memory by address"),
+        };
+        let [lo, hi, stride, records] = self.memory_descriptor(inst, rsrc, src)?;
+        let guard = self.guard(b, i)?;
+        let c = self.cur;
+        let (i32t, res, void) = (self.s.t.i32, self.s.t.res_ret, self.s.t.void);
+        let Operand::Vector { reg: areg, .. } = *addr else {
+            return Err("a buffer address");
+        };
+        let vaddr = |l: &mut Self, k: u8| -> Result<V, Why> {
+            let v = inst.read(Reg::V(areg + k)).ok_or("a buffer address")?;
+            l.i32_of(v)
+        };
+        let index = if *idxen { Some(vaddr(self, 0)?) } else { None };
+        // The offset the range check sees: the immediate, the offset VGPR
+        // and the offset register.
+        let mut off = self.s.m.i32(u32::from(*offset));
+        if *offen {
+            let o = vaddr(self, u8::from(*idxen))?;
+            off = self.s.m.bin(c, Bin::Add, off, o);
+        }
+        if !matches!(
+            soffset,
+            Operand::Scalar { code: NULL, .. } | Operand::Const(128)
+        ) {
+            let so = self.operand(inst, soffset)?;
+            off = self.s.m.bin(c, Bin::Add, off, so);
+        }
+        let mut within = off;
+        if let Some(index) = index {
+            let start = self.s.m.bin(c, Bin::Mul, index, stride);
+            within = self.s.m.bin(c, Bin::Add, start, off);
+        }
+        // shortcut: the offset from the base is taken below 4 GiB.
+        let (lo, hi) = self.address_add(lo, hi, within);
+        // Whether dword `k` of the access is in range (none: always).
+        let oob = words[1] >> 28 & 3;
+        let in_range = |l: &mut Self, k: u32| -> Option<V> {
+            let c = l.cur;
+            match (oob, index) {
+                // Checking disabled.
+                (2, _) => None,
+                // Raw: the byte offset against the size in bytes.
+                (3, _) => {
+                    let at = l.add_bytes(off, 4 * k);
+                    Some(l.s.m.cmp(c, pred::IULT, at, records))
+                }
+                // Structured: the index against the size in records.
+                // shortcut: the offset is not checked against the stride
+                // (`OOB_SELECT` 0).
+                (_, Some(index)) => Some(l.s.m.cmp(c, pred::IULT, index, records)),
+                (_, None) => {
+                    let zero = l.s.m.i32(0);
+                    Some(l.s.m.cmp(c, pred::IULT, zero, records))
+                }
+            }
+        };
+        let and = |l: &mut Self, a: Option<V>, b: Option<V>| match (a, b) {
+            (Some(a), Some(b)) => Some(l.s.m.bin(l.cur, Bin::And, a, b)),
+            (a, b) => a.or(b),
+        };
+        let iu = self.s.m.undef(i32t);
+        let align = self.s.m.i32(4);
+        if let Some(rest) = name.strip_prefix("buffer_load_") {
+            let n = count(rest)?;
+            let Some(Operand::Vector { reg, .. }) = *data else {
+                return Err("a buffer result");
+            };
+            let first = in_range(self, 0);
+            let first = and(self, first, guard);
+            let (h, byte) = self.memory(lo, hi, first);
+            let mask = self.s.m.i8((1u8 << n) - 1);
+            let r = self.s.op(
+                self.cur,
+                "rawBufferLoad.f32",
+                Attr::ReadOnly,
+                res,
+                139,
+                &[h, byte, iu, mask, align],
+            );
+            for k in 0..n {
+                let x = self.s.m.extract(self.cur, r, u32::from(k));
+                let mut x = self.as_int(x);
+                if let Some(ok) = in_range(self, u32::from(k)) {
+                    let zero = self.s.m.i32(0);
+                    x = self.s.m.select(self.cur, ok, x, zero);
+                }
+                self.write(inst, Reg::V(reg + k), x, guard);
+            }
+            return Ok(());
+        }
+        if let Some(rest) = name.strip_prefix("buffer_store_") {
+            let n = count(rest)?;
+            let d = data.as_ref().ok_or("buffer store data")?;
+            let vals = self.vgprs(inst, d, n)?;
+            // shortcut: a store partly out of range writes none of it.
+            let last = in_range(self, u32::from(n) - 1);
+            let run = and(self, last, guard);
+            let (h, byte) = self.memory(lo, hi, run);
+            let mut args = vec![h, byte, iu];
+            args.extend(&vals);
+            args.resize(3 + 4, iu);
+            args.push(self.s.m.i8((1u8 << n) - 1));
+            args.push(align);
+            let at = self.begin_guarded(run);
+            self.s.op(
+                self.cur,
+                "rawBufferStore.i32",
+                Attr::NoUnwind,
+                void,
+                140,
+                &args,
+            );
+            self.end_guarded(at, &[]);
+            return Ok(());
+        }
+        let Some(op) = name.strip_prefix("buffer_atomic_") else {
+            return Err(name);
+        };
+        let d = data.as_ref().ok_or("buffer atomic data")?;
+        let Operand::Vector { reg: dreg, .. } = *d else {
+            return Err("buffer atomic data");
+        };
+        let back = cache.glc;
+        let old = match inst.read(Reg::V(dreg)) {
+            Some(x) if back => self.i32_of(x)?,
+            _ => self.s.m.i32(0),
+        };
+        let first = in_range(self, 0);
+        let run = and(self, first, guard);
+        let was = if op == "cmpswap" {
+            // Data is (new, compare).
+            let vals = self.vgprs(inst, d, 2)?;
+            let (h, byte) = self.memory(lo, hi, run);
+            let at = self.begin_guarded(run);
+            let was = self.s.op(
+                self.cur,
+                "atomicCompareExchange.i32",
+                Attr::NoUnwind,
+                i32t,
+                79,
+                &[h, byte, iu, iu, vals[1], vals[0]],
+            );
+            self.end_guarded(at, &[(was, old)])[0]
+        } else {
+            let v = self.vgprs(inst, d, 1)?[0];
+            let (h, byte) = self.memory(lo, hi, run);
+            self.memory_atomic(name, op, h, byte, v, run, old)?
+        };
+        if back {
+            // An access out of range returns 0.
+            let was = match first {
+                Some(ok) => {
+                    let zero = self.s.m.i32(0);
+                    self.s.m.select(self.cur, ok, was, zero)
+                }
+                None => was,
+            };
+            self.write(inst, Reg::V(dreg), was, guard);
+        }
+        Ok(())
+    }
+
+    /// `s_buffer_load_dword*` through a descriptor built around title
+    /// memory (`resource::MEMORY`): the base plus the offsets (their low
+    /// two bits cleared), each dword bounded by the size in bytes.
+    pub(super) fn memory_sbuffer(&mut self, inst: &Inst, src: &Source) -> Result<(), Why> {
+        let Fields::Smem {
+            data: Some(Operand::Scalar { code, .. }),
+            base,
+            offset,
+            soffset,
+            ..
+        } = inst.fields
+        else {
+            return Err("a scalar buffer load");
+        };
+        let count = match inst.name().strip_prefix("s_buffer_load_dword") {
+            Some("") => 1u8,
+            Some("x2") => 2,
+            Some("x4") => 4,
+            Some("x8") => 8,
+            Some("x16") => 16,
+            _ => return Err("a scalar buffer access to title memory by address"),
+        };
+        let [lo, hi, _, records] = self.memory_descriptor(inst, &base, src)?;
+        let c = self.cur;
+        let (i32t, res) = (self.s.t.i32, self.s.t.res_ret);
+        let not3 = self.s.m.i32(!3);
+        let mut off = self.s.m.i32((offset as u32) & !3);
+        if !matches!(soffset, Operand::Scalar { code: NULL, .. }) {
+            let so = self.operand(inst, &soffset)?;
+            let so = self.s.m.bin(c, Bin::And, so, not3);
+            off = self.s.m.bin(c, Bin::Add, off, so);
+        }
+        let (lo, hi) = self.address_add(lo, hi, off);
+        let (iu, align) = (self.s.m.undef(i32t), self.s.m.i32(4));
+        for first in (0..count).step_by(4) {
+            let n = (count - first).min(4);
+            let (lo, hi) = self.address_plus(lo, hi, 4 * i32::from(first));
+            let (h, byte) = self.memory(lo, hi, None);
+            let mask = self.s.m.i8((1u8 << n) - 1);
+            let r = self.s.op(
+                c,
+                "rawBufferLoad.f32",
+                Attr::ReadOnly,
+                res,
+                139,
+                &[h, byte, iu, mask, align],
+            );
+            for k in 0..n {
+                let x = self.s.m.extract(c, r, u32::from(k));
+                let x = self.as_int(x);
+                let at = self.add_bytes(off, 4 * u32::from(first + k));
+                let ok = self.s.m.cmp(c, pred::IULT, at, records);
+                let zero = self.s.m.i32(0);
+                let x = self.s.m.select(c, ok, x, zero);
+                self.write(inst, Reg::S(code + first + k), x, None);
+            }
         }
         Ok(())
     }

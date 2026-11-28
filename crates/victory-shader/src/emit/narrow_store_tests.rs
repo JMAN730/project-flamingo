@@ -32,10 +32,14 @@ const WORDS: &[u32] = &[
 ];
 
 fn shader() -> HostShader {
+    shader_of(WORDS)
+}
+
+fn shader_of(words: &[u32]) -> HostShader {
     let native = NativeProgram {
         stage: HwStage::Cs,
         wave64: false,
-        vgprs: 4,
+        vgprs: 8,
         layout: vec![RootParam {
             root: RootType::Table,
             table_offset_dwords: 0,
@@ -58,7 +62,7 @@ fn shader() -> HostShader {
             rsrc2: 1 << 1, // one user SGPR
             threads: [64, 1, 1],
         }),
-        code: WORDS.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
     };
     let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
     let st = structure::structure(&p).unwrap();
@@ -131,4 +135,61 @@ fn byte_and_halfword_stores_keep_the_rest_of_each_dword() {
         ran += 1;
     }
     assert!(ran > 0, "no SM 6.6 device available");
+}
+
+/// Every lane stores its own one-bit byte (`1 << (lane & 7)`) to byte 0:
+/// one lane's store wins, so the byte holds one bit, never the bits of
+/// several lanes that cleared it before any of them set theirs.
+const RACE: &[u32] = &[
+    0xBE81_0380, // s_mov_b32 s1, 0
+    0xF408_0300,
+    0xFA00_0000, // s_load_dwordx4 s[12:15], s[0:1], 0
+    0x3608_0087, // v_and_b32 v4, 7, v0
+    0x7E0A_0281, // v_mov_b32 v5, 1
+    0x3402_0B04, // v_lshlrev_b32 v1, v4, v5
+    0x7E0C_0280, // v_mov_b32 v6, 0
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0xE060_1000,
+    0x8003_0106, // buffer_store_byte v1, v6, s[12:15], 0 offen
+    0xBF81_0000, // s_endpgm
+];
+
+#[cfg(windows)]
+#[test]
+fn lanes_storing_the_same_byte_leave_one_lanes_value() {
+    use super::host::{Dispatch, Host, Root, View};
+    let shader = shader_of(RACE);
+    if let Ok(mut validator) =
+        super::validator::Validator::load(super::validator::Validator::default_path().as_deref())
+    {
+        validator.validate(&mut shader.dxil.clone()).unwrap();
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let force_warp = std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
+    for &(name, warp) in super::valu_tests::backends(force_warp) {
+        let Ok(host) = Host::new(warp) else { continue };
+        let (root, pso) = host.compute_pipeline(&shader).unwrap();
+        for _ in 0..8 {
+            let output = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(
+                            0,
+                            Root::Constants(vec![0; shader.user_data_dwords() as usize]),
+                        )],
+                        views: &[View::RawUav(1)],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap();
+            let word = output[0][0];
+            assert_eq!(word.count_ones(), 1, "{name}: {word:#x}");
+            assert_eq!(word & !0xFF, 0, "{name}: {word:#x}");
+        }
+    }
 }

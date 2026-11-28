@@ -64,11 +64,14 @@ pub enum Source {
     /// [`Resources::scalar`] for its address).
     Loaded { load: Site, first: u8 },
     /// A buffer descriptor built around an address: `bits` OR-ed into
-    /// dword 1 (stride, swizzle), dwords 2 and 3 as given.
+    /// dword 1 (stride, swizzle), dwords 2 and 3 as given. Around title
+    /// memory ([`MEMORY`]) dword 2, the size, may be one the code computes
+    /// (`records`; `words[0]` is then 0).
     Built {
         address: Address,
         bits: u32,
         words: [u32; 2],
+        records: Option<Value>,
     },
     /// Fixed in the code (an immediate sampler, say).
     Constant(Vec<u32>),
@@ -289,14 +292,16 @@ fn track_with(
                     t.clamped.set(false);
                     let address = match t.smem_address(inst, base, *offset, soffset) {
                         Ok(a) => a,
-                        Err("an address read from the first lane of a per-lane value") => {
-                            let (a, reads) = t
-                                .smem_waterfall_address(b, inst, base, *offset, soffset)
-                                .ok_or_else(|| {
-                                    fail("an address read from the first lane of a per-lane value")
-                                })?;
-                            pending_waterfall_loads.insert(site, reads);
-                            a
+                        Err(why @ "an address read from the first lane of a per-lane value") => {
+                            match t.smem_waterfall_address(b, inst, base, *offset, soffset) {
+                                Some((a, reads)) => {
+                                    pending_waterfall_loads.insert(site, reads);
+                                    a
+                                }
+                                // A uniform address the scalar unit reads as it
+                                // stands: title memory at it.
+                                None => t.first_lane_by_address(inst, base, why).map_err(fail)?,
+                            }
                         }
                         Err(what) => t.by_address(what).map_err(fail)?,
                     };
@@ -311,7 +316,15 @@ fn track_with(
                     t.clamped.set(false);
                     let address = t
                         .flat_address(inst, addr.as_ref(), saddr.as_ref(), *offset)
-                        .or_else(|why| t.by_address(why))
+                        .or_else(|why| match (why, saddr) {
+                            // A scalar base read from the first lane, plus
+                            // each lane's offset.
+                            (
+                                "an address read from the first lane of a per-lane value",
+                                Some(s),
+                            ) => t.first_lane_by_address(inst, s, why),
+                            _ => t.by_address(why),
+                        })
                         .map_err(fail)?;
                     out.scalar.push((site, address));
                 }
@@ -404,11 +417,17 @@ fn track_with(
                 // descriptor. Lowering one is a no-op on the host, so there
                 // is no descriptor to keep alive for it.
                 Fields::Buffer { rsrc, .. } if !inst.name().ends_with("_inv") => {
-                    descriptor(rsrc, Role::Resource)?
+                    t.buffer_access.set(true);
+                    let traced = descriptor(rsrc, Role::Resource);
+                    t.buffer_access.set(false);
+                    traced?
                 }
                 Fields::Buffer { .. } => {}
                 Fields::Smem { base, .. } if inst.name().starts_with("s_buffer_") => {
-                    descriptor(base, Role::Resource)?;
+                    t.buffer_access.set(true);
+                    let traced = descriptor(base, Role::Resource);
+                    t.buffer_access.set(false);
+                    traced?;
                 }
                 _ => {}
             }
@@ -494,6 +513,12 @@ fn track_with(
     }
     out.code_joins = t.code_joins(&out);
     Ok(out)
+}
+
+/// The lower of two address offsets taken as signed (one arm of a join
+/// may subtract from the base).
+fn signed_min(a: u32, b: u32) -> u32 {
+    if (a as i32) <= (b as i32) { a } else { b }
 }
 
 /// A dword after copy propagation.
@@ -592,6 +617,12 @@ struct Tracer<'a> {
     /// its result saturates, so the sum must not be folded (and a non-root
     /// address is not taken as title memory either).
     clamped: std::cell::Cell<bool>,
+    /// The descriptor being classified is a vector buffer access's or an
+    /// `s_buffer_*`'s: built around an address that traces to no root
+    /// parameter, it is title memory ([`MEMORY`]) in a compute program.
+    /// Never an image's (a ray and node test's untraced descriptor lowers
+    /// as a miss), and never in the last chance of [`track`].
+    buffer_access: std::cell::Cell<bool>,
 }
 
 /// VALU operations whose result is uniform when their operands are: the
@@ -712,6 +743,7 @@ impl<'a> Tracer<'a> {
             uniform_memo: std::cell::RefCell::new(vec![None; n]),
             leftovers: false,
             clamped: std::cell::Cell::new(false),
+            buffer_access: std::cell::Cell::new(false),
         };
         t.origin = t.propagate_copies(n)?;
         Ok(t)
@@ -958,7 +990,8 @@ impl<'a> Tracer<'a> {
             let mut entry: Option<(Value, u32, Option<Value>, bool)> = None;
             let mut exact = true;
             let mut ok = true;
-            let mut min_off = u32::MAX;
+            // The lowest arm offset, signed (an arm may subtract).
+            let mut min_off: Option<u32> = None;
             for &arg in &phi.args {
                 let term = if vector {
                     self.vorigin(arg)
@@ -978,7 +1011,7 @@ impl<'a> Tracer<'a> {
                     ok = false;
                     break;
                 }
-                min_off = min_off.min(arm.offset);
+                min_off = Some(min_off.map_or(arm.offset, |m| signed_min(m, arm.offset)));
                 match entry {
                     None => entry = Some((base, arm.offset, arm.dynamic, arm.base_included)),
                     Some((eb, eo, ed, ebi)) if eb == base => {
@@ -1004,7 +1037,7 @@ impl<'a> Tracer<'a> {
                 } else {
                     Sum {
                         base: Some(base),
-                        offset: min_off,
+                        offset: min_off.unwrap_or(offset),
                         dynamic: Some(v),
                         base_included: true,
                     }
@@ -1110,7 +1143,7 @@ impl<'a> Tracer<'a> {
             } else {
                 Sum {
                     base: a.base,
-                    offset: a.offset.min(b.offset),
+                    offset: signed_min(a.offset, b.offset),
                     dynamic: Some(v),
                     base_included: true,
                 }
@@ -1322,7 +1355,18 @@ impl<'a> Tracer<'a> {
                     return Err("an offset from a root parameter");
                 }
                 extra.offset = extra.offset.wrapping_add(off);
-                self.address(lo, hi, extra)
+                match self.address(lo, hi, extra) {
+                    // A scalar base that traces to no root parameter plus
+                    // each lane's offset: the base's reason, so that the
+                    // access is title memory at the sum.
+                    Err(two @ "an address with two computed terms") => {
+                        match self.address(lo, hi, Sum::constant(off)) {
+                            Err(why) if RAW.contains(&why) => Err(why),
+                            _ => Err(two),
+                        }
+                    }
+                    traced => traced,
+                }
             }
             _ => {
                 let word = |k| inst.read(Reg::V(reg + k)).map(|v| self.vorigin(v));
@@ -1429,6 +1473,70 @@ impl<'a> Tracer<'a> {
         } else {
             Err(why)
         }
+    }
+
+    /// [`Self::by_address`] for a scalar access whose address (`base`) is
+    /// read from the first lane of a per-lane value and is no waterfall
+    /// loop's: the SGPRs hold one address for the wave, which the access
+    /// reads as it stands, when the per-lane address it is read from traces
+    /// to no root parameter and to no table in the code either (lowering
+    /// gives `s_getpc_b64` the offset in the code, no title address). Not in
+    /// the last chance of [`track`].
+    fn first_lane_by_address(
+        &self,
+        inst: &Inst,
+        base: &Operand,
+        why: &'static str,
+    ) -> Result<Address, &'static str> {
+        if self.leftovers {
+            return Err(why);
+        }
+        let Operand::Scalar { code, .. } = *base else {
+            return Err(why);
+        };
+        let word = |k| inst.read(Reg::S(code + k)).map(|v| self.origin(v));
+        let (Some(Term::Value(lo)), Some(hi)) = (word(0), word(1)) else {
+            return Err(why);
+        };
+        let Some(lo) = self.first_lane_source(lo) else {
+            return Err(why);
+        };
+        let hi = match hi {
+            Term::Value(h) => self.first_lane_source(h).map_or(hi, |h| self.vorigin(h)),
+            Term::Const(_) => hi,
+        };
+        if self.reads_code_address(lo) {
+            return Err(why);
+        }
+        self.clamped.set(false);
+        match self.address(self.vorigin(lo), hi, Sum::constant(0)) {
+            Err(raw) if RAW.contains(&raw) => self.by_address(raw).map_err(|_| why),
+            _ => Err(why),
+        }
+    }
+
+    /// Whether `v` may be computed from what `s_getpc_b64` writes (through
+    /// any instruction or join; past a bound, taken to be).
+    fn reads_code_address(&self, v: Value) -> bool {
+        let mut seen = std::collections::HashSet::new();
+        let mut todo = vec![v];
+        while let Some(v) = todo.pop() {
+            if !seen.insert(v) {
+                continue;
+            }
+            if seen.len() > 512 {
+                return true;
+            }
+            if let Some(inst) = self.def(v) {
+                if inst.name() == "s_getpc_b64" {
+                    return true;
+                }
+                todo.extend(inst.reads.iter().map(|r| r.1));
+            } else if let Some((b, i)) = self.phis[v.0 as usize] {
+                todo.extend(self.p.blocks[b].phis[i].args.iter().copied());
+            }
+        }
+        false
     }
 
     fn high_half(&self, hi: Term, high: Option<Value>) -> bool {
@@ -1809,19 +1917,50 @@ impl<'a> Tracer<'a> {
         if let Some(source) = self.unraw(words).and_then(|w| self.loaded(&w)) {
             return Ok(source);
         }
-        if let [lo, hi, Term::Const(w2), Term::Const(w3)] = *words {
+        if let [lo, hi, w2, Term::Const(w3)] = *words {
             let (mut hi, mut bits) = (hi, 0);
             while let Term::Value(v) = hi
                 && let Some((x, more)) = self.set_bits(v)
             {
                 (hi, bits) = (x, bits | more);
             }
-            let address = self.address(lo, hi, Sum::constant(0))?;
-            return Ok(Source::Built {
-                address,
-                bits,
-                words: [w2, w3],
-            });
+            let by_address = self.buffer_access.get() && !self.leftovers;
+            match w2 {
+                Term::Const(w2) => {
+                    self.clamped.set(false);
+                    let address = match self.address(lo, hi, Sum::constant(0)) {
+                        Ok(a) => a,
+                        Err(why) if by_address => self.by_address(why)?,
+                        Err(why) => return Err(why),
+                    };
+                    return Ok(Source::Built {
+                        address,
+                        bits,
+                        words: [w2, w3],
+                        records: None,
+                    });
+                }
+                // A size the code computes: only around title memory, which
+                // bounds the access at run time.
+                Term::Value(records) if by_address => {
+                    self.clamped.set(false);
+                    let address = match self.address(lo, hi, Sum::constant(0)) {
+                        Ok(a) if a.param == CODE => Err("an address with an untracked high half"),
+                        Ok(_) => Err("an address from a root parameter"),
+                        Err(why) => Err(why),
+                    }
+                    .or_else(|why| self.by_address(why));
+                    if let Ok(address) = address {
+                        return Ok(Source::Built {
+                            address,
+                            bits,
+                            words: [0, w3],
+                            records: Some(records),
+                        });
+                    }
+                }
+                Term::Value(_) => {}
+            }
         }
         let loaded = |w: &Term| {
             matches!(*w, Term::Value(v)
@@ -3686,7 +3825,8 @@ pub(crate) mod tests {
             Source::Built {
                 address: at(0, 0),
                 bits: 0x10_0000,
-                words: [u32::MAX, 0x1101_4FAC]
+                words: [u32::MAX, 0x1101_4FAC],
+                records: None,
             }
         );
         assert_eq!(
@@ -3938,6 +4078,114 @@ pub(crate) mod tests {
                 what: "an address in an SGPR that is no root parameter"
             }
         );
+    }
+
+    /// A raw buffer descriptor the code builds around a pointer it loads
+    /// from title memory (`s_load_dwordx2 s[4:5], s[2:3]`, root constants 2
+    /// and 3 its address), read by `buffer_load_dword v1, v0, s[4:7]`; dword
+    /// 2 is -1, or loaded too with `records`.
+    fn pointer_descriptor(records: bool) -> Vec<u32> {
+        let mut w = vec![0xF404_0101, 0xFA00_0000]; // s_load_dwordx2 s[4:5], s[2:3], 0
+        if records {
+            w.extend([0xF400_0181, 0xFA00_0008]); // s_load_dword s6, s[2:3], 8
+        } else {
+            w.push(0xBE86_03C1); // s_mov_b32 s6, -1
+        }
+        w.extend([
+            0xBE87_03FF, // s_mov_b32 s7, 0x31014fac
+            0x3101_4FAC,
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0xE030_1000, // buffer_load_dword v1, v0, s[4:7], 0 offen
+            0x8001_0100,
+            S_ENDPGM,
+        ]);
+        w
+    }
+
+    /// A join of offsets 8 and -4 from one base starts at -4.
+    #[test]
+    fn the_lowest_joined_offset_is_signed() {
+        assert_eq!(signed_min(8, (-4i32) as u32), (-4i32) as u32);
+        assert_eq!(signed_min(8, 4), 4);
+        assert_eq!(signed_min(0x8000_0000, 0), 0x8000_0000);
+    }
+
+    #[test]
+    fn a_buffer_descriptor_around_a_loaded_pointer_is_title_memory_in_a_compute_program() {
+        let r = track_words(
+            &pointer_descriptor(false),
+            &[param(Constants, 0, 4)],
+            HwStage::Cs,
+        );
+        assert_eq!(r.descriptors.len(), 1);
+        assert_eq!(
+            r.descriptors[0].source,
+            Source::Built {
+                address: at(MEMORY, 0),
+                bits: 0,
+                words: [u32::MAX, 0x3101_4FAC],
+                records: None,
+            }
+        );
+    }
+
+    #[test]
+    fn a_buffer_descriptor_around_a_loaded_pointer_is_refused_outside_compute() {
+        let code: Vec<u8> = pointer_descriptor(false)
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let r = track(
+            &p,
+            &[param(Constants, 0, 4)],
+            HwStage::Ps,
+            lanes(&p).as_ref(),
+        );
+        assert!(r.is_err(), "{r:?}");
+    }
+
+    #[test]
+    fn a_size_the_code_loads_is_kept_for_title_memory() {
+        let r = track_words(
+            &pointer_descriptor(true),
+            &[param(Constants, 0, 4)],
+            HwStage::Cs,
+        );
+        let Source::Built {
+            address,
+            words,
+            records,
+            ..
+        } = r.descriptors[0].source
+        else {
+            panic!("{:?}", r.descriptors[0].source);
+        };
+        assert_eq!((address.param, words), (MEMORY, [0, 0x3101_4FAC]));
+        assert!(records.is_some(), "the size is the loaded dword");
+    }
+
+    /// `v_readfirstlane_b32` of a per-lane pointer each lane loads: a
+    /// scalar load at the first lane's pointer is title memory as it stands.
+    #[test]
+    fn a_scalar_load_at_a_first_lane_pointer_is_title_memory() {
+        let words = [
+            0xDC34_8000, // global_load_dwordx2 v[2:3], v[0:1], off
+            0x027D_0000,
+            0xBF8C_3F70, // s_waitcnt vmcnt(0)
+            0x7E08_0502, // v_readfirstlane_b32 s4, v2
+            0x7E0A_0503, // v_readfirstlane_b32 s5, v3
+            0xF400_0202, // s_load_dword s8, s[4:5], 0
+            0xFA00_0000,
+            S_ENDPGM,
+        ];
+        let r = track_words(&words, &[], HwStage::Cs);
+        assert!(
+            r.scalar.iter().all(|s| s.1.param == MEMORY),
+            "{:?}",
+            r.scalar
+        );
+        assert_eq!(r.scalar.len(), 2);
     }
 
     /// A scalar load of a table in the code, at an address a VGPR sum builds
