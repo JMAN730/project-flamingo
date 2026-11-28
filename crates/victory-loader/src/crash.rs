@@ -27,7 +27,9 @@ use windows_sys::Win32::System::LibraryLoader::{
     GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
     GetModuleFileNameW, GetModuleHandleExW,
 };
-use windows_sys::Win32::System::Threading::GetCurrentThreadStackLimits;
+use windows_sys::Win32::System::Threading::{
+    CreateEventW, GetCurrentThreadStackLimits, SetEvent, WaitForSingleObject,
+};
 
 const EXCEPTION_CONTINUE_SEARCH: i32 = 0;
 /// Frames listed per report.
@@ -200,6 +202,108 @@ pub fn report_crashes() {
     unsafe {
         AddVectoredExceptionHandler(0, Some(handler));
         SetUnhandledExceptionFilter(Some(filter));
+    }
+    overflow::start();
+}
+
+/// A stack overflow is reported by a thread of its own: the thread that
+/// overflowed has a page of stack left, too little to walk and print its
+/// stack with, so it hands its exception over and waits.
+mod overflow {
+    use super::{CONTEXT, EXCEPTION_POINTERS};
+    use std::cell::UnsafeCell;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_RECORD;
+
+    /// The exception handed over: written by the one thread that holds
+    /// [`BUSY`], read by the reporting thread between the two events.
+    struct Handed(UnsafeCell<Option<(EXCEPTION_RECORD, super::Aligned16)>>);
+    // SAFETY: access is serialised by `BUSY` and the two events.
+    unsafe impl Sync for Handed {}
+    static HANDED: Handed = Handed(UnsafeCell::new(None));
+    static BUSY: AtomicBool = AtomicBool::new(false);
+    /// Event handles: one asks for a report, the other says it is written.
+    static ASKED: AtomicUsize = AtomicUsize::new(0);
+    static WRITTEN: AtomicUsize = AtomicUsize::new(0);
+    /// The stack of the thread that overflowed, for the walk (0: none).
+    pub(super) static LIMITS: [AtomicUsize; 2] = [AtomicUsize::new(0), AtomicUsize::new(0)];
+
+    /// Makes the reporting thread. Without it an overflow is reported as
+    /// before: by one line of the runtime's, and no stack.
+    pub(super) fn start() {
+        // SAFETY: plain event objects, never closed (they live as long as
+        // the process).
+        let (asked, written) = unsafe {
+            (
+                super::CreateEventW(std::ptr::null(), 0, 0, std::ptr::null()),
+                super::CreateEventW(std::ptr::null(), 0, 0, std::ptr::null()),
+            )
+        };
+        if asked.is_null() || written.is_null() {
+            return;
+        }
+        let (asked, written) = (asked as usize, written as usize);
+        let spawned = std::thread::Builder::new()
+            .name("crash report".into())
+            .spawn(move || {
+                loop {
+                    // SAFETY: a live event handle.
+                    unsafe { super::WaitForSingleObject(asked as _, u32::MAX) };
+                    // SAFETY: the thread that set the event wrote the
+                    // exception and waits for `written`.
+                    if let Some((record, context)) = unsafe { &mut *HANDED.0.get() }.as_mut() {
+                        let pointers = EXCEPTION_POINTERS {
+                            ExceptionRecord: record,
+                            ContextRecord: &mut context.0,
+                        };
+                        // SAFETY: both point at the copies above.
+                        unsafe { super::report("stack overflow", &pointers, true) };
+                    }
+                    // SAFETY: a live event handle.
+                    unsafe { super::SetEvent(written as _) };
+                }
+            });
+        if spawned.is_ok() {
+            ASKED.store(asked, Ordering::Release);
+            WRITTEN.store(written, Ordering::Release);
+        }
+    }
+
+    /// Hands the stack overflow `info` describes to the reporting thread
+    /// and waits for its report (at most 20 s). False if there is no such
+    /// thread or another overflow is being reported.
+    ///
+    /// # Safety
+    /// `info` comes from the system, for an exception being dispatched on
+    /// the calling thread.
+    pub(super) unsafe fn hand_over(info: *const EXCEPTION_POINTERS) -> bool {
+        let (asked, written) = (
+            ASKED.load(Ordering::Acquire),
+            WRITTEN.load(Ordering::Acquire),
+        );
+        if asked == 0 || BUSY.swap(true, Ordering::AcqRel) {
+            return false;
+        }
+        let (mut low, mut high) = (0, 0);
+        // SAFETY: writes the calling thread's stack bounds; the system
+        // passes valid exception pointers; `BUSY` makes this thread the
+        // only writer of `HANDED`.
+        unsafe {
+            super::GetCurrentThreadStackLimits(&mut low, &mut high);
+            let context: CONTEXT = *(*info).ContextRecord;
+            *HANDED.0.get() = Some((*(*info).ExceptionRecord, super::Aligned16(context)));
+        }
+        LIMITS[0].store(low, Ordering::Release);
+        LIMITS[1].store(high, Ordering::Release);
+        // SAFETY: live event handles.
+        unsafe {
+            super::SetEvent(asked as _);
+            super::WaitForSingleObject(written as _, 20_000);
+        }
+        LIMITS[0].store(0, Ordering::Release);
+        LIMITS[1].store(0, Ordering::Release);
+        BUSY.store(false, Ordering::Release);
+        true
     }
 }
 
@@ -586,6 +690,10 @@ unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
     }
     // SAFETY: as above.
     let code = unsafe { (*(*info).ExceptionRecord).ExceptionCode };
+    // SAFETY: as above.
+    if code == EXCEPTION_STACK_OVERFLOW && unsafe { overflow::hand_over(info) } {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
     if FATAL.contains(&code) {
         let to_file =
             code == EXCEPTION_BREAKPOINT && LOG_FIRST_CHANCE_BREAKPOINTS.load(Ordering::Relaxed);
@@ -748,9 +856,16 @@ unsafe fn report(what: &str, info: *const EXCEPTION_POINTERS, to_file: bool) {
 /// registered it for title images too). Code without unwind data (our
 /// thunks, leaf functions) is taken to have its return address at `rsp`.
 fn unwind(context: CONTEXT) -> Vec<u64> {
-    let (mut low, mut high) = (0, 0);
-    // SAFETY: writes the current thread's stack bounds.
-    unsafe { GetCurrentThreadStackLimits(&mut low, &mut high) };
+    // A stack overflow is walked by another thread than the one whose
+    // stack it is (`overflow`).
+    let (mut low, mut high) = (
+        overflow::LIMITS[0].load(Ordering::Acquire),
+        overflow::LIMITS[1].load(Ordering::Acquire),
+    );
+    if high == 0 {
+        // SAFETY: writes the current thread's stack bounds.
+        unsafe { GetCurrentThreadStackLimits(&mut low, &mut high) };
+    }
     let mut frames = Vec::with_capacity(MAX_FRAMES);
     unwind_into(context, low, high, &mut frames);
     frames
