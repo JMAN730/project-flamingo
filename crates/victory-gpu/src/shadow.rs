@@ -6623,6 +6623,29 @@ mod tests {
             PAGE_READWRITE, UnmapViewOfFile,
         };
 
+        /// The test's section and its view: unmapped and closed when the
+        /// test ends, on a failed assertion too, after what the view was
+        /// registered as is forgotten.
+        struct Mapped {
+            section: HANDLE,
+            view: MEMORY_MAPPED_VIEW_ADDRESS,
+            len: usize,
+        }
+        impl Drop for Mapped {
+            fn drop(&mut self) {
+                let va0 = self.view.Value as usize;
+                if va0 != 0 {
+                    crate::lazy_back::clear_hot_for_test_pub(va0 / PAGE);
+                    crate::watch::title_memory_remapped(va0, self.len);
+                    // SAFETY: the view mapped by the test, which nothing
+                    // uses any more (the copy over it was dropped first).
+                    unsafe { UnmapViewOfFile(self.view) };
+                }
+                // SAFETY: the section made by the test, with no view left.
+                unsafe { CloseHandle(self.section) };
+            }
+        }
+
         if host().is_none() {
             return;
         }
@@ -6639,9 +6662,17 @@ mod tests {
             )
         };
         assert!(!section.is_null());
+        let mut mapped = Mapped {
+            section,
+            view: MEMORY_MAPPED_VIEW_ADDRESS {
+                Value: std::ptr::null_mut(),
+            },
+            len,
+        };
         // SAFETY: maps the whole section made above.
         let view = unsafe { MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, len) };
         assert!(!view.Value.is_null());
+        mapped.view = view;
         let ptr = view.Value.cast::<u8>();
         let va0 = ptr as usize;
         crate::lazy_back::clear_hot_for_test_pub(va0 / PAGE);
@@ -6655,7 +6686,8 @@ mod tests {
         // SAFETY: both pages of the view are mapped read-write.
         unsafe { std::ptr::write_bytes(ptr, 0x11, len) };
 
-        // The copy begins as zeros: it holds no title bytes yet.
+        // The copy begins as zeros: it holds no title bytes yet. Declared
+        // after the mapping, so it is dropped before the view goes.
         let mut side = vec![0u8; len];
         let shadow = Shadow::new_card_sized_for_test(side.as_mut_ptr(), va0 as u64, len as u64)
             .expect("the host made buffers a moment ago");
@@ -6684,13 +6716,7 @@ mod tests {
         let (first_page, second_page) = (title[..8].to_vec(), title[PAGE..PAGE + 8].to_vec());
 
         drop(shadow);
-        crate::lazy_back::clear_hot_for_test_pub(va0 / PAGE);
-        crate::watch::title_memory_remapped(va0, len);
-        // SAFETY: the view and section made above, used by nothing else now.
-        unsafe {
-            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: view.Value });
-            CloseHandle(section);
-        }
+        drop(mapped);
 
         assert_eq!(
             first_page,
