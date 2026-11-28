@@ -259,6 +259,20 @@ fn ds_swizzle_b32_zeros_inactive_source_lanes() {
     assert!(lowered.wave_ops, "ds_swizzle_b32 uses wave operations");
 }
 
+/// `ds_bpermute_b32` gives each lane the data of the lane its address names,
+/// and 0 from a lane out of EXEC: a lane read behind a ballot.
+#[test]
+fn ds_bpermute_b32_reads_the_lane_its_address_names() {
+    // s_mov_b32 exec_lo, 0x5555; ds_bpermute_b32 v1, v0, v2 (address v0, data v2).
+    let words = [0xBEFE_03FF, 0x0000_5555, 0xDACC_0000, 0x0100_0200, S_ENDPGM];
+    let lowered = lower_words(&words, 0).expect("ds_bpermute_b32 lowers");
+    assert!(
+        lowered.has_wave_ballot,
+        "a source lane out of EXEC must read as 0"
+    );
+    assert!(lowered.wave_ops, "ds_bpermute_b32 uses wave operations");
+}
+
 /// A wave64 mesh shader's quad swizzle asks the ballot about the source's
 /// host lane (quad-local, from `waveGetLaneIndex`), not its console lane
 /// number: console lanes 32..63 have no bit in a wave32 host's ballot.

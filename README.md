@@ -351,8 +351,8 @@ A run:
    holds the session name, the run id, the start time and the process ids of
    the launcher and the title. While those processes run, another
    `run-world` refuses to start and says who holds the card. A lock whose
-   processes are gone is stale and is cleared. Reading, clearing and writing
-   the lock happen while a second file, `card.lock.guard`, exists for a
+   processes are gone is stale and is cleared. Reading, clearing, writing and
+   releasing the lock happen while a second file, `card.lock.guard`, exists for a
    moment, so two runs that start together cannot both get the card;
 3. copies the exe as `victory-<run id>.exe`, with its `D3D12` folder, to a
    folder of its own under `victory-data\runs` in your user folder

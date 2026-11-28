@@ -1054,10 +1054,25 @@ impl State {
     }
 
     /// A user-data dword the host computes for a translated shader
-    /// (`victory_shader::emit::USER_MEMORY_BASE`).
+    /// (`victory_shader::emit::USER_MEMORY_BASE`, `USER_VIEW_ADDRESSES`).
     fn host_word(&self, kind: u32, memory: Option<&crate::memory::Ready>) -> u32 {
         if kind == victory_shader::emit::USER_MEMORY_BASE {
             return memory.map_or(0, |m| m.base);
+        }
+        if kind == victory_shader::emit::USER_VIEW_ADDRESSES {
+            // Where the bound view heap's buffer view table lists its
+            // views' addresses; 0 (no list) without such a heap.
+            let key = self.heaps[0];
+            if key == 0 {
+                return 0;
+            }
+            let heap = crate::descriptor::heap(key as This);
+            return match heap.host() {
+                Some(host) if !heap.samplers() => {
+                    crate::descriptor::table::address_list(host.count())
+                }
+                _ => 0,
+            };
         }
         once!(kind, "a shader reads a host value this build does not know");
         0

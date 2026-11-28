@@ -1321,3 +1321,52 @@ fn accesses_to_title_memory_by_address_lower_in_halves() {
         "the lowering must declare WaveSize(32)"
     );
 }
+
+/// Lane `l` of both halves stores the halfword `0xA000 + l` and its low
+/// byte into the dword its partner in the other half (`l ^ 32`) shares:
+/// halfword `l >> 5` of dword `64 + (l & 31)` and byte `l >> 5` of dword
+/// `96 + (l & 31)`. A mask count makes the program split; every lane
+/// stores it (40) at dword `lane`.
+fn narrow_stores() -> Vec<u32> {
+    program(&[
+        0x3604_009F, // v_and_b32 v2, 31, v0
+        0x3404_0482, // v_lshlrev_b32 v2, 2, v2
+        0x2C06_0085, // v_lshrrev_b32 v3, 5, v0: the half
+        0x3408_0681, // v_lshlrev_b32 v4, 1, v3
+        0x380A_0902, // v_or_b32 v5, v2, v4: the halfword's byte
+        0x380C_0702, // v_or_b32 v6, v2, v3: the byte's
+        0x4A0E_00FF,
+        0x0000_A000, // v_add_nc_u32 v7, 0xa000, v0
+        0xE068_1100,
+        0x8002_0705, // buffer_store_short v7, v5, s[8:11], 0 offen offset:256
+        0xE060_1180,
+        0x8002_0706, // buffer_store_byte v7, v6, s[8:11], 0 offen offset:384
+        v_cmp_lanes_below(40),
+        s_bcnt1_i32_b64(4, VCC),
+        v_mov_b32(1, 4),
+    ])
+}
+
+/// What [`narrow_stores`] leaves in the view's 128 dwords.
+fn narrow_stores_want() -> Vec<u32> {
+    let mut want = vec![40; 128];
+    for k in 0..32u32 {
+        let (lo, hi) = (k, k + 32);
+        want[64 + k as usize] = (0xA000 + lo) | (0xA000 + hi) << 16;
+        want[96 + k as usize] = lo | hi << 8;
+    }
+    want
+}
+
+/// Halfword and byte stores of the two halves into one dword lower in
+/// split form and validate.
+#[test]
+fn narrow_stores_of_both_halves_into_one_dword_lower_split() {
+    build(&narrow_stores(), 64, 0);
+}
+
+/// Neither half's halfword or byte store loses the other's.
+#[test]
+fn narrow_stores_of_both_halves_keep_each_other_s_bytes_on_hardware() {
+    check(&build(&narrow_stores(), 64, 0), &narrow_stores_want());
+}
