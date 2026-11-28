@@ -146,7 +146,26 @@ fn run_with_table(
     run_with(
         shader,
         views,
-        table,
+        table.map(|t| (t, 0, 0)),
+        point_sampler(D3D12_FILTER_MIN_MAG_MIP_POINT),
+    )
+}
+
+/// [`run_with_table`], the table's list of view addresses at byte
+/// `addresses` of it (see `USER_VIEW_ADDRESSES`; 0: none), and the root
+/// tables bound `moved` slots after the title's own, which start the heap
+/// (see `USER_TABLE_SLOTS`).
+fn run_with_addresses(
+    shader: &HostShader,
+    views: &[View],
+    table: u32,
+    addresses: u32,
+    moved: u32,
+) -> Vec<(&'static str, Vec<u32>)> {
+    run_with(
+        shader,
+        views,
+        Some((table, addresses, moved)),
         point_sampler(D3D12_FILTER_MIN_MAG_MIP_POINT),
     )
 }
@@ -175,12 +194,13 @@ pub(super) fn point_sampler(filter: D3D12_FILTER) -> D3D12_SAMPLER_DESC {
     }
 }
 
-/// [`run`] with the view table at `table` and the one sampler `sampler` at
-/// index 0.
+/// [`run`] with the buffer view table at `table` (its heap index, the byte
+/// of its view address list, and how many slots after the title's own
+/// tables the bound ones lie) and the one sampler `sampler` at index 0.
 fn run_with(
     shader: &HostShader,
     views: &[View],
-    table: Option<u32>,
+    table: Option<(u32, u32, u32)>,
     sampler: D3D12_SAMPLER_DESC,
 ) -> Vec<(&'static str, Vec<u32>)> {
     let samplers = [sampler];
@@ -201,12 +221,17 @@ fn run_with(
             Ok(p) => p,
             Err(e) => panic!("{label}: compute_pipeline failed: {e}"),
         };
-        // Both tables start at heap index 0.
+        // The title's tables both start at heap index 0.
+        let moved = table.map_or(0, |t| t.2);
         let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
         for u in &shader.user_data {
             ud[u.index as usize] = match u.root {
-                RootType::Table => 0,
-                RootType::ResourceHeap => table.expect("a buffer view table"),
+                RootType::Table => 32 * moved,
+                RootType::Other(super::USER_TABLE_SLOTS) => 0u32.wrapping_sub(moved),
+                RootType::ResourceHeap => table.expect("a buffer view table").0,
+                RootType::Other(super::USER_VIEW_ADDRESSES) => {
+                    table.expect("a buffer view table").1
+                }
                 _ => panic!("{u:?}"),
             };
         }
@@ -1140,6 +1165,101 @@ fn packed_buffer_load_keeps_unwritten_high_half() {
         }
         for (backend, got) in results {
             assert_eq!(got, vec![want; 32], "{backend}: {} channels", opcode + 1);
+        }
+    }
+}
+
+/// A buffer descriptor no memory instruction takes, read only for its base
+/// address and record count (as programs that walk a ray-tracing structure
+/// through title memory read it): words 0 to 2 come from the host's buffer
+/// view table and its list of view addresses, in the GFX10 layout. Without
+/// a list (a host that does not know the value supplies 0) the address
+/// reads 0. The record is the one of the title's slot, also when the host
+/// bound a copy of the root table in other slots.
+#[test]
+fn a_descriptor_read_for_its_address_takes_it_from_the_host_list() {
+    let words = [
+        0xBE84_0300, // s_mov_b32 s4, s0
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF408_0202,
+        0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], null
+        0xF408_0302,
+        0xFA00_0040, // s_load_dwordx4 s[12:15], s[4:5], 0x40
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x7E02_0208, // v_mov_b32 v1, s8
+        0x7E04_0209, // v_mov_b32 v2, s9
+        0x7E06_020A, // v_mov_b32 v3, s10
+        0x7E0A_0280, // v_mov_b32 v5, 0
+        0xE070_1000,
+        0x8003_0105, // buffer_store_dword v1, v5, s[12:15], 0 offen
+        0xE070_1004,
+        0x8003_0205, // buffer_store_dword v2, v5, s[12:15], 0 offen offset:4
+        0xE070_1008,
+        0x8003_0305, // buffer_store_dword v3, v5, s[12:15], 0 offen offset:8
+        0xBF81_0000, // s_endpgm
+    ];
+    let (shader, lowered) = build_with_view(&words, Some(4));
+    assert!(
+        lowered
+            .user_data
+            .iter()
+            .any(|u| u.root == RootType::ResourceHeap)
+            && [super::USER_VIEW_ADDRESSES, super::USER_TABLE_SLOTS]
+                .iter()
+                .all(|&kind| {
+                    lowered
+                        .user_data
+                        .iter()
+                        .any(|u| u.root == RootType::Other(kind) && u.slot == 0)
+                }),
+        "{:?}",
+        lowered.user_data
+    );
+    // The table at heap index 3: entry 0 lists 20 elements of 12 bytes,
+    // and its address entry (after eight records) a 256-byte aligned one.
+    let mut table = vec![0u32; 4 * 8 + 2 * 8];
+    table[..4].copy_from_slice(&[4, 12, 0, 20]);
+    table[32..34].copy_from_slice(&[0x1234_5600, 0x7]);
+    let unread = [0u32; 4];
+    let raw = |data| View::Buffer {
+        data,
+        stride: Stride::Raw,
+    };
+    // The title's table at slots 0 to 2 (the output its third entry), or
+    // the host's copy of it at slots 5 to 7.
+    let own = [
+        raw(&unread),
+        raw(&unread),
+        View::RawUav(32),
+        raw(&table),
+        raw(&unread),
+    ];
+    let copied = [
+        raw(&unread),
+        raw(&unread),
+        raw(&unread),
+        raw(&table),
+        raw(&unread),
+        raw(&unread),
+        raw(&unread),
+        View::RawUav(32),
+    ];
+    for (addresses, moved, want) in [
+        (128, 0, [0x1234_5600, 0x000C_0007, 20]),
+        (0, 0, [0, 0x000C_0000, 20]),
+        (128, 5, [0x1234_5600, 0x000C_0007, 20]),
+    ] {
+        let views: &[View] = if moved == 0 { &own } else { &copied };
+        let results = run_with_addresses(&shader, views, 3, addresses, moved);
+        if !device_ran(&results) {
+            return;
+        }
+        for (backend, got) in results {
+            assert_eq!(
+                got[..3],
+                want,
+                "{backend}: list at {addresses}, moved {moved}"
+            );
         }
     }
 }
