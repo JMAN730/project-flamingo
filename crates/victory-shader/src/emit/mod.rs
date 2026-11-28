@@ -776,6 +776,15 @@ pub const VIEW_ADDRESS_ENTRY: u32 = 8;
 /// looks the record up.
 pub const USER_TABLE_SLOTS: u32 = 0x102;
 
+/// `RootType::Other` code of a user-data dword the host computes, one per
+/// root slot ([`UserData::slot`]) holding a root SRV or UAV: how many bytes
+/// below the view's title address the raw view the host binds for it
+/// starts (0 to 15: a raw view begins on 16 bytes, a root descriptor
+/// anywhere). A shader adds it to every byte offset into that view. A host
+/// that does not know this value supplies 0 and binds views at their own
+/// address, as before.
+pub const USER_ROOT_VIEW_BIAS: u32 = 0x103;
+
 /// One dword of user data and the root parameter that fills it.
 ///
 /// With `root` [`RootType::ResourceHeap`] (and `indexed_buffer` false) the

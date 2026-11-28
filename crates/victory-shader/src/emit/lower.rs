@@ -23,6 +23,7 @@ use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 mod exec_edge;
 mod memory_ops;
+mod root_view_bias;
 mod split;
 mod table;
 
@@ -5417,6 +5418,7 @@ impl<'a> Lower<'a> {
         if let Some(v) = self.s.m.int_value(addr) {
             self.s.smem_buffer_bytes.push(v as u32);
         }
+        let addr = self.plus_root_view_bias(src, addr)?;
         if matches!(src, Source::Built { address, .. } if address.param == CODE) {
             // A descriptor built around a table in the code.
             for k in 0..count {

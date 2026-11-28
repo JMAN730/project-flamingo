@@ -1151,6 +1151,7 @@ impl Lower<'_> {
         if let Some(x) = extra {
             off = self.s.m.bin(c, Bin::Add, off, x);
         }
+        off = self.plus_root_view_bias(src, off)?;
         if used.is_some_and(|u| u.kind == ResourceType::Cbv) && !typed {
             if sub.is_some() {
                 return Err("a byte or halfword load through a constant or structured buffer");
