@@ -69,6 +69,30 @@ impl Drop for Alias {
     }
 }
 
+/// What a look at a title slot does with its record.
+#[derive(Debug, PartialEq, Eq)]
+enum Look {
+    Keep,
+    /// The slot holds another view (or none): its record is made again.
+    Remake,
+    /// The slot holds the same bytes, but the view they name is gone: its
+    /// record is cleared.
+    Unlist,
+}
+
+/// The look at a slot whose record was made from `made` and that now holds
+/// `now`, `named` if its record names a raw view, `recheck` if views went
+/// stale since the last look; `alive` tells whether the view is still live.
+fn look(made: u64, now: u64, named: bool, recheck: bool, alive: impl FnOnce() -> bool) -> Look {
+    if made != now {
+        Look::Remake
+    } else if recheck && named && !alive() {
+        Look::Unlist
+    } else {
+        Look::Keep
+    }
+}
+
 /// A copy buffer and the start of a window in it.
 type AliasKey = (usize, u64);
 
@@ -138,6 +162,11 @@ impl<V> Aliases<V> {
         self.by_key.len()
     }
 
+    /// Whether title slot `index`'s record names a raw view.
+    fn named(&self, index: usize) -> bool {
+        self.of_slot.get(index).is_some_and(Option::is_some)
+    }
+
     fn values(&self) -> impl Iterator<Item = &V> {
         self.by_key.values().map(|(v, _)| v)
     }
@@ -190,6 +219,9 @@ pub(crate) struct BufferTable {
     /// The heap's write count `made` was last brought up to date at
     /// ([`HostHeap`]'s `writes`; `u64::MAX` before the first time).
     seen: u64,
+    /// The count of view entries made stale ([`super::FORGOTTEN`]) at that
+    /// time.
+    seen_forgotten: u64,
     /// Views listed since the last draw or dispatch that read the table:
     /// their copy and range, to copy once.
     fresh: Vec<(Arc<Shadow>, u64, u64)>,
@@ -223,6 +255,7 @@ impl BufferTable {
             aliases: Aliases::new(count),
             title_heap,
             seen: u64::MAX,
+            seen_forgotten: 0,
             fresh: Vec::new(),
             starved: false,
         })
@@ -267,14 +300,17 @@ impl BufferTable {
     }
 
     /// Brings the records up to date with what the title's slots hold,
-    /// unless no slot of the heap changed since the last time. Returns the
-    /// raw views no record names any more, taken out of the table.
+    /// unless no slot of the heap changed and no view went stale since the
+    /// last time. Returns the raw views no record names any more, taken out
+    /// of the table.
     fn sync(&mut self, heap: &HostHeap, start: u64) -> Vec<Arc<Alias>> {
         let writes = heap.writes.load(std::sync::atomic::Ordering::Acquire);
-        if writes == self.seen {
+        let forgotten = super::FORGOTTEN.load(std::sync::atomic::Ordering::Acquire);
+        if writes == self.seen && forgotten == self.seen_forgotten {
             return Vec::new();
         }
-        self.seen = writes;
+        let recheck = forgotten != self.seen_forgotten;
+        (self.seen, self.seen_forgotten) = (writes, forgotten);
         let mut again = false;
         for index in 0..self.made.len() as u32 {
             let at = start + u64::from(index) * 32;
@@ -285,8 +321,23 @@ impl BufferTable {
             } else {
                 0
             };
-            if self.made[index as usize] == key {
-                continue;
+            let named = self.aliases.named(index as usize);
+            match look(self.made[index as usize], key, named, recheck, || {
+                super::is_view_alive(i, generation)
+            }) {
+                Look::Keep => continue,
+                Look::Unlist => {
+                    // The title released the view's buffer and left the
+                    // slot as it was: the record goes, and with it the raw
+                    // view's last name (and the copy it keeps).
+                    self.aliases.name(index as usize, None);
+                    if self.read(index)[3] != 0 {
+                        self.listed -= 1;
+                    }
+                    self.write(index, [0; 4]);
+                    continue;
+                }
+                Look::Remake => {}
             }
             let was = self.made[index as usize];
             self.made[index as usize] = key;
@@ -451,6 +502,35 @@ mod tests {
         aliases.name(0, None);
         assert_eq!(aliases.prune(), ["b"]);
         assert_eq!(aliases.len(), 0);
+    }
+
+    /// The pattern a run showed: the title releases buffers and leaves their
+    /// descriptors in the heap's slots, so no slot's bytes change. A look
+    /// after views went stale clears the records naming dead views, and the
+    /// raw views they named go; without that recheck, or for live views,
+    /// records stay.
+    #[test]
+    fn records_of_released_views_go_though_their_slots_are_unchanged() {
+        let key = 7 << 32 | 3;
+        assert_eq!(look(key, key, true, false, || false), Look::Keep);
+        assert_eq!(look(key, key, true, true, || true), Look::Keep);
+        assert_eq!(look(key, key, false, true, || false), Look::Keep);
+        assert_eq!(look(key, key, true, true, || false), Look::Unlist);
+        assert_eq!(look(key, 0, true, false, || true), Look::Remake);
+        // Unlisting the slots that named a window lets its raw view go.
+        let window = (1, 0);
+        let mut aliases = Aliases::new(2);
+        aliases.insert(window, "copy of a released buffer");
+        aliases.name(0, Some(window));
+        aliases.name(1, Some(window));
+        for slot in 0..2 {
+            assert!(aliases.named(slot));
+            if look(key, key, aliases.named(slot), true, || false) == Look::Unlist {
+                aliases.name(slot, None);
+            }
+        }
+        assert_eq!(aliases.prune(), ["copy of a released buffer"]);
+        assert!(!aliases.named(0));
     }
 
     /// A raw view made but named by no record (its record could not be

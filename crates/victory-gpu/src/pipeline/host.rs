@@ -1729,6 +1729,10 @@ mod tests {
         let Some(host) = host() else {
             return; // no host GPU here
         };
+        if !host.mesh_shaders() {
+            eprintln!("skipped: this host has no mesh shaders");
+            return;
+        }
         let Some(dxc) = dxc() else {
             eprintln!("no PC dxc.exe; skipped");
             return;

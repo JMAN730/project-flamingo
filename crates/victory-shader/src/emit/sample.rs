@@ -85,6 +85,12 @@ const PRIM: u8 = 20;
 const PARAM0: u8 = 32;
 
 fn program(extra: &[u32]) -> NativeProgram {
+    program_of(extra, true)
+}
+
+/// [`program`] as one wave of 32 or (`wave64`) 64 lanes; its first three
+/// lanes draw the same triangle either way.
+fn program_of(extra: &[u32], wave64: bool) -> NativeProgram {
     let mut words = Vec::new();
     // v1: the lane's index (the lanes below it in a full mask).
     words.extend(vop3(V_MBCNT_LO_U32_B32, 1, MINUS_ONE, int(0)));
@@ -126,7 +132,7 @@ fn program(extra: &[u32]) -> NativeProgram {
     };
     NativeProgram {
         stage: HwStage::Ms,
-        wave64: true,
+        wave64,
         vgprs: 16,
         layout: vec![],
         used: vec![],
@@ -134,7 +140,7 @@ fn program(extra: &[u32]) -> NativeProgram {
             // Bit 7: per primitive, a row of the primitive signature.
             outputs: vec![output(0, 0), output(2, 0x80 | 1)],
             clip_cntl: 0,
-            threads: 64,
+            threads: if wave64 { 64 } else { 32 },
             max_vertices: 3,
             max_primitives: 1,
             topology: 2,
@@ -172,6 +178,14 @@ fn signatures() -> (Vec<SigElement>, Vec<SigElement>) {
 
 /// The program as a mesh shader, or its compute half with the buffer's layout.
 fn lowered(native: &NativeProgram, mesh_buffer: bool) -> lower::Lowered {
+    try_lowered(native, mesh_buffer).expect("lower")
+}
+
+/// [`lowered`], as the error it may stop with.
+fn try_lowered(
+    native: &NativeProgram,
+    mesh_buffer: bool,
+) -> Result<lower::Lowered, crate::ShaderError> {
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
     let st = structure::structure(&p).expect("structure");
     let res =
@@ -190,7 +204,6 @@ fn lowered(native: &NativeProgram, mesh_buffer: bool) -> lower::Lowered {
         mesh_stride: GROUP_THREADS,
         mesh_buffer,
     })
-    .expect("lower")
 }
 
 fn host_shader(stage: HwStage, l: lower::Lowered) -> HostShader {
@@ -284,6 +297,34 @@ pub(super) fn mesh_error(extra: &[u32]) -> Option<crate::ShaderError> {
         mesh_buffer: false,
     })
     .err()
+}
+
+/// The sample program, of one wave of 32 or (`wave64`) 64 lanes with `extra`
+/// as in [`mesh_with`], as hosts without mesh shaders run it, with the pixel
+/// shader; or the error its compute half stops with.
+#[cfg(all(test, windows))]
+pub(super) fn fallback_of(
+    extra: &[u32],
+    wave64: bool,
+) -> Result<(MeshFallback, HostShader), crate::ShaderError> {
+    let l = try_lowered(&program_of(extra, wave64), true)?;
+    let buffer = l
+        .mesh_buffer
+        .clone()
+        .expect("the compute half has the buffer's layout");
+    let fallback = MeshFallback {
+        vertex: buffer.vertex_shader()?,
+        compute: host_shader(HwStage::Ms, l),
+        buffer,
+    };
+    Ok((fallback, pixel_shader()))
+}
+
+/// The sample program of one wave of 32 lanes as a mesh shader, as the
+/// error it stops with.
+#[cfg(all(test, windows))]
+pub(super) fn mesh_error_wave32(extra: &[u32]) -> Option<crate::ShaderError> {
+    try_lowered(&program_of(extra, false), false).err()
 }
 
 fn mesh_of(native: &NativeProgram) -> MeshSample {
