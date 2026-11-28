@@ -130,16 +130,19 @@ pub(crate) fn validate_layout(
 /// (PC argument numbering) `stride` bytes apart from `src` into a list-owned
 /// scratch buffer, leaving the scratch buffer in `UNORDERED_ACCESS` with a UAV
 /// barrier after the write (for passes such as [`crate::rectangles`] that read
-/// the clamped records in another compute shader). Callers return the scratch
-/// buffer to `COMMON` via [`done_uav`] once done reading it. Replaces the
-/// list's compute root signature and pipeline. `None` if the clamp or layout
-/// is not available.
+/// the clamped records in another compute shader), bounded by the 32-bit
+/// count in `count` when given (records past it are neither clamped nor
+/// charged to the list's budget). Callers return the scratch buffer to
+/// `COMMON` via [`done_uav`] once done reading it. Replaces the list's
+/// compute root signature and pipeline. `None` if the clamp or layout is not
+/// available.
 pub(crate) fn clamp_uav(
     list: &HostList,
     src: (&ID3D12Resource, u64),
+    count: Option<(&ID3D12Resource, u64)>,
     spec: (u32, u32, u32),
 ) -> Option<ID3D12Resource> {
-    validate_layout(spec, src.1, None)?;
+    validate_layout(spec, src.1, count.map(|(_, off)| off))?;
     let bytes = scratch_bytes(spec.0, spec.1, spec.2);
     let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
     let wait = list.take_buffer_writes() || every_wait();
@@ -149,7 +152,7 @@ pub(crate) fn clamp_uav(
         &dst,
         budget,
         src,
-        None,
+        count,
         spec,
         false,
         wait,

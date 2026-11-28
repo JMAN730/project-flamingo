@@ -788,6 +788,11 @@ fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
 
 /// A host command list and its allocator, always used together.
 pub(crate) struct HostList {
+    /// The id occlusion query tracking knows this list's recordings by
+    /// (`crate::query::next_recording`): it stays with the list when the
+    /// list is moved out of its `Arc` to be recycled, which its address
+    /// does not.
+    recording: usize,
     allocator: ID3D12CommandAllocator,
     pub(crate) list: ID3D12GraphicsCommandList,
     /// Work for submission time, in recorded order.
@@ -888,7 +893,7 @@ pub(crate) struct HostList {
 
 impl Drop for HostList {
     fn drop(&mut self) {
-        crate::query::forget_list(std::ptr::from_ref(self) as usize);
+        crate::query::forget_list(self.recording);
         self.release_kept();
         self.release_epoch();
     }
@@ -1858,6 +1863,7 @@ impl Host {
             )?;
             prelude.Close()?;
             Ok(HostList {
+                recording: crate::query::next_recording(),
                 allocator,
                 list,
                 deferred: Mutex::default(),
@@ -1970,7 +1976,7 @@ impl Host {
         // The order these lists reach the host queue in: occlusion query
         // resolves choose the parts of the runs submitted before them.
         for list in runs {
-            crate::query::submitting(std::ptr::from_ref(*list) as usize);
+            crate::query::submitting(list.recording());
         }
         let this_submission = relay::STARTED.fetch_add(1, Ordering::AcqRel) + 1;
         crate::shadow::preparing(this_submission);
@@ -2410,10 +2416,15 @@ impl Host {
     }
 }
 
+/// Submissions of lists whose indirect work budget ran out
+/// ([`HostList::budget`]): their indirect records after that ran empty.
+pub(crate) static BUDGET_SPENT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Copies a finished list's texture-to-buffer and texture readbacks into title memory.
 /// Returns `false` if lazy materialization failed for any readback destination;
 /// rows that could not be materialized or written are never counted in `COPY_BACK[1]`.
 pub(super) fn read_backs(list: &HostList) -> bool {
+    list.note_budget_spent();
     let deferred = list.deferred();
     let mut ok = true;
     for rb in &deferred.readbacks {
@@ -2767,6 +2778,11 @@ impl Host {
 }
 
 impl HostList {
+    /// The id occlusion query tracking knows this list's recordings by.
+    pub(crate) fn recording(&self) -> usize {
+        self.recording
+    }
+
     /// Keeps `blocks` (memory handed out for the recording) until the list
     /// finishes executing and is recycled or dropped.
     pub(crate) fn keep_uploads(&self, blocks: Vec<Vec<u8>>) {
@@ -3111,7 +3127,7 @@ impl HostList {
     fn clear_tracking(&self) {
         // The recording is over: its occlusion query runs that no later
         // list resolves are let go.
-        crate::query::forget_list(std::ptr::from_ref(self) as usize);
+        crate::query::forget_list(self.recording);
         self.release_kept();
         self.shadow_states
             .lock()
@@ -4158,6 +4174,27 @@ impl HostList {
         }
         // SAFETY: a live buffer.
         Some(unsafe { buffer.GetGPUVirtualAddress() })
+    }
+
+    /// After the list ran: counts it in [`BUDGET_SPENT`] if its indirect
+    /// work budget ([`Self::budget`]) ran out, so indirect records after that
+    /// point ran empty, logging at powers of two.
+    fn note_budget_spent(&self) {
+        let Some(Some((_, data))) = self.budget.get() else {
+            return;
+        };
+        // SAFETY: the list's own mapped word; the list has run.
+        let used = unsafe { (*data as *const u32).read_volatile() };
+        // `BUDGET` in `shaders/argument_clamp.hlsl` (`indirect_budget` models it).
+        if used >= 1 << 31 {
+            let n = BUDGET_SPENT.fetch_add(1, Ordering::Relaxed) + 1;
+            if n.is_power_of_two() {
+                tracing::warn!(
+                    lists = n,
+                    "a list spent its indirect work budget: its later indirect draws and dispatches ran empty"
+                );
+            }
+        }
     }
 
     /// A shader that can store to buffers is bound.

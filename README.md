@@ -190,7 +190,8 @@ victory inspect <exe|dll> [--imports] [--exports]
 victory census [paths...] [--missing] [--strict]
 victory lib-exports <import.lib> [--list]
 victory shader-info [paths...] [--verbose] [--disasm]
-victory translate [paths...] [--validate] [--pipelines] [--list] [--jobs N]
+victory translate [paths...] [--validate] [--pipelines] [--mesh-fallback]
+                  [--barycentric-fallback] [--list] [--jobs N] [--hash H,...]
 victory run <exe> [--execute] [--unimplemented trap|zero] [--strict]
             [--console series-x|series-s] [-- <title arguments>]
 victory config
@@ -198,6 +199,8 @@ victory config
 
 `translate --jobs N` requires a positive worker count. Omit it to use the
 default worker count.
+`translate --hash H` translates only the containers whose runtime hash (the
+16 hex digits the runtime logs a shader by) is one of those given.
 
 Logging: `VICTORY_LOG=victory_loader=trace,info` (a release build logs
 info and above).

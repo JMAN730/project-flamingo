@@ -41,6 +41,10 @@ struct Queue {
     desc: QueueDesc,
     /// The work, in order, held back behind waits.
     timeline: Arc<Timeline>,
+    /// Submission stamps this queue minted ([`crate::watch::TITLE_SUBMITS`]
+    /// counts every queue's, which tests submitting at the same time move).
+    #[cfg(test)]
+    stamps: std::sync::atomic::AtomicU64,
 }
 const _: () = assert!(std::mem::offset_of!(Queue, kind) == 0x10);
 
@@ -69,6 +73,8 @@ pub(crate) extern "system" fn create(
         kind: desc.kind,
         desc,
         timeline: Arc::default(),
+        #[cfg(test)]
+        stamps: Default::default(),
     });
     object::hand_out(QUEUE, queue, iid, &QUEUE_IIDS, out)
 }
@@ -246,6 +252,8 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
             return;
         }
         let stamp = crate::watch::TITLE_SUBMITS.fetch_add(1, Ordering::AcqRel) + 1;
+        #[cfg(test)]
+        queue(this).stamps.fetch_add(1, Ordering::AcqRel);
         let timeline = &queue(this).timeline;
         let async_mode = async_submit();
         let submit_op = |op: Op| {
@@ -2012,15 +2020,18 @@ mod tests {
         }
         let _settle = SettleOnDrop;
 
+        // Stamps this queue minted: other tests' queues mint theirs from the
+        // same global count at the same time.
+        let minted = || queue(q).stamps.load(Ordering::Acquire);
         // Empty submission must not mint a stamp.
-        let before = crate::watch::TITLE_SUBMITS.load(Ordering::Acquire);
+        let before = minted();
         exec(q, 0, &list1);
-        assert_eq!(crate::watch::TITLE_SUBMITS.load(Ordering::Acquire), before);
+        assert_eq!(minted(), before);
         assert_eq!(crate::watch::current_stamp(), 0);
 
         let lists = [list1, list2];
         exec(q, 2, lists.as_ptr());
-        let after = crate::watch::TITLE_SUBMITS.load(Ordering::Acquire);
+        let after = minted();
         assert_eq!(
             after,
             before + 1,
@@ -2045,7 +2056,7 @@ mod tests {
         assert_eq!(out[1].load(Ordering::Acquire), 2);
         assert_eq!(out[2].load(Ordering::Acquire), 3);
         assert_eq!(
-            crate::watch::TITLE_SUBMITS.load(Ordering::Acquire),
+            minted(),
             after,
             "draining held segments must reuse the original stamp without minting new ones"
         );

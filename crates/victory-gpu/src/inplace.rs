@@ -2030,6 +2030,17 @@ pub(crate) fn tick() {
     }
 }
 
+/// Serialises the tests that map, unmap or arm in-place views and lazy
+/// copy-back pages: they share [`GENERATION`], the in-place view registry
+/// and `lazy_back`'s page table, and one test's remap fails another's
+/// arming (`lazy_back::try_defer_page_inner` gives up when the generation
+/// moves) or its view lookups.
+#[cfg(test)]
+pub(crate) fn view_tests_lock() -> std::sync::MutexGuard<'static, ()> {
+    static VIEW_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    VIEW_TESTS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2039,6 +2050,7 @@ mod tests {
     /// views from elsewhere it is scattered; over a gap it has holes.
     #[test]
     fn the_views_say_how_much_of_a_range_is_there() {
+        let _views = crate::inplace::view_tests_lock();
         // Addresses nothing has: only the record is asked.
         let at = 0x7ff1_0000_0000_usize;
         for (block, blocks) in [(0, 1), (1, 1), (4, 2)] {
@@ -2074,6 +2086,7 @@ mod tests {
 
     #[test]
     fn views_say_what_one_placed_buffer_could_show() {
+        let _views = crate::inplace::view_tests_lock();
         let mut views = BTreeMap::new();
         let at = 0x7_0000_0000usize;
         views.insert(at, (4 * K64, 9, 16 * K64 as u64));
@@ -2100,6 +2113,7 @@ mod tests {
     /// What the runtime forgets when memory is mapped anew.
     #[test]
     fn remapped_memory_forgets_its_views() {
+        let _views = crate::inplace::view_tests_lock();
         let at = 0x7_4000_0000usize;
         assert!(title_memory_view(at, 4 * K64, 77, 0));
         assert!(title_memory_view(at + 4 * K64, K64, 77, 4 * K64 as u64));
@@ -2117,6 +2131,7 @@ mod tests {
     /// stretch; a gap in either ends it.
     #[test]
     fn a_stretch_is_views_that_follow_in_memory_and_in_the_section() {
+        let _views = crate::inplace::view_tests_lock();
         let base = 0x7a00_0000_0000usize;
         let (section, other) = (0x51, 0x52);
         for k in 0..3 {
@@ -2163,6 +2178,7 @@ mod tests {
     /// Only private memory committed whole, read-write, is taken for a part.
     #[test]
     fn only_private_memory_committed_whole_is_a_part() {
+        let _views = crate::inplace::view_tests_lock();
         // SAFETY: an allocation of the test's own.
         unsafe {
             let base = mem::VirtualAlloc(
@@ -2211,6 +2227,7 @@ mod tests {
     /// driver is what a run with `VICTORY_INPLACE_PROBE=1` adds.
     #[test]
     fn warp_probe_opens_title_like_memory_and_the_gpu_sees_its_bytes() {
+        let _views = crate::inplace::view_tests_lock();
         let Some(device) = warp() else { return };
         if device.cast::<ID3D12Device13>().is_err() {
             eprintln!("no ID3D12Device13 here: parts of an allocation cannot be opened");
@@ -2243,6 +2260,7 @@ mod tests {
     /// whole is turned down without asking the host.
     #[test]
     fn warp_a_title_buffer_in_place_shows_its_bytes_at_its_offset() {
+        let _views = crate::inplace::view_tests_lock();
         let Some(device) = warp() else { return };
         if device.cast::<ID3D12Device13>().is_err() {
             return;
@@ -2295,6 +2313,7 @@ mod tests {
     /// The census names each kind of memory.
     #[test]
     fn census_tells_private_memory_from_views() {
+        let _views = crate::inplace::view_tests_lock();
         // SAFETY: an allocation of the test's own.
         unsafe {
             let base = mem::VirtualAlloc(
@@ -2344,6 +2363,7 @@ mod tests {
     /// when a section handle number is reused.
     #[test]
     fn write_own_preserves_guard_and_forgets_on_section_reuse() {
+        let _views = crate::inplace::view_tests_lock();
         use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
         const SIZE: usize = 2 * K64;
         // SAFETY: pagefile section mapped into two title views, cleaned up below.
@@ -2433,6 +2453,7 @@ mod tests {
     /// unmap it cleanly via `Own::drop` without leaking virtual memory or UAF.
     #[test]
     fn own_view_eviction_unmaps_only_after_active_callers_drop() {
+        let _views = crate::inplace::view_tests_lock();
         use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
         const SIZE: usize = K64;
         // SAFETY: pagefile section mapped into a title view, cleaned up below.
