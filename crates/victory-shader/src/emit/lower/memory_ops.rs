@@ -1185,6 +1185,7 @@ impl Lower<'_> {
         // A root descriptor is a raw view: an indexed access through the
         // descriptor the code builds around it is at index * stride + offset.
         let root_index = super::super::fixes() & super::super::FIX_ROOT_INDEX != 0;
+        let root_view = root_index && self.root_view_stride(src).is_some();
         let (index, off) = match (index, self.root_view_stride(src)) {
             (Some(i), Some(stride)) if !typed && root_index => {
                 let stride = self.s.m.i32(stride);
@@ -1204,7 +1205,10 @@ impl Lower<'_> {
             if narrow_format.is_none() && narrow_store.is_none() {
                 return Err(name);
             }
-            if used.is_some_and(|u| u.stride > 1) {
+            // A root descriptor is a raw view whatever stride the
+            // descriptor the code builds around it names (and the resource
+            // list with it): a byte address reads it.
+            if used.is_some_and(|u| u.stride > 1) && !root_view {
                 return Err("a byte or halfword load through a constant or structured buffer");
             }
         }
