@@ -833,6 +833,7 @@ impl State {
                 }
                 PendingRtv::Live(texture, record) => {
                     self.targets.push(record.resource as usize);
+                    crate::texture::gpu_target(record.resource);
                     #[cfg(feature = "diagnostics")]
                     crate::capture::note_target(record.resource);
                     self.bound_rtvs.push(BoundRtv {
@@ -845,6 +846,7 @@ impl State {
         self.depth = None;
         self.bound_dsv = None;
         if let Some((texture, record)) = dsv {
+            crate::texture::gpu_target(record.resource);
             let desc = record.depth_desc();
             self.depth = Some(DepthTarget {
                 resource: record.resource as usize,
@@ -2164,7 +2166,7 @@ impl State {
                     continue;
                 }
                 if let Some(t) = crate::resource::host_resource(held.get()) {
-                    if crate::texture::title_written(t) {
+                    if crate::texture::reads_title_memory(held.get(), t) {
                         crate::texture::PICKING.set(Some(u64::MAX));
                         crate::texture::upload_from(list, held.get(), t, *first);
                         crate::texture::PICKING.set(None);
@@ -4309,7 +4311,7 @@ fn readable(
                 .is_some_and(|source| crate::texture::alias(list, *resource as This, source));
             if !aliased
                 && let Some(t) = crate::resource::host_resource(*resource as This)
-                && crate::texture::title_written(t)
+                && crate::texture::reads_title_memory(*resource as This, t)
             {
                 crate::texture::upload_from(list, *resource as This, t, first_mip);
             }

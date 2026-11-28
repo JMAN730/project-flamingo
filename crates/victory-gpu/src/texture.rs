@@ -706,6 +706,90 @@ pub(crate) fn forget(resource: usize) {
     }
 }
 
+/// `VICTORY_TEXTURE_RT_UPLOAD=1`: render-target and UAV-capable textures
+/// also take their contents from title memory until the host GPU first
+/// writes them ([`reads_title_memory`]).
+pub(crate) fn rt_upload() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_RT_UPLOAD").is_some_and(|v| v == "1"))
+}
+
+/// The host GPU renders to, clears or writes `resource` (a render target or
+/// depth target bound, a clear): with `VICTORY_TEXTURE_RT_UPLOAD=1` its
+/// contents are the GPU's from then on, as for copies ([`host_written`]).
+pub(crate) fn gpu_target(resource: This) {
+    if rt_upload() && !is_host_written(resource) {
+        host_written(resource);
+    }
+}
+
+/// Where a read of a host texture takes its contents from.
+#[derive(Debug, PartialEq, Eq)]
+enum Source {
+    /// Title memory: uploaded when read.
+    Title,
+    /// The host GPU's: not uploaded.
+    Host,
+    /// A depth texture not written on the host yet: title memory, but
+    /// uploads into depth textures are not made.
+    DepthSkipped,
+}
+
+/// [`Source`] of a texture with host `flags`: `host_written` if the host
+/// GPU wrote it, `rt_upload` for `VICTORY_TEXTURE_RT_UPLOAD=1`.
+fn source(flags: i32, host_written: bool, rt_upload: bool) -> Source {
+    const RENDER_TARGET: i32 = 0x1;
+    const DEPTH_STENCIL: i32 = 0x2;
+    const UNORDERED: i32 = 0x4;
+    if flags & (RENDER_TARGET | DEPTH_STENCIL | UNORDERED) == 0 {
+        Source::Title
+    } else if !rt_upload || host_written {
+        Source::Host
+    } else if flags & DEPTH_STENCIL != 0 {
+        // shortcut: a copy into a depth texture must cover whole
+        // subresources and some depth formats take none from an upload
+        // buffer; such a texture keeps what the host has.
+        Source::DepthSkipped
+    } else {
+        Source::Title
+    }
+}
+
+/// Whether a read of `resource` (host copy `texture`) uploads it from title
+/// memory: one the host GPU does not render to or write ([`title_written`]),
+/// or with `VICTORY_TEXTURE_RT_UPLOAD=1` a render-target or UAV texture the
+/// host GPU has not written yet, logged once per texture.
+pub(crate) fn reads_title_memory(resource: This, texture: &ID3D12Resource) -> bool {
+    if title_written(texture) {
+        return true;
+    }
+    if !rt_upload() {
+        return false;
+    }
+    // SAFETY: a live resource.
+    let flags = unsafe { texture.GetDesc() }.Flags.0;
+    let found = source(flags, is_host_written(resource), true);
+    static LOGGED: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
+    if found != Source::Host
+        && LOGGED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_or_insert_with(Default::default)
+            .insert(resource as usize)
+    {
+        let what = if found == Source::Title {
+            "uploaded from title memory"
+        } else {
+            "a depth texture, not uploaded"
+        };
+        tracing::debug!(
+            resource = format_args!("{:#x}", resource as usize),
+            "render-target or UAV texture read before any GPU write: {what}"
+        );
+    }
+    found == Source::Title
+}
+
 /// Whether `resource`'s host copy takes its contents from title memory:
 /// a texture the host GPU does not render to or write.
 pub(crate) fn title_written(texture: &ID3D12Resource) -> bool {
@@ -1779,6 +1863,23 @@ pub(crate) fn fingerprint_raw(at: u64, len: u64, mips: &[(u64, u64)]) -> Option<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Textures the host renders to or writes take title memory only with
+    /// `VICTORY_TEXTURE_RT_UPLOAD=1` and only until the host GPU writes
+    /// them; depth textures never; plain textures always.
+    #[test]
+    fn render_targets_take_title_memory_until_the_gpu_writes_them() {
+        let (rt, depth, uav) = (0x1, 0x2, 0x4);
+        assert_eq!(source(0, false, false), Source::Title);
+        assert_eq!(source(0, true, true), Source::Title);
+        for flags in [rt, uav, rt | uav] {
+            assert_eq!(source(flags, false, false), Source::Host);
+            assert_eq!(source(flags, false, true), Source::Title);
+            assert_eq!(source(flags, true, true), Source::Host);
+        }
+        assert_eq!(source(depth, false, true), Source::DepthSkipped);
+        assert_eq!(source(depth, true, true), Source::Host);
+    }
 
     /// A texture the GPU wrote is uploaded again only when its title memory
     /// changed since, and only with uploading asked for; one whose memory
