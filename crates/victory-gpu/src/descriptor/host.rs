@@ -2270,30 +2270,8 @@ impl HostHeap {
         if changed.is_empty() {
             return;
         }
-        let desc_fast = descriptor_fast();
-        if !desc_fast {
-            let mut retired = Vec::new();
-            for &slot in changed {
-                if slot.words[0] != VIEW_TAG {
-                    if self.shows_none(slot.index) {
-                        continue;
-                    }
-                    let _held = self.made.lock(slot.index);
-                    if self.made.get(slot.index).unwrap_or(0) != 0 {
-                        self.fast[slot.index as usize].store(0, Ordering::Release);
-                        self.made.set(slot.index, 0);
-                        if !self.sampler {
-                            self.made.set_null_kind(slot.index, NullKind::Tex2dSrv);
-                        }
-                        self.make_null_opt(slot.index, Some(&mut retired));
-                        self.track_slot(slot.index, None);
-                        self.track_buffer(slot.index, None);
-                    }
-                } else {
-                    self.mirror_words(slot.index, slot.words, for_draw, false, Some(&mut retired));
-                }
-            }
-            crate::host::retire_executing_batch(retired);
+        if !descriptor_fast() {
+            self.apply_changed_slots_plain(changed, for_draw);
             return;
         }
 
@@ -2319,6 +2297,37 @@ impl HostHeap {
                     &mut todo,
                     &mut retired,
                 );
+            }
+        }
+        crate::host::retire_executing_batch(retired);
+    }
+
+    /// [`Self::apply_changed_slots`] slot by slot, without the batching
+    /// (`VICTORY_DESCRIPTOR_FAST=0`).
+    fn apply_changed_slots_plain(&self, changed: &[ChangedSlot], for_draw: bool) {
+        let mut retired = Vec::new();
+        for &slot in changed {
+            if slot.words[0] != VIEW_TAG {
+                if self.shows_none(slot.index) {
+                    continue;
+                }
+                let _held = self.made.lock(slot.index);
+                if self.made.get(slot.index).unwrap_or(0) != 0 {
+                    // The buffer view table lists what the slot showed: it
+                    // looks again only when this count moved.
+                    self.writes
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    self.fast[slot.index as usize].store(0, Ordering::Release);
+                    self.made.set(slot.index, 0);
+                    if !self.sampler {
+                        self.made.set_null_kind(slot.index, NullKind::Tex2dSrv);
+                    }
+                    self.make_null_opt(slot.index, Some(&mut retired));
+                    self.track_slot(slot.index, None);
+                    self.track_buffer(slot.index, None);
+                }
+            } else {
+                self.mirror_words(slot.index, slot.words, for_draw, false, Some(&mut retired));
             }
         }
         crate::host::retire_executing_batch(retired);
@@ -5200,6 +5209,38 @@ mod tests {
         null_for(&view, heap.cpu(0));
         // SAFETY: a plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    /// A slot the title cleared counts as a write on the slot-by-slot path
+    /// too: the buffer view table brings its records up to date only when
+    /// the heap's write count moved, and would go on listing the view.
+    #[test]
+    fn a_slot_cleared_slot_by_slot_counts_as_a_write() {
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return; // no host GPU
+        };
+        {
+            // Slot 1 as made from a view record.
+            let _held = heap.made.lock(1);
+            heap.made.set(1, 1 << 32 | 1);
+        }
+        let writes = || heap.writes.load(std::sync::atomic::Ordering::Acquire);
+        let before = writes();
+        let cleared = [
+            ChangedSlot {
+                index: 1,
+                words: [0; 3],
+            },
+            ChangedSlot {
+                index: 2,
+                words: [0; 3],
+            },
+        ];
+        heap.apply_changed_slots_plain(&cleared, false);
+        assert!(heap.shows_none(1));
+        assert_eq!(writes(), before + 1, "slot 2 showed nothing already");
+        heap.apply_changed_slots_plain(&cleared, false);
+        assert_eq!(writes(), before + 1);
     }
 
     /// Buffer views of no elements (the title makes them for buffers it has
