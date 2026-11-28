@@ -376,8 +376,10 @@ which must be outside the repository like every other output folder:
 `victory.log` (the title's output), `frames\` (captured frames),
 `crashes.log` (what the run appended to the title's `crashes.log`, if
 anything) and `manifest.json`: the commit and whether the tree had changes,
-the build, the arguments, every variable that was set, the start and end
-times, the exit code, what ended the run and where the crash report is.
+the build, the arguments, every variable that was set, when the run was
+asked for, when the title was started and when it ended (the run's length
+counts from the title's start, not from the build before it), the exit code,
+what ended the run and where the crash report is.
 
 The defaults are the environment world runs are known to work with on an 8 GB
 card: `--console series-s`, `VICTORY_SKIP_PIPELINES=5d113aa6830760b6,caa78b8ca62bc3d6,5552dac6a2b7a1fd`,
