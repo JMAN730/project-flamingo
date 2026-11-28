@@ -286,6 +286,14 @@ fn launch(
     // process by.
     let image = format!("victory-{}.exe", held.run_id);
     let copy = copy_with_agility(&exe, &bin_dir, &image)?;
+    // `stop` may have come while the exe was being copied.
+    if lock::stop_requested(lock_path, &held.run_id)? {
+        let _ = std::fs::remove_dir_all(&bin_dir);
+        bail!(
+            "run {} was stopped before its title was started",
+            held.run_id
+        );
+    }
 
     let run_dir = held.manifest.parent().expect("set by start").to_path_buf();
     let log = run_dir.join("victory.log");
@@ -340,8 +348,22 @@ fn launch(
     };
     // From here on the title runs: whatever fails, wait for it and say how
     // it ended.
-    let bookkeeping = lock::update(lock_path, held).and(manifest.write(&run_dir));
-    if let Err(e) = &bookkeeping {
+    let mut ended_by = EndedBy::Title;
+    match lock::publish_title(lock_path, held) {
+        Ok(false) => {}
+        Ok(true) => {
+            // `stop` came between the check above and the start: it found
+            // no pid to end, so the title is ended here.
+            println!(
+                "stop was asked while the title started: ending pid {}",
+                child.id()
+            );
+            ended_by = EndedBy::Stop;
+            child.kill().context("ending the title")?;
+        }
+        Err(e) => eprintln!("the run goes on, but: {e:#}"),
+    }
+    if let Err(e) = manifest.write(&run_dir) {
         eprintln!("the run goes on, but: {e:#}");
     }
     println!("run {} started: pid {}", held.run_id, child.id());
@@ -349,7 +371,6 @@ fn launch(
     println!("  manifest  {}", held.manifest.display());
 
     let clock = Instant::now();
-    let mut ended_by = EndedBy::Title;
     let mut adapter_checked = false;
     let status = loop {
         if let Some(status) = child.try_wait().context("waiting for the title")? {
@@ -385,9 +406,7 @@ fn launch(
         }
         std::thread::sleep(Duration::from_millis(500));
     };
-    if ended_by == EndedBy::Title
-        && lock::read(lock_path)?.is_some_and(|l| l.run_id == held.run_id && l.stop_requested)
-    {
+    if ended_by == EndedBy::Title && lock::stop_requested(lock_path, &held.run_id)? {
         ended_by = EndedBy::Stop;
     }
     let exit_code = status.code().map(i64::from);
@@ -604,6 +623,12 @@ fn stop(shared: &Shared) -> Result<()> {
         }
         Found::Live(held) | Found::Stale(held) => held,
     };
+    // Recorded first, and read back: a launcher that has not published its
+    // title's pid yet finds the request when it does, and a pid published
+    // since the look above is in what comes back.
+    if let Some(now) = lock::request_stop(&shared.lock, &held.run_id)? {
+        held = now;
+    }
     if held.title_runs(&System) {
         let pid = held.pid.expect("a running title has a pid");
         if held.image.is_none() {
@@ -616,8 +641,6 @@ fn stop(shared: &Shared) -> Result<()> {
                 shared.lock.display()
             );
         }
-        held.stop_requested = true;
-        lock::update(&shared.lock, &held)?;
         println!(
             "ending run {} of session {}: pid {pid}",
             held.run_id, held.session
@@ -627,6 +650,11 @@ fn stop(shared: &Shared) -> Result<()> {
         ensure!(gone, "pid {pid} is still running");
     } else if let Some(pid) = held.pid {
         println!("pid {pid} of run {} is already gone", held.run_id);
+    } else if held.launcher_runs(&System) {
+        println!(
+            "run {} has not started its title yet: its launcher (pid {}) is told to stop",
+            held.run_id, held.launcher_pid
+        );
     }
     // A live launcher writes the end of the manifest and releases the lock.
     if wait_until(Duration::from_secs(10), || !held.launcher_runs(&System)) {

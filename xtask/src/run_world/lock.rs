@@ -291,18 +291,43 @@ fn same_lock(a: &str, b: &str) -> bool {
     a.trim() == b.trim() || (lock(a).is_some() && lock(a) == lock(b))
 }
 
-/// Rewrites the lock of run `lock.run_id` (to add the title's pid, or the
-/// stop request). Fails if the file now belongs to another run.
-pub fn update(path: &Path, lock: &Lock) -> Result<()> {
-    let held = read(path)?;
-    if held.as_ref().map(|h| &h.run_id) != Some(&lock.run_id) {
+/// Records in the lock of run `run_id` that the run is to stop, and
+/// returns the lock as it then is; `None` if the file is not that run's
+/// any more. Under the guard, like `publish_title`: whichever of the two
+/// comes second sees what the first wrote, so a stop asked for while the
+/// title is being started is not lost. Either `stop` finds the title's
+/// pid here and ends it, or the launcher finds the request when it
+/// publishes the pid and ends its own child.
+pub fn request_stop(path: &Path, run_id: &str) -> Result<Option<Lock>> {
+    let _guard = Guard::take(path, GUARD_WAIT)?;
+    let Some(mut held) = read(path)?.filter(|held| held.run_id == run_id) else {
+        return Ok(None);
+    };
+    held.stop_requested = true;
+    std::fs::write(path, text_of(&held)).with_context(|| format!("writing {}", path.display()))?;
+    Ok(Some(held))
+}
+
+/// Whether a stop was asked of run `run_id`.
+pub fn stop_requested(path: &Path, run_id: &str) -> Result<bool> {
+    Ok(read(path)?.is_some_and(|held| held.run_id == run_id && held.stop_requested))
+}
+
+/// Writes the title's pid and image of `lock` into the lock file, keeping
+/// a stop request made in the meantime, and says whether there is one.
+/// Fails if the file now belongs to another run.
+pub fn publish_title(path: &Path, lock: &mut Lock) -> Result<bool> {
+    let _guard = Guard::take(path, GUARD_WAIT)?;
+    let Some(held) = read(path)?.filter(|held| held.run_id == lock.run_id) else {
         bail!(
             "{} no longer belongs to run {}",
             path.display(),
             lock.run_id
         );
-    }
-    std::fs::write(path, text_of(lock)).with_context(|| format!("writing {}", path.display()))
+    };
+    lock.stop_requested |= held.stop_requested;
+    std::fs::write(path, text_of(lock)).with_context(|| format!("writing {}", path.display()))?;
+    Ok(lock.stop_requested)
 }
 
 /// The lock at `path`, if the file exists and reads as one.
@@ -493,6 +518,38 @@ pub mod tests {
     }
 
     #[test]
+    fn a_stop_asked_before_the_title_has_a_pid_reaches_the_launcher() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("card.lock");
+        // The launcher holds the card and is still copying the exe.
+        acquire(&path, &lock("a", None), &table(&[])).unwrap();
+        assert!(!stop_requested(&path, "a").unwrap());
+        let seen = request_stop(&path, "a").unwrap().unwrap();
+        assert_eq!(seen.pid, None);
+        // Checked before the title is started...
+        assert!(stop_requested(&path, "a").unwrap());
+        assert!(!stop_requested(&path, "other").unwrap());
+        // ...and if it was started all the same, publishing its pid does
+        // not wipe the request: the launcher is told and the file keeps it.
+        let mut started = lock("a", Some(20));
+        assert!(publish_title(&path, &mut started).unwrap());
+        assert!(started.stop_requested);
+        let kept = read(&path).unwrap().unwrap();
+        assert_eq!((kept.pid, kept.stop_requested), (Some(20), true));
+    }
+
+    #[test]
+    fn a_stop_asked_after_the_pid_is_published_finds_the_pid() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("card.lock");
+        acquire(&path, &lock("a", None), &table(&[])).unwrap();
+        assert!(!publish_title(&path, &mut lock("a", Some(20))).unwrap());
+        let seen = request_stop(&path, "a").unwrap().unwrap();
+        assert_eq!((seen.pid, seen.stop_requested), (Some(20), true));
+        assert!(seen.title_runs(&table(&[(20, "victory-a.exe")])));
+    }
+
+    #[test]
     fn the_lock_folder_is_made_when_missing() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("deep").join("card.lock");
@@ -505,9 +562,11 @@ pub mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("card.lock");
         acquire(&path, &lock("a", None), &table(&[])).unwrap();
-        update(&path, &lock("a", Some(20))).unwrap();
+        assert!(!publish_title(&path, &mut lock("a", Some(20))).unwrap());
         assert_eq!(read(&path).unwrap().unwrap().pid, Some(20));
-        assert!(update(&path, &lock("b", Some(30))).is_err());
+        assert!(publish_title(&path, &mut lock("b", Some(30))).is_err());
+        assert_eq!(request_stop(&path, "b").unwrap(), None);
+        assert!(!stop_requested(&path, "a").unwrap());
         release(&path, "b").unwrap();
         assert!(path.is_file());
         release(&path, "a").unwrap();
