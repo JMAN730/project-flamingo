@@ -4458,8 +4458,6 @@ fn twin_uav(
         }
         all
     });
-    // A stencil plane's twin (R8 typeless, 60): the title's view is of the
-    // stencil plane if it names plane 1 or a stencil view format (22, 47).
     if d.Format.0 == 60 {
         let mut plane = 0;
         match desc.ViewDimension {
@@ -4477,22 +4475,38 @@ fn twin_uav(
             }
             _ => {}
         }
-        if plane != 1 && !matches!(desc.Format.0, 22 | 47) {
-            return None;
-        }
-        desc.Format.0 = 62;
+        desc.Format.0 = twin_view_format(desc.Format.0 as u32, plane, 60)? as i32;
         return Some(desc);
     }
-    // None, typeless and depth formats (R16: 0, 53, 55; R32: 0, 39, 40),
-    // and those of a depth-stencil format's depth plane (19 to 21, 44 to
-    // 46), for the twin of such a plane: the twin's UNORM / float view
-    // formats (R16_UNORM 56, R32_FLOAT 41).
-    desc.Format.0 = match (desc.Format.0, d.Format.0) {
+    desc.Format.0 = twin_view_format(desc.Format.0 as u32, 0, d.Format.0 as u32)? as i32;
+    Some(desc)
+}
+
+/// The format of the view of a depth texture's colour twin (of format
+/// `twin`) that stands for the title's unordered access view of format
+/// `view` (its plane slice `plane`), or `None` if the twin does not stand
+/// for that view.
+///
+/// A stencil plane's twin (R8 typeless, 60) stands for views of the
+/// stencil plane: those naming plane 1 or a stencil view format (22, 47).
+/// Their view is R8_UINT (63): the console's stencil views are unsigned
+/// integer, so its image stores take the data registers as the integer to
+/// write, and the translated store passes those bits on unchanged. An R8_UNORM view would read them as a float instead (a stencil
+/// value of 1 to 255 is a denormal, which converts to 0).
+///
+/// For the twin of a one-plane depth texture or of a depth plane: none,
+/// typeless and depth formats (R16: 0, 53, 55; R32: 0, 39, 40) and those
+/// of a depth-stencil format's depth plane (19 to 21, 44 to 46) take the
+/// twin's UNORM / float view format (R16_UNORM 56, R32_FLOAT 41).
+fn twin_view_format(view: u32, plane: u32, twin: u32) -> Option<u32> {
+    if twin == 60 {
+        return (plane == 1 || matches!(view, 22 | 47)).then_some(63);
+    }
+    Some(match (view, twin) {
         (0 | 53 | 55 | 19..=21 | 44..=46, 53) => 56,
         (0 | 39 | 40 | 19..=21 | 44..=46, 39) => 41,
         (other, _) => other,
-    };
-    Some(desc)
+    })
 }
 
 /// Makes the host descriptor for `view` at `at`: the host resource it
@@ -5096,6 +5110,28 @@ mod tests {
         // Overflowing arithmetic is past the end, not wrapped into it.
         assert!(!in_buffer(256, u64::MAX, 1, 4));
         assert!(!in_buffer(256, 1 << 62, 1, 16));
+    }
+
+    /// A stencil plane's twin is viewed as unsigned integer, as the
+    /// console's stencil views are: an image store's data registers hold
+    /// the stencil value as an integer, which an R8_UNORM view would read
+    /// as a denormal float and write as 0. Depth planes keep their UNORM /
+    /// float views, and a view that is not of the stencil plane gets none.
+    #[test]
+    fn a_stencil_twin_is_viewed_as_unsigned_integer() {
+        const R8_TYPELESS: u32 = 60;
+        const R8_UINT: u32 = 63;
+        // Stencil view formats (X32_TYPELESS_G8X24_UINT, X24_TYPELESS_G8_UINT),
+        // and plane 1 with any format.
+        assert_eq!(super::twin_view_format(47, 0, R8_TYPELESS), Some(R8_UINT));
+        assert_eq!(super::twin_view_format(22, 0, R8_TYPELESS), Some(R8_UINT));
+        assert_eq!(super::twin_view_format(0, 1, R8_TYPELESS), Some(R8_UINT));
+        // A view of the depth plane is not the stencil twin's.
+        assert_eq!(super::twin_view_format(46, 0, R8_TYPELESS), None);
+        // Depth twins: R16_UNORM and R32_FLOAT, other formats kept.
+        assert_eq!(super::twin_view_format(55, 0, 53), Some(56));
+        assert_eq!(super::twin_view_format(46, 0, 39), Some(41));
+        assert_eq!(super::twin_view_format(42, 0, 39), Some(42));
     }
 
     /// A texture filled with less than was mapped is looked at again, but
