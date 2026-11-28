@@ -4249,6 +4249,32 @@ impl<'a> Lower<'a> {
             self.write(inst, Reg::V(reg), r, guard);
             return Ok(());
         }
+        if name == "ds_bpermute_b32" {
+            // Each lane reads the data of the lane its address names
+            // (address / 4, within the wave): 0 from a lane out of EXEC.
+            if self.split.is_some() || (self.console_cf && self.halves) {
+                // shortcut: the two halves of a wave64 on a 32-lane host
+                // do not read each other's lanes here.
+                return Err("a lane permute across the halves of a wave");
+            }
+            self.cross_lane(false)?;
+            let at = self.vgprs(inst, addr.as_ref().ok_or("a permute address")?, 1)?[0];
+            let x = self.vgprs(inst, data.first().ok_or("a permute source")?, 1)?[0];
+            let (two, lanes) = (self.s.m.i32(2), self.s.m.i32(self.wave() - 1));
+            let src = self.s.m.bin(c, Bin::LShr, at, two);
+            let src = self.s.m.bin(c, Bin::And, src, lanes);
+            let r = self.read_lane(x, src);
+            let r = if self.console_cf {
+                let active = self.src_lane_active(src, guard);
+                let zero = self.s.m.i32(0);
+                self.s.m.select(c, active, r, zero)
+            } else {
+                self.active_lane_or_zero(r, src)
+            };
+            let reg = dst_reg.ok_or("a permute result")?;
+            self.write(inst, Reg::V(reg), r, guard);
+            return Ok(());
+        }
         if self.s.lds_dwords == 0 {
             return Err("LDS the program does not allocate");
         }
@@ -8004,6 +8030,38 @@ impl<'a> Lower<'a> {
                 let (lo, hi) = self.split64(r);
                 self.write(inst, Reg::V(reg), lo, guard);
                 self.write(inst, Reg::V(reg + 1), hi, guard);
+                Ok(())
+            }
+            "v_mad_u64_u32" => {
+                // The 64-bit product of two dwords plus a 64-bit addend; the
+                // carry out is a lane mask (this lane's bit), as an add's.
+                let (a, b) = (s(self, 0)?, s(self, 1)?);
+                let x = self.src64(inst, 2)?;
+                let i64t = self.s.m.int(64);
+                let a = self.s.m.cast(c, Cast::ZExt, a, i64t);
+                let b = self.s.m.cast(c, Cast::ZExt, b, i64t);
+                let product = self.s.m.bin(c, Bin::Mul, a, b);
+                let r = self.s.m.bin(c, Bin::Add, product, x);
+                let carry = self.s.m.cmp(c, pred::IULT, r, x);
+                let Some(Operand::Vector { reg, .. }) = v.dst else {
+                    return Err("a 64-bit result");
+                };
+                let (lo, hi) = self.split64(r);
+                self.write(inst, Reg::V(reg), lo, guard);
+                self.write(inst, Reg::V(reg + 1), hi, guard);
+                if let Some(Operand::Scalar { code, .. }) = v.carry
+                    && let Some(w) = inst.write(Reg::S(code))
+                {
+                    self.lane_bits.insert(w, carry);
+                    if self.split.is_some() {
+                        self.split_lanes_written(inst, code, carry);
+                    }
+                }
+                for &(_, w) in &inst.writes {
+                    self.vals
+                        .entry(w)
+                        .or_insert(Val::Missing("a lane mask read as data"));
+                }
                 Ok(())
             }
             "v_cubeid_f32" | "v_cubesc_f32" | "v_cubetc_f32" | "v_cubema_f32" => {

@@ -1964,6 +1964,44 @@ fn cmp16_sdwa_preserves_word_selects() {
     }
 }
 
+/// `v_mad_u64_u32`: the 64-bit product of two dwords plus a 64-bit addend,
+/// with the carry out of bit 63 as this lane's bit of the mask.
+#[test]
+fn v_mad_u64_u32_adds_a_64_bit_addend_to_the_product_and_carries_out() {
+    // v_mad_u64_u32 v[5:6], vcc_lo, v1, v2, v[3:4] (VOP3B 0x176).
+    let mut mad = vop3(0x176, 5, vgpr(1), vgpr(2), vgpr(3));
+    mad[0] |= 106 << 8;
+    let cases = [
+        [3, 5, 7, 9],
+        [!0, !0, !0, 0],
+        [0x1_0000, 0x1_0000, 0, 1],
+        [!0, !0, !0, !0],
+        [2, 0x8000_0000, 0, !0],
+    ];
+    let sum = |i: [u32; 4]| {
+        let addend = u64::from(i[2]) | u64::from(i[3]) << 32;
+        (u64::from(i[0]) * u64::from(i[1])).overflowing_add(addend)
+    };
+    // v_mov_b32 v0, v5 / v0, v6; v_cndmask_b32 v0, 0, 1, vcc_lo.
+    let low = [mad[0], mad[1], vop1(0x001, 0, vgpr(5))];
+    let high = [mad[0], mad[1], vop1(0x001, 0, vgpr(6))];
+    let select = vop3(0x101, 0, 0x80, 0x81, sgpr(106));
+    let carry = [mad[0], mad[1], select[0], select[1]];
+    run_cases(&build_valu_cs(&low), &cases, |backend, i, inp, got| {
+        assert_eq!(got, sum(inp).0 as u32, "{backend} case {i}: low dword");
+    });
+    run_cases(&build_valu_cs(&high), &cases, |backend, i, inp, got| {
+        assert_eq!(
+            got,
+            (sum(inp).0 >> 32) as u32,
+            "{backend} case {i}: high dword"
+        );
+    });
+    run_cases(&build_valu_cs(&carry), &cases, |backend, i, inp, got| {
+        assert_eq!(got, u32::from(sum(inp).1), "{backend} case {i}: carry");
+    });
+}
+
 /// A carry-in whose mask is a plain SGPR (a root constant) the structure pass
 /// does not follow: this lane adds its own bit of the number.
 #[test]
