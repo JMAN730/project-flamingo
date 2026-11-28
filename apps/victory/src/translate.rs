@@ -577,7 +577,10 @@ fn translate(
         return t.fail(None, "corrupt record".into(), location);
     };
     let list = t.list;
-    let hash = blake3::hash(&bytes).to_hex().to_string();
+    // One digest names the container everywhere below: its prefix chooses
+    // the lowering, and the whole of it is what a duplicate is told by.
+    let digest = blake3::hash(&bytes);
+    let hash = digest.to_hex().to_string();
     let short_hash = &hash[..16];
     let example = || {
         let location = location();
@@ -602,8 +605,7 @@ fn translate(
     // part's: the lowering is chosen by the container's hash (a built-in
     // list, or `VICTORY_WAVE_WIDE_ONLY`), so two containers sharing a
     // program can lower differently.
-    let key = blake3::hash(&bytes);
-    if !lock(seen).insert(key) && !list {
+    if !lock(seen).insert(digest) && !list {
         t.duplicates += 1;
         return;
     }
