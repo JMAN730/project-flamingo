@@ -421,6 +421,17 @@ struct Checks {
     barycentric_fallback: bool,
 }
 
+impl Checks {
+    /// Whether the geometry shader of a pixel program's fallback is built.
+    /// It is built from a stub vertex shader, which the host's compiler
+    /// makes: on Windows always, elsewhere only for a validator or a host
+    /// that was asked for (neither exists there), so a scan that only
+    /// emits does not fail every such program for the platform it runs on.
+    fn builds_geometry(&self) -> bool {
+        cfg!(windows) || self.validator.is_some() || self.host.is_some()
+    }
+}
+
 pub fn run(
     paths: Vec<PathBuf>,
     validate: bool,
@@ -795,6 +806,9 @@ fn check_barycentric(
         );
     }
     t.barycentric[1] += 1;
+    if !checks.builds_geometry() {
+        return;
+    }
     // The stub vertex shader feeds the plain program's inputs, as `check`'s.
     let made = host::stub_vs(native).and_then(|vs| {
         emit::barycentric_gs(&vs.dxil, &fallback.dxil)
@@ -1616,5 +1630,21 @@ mod tests {
         assert_eq!(t.barycentric, [1, 0, 0, 0]);
         assert_eq!(t.barycentric_same, [0, 0]);
         assert_eq!(t.failed.values().map(|f| f.total).sum::<usize>(), 1);
+    }
+
+    /// Off Windows no stub vertex shader can be made, and a scan that only
+    /// emits does not need one: a fallback that emitted counts as emitted
+    /// and is not a failure.
+    #[cfg(not(windows))]
+    #[test]
+    fn an_emitted_fallback_is_no_failure_where_no_geometry_shader_is_built() {
+        let native = pixel_shader(true);
+        let mut t = Tally::default();
+        let label = || "synth.bin Ps".to_owned();
+        let fallback = Ok(pixel_shader(false));
+        check_barycentric(&native, fallback, &mut t, &mut no_checks(), &label);
+
+        assert_eq!(t.barycentric, [1, 1, 0, 0]);
+        assert!(t.failed.is_empty(), "{:#?}", t.failure_lines());
     }
 }
