@@ -774,6 +774,15 @@ impl Processes for System {
 
     #[cfg(not(windows))]
     fn image_of(&self, pid: u32) -> Option<String> {
+        // Linux: the executable's own file name. `ps -o comm=` cuts names
+        // at 15 characters there, which no run's exe copy fits in.
+        if let Ok(exe) = std::fs::read_link(format!("/proc/{pid}/exe")) {
+            return exe.file_name().map(|n| n.to_string_lossy().into_owned());
+        }
+        if Path::new("/proc/self/exe").exists() {
+            // A system with /proc: the process is gone (or not ours to see).
+            return None;
+        }
         let out = Command::new("ps")
             .args(["-p", &pid.to_string(), "-o", "comm="])
             .output()
