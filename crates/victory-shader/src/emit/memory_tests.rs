@@ -237,3 +237,58 @@ fn a_scalar_load_at_a_first_lane_read_of_a_lane_pointer_reads_the_directory() {
     ];
     lowered_by_address(&words);
 }
+
+/// The `dx.op.<function>` calls of `lowered` whose argument `at` is the
+/// constant `mask`.
+fn with_mask(lowered: &lower::Lowered, function: &str, at: usize, mask: i32) -> usize {
+    let name = format!("dx.op.{function}");
+    lowered
+        .dx_ops
+        .iter()
+        .filter(|(n, args)| *n == name && args.get(at) == Some(&Some(mask)))
+        .count()
+}
+
+/// Every dword of a multi-dword access to title memory has its own
+/// directory entry (the next dword may be in another copy) and its own
+/// range check: each is loaded or stored alone, after its own lookup.
+#[test]
+fn each_dword_of_a_title_memory_access_is_looked_up_and_checked_alone() {
+    let lowered = lowered_by_address(&with_descriptor(&[
+        0xF428_0202, // s_buffer_load_dwordx4 s[8:11], s[4:7], 0x10
+        0xFA00_0010,
+        0xE034_1000, // buffer_load_dwordx2 v[1:2], v0, s[4:7], 0 offen
+        0x8001_0100,
+        0xBF8C_0070, // s_waitcnt vmcnt(0) lgkmcnt(0)
+        0x7E02_0208, // v_mov_b32 v1, s8
+        0x7E04_020B, // v_mov_b32 v2, s11
+        0xE074_1010, // buffer_store_dwordx2 v[1:2], v0, s[4:7], 0 offen offset:16
+        0x8001_0100,
+    ]));
+    // Loads: a directory entry (two dwords) then the dword it locates, for
+    // the pointer's two dwords, the scalar load's four and the vector
+    // load's two.
+    let load = "rawBufferLoad.f32";
+    let (lookups, dwords) = (
+        with_mask(&lowered, load, 4, 3),
+        with_mask(&lowered, load, 4, 1),
+    );
+    assert_eq!(
+        (lookups, dwords),
+        (2 + 4 + 2 + 2, 2 + 4 + 2),
+        "{:?}",
+        lowered.dx_ops
+    );
+    for mask in [7, 15] {
+        assert_eq!(
+            with_mask(&lowered, load, 4, mask),
+            0,
+            "{:?}",
+            lowered.dx_ops
+        );
+    }
+    // Stores: one dword at a time (each lookup's fault note is one too).
+    let store = "rawBufferStore.i32";
+    assert_eq!(with_mask(&lowered, store, 8, 3), 0, "{:?}", lowered.dx_ops);
+    assert_eq!(with_mask(&lowered, store, 8, 1), lookups + 2);
+}

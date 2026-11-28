@@ -860,7 +860,12 @@ const SPLIT_LEFT_OUT_WRONG: &[&str] = &["02384a60fda6f2d0"];
 /// nothing already seen.
 pub fn split_takes(container: &[u8]) -> bool {
     let hash = blake3::hash(container).to_hex();
-    let hash = &hash[..16];
+    split_takes_hash(&hash[..16])
+}
+
+/// [`split_takes`] for the shader whose container's BLAKE3 starts with the
+/// 16 hex digits `hash`.
+fn split_takes_hash(hash: &str) -> bool {
     !SPLIT_LEFT_OUT_BVH.contains(&hash)
         && !SPLIT_LEFT_OUT_TILES.contains(&hash)
         && !SPLIT_LEFT_OUT_WRONG.contains(&hash)
@@ -869,7 +874,17 @@ pub fn split_takes(container: &[u8]) -> bool {
 
 /// Runs `f` for the shader `container` with [`split_filter`] applied.
 fn with_split_filter<T>(container: &[u8], f: impl FnOnce() -> T) -> T {
-    let left_out = !probe::force_split() && !split_takes(container);
+    let hash = blake3::hash(container).to_hex();
+    with_split_selection(&hash[..16], f)
+}
+
+/// Runs `f` with the two-half selection translation applies to the shader
+/// whose container's BLAKE3 starts with the 16 hex digits `hash`: one that
+/// [`split_takes`] leaves out is lowered as for a 64-lane host
+/// ([`host_wave64`] answers true inside `f`), as [`translate`] does. For
+/// tools that call the emitter directly (`victory translate`).
+pub fn with_split_selection<T>(hash: &str, f: impl FnOnce() -> T) -> T {
+    let left_out = !probe::force_split() && !split_takes_hash(hash);
     let old = SPLIT_LEFT_OUT.with(|w| w.replace(left_out));
     struct Restore(bool);
     impl Drop for Restore {

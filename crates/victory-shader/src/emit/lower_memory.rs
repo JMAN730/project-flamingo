@@ -155,10 +155,6 @@ impl<'a> Lower<'a> {
         };
         let (lo, hi) = self.address_plus(lo, hi, i32::from(*offset));
         let guard = self.guard(b, i)?;
-        let c = self.cur;
-        let (i32t, res, void) = (self.s.t.i32, self.s.t.res_ret, self.s.t.void);
-        let iu = self.s.m.undef(i32t);
-        let align = self.s.m.i32(4);
         let name = inst.name();
         let count = |rest: &str| match rest {
             "dword" => Ok(1u8),
@@ -167,24 +163,15 @@ impl<'a> Lower<'a> {
             "dwordx4" => Ok(4),
             _ => Err(name),
         };
+        // Each dword with its own directory entry: the next one may be in
+        // another copy.
         if let Some(rest) = name.strip_prefix("global_load_") {
             let n = count(rest)?;
             let Some(Operand::Vector { reg, .. }) = *dst else {
                 return Err("a global load result");
             };
-            let (h, byte) = self.memory(lo, hi, guard);
-            let mask = self.s.m.i8((1u8 << n) - 1);
-            let r = self.s.op(
-                c,
-                "rawBufferLoad.f32",
-                Attr::ReadOnly,
-                res,
-                139,
-                &[h, byte, iu, mask, align],
-            );
             for k in 0..n {
-                let x = self.s.m.extract(c, r, u32::from(k));
-                let x = self.as_int(x);
+                let x = self.memory_dword(lo, hi, k, guard);
                 self.write(inst, Reg::V(reg + k), x, guard);
             }
             return Ok(());
@@ -193,22 +180,9 @@ impl<'a> Lower<'a> {
             let n = count(rest)?;
             let d = data.as_ref().ok_or("global store data")?;
             let vals = self.vgprs(inst, d, n)?;
-            let (h, byte) = self.memory(lo, hi, guard);
-            let mut args = vec![h, byte, iu];
-            args.extend(&vals);
-            args.resize(3 + 4, iu);
-            args.push(self.s.m.i8((1u8 << n) - 1));
-            args.push(align);
-            let at = self.begin_guarded(guard);
-            self.s.op(
-                self.cur,
-                "rawBufferStore.i32",
-                Attr::NoUnwind,
-                void,
-                140,
-                &args,
-            );
-            self.end_guarded(at, &[]);
+            for (k, &x) in (0..n).zip(&vals) {
+                self.memory_store_dword(lo, hi, k, x, guard);
+            }
             return Ok(());
         }
         let Some(op) = name.strip_prefix("global_atomic_") else {
@@ -436,7 +410,7 @@ impl<'a> Lower<'a> {
         let [lo, hi, stride, records] = self.memory_descriptor(inst, rsrc, src)?;
         let guard = self.guard(b, i)?;
         let c = self.cur;
-        let (i32t, res, void) = (self.s.t.i32, self.s.t.res_ret, self.s.t.void);
+        let i32t = self.s.t.i32;
         let Operand::Vector { reg: areg, .. } = *addr else {
             return Err("a buffer address");
         };
@@ -466,55 +440,43 @@ impl<'a> Lower<'a> {
         }
         // shortcut: the offset from the base is taken below 4 GiB.
         let (lo, hi) = self.address_add(lo, hi, within);
-        // Whether dword `k` of the access is in range (none: always).
+        // Whether dword `k` of the access is in range.
         let oob = words[1] >> 28 & 3;
-        let in_range = |l: &mut Self, k: u32| -> Option<V> {
+        let bound = Bound::of(oob, index.is_some());
+        let in_range = |l: &mut Self, k: u32| -> V {
             let c = l.cur;
-            match (oob, index) {
-                // Checking disabled.
-                (2, _) => None,
-                // Raw: the byte offset against the size in bytes.
-                (3, _) => {
-                    let at = l.add_bytes(off, 4 * k);
-                    Some(l.s.m.cmp(c, pred::IULT, at, records))
-                }
-                // Structured: the index against the size in records.
-                // shortcut: the offset is not checked against the stride
-                // (`OOB_SELECT` 0).
-                (_, Some(index)) => Some(l.s.m.cmp(c, pred::IULT, index, records)),
-                (_, None) => {
-                    let zero = l.s.m.i32(0);
-                    Some(l.s.m.cmp(c, pred::IULT, zero, records))
+            let zero = l.s.m.i32(0);
+            let index = index.unwrap_or(zero);
+            let at = l.add_bytes(off, 4 * k);
+            match bound {
+                Bound::NotEmpty => l.s.m.cmp(c, pred::NE, records, zero),
+                Bound::Bytes => l.s.m.cmp(c, pred::IULT, at, records),
+                Bound::Records => l.s.m.cmp(c, pred::IULT, index, records),
+                Bound::RecordAndStride => {
+                    let ok = l.s.m.cmp(c, pred::IULT, index, records);
+                    let inside = l.s.m.cmp(c, pred::IULT, at, stride);
+                    l.s.m.bin(c, Bin::And, ok, inside)
                 }
             }
         };
+        let in_range = |l: &mut Self, k: u32| Some(in_range(l, k));
         let and = |l: &mut Self, a: Option<V>, b: Option<V>| match (a, b) {
             (Some(a), Some(b)) => Some(l.s.m.bin(l.cur, Bin::And, a, b)),
             (a, b) => a.or(b),
         };
         let iu = self.s.m.undef(i32t);
-        let align = self.s.m.i32(4);
+        // Each dword on its own: its own range check (GFX10 checks each),
+        // and its own directory entry (the next one may be in another copy).
         if let Some(rest) = name.strip_prefix("buffer_load_") {
             let n = count(rest)?;
             let Some(Operand::Vector { reg, .. }) = *data else {
                 return Err("a buffer result");
             };
-            let first = in_range(self, 0);
-            let first = and(self, first, guard);
-            let (h, byte) = self.memory(lo, hi, first);
-            let mask = self.s.m.i8((1u8 << n) - 1);
-            let r = self.s.op(
-                self.cur,
-                "rawBufferLoad.f32",
-                Attr::ReadOnly,
-                res,
-                139,
-                &[h, byte, iu, mask, align],
-            );
             for k in 0..n {
-                let x = self.s.m.extract(self.cur, r, u32::from(k));
-                let mut x = self.as_int(x);
-                if let Some(ok) = in_range(self, u32::from(k)) {
+                let ok = in_range(self, u32::from(k));
+                let run = and(self, ok, guard);
+                let mut x = self.memory_dword(lo, hi, k, run);
+                if let Some(ok) = ok {
                     let zero = self.s.m.i32(0);
                     x = self.s.m.select(self.cur, ok, x, zero);
                 }
@@ -526,25 +488,11 @@ impl<'a> Lower<'a> {
             let n = count(rest)?;
             let d = data.as_ref().ok_or("buffer store data")?;
             let vals = self.vgprs(inst, d, n)?;
-            // shortcut: a store partly out of range writes none of it.
-            let last = in_range(self, u32::from(n) - 1);
-            let run = and(self, last, guard);
-            let (h, byte) = self.memory(lo, hi, run);
-            let mut args = vec![h, byte, iu];
-            args.extend(&vals);
-            args.resize(3 + 4, iu);
-            args.push(self.s.m.i8((1u8 << n) - 1));
-            args.push(align);
-            let at = self.begin_guarded(run);
-            self.s.op(
-                self.cur,
-                "rawBufferStore.i32",
-                Attr::NoUnwind,
-                void,
-                140,
-                &args,
-            );
-            self.end_guarded(at, &[]);
+            for (k, &x) in (0..n).zip(&vals) {
+                let ok = in_range(self, u32::from(k));
+                let run = and(self, ok, guard);
+                self.memory_store_dword(lo, hi, k, x, run);
+            }
             return Ok(());
         }
         let Some(op) = name.strip_prefix("buffer_atomic_") else {
@@ -618,7 +566,6 @@ impl<'a> Lower<'a> {
         };
         let [lo, hi, _, records] = self.memory_descriptor(inst, &base, src)?;
         let c = self.cur;
-        let (i32t, res) = (self.s.t.i32, self.s.t.res_ret);
         let not3 = self.s.m.i32(!3);
         let mut off = self.s.m.i32((offset as u32) & !3);
         if !matches!(soffset, Operand::Scalar { code: NULL, .. }) {
@@ -627,31 +574,59 @@ impl<'a> Lower<'a> {
             off = self.s.m.bin(c, Bin::Add, off, so);
         }
         let (lo, hi) = self.address_add(lo, hi, off);
-        let (iu, align) = (self.s.m.undef(i32t), self.s.m.i32(4));
-        for first in (0..count).step_by(4) {
-            let n = (count - first).min(4);
-            let (lo, hi) = self.address_plus(lo, hi, 4 * i32::from(first));
-            let (h, byte) = self.memory(lo, hi, None);
-            let mask = self.s.m.i8((1u8 << n) - 1);
-            let r = self.s.op(
-                c,
-                "rawBufferLoad.f32",
-                Attr::ReadOnly,
-                res,
-                139,
-                &[h, byte, iu, mask, align],
-            );
-            for k in 0..n {
-                let x = self.s.m.extract(c, r, u32::from(k));
-                let x = self.as_int(x);
-                let at = self.add_bytes(off, 4 * u32::from(first + k));
-                let ok = self.s.m.cmp(c, pred::IULT, at, records);
-                let zero = self.s.m.i32(0);
-                let x = self.s.m.select(c, ok, x, zero);
-                self.write(inst, Reg::S(code + first + k), x, None);
-            }
+        // Each dword with its own directory entry: the next one may be in
+        // another copy.
+        for k in 0..count {
+            let x = self.memory_dword(lo, hi, k, None);
+            let at = self.add_bytes(off, 4 * u32::from(k));
+            let ok = self.s.m.cmp(c, pred::IULT, at, records);
+            let zero = self.s.m.i32(0);
+            let x = self.s.m.select(c, ok, x, zero);
+            self.write(inst, Reg::S(code + k), x, None);
         }
         Ok(())
+    }
+
+    /// Dword `k` of title memory from `lo`, `hi` up, looked up in the
+    /// directory on its own ([`Self::memory`]; `guard` the lanes that read
+    /// it): consecutive dwords may lie in different copies, a buffer's and
+    /// then the window after it, say.
+    pub(super) fn memory_dword(&mut self, lo: V, hi: V, k: u8, guard: Option<V>) -> V {
+        let (lo, hi) = self.address_plus(lo, hi, 4 * i32::from(k));
+        let (h, byte) = self.memory(lo, hi, guard);
+        let c = self.cur;
+        let (i32t, res) = (self.s.t.i32, self.s.t.res_ret);
+        let (iu, one, align) = (self.s.m.undef(i32t), self.s.m.i8(1), self.s.m.i32(4));
+        let r = self.s.op(
+            c,
+            "rawBufferLoad.f32",
+            Attr::ReadOnly,
+            res,
+            139,
+            &[h, byte, iu, one, align],
+        );
+        let x = self.s.m.extract(c, r, 0);
+        self.as_int(x)
+    }
+
+    /// Stores `x` as dword `k` of title memory from `lo`, `hi` up, in the
+    /// lanes `run` leaves (none: every lane), the dword looked up in the
+    /// directory on its own (see [`Self::memory_dword`]).
+    pub(super) fn memory_store_dword(&mut self, lo: V, hi: V, k: u8, x: V, run: Option<V>) {
+        let (lo, hi) = self.address_plus(lo, hi, 4 * i32::from(k));
+        let (h, byte) = self.memory(lo, hi, run);
+        let (i32t, void) = (self.s.t.i32, self.s.t.void);
+        let (iu, one, align) = (self.s.m.undef(i32t), self.s.m.i8(1), self.s.m.i32(4));
+        let at = self.begin_guarded(run);
+        self.s.op(
+            self.cur,
+            "rawBufferStore.i32",
+            Attr::NoUnwind,
+            void,
+            140,
+            &[h, byte, iu, x, iu, iu, iu, one, align],
+        );
+        self.end_guarded(at, &[]);
     }
 
     /// `s_load_dword*` from title memory by address (`resource::MEMORY`):
@@ -683,7 +658,7 @@ impl<'a> Lower<'a> {
         };
         let (mut lo, mut hi) = (word(self, 0)?, word(self, 1)?);
         let c = self.cur;
-        let (i32t, res) = (self.s.t.i32, self.s.t.res_ret);
+        let i32t = self.s.t.i32;
         if !matches!(soffset, Operand::Scalar { code: NULL, .. }) {
             // An offset register counts up from the address.
             let so = self.operand(inst, &soffset)?;
@@ -693,25 +668,12 @@ impl<'a> Lower<'a> {
             hi = self.s.m.bin(c, Bin::Add, hi, carry);
             lo = sum;
         }
-        let (iu, align) = (self.s.m.undef(i32t), self.s.m.i32(4));
-        for first in (0..count).step_by(4) {
-            let n = (count - first).min(4);
-            let (lo, hi) = self.address_plus(lo, hi, offset + 4 * i32::from(first));
-            let (h, byte) = self.memory(lo, hi, None);
-            let mask = self.s.m.i8((1u8 << n) - 1);
-            let r = self.s.op(
-                c,
-                "rawBufferLoad.f32",
-                Attr::ReadOnly,
-                res,
-                139,
-                &[h, byte, iu, mask, align],
-            );
-            for k in 0..n {
-                let x = self.s.m.extract(c, r, u32::from(k));
-                let x = self.as_int(x);
-                self.write(inst, Reg::S(code + first + k), x, None);
-            }
+        // Each dword with its own directory entry: the next one may be in
+        // another copy.
+        let (lo, hi) = self.address_plus(lo, hi, offset);
+        for k in 0..count {
+            let x = self.memory_dword(lo, hi, k, None);
+            self.write(inst, Reg::S(code + k), x, None);
         }
         Ok(())
     }
@@ -725,5 +687,55 @@ impl<'a> Lower<'a> {
         let abs = self.s.m.bin(c, Bin::And, bits, mask);
         let inf = self.s.m.i32(0x7F80_0000);
         self.s.m.cmp(c, pred::IUGT, abs, inf)
+    }
+}
+
+/// What GFX10 checks each dword of a buffer access against, by dword 3's
+/// `OOB_SELECT` (an access that fails reads 0 and writes nothing).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Bound {
+    /// Checking disabled (2), but a buffer of no records takes nothing.
+    NotEmpty,
+    /// Raw (3): the dword's byte offset against the size in bytes.
+    Bytes,
+    /// Structured (1; 0 without an index): the index against the size in
+    /// records.
+    Records,
+    /// Structured with an index (0): the index against the size in records
+    /// and the dword's offset in its record against the stride.
+    // shortcut: without an index the offset is not checked against the
+    // stride (raw descriptors built with stride 0 would take nothing).
+    RecordAndStride,
+}
+
+impl Bound {
+    /// The check of `OOB_SELECT` `oob`, for an access with an index or
+    /// without.
+    pub(super) fn of(oob: u32, indexed: bool) -> Self {
+        match (oob & 3, indexed) {
+            (2, _) => Bound::NotEmpty,
+            (3, _) => Bound::Bytes,
+            (0, true) => Bound::RecordAndStride,
+            _ => Bound::Records,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Bound;
+
+    /// Each `OOB_SELECT` checks what GFX10 does: an empty buffer takes no
+    /// access even with checking disabled, and mode 0 checks the offset in
+    /// the record against the stride where mode 1 checks the index only.
+    #[test]
+    fn each_oob_select_checks_what_gfx10_checks() {
+        assert_eq!(Bound::of(2, false), Bound::NotEmpty);
+        assert_eq!(Bound::of(2, true), Bound::NotEmpty);
+        assert_eq!(Bound::of(3, true), Bound::Bytes);
+        assert_eq!(Bound::of(0, true), Bound::RecordAndStride);
+        assert_eq!(Bound::of(1, true), Bound::Records);
+        assert_eq!(Bound::of(1, false), Bound::Records);
+        assert_eq!(Bound::of(0, false), Bound::Records);
     }
 }

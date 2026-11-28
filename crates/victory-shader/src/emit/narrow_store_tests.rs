@@ -168,9 +168,11 @@ fn lanes_storing_the_same_byte_leave_one_lanes_value() {
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let force_warp = std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
+    let mut ran = 0;
     for &(name, warp) in super::valu_tests::backends(force_warp) {
         let Ok(host) = Host::new(warp) else { continue };
         let (root, pso) = host.compute_pipeline(&shader).unwrap();
+        ran += 1;
         for _ in 0..8 {
             let output = host
                 .dispatch(
@@ -192,4 +194,5 @@ fn lanes_storing_the_same_byte_leave_one_lanes_value() {
             assert_eq!(word & !0xFF, 0, "{name}: {word:#x}");
         }
     }
+    assert!(ran > 0, "no SM 6.6 device available");
 }

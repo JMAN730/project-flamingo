@@ -613,6 +613,22 @@ fn tally_program(
     t: &mut Tally,
     checks: &mut Checks,
 ) {
+    // As translation at run time: a Wave64 shader left out of the two-half
+    // lowering is lowered as for a 64-lane host.
+    emit::with_split_selection(hash, || {
+        tally_selected(container, p, hash, example, t, checks)
+    });
+}
+
+/// [`tally_program`] with the shader's two-half selection applied.
+fn tally_selected(
+    container: &Container<'_>,
+    p: &NativeProgram,
+    hash: &str,
+    example: &impl Fn() -> String,
+    t: &mut Tally,
+    checks: &mut Checks,
+) {
     t.programs += 1;
     match ir::build_with(&p.patched_code(), p.wave64, p.vgprs, p.uses_spill_table()) {
         Ok(program) => {

@@ -685,6 +685,9 @@ type Known = Vec<(Bool, bool)>;
 const HEAP_BASE_DWORD: u8 = 2;
 const MAX_ROUNDS: usize = 64;
 const MAX_JOINS: usize = 8;
+/// The refusal of a per-lane descriptor whose dwords some instruction
+/// computes ([`Tracer::per_lane`]).
+const COMPUTED_VGPRS: &str = "a descriptor read from the first lane of computed VGPRs";
 const MAX_MEET: usize = 1 << 16;
 
 impl<'a> Tracer<'a> {
@@ -2940,7 +2943,7 @@ impl<'a> Tracer<'a> {
             Some(n) if n.starts_with("global_load") || n.starts_with("flat_load") => {
                 "a descriptor read from the first lane of a partial or mixed load"
             }
-            Some(_) => "a descriptor read from the first lane of computed VGPRs",
+            Some(_) => COMPUTED_VGPRS,
         })
     }
 
@@ -3178,7 +3181,9 @@ impl<'a> Tracer<'a> {
                     // the program computed there), no descriptor: the
                     // lane's access reads garbage on the console too, and
                     // here takes index 0 (as an edge no lane takes does).
-                    Err(_) if self.leftovers && self.data_words(&edge) => Ok(None),
+                    // Only that refusal: an edge refused for anything else
+                    // stays refused.
+                    Err(COMPUTED_VGPRS) if self.leftovers && self.data_words(&edge) => Ok(None),
                     Err(e) => Err(e),
                 }
             } else {
@@ -5665,6 +5670,23 @@ pub(crate) mod tests {
             .collect();
         assert_eq!(offsets, [0x20]);
         assert_eq!(r.waterfall.compares.len(), 4);
+    }
+
+    #[test]
+    fn lanes_refused_for_more_than_computed_dwords_stay_refused() {
+        // The else arm's first dword copied from an input VGPR, the rest
+        // float results: not all data, so the last chance does not take the
+        // edge for lanes that read garbage.
+        let mut words = waterfall_joined_data_wave32(false);
+        let first = words
+            .iter()
+            .position(|&w| w == 3 << 25 | 4 << 17 | 2 << 9 | 258)
+            .unwrap();
+        words[first] = 0x7E08_0300; // v_mov_b32 v4, v0
+        assert_eq!(
+            refusal(&words, false),
+            "a descriptor read from the first lane of an input VGPR"
+        );
     }
 
     #[test]
