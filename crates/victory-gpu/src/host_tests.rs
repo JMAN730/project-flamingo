@@ -35,6 +35,40 @@ fn half_float_swap_chains_present_as_scrgb_on_any_display() {
     );
 }
 
+/// Only the window's own monitor decides HDR, and the swap chain follows
+/// what the title was told.
+#[test]
+fn hdr_state_comes_from_the_windows_monitor_and_what_the_title_was_told() {
+    let info = HdrDisplayInfo {
+        min_luminance: 0.01,
+        max_luminance: 1000.0,
+        max_full_frame_luminance: 600.0,
+    };
+    let outputs = [
+        OutputHdr {
+            monitor: 1,
+            hdr: None,
+        },
+        OutputHdr {
+            monitor: 2,
+            hdr: Some(info),
+        },
+    ];
+    assert_eq!(
+        monitor_hdr(&outputs, 1),
+        None,
+        "SDR monitor next to an HDR one"
+    );
+    assert_eq!(monitor_hdr(&outputs, 2), Some(info));
+    assert_eq!(monitor_hdr(&outputs, 3), None, "unknown monitor");
+    assert_eq!(monitor_hdr(&[], 1), None);
+
+    assert!(swap_chain_hdr(Some(true), true));
+    assert!(!swap_chain_hdr(Some(true), false), "told HDR, SDR monitor");
+    assert!(!swap_chain_hdr(Some(false), true), "told SDR, HDR monitor");
+    assert!(!swap_chain_hdr(None, true), "never asked: SDR");
+}
+
 #[test]
 fn shadow_buffer_transitions_between_writes_and_reads() {
     let uav = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;

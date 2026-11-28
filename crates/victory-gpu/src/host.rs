@@ -7532,40 +7532,156 @@ fn log_video_memory() {
     }
 }
 
-/// Queries the host display outputs for an active HDR10 (`G2084_NONE_P2020`)
-/// desktop mode. Returns `None` when HDR is disabled or unsupported.
-pub fn display_hdr_info() -> Option<HdrDisplayInfo> {
-    // SAFETY: plain DXGI factory, adapter and output enumeration.
+/// One host output as DXGI describes it: its monitor and, when it is in
+/// HDR10 mode (`G2084_NONE_P2020`), its luminance bounds.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct OutputHdr {
+    monitor: isize,
+    hdr: Option<HdrDisplayInfo>,
+}
+
+/// The HDR state of `monitor`'s output. Only that output counts, not any
+/// output of the adapter: a window on an SDR monitor is SDR even when
+/// another monitor is in HDR mode.
+fn monitor_hdr(outputs: &[OutputHdr], monitor: isize) -> Option<HdrDisplayInfo> {
+    outputs.iter().find(|o| o.monitor == monitor)?.hdr
+}
+
+/// The swap chain presents in HDR only when the title was told HDR and the
+/// window's monitor is in HDR mode. A title told SDR (or that never asked)
+/// writes SDR values whatever the desktop does.
+fn swap_chain_hdr(told: Option<bool>, window_hdr: bool) -> bool {
+    told == Some(true) && window_hdr
+}
+
+/// The outputs of every adapter `factory` lists.
+fn host_outputs(factory: &IDXGIFactory1) -> Vec<OutputHdr> {
+    let mut outputs = Vec::new();
+    // SAFETY: plain DXGI adapter and output enumeration.
     unsafe {
-        let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
-        let adapter: IDXGIAdapter1 = if let Some(host) = host() {
-            let luid = host.device.GetAdapterLuid();
-            factory
-                .EnumAdapterByLuid::<IDXGIAdapter1>(luid)
-                .or_else(|_| factory.EnumAdapters1(0))
-                .ok()?
-        } else {
-            factory.EnumAdapters1(0).ok()?
-        };
-        let mut i = 0u32;
-        while let Ok(output) = adapter.EnumOutputs(i) {
-            i += 1;
-            let Ok(output6) = output.cast::<IDXGIOutput6>() else {
-                continue;
-            };
-            let Ok(desc) = output6.GetDesc1() else {
-                continue;
-            };
-            if desc.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020 {
-                return Some(HdrDisplayInfo {
-                    min_luminance: desc.MinLuminance,
-                    max_luminance: desc.MaxLuminance,
-                    max_full_frame_luminance: desc.MaxFullFrameLuminance,
+        let mut a = 0;
+        while let Ok(adapter) = factory.EnumAdapters1(a) {
+            a += 1;
+            let mut i = 0;
+            while let Ok(output) = adapter.EnumOutputs(i) {
+                i += 1;
+                let Ok(desc) = output.cast::<IDXGIOutput6>().and_then(|o| o.GetDesc1()) else {
+                    continue;
+                };
+                let hdr = desc.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
+                outputs.push(OutputHdr {
+                    monitor: desc.Monitor.0 as isize,
+                    hdr: hdr.then_some(HdrDisplayInfo {
+                        min_luminance: desc.MinLuminance,
+                        max_luminance: desc.MaxLuminance,
+                        max_full_frame_luminance: desc.MaxFullFrameLuminance,
+                    }),
                 });
             }
         }
-        None
     }
+    outputs
+}
+
+/// The outputs as last enumerated, with the factory that enumerated them.
+/// They are enumerated again only when the factory is no longer current
+/// (a display was added, removed or changed mode, HDR included).
+struct OutputCache {
+    factory: IDXGIFactory1,
+    outputs: Vec<OutputHdr>,
+}
+// SAFETY: DXGI factories are free-threaded; the cache is used under a lock.
+unsafe impl Send for OutputCache {}
+
+fn cached_outputs() -> Vec<OutputHdr> {
+    static CACHE: Mutex<Option<OutputCache>> = Mutex::new(None);
+    let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    // SAFETY: a live factory.
+    let current = |c: &&OutputCache| unsafe { c.factory.IsCurrent() }.as_bool();
+    if let Some(c) = cache.as_ref().filter(current) {
+        return c.outputs.clone();
+    }
+    // SAFETY: plain factory creation.
+    let Ok(factory) =
+        (unsafe { CreateDXGIFactory2::<IDXGIFactory1>(DXGI_CREATE_FACTORY_FLAGS(0)) })
+    else {
+        return cache
+            .as_ref()
+            .map(|c| c.outputs.clone())
+            .unwrap_or_default();
+    };
+    let outputs = host_outputs(&factory);
+    if cache.is_some() {
+        tracing::info!(
+            outputs = outputs.len(),
+            "host displays changed; HDR state read again"
+        );
+    }
+    *cache = Some(OutputCache {
+        factory,
+        outputs: outputs.clone(),
+    });
+    outputs
+}
+
+/// The monitor `hwnd` is on, or the primary monitor without a window.
+fn monitor_of(hwnd: Option<HWND>) -> isize {
+    use windows::Win32::Graphics::Gdi::{
+        MONITOR_DEFAULTTOPRIMARY, MonitorFromPoint, MonitorFromWindow,
+    };
+    // SAFETY: plain monitor queries; a stale window handle gives the primary.
+    let monitor = unsafe {
+        match hwnd {
+            Some(hwnd) => MonitorFromWindow(hwnd, MONITOR_DEFAULTTOPRIMARY),
+            None => MonitorFromPoint(Default::default(), MONITOR_DEFAULTTOPRIMARY),
+        }
+    };
+    monitor.0 as isize
+}
+
+/// The HDR state of the monitor `hwnd` is on (cached; see [`OutputCache`]).
+fn window_hdr_info(hwnd: Option<HWND>) -> Option<HdrDisplayInfo> {
+    monitor_hdr(&cached_outputs(), monitor_of(hwnd))
+}
+
+/// Whether HDR10 desktop mode is active on the monitor the title's window
+/// is on (the primary monitor before there is a window), with its luminance
+/// bounds. `None` when that monitor is SDR.
+pub fn display_hdr_info() -> Option<HdrDisplayInfo> {
+    window_hdr_info(title_window())
+}
+
+/// What the title was last told about HDR: 0 never, 1 SDR, 2 HDR.
+static TOLD_HDR: AtomicU32 = AtomicU32::new(0);
+
+/// Records what the title was told about HDR (`XDisplayTryEnableHdrMode`),
+/// so the swap chain presents in the color space the title writes.
+pub fn title_told_hdr(enabled: bool) {
+    TOLD_HDR.store(if enabled { 2 } else { 1 }, Ordering::Relaxed);
+}
+
+fn told_hdr() -> Option<bool> {
+    match TOLD_HDR.load(Ordering::Relaxed) {
+        0 => None,
+        v => Some(v == 2),
+    }
+}
+
+/// The swap chain's HDR state for `hwnd`. Warns when the title was told
+/// HDR but the window's monitor is SDR (once each time that starts).
+fn presenter_hdr(hwnd: HWND) -> bool {
+    static MISMATCH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let told = told_hdr();
+    let window = window_hdr_info(Some(hwnd)).is_some();
+    let mismatch = told == Some(true) && !window;
+    if mismatch && !MISMATCH.swap(true, Ordering::Relaxed) {
+        tracing::warn!(
+            "the title was told HDR but the window's monitor is SDR: its PQ values show as SDR"
+        );
+    } else if !mismatch {
+        MISMATCH.store(false, Ordering::Relaxed);
+    }
+    swap_chain_hdr(told, window)
 }
 
 /// The color space DXGI gives a new swap chain of `format`: scRGB (linear)
@@ -7992,7 +8108,7 @@ impl Host {
             format,
             DXGI_FORMAT_R10G10B10A2_UNORM | DXGI_FORMAT_R16G16B16A16_FLOAT
         ) {
-            p.sync_color_space(display_hdr_info().is_some());
+            p.sync_color_space(presenter_hdr(p.hwnd));
         } else {
             p.sync_color_space(false);
         }
@@ -8187,7 +8303,7 @@ impl Host {
                 last_present_issue: None,
                 compositor: None,
             };
-            p.sync_color_space(display_hdr_info().is_some());
+            p.sync_color_space(presenter_hdr(hwnd));
             Ok(p)
         }
     }

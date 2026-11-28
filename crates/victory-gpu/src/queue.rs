@@ -464,6 +464,8 @@ extern "system" fn present(
 ) -> HRESULT {
     // Read now: the parameters are the title's, maybe on its stack. The
     // frame is shown in the queue's order, after the work before it.
+    #[cfg(windows)]
+    crate::present_params::note(planes, plane_parameters.cast(), _parameters);
     let plane = if planes > 0 {
         // SAFETY: the title passes `planes` plane descriptions.
         unsafe { plane_parameters.as_ref() }
@@ -505,8 +507,7 @@ fn retain_present_overlay(
     plane_parameters: *const Plane,
     primary: This,
 ) -> Option<crate::resource::PresentTarget> {
-    const SERIES_S_PLANE_STRIDE: usize = 0x48;
-    let plane = (plane_parameters as usize).checked_add(SERIES_S_PLANE_STRIDE)?;
+    let plane = (plane_parameters as usize).checked_add(crate::present_params::PLANE_STRIDE)?;
     let count_at = plane.checked_add(std::mem::offset_of!(Plane, count))?;
     let mut count = [0; size_of::<u32>()];
     if !crate::host::read_into(count_at as *const u8, &mut count) || u32::from_ne_bytes(count) != 1
