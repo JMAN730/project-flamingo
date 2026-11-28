@@ -69,10 +69,16 @@ struct HdrModeInfo {
 }
 
 /// `XDisplayTryEnableHdrMode`: enables HDR (`1`) and fills the host display's
-/// luminance bounds when Windows HDR is active; otherwise returns disabled (`2`).
+/// luminance bounds when Windows HDR is active on the window's monitor;
+/// otherwise returns disabled (`2`).
 extern "system" fn try_enable_hdr(_: This, preference: u32, info: *mut c_void) -> u32 {
     #[cfg(windows)]
-    if let Some(hdr) = victory_gpu::display_hdr_info() {
+    let hdr = victory_gpu::display_hdr_info();
+    // The swap chain presents in the color space the title is told here.
+    #[cfg(windows)]
+    victory_gpu::title_told_hdr(hdr.is_some());
+    #[cfg(windows)]
+    if let Some(hdr) = hdr {
         if !info.is_null() {
             // SAFETY: caller passed a writable `XDisplayHdrModeInfo` pointer.
             unsafe {

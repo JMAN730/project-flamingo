@@ -95,6 +95,23 @@ fn writable_root_bytes(remaining: u64) -> Option<u64> {
     u32::try_from(remaining / 4).ok().map(|n| u64::from(n) * 4)
 }
 
+/// Where a raw root view of the byte at `offset` in a copy starts, and how
+/// far below `offset` (a raw view begins on 16 bytes): the boundary below
+/// when the shader adds that bias (`biased`, see
+/// [`victory_shader::emit::USER_ROOT_VIEW_BIAS`]), else only an offset on
+/// 16 bytes itself.
+fn raw_view_start(offset: u64, biased: bool) -> Option<(u64, u64)> {
+    let bias = offset % 16;
+    (bias == 0 || biased).then_some((offset - bias, bias))
+}
+
+/// Whether `shader` adds a bias word to root slot `slot`'s byte offsets.
+fn root_view_biased(shader: &victory_shader::emit::HostShader, slot: u8) -> bool {
+    shader.user_data.iter().any(|u| {
+        u.slot == slot && u.root == RootType::Other(victory_shader::emit::USER_ROOT_VIEW_BIAS)
+    })
+}
+
 /// A raw view describes bytes of a particular host resource. The descriptor
 /// slot keeps that resource alive for the recorded commands.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -1446,6 +1463,10 @@ impl State {
                     values[u.index as usize] = self.view_classes(list, to_compute).unwrap_or(0);
                     continue;
                 }
+                if u.root == RootType::Other(victory_shader::emit::USER_ROOT_VIEW_BIAS) {
+                    values[u.index as usize] = self.root_view_bias(&t.host, from_compute, u.slot);
+                    continue;
+                }
                 if let RootType::Other(kind) = u.root {
                     values[u.index as usize] = self.host_word(kind, memory.as_ref());
                     continue;
@@ -1520,7 +1541,13 @@ impl State {
                     once!(slot, "a shader reads a root view the title did not set");
                     // An unset table is undefined: a null view instead.
                     if tabled
-                        && !self.root_buffer_table(list, None, param, to_compute, RawAccess::Read)
+                        && !self.root_buffer_table(
+                            list,
+                            None,
+                            param,
+                            to_compute,
+                            (RawAccess::Read, false),
+                        )
                     {
                         return false;
                     }
@@ -1532,7 +1559,7 @@ impl State {
                         Some(address),
                         param,
                         to_compute,
-                        RawAccess::Read,
+                        (RawAccess::Read, root_view_biased(&t.host, slot)),
                     ) {
                         return false;
                     }
@@ -1575,7 +1602,13 @@ impl State {
                     None
                 }
             };
-            if !self.root_buffer_table(list, address, param, to_compute, RawAccess::ReadWrite) {
+            if !self.root_buffer_table(
+                list,
+                address,
+                param,
+                to_compute,
+                (RawAccess::ReadWrite, root_view_biased(&t.host, slot)),
+            ) {
                 return false;
             }
         }
@@ -1944,15 +1977,44 @@ impl State {
         Some([index, read.stride, bias as u32])
     }
 
+    /// The bias word ([`victory_shader::emit::USER_ROOT_VIEW_BIAS`]) of root
+    /// slot `slot` of `shader`: how far below the root view's address the
+    /// raw view [`Self::root_buffer_table`] binds for it starts. 0 for a
+    /// view bound by address (a root SRV when root SRVs are not tables, a
+    /// root CBV) or not set.
+    fn root_view_bias(
+        &self,
+        shader: &victory_shader::emit::HostShader,
+        from_compute: bool,
+        slot: u8,
+    ) -> u32 {
+        let tabled = shader.root_uavs.contains(&slot)
+            || (shader.root_srvs.contains(&slot) && crate::pipeline::host::bounded_root_srvs());
+        if !tabled {
+            return 0;
+        }
+        let Some(&Root::View(address)) = self.roots_ref(from_compute).get(usize::from(slot)) else {
+            return 0;
+        };
+        if address == 0 {
+            return 0;
+        }
+        crate::shadow::find(address, 1)
+            .and_then(|s| raw_view_start(s.offset(address), true))
+            .map_or(0, |(_, bias)| bias as u32)
+    }
+
     /// Bind a raw view of the remaining host buffer. A writable view, its
     /// initial contents, and its copy-back all cover the same whole dwords.
+    /// `biased`: the shader adds the view's bias word, so a view whose
+    /// address is not on 16 bytes starts on the boundary below it.
     fn root_buffer_table(
         &mut self,
         list: &HostList,
         address: Option<u64>,
         param: u32,
         compute: bool,
-        access: RawAccess,
+        (access, biased): (RawAccess, bool),
     ) -> bool {
         let heap_id = self.host_heaps[0];
         let Some(host) = crate::descriptor::recording_heap(heap_id) else {
@@ -1962,10 +2024,12 @@ impl State {
         let shadow = address
             .filter(|&a| a != 0)
             .and_then(|a| crate::shadow::find(a, 1).map(|s| (a, s)));
+        let mut bias = 0;
         let view = if let Some((a, s)) = &shadow {
             let offset = s.offset(*a);
-            if offset.is_multiple_of(16) {
-                let remaining = s.left(*a);
+            if let Some((start, below)) = raw_view_start(offset, biased) {
+                bias = below;
+                let remaining = s.left(*a) + below;
                 let len = match access {
                     RawAccess::Read => remaining,
                     RawAccess::ReadWrite => {
@@ -1979,16 +2043,16 @@ impl State {
                         len
                     }
                 };
-                (len >= 4).then_some((s, offset, len))
+                (len >= 4).then_some((s, start, len))
             } else {
-                // shortcut: a raw view starts on 16 bytes and this binding
-                // has no bias word for the shader. A null view would read 0
-                // and drop the stores, half running the shader over what it
+                // A raw view starts on 16 bytes and this shader adds no bias
+                // (translated before it could). A null view would read 0 and
+                // drop the stores, half running the shader over what it
                 // builds (allocators, bounds); dropping the draw leaves that
                 // memory as it was.
                 once!(
                     address = format_args!("{a:#x}"),
-                    "an unaligned raw root view: the draw is dropped (a null view would read 0 and drop its stores)"
+                    "an unaligned raw root view the shader adds no bias to: the draw is dropped"
                 );
                 return false;
             }
@@ -2007,11 +2071,13 @@ impl State {
                 }
                 RawAccess::ReadWrite => D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
             };
+            // The view's first byte: `bias` below the root view's address.
+            let from = *a - bias;
             match access {
-                RawAccess::Read => s.refresh_as(list, *a, len.min(1 << 20), wanted),
+                RawAccess::Read => s.refresh_as(list, from, len.min(1 << 20), wanted),
                 RawAccess::ReadWrite => {
-                    s.refresh_as(list, *a, len, wanted);
-                    s.gpu_writes(list, *a, len);
+                    s.refresh_as(list, from, len, wanted);
+                    s.gpu_writes(list, from, len);
                 }
             }
         }
@@ -4579,6 +4645,20 @@ mod tests {
         assert_eq!(super::writable_root_bytes(max + 4), None);
     }
 
+    /// A root view on 16 bytes starts there; one off it starts on the
+    /// boundary below with that bias, if the shader adds it, and is not
+    /// bound otherwise.
+    #[test]
+    fn a_raw_root_view_starts_on_the_16_bytes_below_with_its_bias() {
+        assert_eq!(super::raw_view_start(0x5c0, false), Some((0x5c0, 0)));
+        assert_eq!(super::raw_view_start(0x5c0, true), Some((0x5c0, 0)));
+        // The run-23 view: 0x...5c4.
+        assert_eq!(super::raw_view_start(0x5c4, true), Some((0x5c0, 4)));
+        assert_eq!(super::raw_view_start(0x5c4, false), None);
+        assert_eq!(super::raw_view_start(0x1f, true), Some((0x10, 0xf)));
+        assert_eq!(super::raw_view_start(3, true), Some((0, 3)));
+    }
+
     #[test]
     fn bounded_root_dispatch_writes_then_reads_without_a_title_heap() {
         use super::*;
@@ -4649,9 +4729,21 @@ mod tests {
                 list.list.SetComputeRootSignature(root);
                 list.list.SetPipelineState(pso);
             }
-            assert!(state.root_buffer_table(&list, Some(dst), 0, true, RawAccess::ReadWrite));
+            assert!(state.root_buffer_table(
+                &list,
+                Some(dst),
+                0,
+                true,
+                (RawAccess::ReadWrite, false)
+            ));
             if let Some(src) = src {
-                assert!(state.root_buffer_table(&list, Some(src), 1, true, RawAccess::Read));
+                assert!(state.root_buffer_table(
+                    &list,
+                    Some(src),
+                    1,
+                    true,
+                    (RawAccess::Read, false)
+                ));
             }
             // SAFETY: a single workgroup with the required tables bound.
             unsafe { list.list.Dispatch(1, 1, 1) };

@@ -212,20 +212,54 @@ pub fn report_crashes() {
 mod overflow {
     use super::{CONTEXT, EXCEPTION_POINTERS};
     use std::cell::UnsafeCell;
+    use std::mem::MaybeUninit;
     use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
     use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
     use windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_RECORD;
 
     /// The exception handed over: written by the one thread that moved
     /// [`STATE`] from [`IDLE`] to [`CLAIMED`], read by the reporting thread
-    /// until it leaves [`CLAIMED`]/[`ABANDONED`].
-    struct Handed(UnsafeCell<Option<(EXCEPTION_RECORD, super::Aligned16)>>);
+    /// until it leaves [`CLAIMED`]/[`ABANDONED`]. Static, so the
+    /// overflowed thread copies into it straight from the system's
+    /// pointers and puts no `CONTEXT` on what is left of its own stack.
+    struct Handed {
+        record: UnsafeCell<MaybeUninit<EXCEPTION_RECORD>>,
+        context: UnsafeCell<MaybeUninit<super::Aligned16>>,
+    }
     // SAFETY: access is serialised by `STATE`: only the claiming thread
     // writes it (before setting `ASKED`), only the reporting thread reads
     // it (between `ASKED` and the state leaving `CLAIMED`/`ABANDONED`),
     // and nobody can claim again until the reporting thread is done.
     unsafe impl Sync for Handed {}
-    static HANDED: Handed = Handed(UnsafeCell::new(None));
+    static HANDED: Handed = Handed {
+        record: UnsafeCell::new(MaybeUninit::uninit()),
+        context: UnsafeCell::new(MaybeUninit::uninit()),
+    };
+
+    /// Copies the exception into [`HANDED`], with no copy on the stack.
+    ///
+    /// # Safety
+    /// The caller holds the claim and the reporting thread is not reading;
+    /// `record` and `context` are valid.
+    unsafe fn store(record: *const EXCEPTION_RECORD, context: *const CONTEXT) {
+        // SAFETY: guaranteed by the caller; the destinations are static
+        // storage of the same types (`Aligned16` is a `CONTEXT` at 16-byte
+        // alignment, so its address is the `CONTEXT`'s).
+        unsafe {
+            std::ptr::copy_nonoverlapping(record, (*HANDED.record.get()).as_mut_ptr(), 1);
+            let into = (*HANDED.context.get()).as_mut_ptr().cast::<CONTEXT>();
+            std::ptr::copy_nonoverlapping(context, into, 1);
+        }
+    }
+
+    /// The exception last stored, as pointers into [`HANDED`]. Reading
+    /// through them needs [`store`] to have run and no write in progress.
+    fn stored() -> EXCEPTION_POINTERS {
+        EXCEPTION_POINTERS {
+            ExceptionRecord: HANDED.record.get().cast(),
+            ContextRecord: HANDED.context.get().cast(),
+        }
+    }
 
     /// Who owns the handoff. A thread that overflowed claims it; the
     /// reporting thread hands it back once its report is written, also when
@@ -305,16 +339,9 @@ mod overflow {
                     // SAFETY: a live event handle.
                     unsafe { super::WaitForSingleObject(asked as _, u32::MAX) };
                     // SAFETY: the thread that set the event claimed `STATE`
-                    // and wrote the exception; nobody else touches it until
-                    // `finish` below.
-                    if let Some((record, context)) = unsafe { &mut *HANDED.0.get() }.as_mut() {
-                        let pointers = EXCEPTION_POINTERS {
-                            ExceptionRecord: record,
-                            ContextRecord: &mut context.0,
-                        };
-                        // SAFETY: both point at the copies above.
-                        unsafe { super::report("stack overflow", &pointers, true) };
-                    }
+                    // and stored the exception before setting it; nobody
+                    // else touches it until `finish` below.
+                    unsafe { super::report("stack overflow", &stored(), true) };
                     LIMITS[0].store(0, Ordering::Release);
                     LIMITS[1].store(0, Ordering::Release);
                     if finish(&STATE) {
@@ -352,8 +379,7 @@ mod overflow {
         // after `asked` is set below.
         unsafe {
             super::GetCurrentThreadStackLimits(&mut low, &mut high);
-            let context: CONTEXT = *(*info).ContextRecord;
-            *HANDED.0.get() = Some((*(*info).ExceptionRecord, super::Aligned16(context)));
+            store((*info).ExceptionRecord, (*info).ContextRecord);
         }
         LIMITS[0].store(low, Ordering::Release);
         LIMITS[1].store(high, Ordering::Release);
@@ -377,6 +403,29 @@ mod overflow {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        /// The handed exception is the one stored, read back in place.
+        #[test]
+        fn a_stored_exception_reads_back_from_static_storage() {
+            // SAFETY: zeroed is valid for both plain-data structures.
+            let mut record: EXCEPTION_RECORD = unsafe { std::mem::zeroed() };
+            record.ExceptionCode = 0xc000_00fd_u32 as i32;
+            record.ExceptionAddress = 0x1234 as *mut _;
+            // SAFETY: as above.
+            let mut context: super::super::Aligned16 = unsafe { std::mem::zeroed() };
+            context.0.Rip = 0x5678;
+            context.0.Rsp = 0x9abc;
+            // SAFETY: no reporting thread runs in unit tests, and this is
+            // the only test touching `HANDED`.
+            unsafe { store(&record, &context.0) };
+            let pointers = stored();
+            // SAFETY: they point into `HANDED`, written just above.
+            let (r, c) = unsafe { (&*pointers.ExceptionRecord, &*pointers.ContextRecord) };
+            assert_eq!(r.ExceptionCode, record.ExceptionCode);
+            assert_eq!(r.ExceptionAddress, record.ExceptionAddress);
+            assert_eq!((c.Rip, c.Rsp), (0x5678, 0x9abc));
+            assert_eq!(pointers.ContextRecord as usize % 16, 0, "CONTEXT alignment");
+        }
 
         #[test]
         fn report_in_time_frees_the_handoff() {

@@ -9,6 +9,9 @@
 
 use std::ffi::{CStr, c_void};
 
+use super::thread_stacks::{
+    _beginthread, _beginthreadex, CreateRemoteThread, CreateRemoteThreadEx, CreateThread,
+};
 use crate::{HleModule, HostPolicy, hle_export, registry, runtime};
 
 /// `GetModuleHandleW(NULL)` must return the title's image, not our exe;
@@ -446,6 +449,11 @@ pub(crate) fn module() -> HleModule {
             hle_export!(TerminateProcess),
             hle_export!(SetUnhandledExceptionFilter),
             hle_export!(SetThreadPriority),
+            hle_export!(CreateThread),
+            hle_export!(CreateRemoteThread),
+            hle_export!(CreateRemoteThreadEx),
+            hle_export!(_beginthreadex),
+            hle_export!(_beginthread),
         ],
     }
 }

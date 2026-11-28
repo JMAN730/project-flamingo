@@ -101,7 +101,10 @@ fn check_readback(shader: &HostShader) {
                 &pso,
                 &Dispatch {
                     roots: vec![
-                        (0, Root::Constants(vec![0])),
+                        (
+                            0,
+                            Root::Constants(vec![0; shader.user_data_dwords().max(1) as usize]),
+                        ),
                         (
                             1,
                             Root::Table {

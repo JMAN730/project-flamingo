@@ -776,6 +776,15 @@ pub const VIEW_ADDRESS_ENTRY: u32 = 8;
 /// looks the record up.
 pub const USER_TABLE_SLOTS: u32 = 0x102;
 
+/// `RootType::Other` code of a user-data dword the host computes, one per
+/// root slot ([`UserData::slot`]) holding a root SRV or UAV: how many bytes
+/// below the view's title address the raw view the host binds for it
+/// starts (0 to 15: a raw view begins on 16 bytes, a root descriptor
+/// anywhere). A shader adds it to every byte offset into that view. A host
+/// that does not know this value supplies 0 and binds views at their own
+/// address, as before.
+pub const USER_ROOT_VIEW_BIAS: u32 = 0x103;
+
 /// `RootType::Other` code of a user-data dword the host computes: the heap
 /// index of its view class list, a raw SRV with one [`VIEW_CLASS_ENTRY`]-
 /// byte entry per slot of the bound view heap: the numeric class of the
@@ -789,7 +798,7 @@ pub const USER_TABLE_SLOTS: u32 = 0x102;
 /// a float one. The host's typed accesses must name the view's type
 /// instead: an image access reads the class of its view here and takes the
 /// typed access of that class.
-pub const USER_VIEW_CLASSES: u32 = 0x103;
+pub const USER_VIEW_CLASSES: u32 = 0x104;
 
 /// Bytes per entry of the view class list (see [`USER_VIEW_CLASSES`]).
 pub const VIEW_CLASS_ENTRY: u32 = 4;

@@ -2305,6 +2305,12 @@ fn targets() -> std::sync::MutexGuard<'static, std::collections::BTreeMap<u64, u
     TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// The description of the render target at `address`, if it is one.
+#[cfg(windows)]
+pub(crate) fn present_plane_desc(address: usize) -> Option<crate::present_params::PlaneDesc> {
+    PresentTarget::retain(address).map(|target| target.desc())
+}
+
 /// A recognized renderable resource retained for an optional present overlay.
 #[cfg(windows)]
 pub(crate) struct PresentTarget(object::Held);
@@ -2321,6 +2327,20 @@ impl PresentTarget {
         // SAFETY: a resource in the table must acquire this same lock before
         // its allocation can be freed. try_new refuses an object in Drop.
         unsafe { object::Held::try_new(address as This) }.map(Self)
+    }
+
+    /// The title's description of the target, for the present log.
+    pub(crate) fn desc(&self) -> crate::present_params::PlaneDesc {
+        let d = resource(self.0.get()).desc;
+        crate::present_params::PlaneDesc {
+            format: d.format,
+            width: d.width,
+            height: d.height,
+            mips: d.mip_levels,
+            samples: d.sample_count,
+            dimension: d.dimension,
+            flags: d.flags,
+        }
     }
 
     /// An ignored plane should not acquire a host texture just by being
