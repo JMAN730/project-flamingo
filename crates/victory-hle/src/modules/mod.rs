@@ -38,6 +38,7 @@ pub mod net;
 pub(crate) mod paths;
 pub mod speech;
 pub mod storage;
+pub(crate) mod thread_stacks;
 pub mod xasync;
 pub mod xg;
 pub mod xgame;
