@@ -190,7 +190,8 @@ victory inspect <exe|dll> [--imports] [--exports]
 victory census [paths...] [--missing] [--strict]
 victory lib-exports <import.lib> [--list]
 victory shader-info [paths...] [--verbose] [--disasm]
-victory translate [paths...] [--validate] [--pipelines] [--list] [--jobs N]
+victory translate [paths...] [--validate] [--pipelines] [--mesh-fallback]
+                  [--barycentric-fallback] [--list] [--jobs N] [--hash H,...]
 victory run <exe> [--execute] [--unimplemented trap|zero] [--strict]
             [--console series-x|series-s] [-- <title arguments>]
 victory config
@@ -198,6 +199,8 @@ victory config
 
 `translate --jobs N` requires a positive worker count. Omit it to use the
 default worker count.
+`translate --hash H` translates only the containers whose runtime hash (the
+16 hex digits the runtime logs a shader by) is one of those given.
 
 Logging: `VICTORY_LOG=victory_loader=trace,info` (a release build logs
 info and above).
@@ -351,8 +354,8 @@ A run:
    holds the session name, the run id, the start time and the process ids of
    the launcher and the title. While those processes run, another
    `run-world` refuses to start and says who holds the card. A lock whose
-   processes are gone is stale and is cleared. Reading, clearing and writing
-   the lock happen while a second file, `card.lock.guard`, exists for a
+   processes are gone is stale and is cleared. Reading, clearing, writing and
+   releasing the lock happen while a second file, `card.lock.guard`, exists for a
    moment, so two runs that start together cannot both get the card;
 3. copies the exe as `victory-<run id>.exe`, with its `D3D12` folder, to a
    folder of its own under `victory-data\runs` in your user folder

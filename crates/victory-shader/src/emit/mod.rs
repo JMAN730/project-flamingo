@@ -1244,7 +1244,13 @@ fn translate_stages(
     // Structurisation first: tracing per-lane descriptors needs it (its
     // failure is reported after the earlier stages').
     let st = structure::structure(&p);
-    let res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok())?;
+    let res = resource::track_initialized(
+        &p,
+        &native.layout,
+        native.stage,
+        st.as_ref().ok(),
+        native.initialized_sgprs(),
+    )?;
     let io = io::raise(&p, native)?;
     let st = st?;
     let parts = Emission {
@@ -1422,7 +1428,13 @@ fn emit_threaded(
     let p = ir::thread_edges(p, &edges)?;
     let st = structure::structure(&p)?;
     let io = io::raise(&p, native)?;
-    let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
+    let res = resource::track_initialized(
+        &p,
+        &native.layout,
+        native.stage,
+        Some(&st),
+        native.initialized_sgprs(),
+    )?;
     emit_program(
         Emission {
             c,

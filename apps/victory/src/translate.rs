@@ -419,6 +419,16 @@ struct Checks {
     mesh_fallback: bool,
     /// Also emit pixel programs for hosts without barycentrics.
     barycentric_fallback: bool,
+    /// Only the containers with these runtime hashes (`--hash`); all when
+    /// empty.
+    hashes: std::sync::Arc<HashSet<String>>,
+}
+
+/// Whether the container with runtime hash `hash`
+/// ([`victory_shader::runtime_hash`]) is translated: every one when `wanted`
+/// is empty, else those it names (lowercase hex, as the runtime logs them).
+fn selected(wanted: &HashSet<String>, hash: &str) -> bool {
+    wanted.is_empty() || wanted.contains(&hash.to_ascii_lowercase())
 }
 
 impl Checks {
@@ -439,7 +449,22 @@ pub fn run(
     (mesh_fallback, barycentric_fallback): (bool, bool),
     list: bool,
     jobs: Option<usize>,
+    hashes: Vec<String>,
 ) -> Result<()> {
+    let hashes: std::sync::Arc<HashSet<String>> = std::sync::Arc::new(
+        hashes
+            .iter()
+            .flat_map(|h| h.split(','))
+            .map(|h| h.trim().to_ascii_lowercase())
+            .filter(|h| !h.is_empty())
+            .collect(),
+    );
+    anyhow::ensure!(
+        hashes
+            .iter()
+            .all(|h| h.len() == 16 && h.chars().all(|c| c.is_ascii_hexdigit())),
+        "--hash takes runtime hashes of 16 hex digits, as the logs print them"
+    );
     emit_dump_outside_repo(std::env::var_os("VICTORY_EMIT_DUMP").as_deref())?;
     let paths = crate::default_paths(paths)?;
     let dll = validate.then(Validator::default_path).flatten();
@@ -500,6 +525,7 @@ pub fn run(
                                 .flatten(),
                             mesh_fallback,
                             barycentric_fallback,
+                            hashes: hashes.clone(),
                         };
                         while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
                             translate(job, entry.path(), &seen, &mut t, &mut checks);
@@ -582,6 +608,10 @@ fn translate(
     let digest = blake3::hash(&bytes);
     let hash = digest.to_hex().to_string();
     let short_hash = &hash[..16];
+    debug_assert_eq!(short_hash, victory_shader::runtime_hash(&bytes));
+    if !selected(&checks.hashes, short_hash) {
+        return;
+    }
     let example = || {
         let location = location();
         if list {
@@ -651,7 +681,13 @@ fn tally_selected(
             // failure is listed after the resources' and I/O's.
             let structured = structure::structure(&program);
             let lanes = structured.as_ref().ok();
-            let res = match resource::track(&program, &p.layout, p.stage, lanes) {
+            let res = match resource::track_initialized(
+                &program,
+                &p.layout,
+                p.stage,
+                lanes,
+                p.initialized_sgprs(),
+            ) {
                 Ok(r) => {
                     tally_resources(p, &r, t);
                     Some(r)
@@ -1262,6 +1298,22 @@ mod offline {
 mod tests {
     use super::*;
 
+    /// `--hash` picks containers by the hash the runtime logs them by, in
+    /// either case; with none given, every container is translated.
+    #[test]
+    fn hashes_pick_containers_as_the_runtime_names_them() {
+        let bytes = b"DXBC: a synthetic container".to_vec();
+        let hash = victory_shader::runtime_hash(&bytes);
+        assert!(selected(&HashSet::new(), &hash));
+        let wanted = HashSet::from([hash.clone()]);
+        assert!(selected(&wanted, &hash));
+        assert!(selected(&wanted, &hash.to_ascii_uppercase()));
+        assert!(!selected(
+            &wanted,
+            &victory_shader::runtime_hash(&bytes[1..])
+        ));
+    }
+
     /// Shader dumps are game-derived, so a dump directory in the repo is
     /// refused; one outside it, or none, is not.
     #[test]
@@ -1458,6 +1510,7 @@ mod tests {
             host: None,
             mesh_fallback: false,
             barycentric_fallback: false,
+            hashes: Default::default(),
         };
         let mut t = Tally {
             list: true,
@@ -1552,6 +1605,7 @@ mod tests {
             host: None,
             mesh_fallback: false,
             barycentric_fallback: false,
+            hashes: Default::default(),
         }
     }
 

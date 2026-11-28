@@ -1335,8 +1335,9 @@ impl Lower<'_> {
                 &args,
             );
             self.s.m.set_phi(old, vec![(zero, start), (seen, latch)]);
-            let stored = self.s.m.cmp(latch, pred::EQ, old, seen);
-            self.s.m.terminate(latch, Term::CondBr(stored, done, retry));
+            let lost = self.s.m.cmp(latch, pred::NE, old, seen);
+            let again = self.retry_within_limit(retry, start, latch, lost);
+            self.s.m.terminate(latch, Term::CondBr(again, retry, done));
             self.cur = done;
             self.end_guarded(at, &[]);
             return Ok(());

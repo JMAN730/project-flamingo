@@ -40,6 +40,22 @@ const WINDOW: u64 = 1 << 28;
 
 const RECORD: usize = victory_shader::emit::BUFFER_TABLE_RECORD as usize;
 
+/// Bytes per entry of the view address list after the records.
+const ENTRY: usize = victory_shader::emit::VIEW_ADDRESS_ENTRY as usize;
+
+/// The byte at which the table of a heap of `slots` title slots holds its
+/// list of view addresses (`victory_shader::emit::USER_VIEW_ADDRESSES`):
+/// past the records, so never 0.
+pub(crate) fn address_list(slots: u32) -> u32 {
+    (slots as usize * RECORD).max(RECORD) as u32
+}
+
+/// Bytes of the table of a heap of `slots` title slots: the records, then
+/// the address list.
+fn table_bytes(slots: u32) -> u64 {
+    u64::from(address_list(slots)) + (slots as u64 * ENTRY as u64).max(ENTRY as u64)
+}
+
 /// Raw views made and given back over the run, across every table: what
 /// the "buffer view table bound" log line reports, to see whether they grow.
 static MADE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -201,7 +217,9 @@ fn window(offset: u64, len: u64, left: u64) -> Option<Window> {
 }
 
 pub(crate) struct BufferTable {
-    /// The records (CPU-visible memory the GPU reads).
+    /// The records, then the title address of each slot's view (0: none),
+    /// for programs that read a descriptor's base address as a number
+    /// (CPU-visible memory the GPU reads).
     buffer: ID3D12Resource,
     data: usize,
     /// The heap slot of the raw view of `buffer`.
@@ -238,10 +256,10 @@ unsafe impl Send for BufferTable {}
 impl BufferTable {
     fn new(heap: &HostHeap, title_heap: (usize, u64)) -> Option<Self> {
         let count = heap.count() as usize;
-        let bytes = (count * RECORD).max(RECORD) as u64;
+        let bytes = table_bytes(heap.count());
         let (buffer, data) = host()?.shared_buffer(bytes.next_multiple_of(1 << 16))?;
         crate::host::name(&buffer, || "buffer view table".to_owned());
-        // A record of zeros lists no view.
+        // A record of zeros lists no view; an address of zero is none.
         // SAFETY: the mapping covers `bytes`.
         unsafe { std::ptr::write_bytes(data, 0, bytes as usize) };
         let slot = heap.dynamic(1)?;
@@ -266,6 +284,14 @@ impl BufferTable {
         unsafe {
             ((self.data + index as usize * RECORD) as *mut [u32; 4]).write_unaligned(record);
         }
+    }
+
+    /// Sets the title address of the view slot `index` lists (0: none).
+    fn write_address(&self, index: u32, address: u64) {
+        let at = address_list(self.made.len() as u32) as usize + index as usize * ENTRY;
+        // SAFETY: `index` is below the title slot count, whose address
+        // entries the mapping covers after the records.
+        unsafe { ((self.data + at) as *mut u64).write_unaligned(address) };
     }
 
     /// The raw view holding `len` bytes at `offset` of `shadow`'s copy
@@ -335,6 +361,7 @@ impl BufferTable {
                         self.listed -= 1;
                     }
                     self.write(index, [0; 4]);
+                    self.write_address(index, 0);
                     continue;
                 }
                 Look::Remake => {}
@@ -355,10 +382,11 @@ impl BufferTable {
                 let elements = u32::try_from(read.bytes / u64::from(read.stride.max(1))).ok()?;
                 self.fresh
                     .push((read.shadow.clone(), read.address, read.bytes));
-                Some((key, [alias, read.stride, bias, elements]))
+                Some((key, [alias, read.stride, bias, elements], read.address))
             });
-            self.aliases.name(index as usize, made.map(|(key, _)| key));
-            let record = made.map(|(_, record)| record);
+            self.aliases.name(index as usize, made.map(|(key, ..)| key));
+            self.write_address(index, made.map_or(0, |(.., address)| address));
+            let record = made.map(|(_, record, _)| record);
             let before = self.read(index)[3] != 0 && was != 0;
             match (before, record.is_some()) {
                 (false, true) => self.listed += 1,
@@ -446,6 +474,23 @@ pub(crate) fn bind(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A shader finds slot `i`'s address at the list's byte plus
+    /// `i * VIEW_ADDRESS_ENTRY`: past every record, inside the table, and
+    /// never at byte 0 (which a shader takes as no list).
+    #[test]
+    fn the_address_list_follows_the_records_inside_the_table() {
+        for slots in [0u32, 1, 7, 1 << 20] {
+            let list = address_list(slots);
+            assert!(list != 0, "{slots} slots");
+            assert!(u64::from(list) >= u64::from(slots) * RECORD as u64);
+            let last = u64::from(list) + u64::from(slots.max(1) - 1) * ENTRY as u64;
+            assert!(last + ENTRY as u64 <= table_bytes(slots), "{slots} slots");
+        }
+        // The shader's limit on a slot index keeps every entry's byte in 32 bits.
+        let most = victory_shader::emit::VIEW_HEAP_LIMIT;
+        assert!(table_bytes(most) <= u64::from(u32::MAX));
+    }
 
     #[test]
     fn a_view_shares_the_raw_view_of_the_window_it_starts_in() {

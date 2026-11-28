@@ -27,6 +27,32 @@ pub use native::{
     native_programs,
 };
 
+/// The name a shader container goes by in the runtime's logs and in
+/// `victory translate --hash`: the first 16 hex digits of the BLAKE3 of its
+/// bytes, as the title passes them. Two-half lowering selection
+/// (`emit::with_split_selection`) keys on it too.
+pub fn runtime_hash(container: &[u8]) -> String {
+    blake3::hash(container).to_hex()[..16].to_owned()
+}
+
+#[cfg(test)]
+mod runtime_hash_tests {
+    /// A synthetic container is named by the first 16 hex digits of its
+    /// BLAKE3, lowercase, as the logs print it.
+    #[test]
+    fn the_runtime_hash_is_the_blake3_prefix() {
+        let bytes = crate::dxbc::build(&[(crate::FourCC::DXIL, &[1, 2, 3, 4])]);
+        let hash = super::runtime_hash(&bytes);
+        assert_eq!(hash.len(), 16);
+        assert!(
+            hash.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        );
+        assert!(blake3::hash(&bytes).to_hex().starts_with(&hash));
+        assert_ne!(hash, super::runtime_hash(&bytes[1..]));
+    }
+}
+
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ShaderError {
     #[error("not a DXBC container")]

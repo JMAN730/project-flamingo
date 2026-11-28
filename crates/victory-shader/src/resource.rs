@@ -243,14 +243,29 @@ pub fn track(
     stage: HwStage,
     lanes: Option<&Structured>,
 ) -> Result<Resources, ShaderError> {
+    track_initialized(p, layout, stage, lanes, None)
+}
+
+/// As [`track`], knowing the SGPRs the hardware initializes
+/// ([`crate::NativeProgram::initialized_sgprs`]): a high half that is one
+/// of the SGPRs above them on some path into a join, read before the program
+/// writes it, holds what the last wave left there, which the lowering reads
+/// as zero, so it is zero there as well.
+pub fn track_initialized(
+    p: &Program,
+    layout: &[RootParam],
+    stage: HwStage,
+    lanes: Option<&Structured>,
+    initialized: Option<u8>,
+) -> Result<Resources, ShaderError> {
     // What is traced only for programs everything else refused is a last
     // chance, so that every other program's resources stay as they were. The
     // refusal reported is the first one.
-    match track_with(p, layout, stage, lanes, false) {
+    match track_with(p, layout, stage, lanes, false, initialized) {
         Err(refusal @ ShaderError::Unsupported { .. })
             if lanes.is_some() && !crate::switch::no_last_chance() =>
         {
-            track_with(p, layout, stage, lanes, true).map_err(|_| refusal)
+            track_with(p, layout, stage, lanes, true, initialized).map_err(|_| refusal)
         }
         result => result,
     }
@@ -263,9 +278,11 @@ fn track_with(
     stage: HwStage,
     lanes: Option<&Structured>,
     leftovers: bool,
+    initialized: Option<u8>,
 ) -> Result<Resources, ShaderError> {
     let mut t = Tracer::new(p, layout, stage, lanes)?;
     t.leftovers = leftovers;
+    t.initialized = initialized;
     let mut out = Resources {
         params: p
             .inputs
@@ -640,6 +657,10 @@ struct Tracer<'a> {
     /// its result saturates, so the sum must not be folded (and a non-root
     /// address is not taken as title memory either).
     clamped: std::cell::Cell<bool>,
+    /// SGPRs the hardware initializes ([`track_initialized`]): one above
+    /// them that the program reads before writing holds what the last wave
+    /// left, which the lowering reads as zero.
+    initialized: Option<u8>,
     /// The descriptor being classified is a vector buffer access's or an
     /// `s_buffer_*`'s: built around an address that traces to no root
     /// parameter, it is title memory ([`MEMORY`]) in a compute program.
@@ -768,6 +789,7 @@ impl<'a> Tracer<'a> {
             rpo,
             uniform_memo: std::cell::RefCell::new(vec![None; n]),
             leftovers: false,
+            initialized: None,
             clamped: std::cell::Cell::new(false),
             buffer_access: std::cell::Cell::new(false),
         };
@@ -1551,7 +1573,10 @@ impl<'a> Tracer<'a> {
     /// Whether `v` may be computed from what `s_getpc_b64` writes (through
     /// any instruction or join; past a bound, taken to be). What a load
     /// returns is data, whatever address it came from, so the search stops
-    /// at loads: a pointer read from a code table is a title address.
+    /// at loads: a pointer read from a code table is a title address. EXEC,
+    /// which every vector instruction reads, picks lanes and holds no
+    /// address, so it is not followed (through it the search would reach
+    /// most of a large program and stop at the bound).
     fn reads_code_address(&self, v: Value) -> bool {
         let mut seen = std::collections::HashSet::new();
         let mut todo = vec![v];
@@ -1570,12 +1595,27 @@ impl<'a> Tracer<'a> {
                 if is_load(name) {
                     continue;
                 }
-                todo.extend(inst.reads.iter().map(|r| r.1));
+                todo.extend(
+                    inst.reads
+                        .iter()
+                        .filter(|r| !matches!(r.0, Reg::S(c) if c == EXEC || c == EXEC + 1))
+                        .map(|r| r.1),
+                );
             } else if let Some((b, i)) = self.phis[v.0 as usize] {
                 todo.extend(self.p.blocks[b].phis[i].args.iter().copied());
             }
         }
         false
+    }
+
+    /// Whether `v` is an SGPR input above the ones the hardware initializes
+    /// ([`Tracer::initialized`]) and no root parameter's: what the last wave
+    /// left there. The lowering reads it as zero.
+    fn left_over(&self, v: Value) -> bool {
+        let Some(Some(reg @ Reg::S(n))) = self.inputs.get(v.0 as usize).copied() else {
+            return false;
+        };
+        n <= 105 && self.initialized.is_some_and(|k| n >= k) && self.param_of(reg).is_none()
     }
 
     fn high_half(&self, hi: Term, high: Option<Value>) -> bool {
@@ -1651,7 +1691,9 @@ impl<'a> Tracer<'a> {
                 } else {
                     self.origin(arg)
                 };
-                self.high_half_in(term, high, visiting)
+                // Left over from the last wave on that path: read as zero.
+                let zero = high.is_none() && matches!(term, Term::Value(a) if self.left_over(a));
+                zero || self.high_half_in(term, high, visiting)
             });
             visiting.pop();
             return ok;
@@ -5696,7 +5738,7 @@ pub(crate) mod tests {
         let l = lanes(&p);
         // Not as every other program is traced: the else arm's dwords are
         // computed, not a descriptor.
-        let err = track_with(&p, &layout, HwStage::Cs, l.as_ref(), false).unwrap_err();
+        let err = track_with(&p, &layout, HwStage::Cs, l.as_ref(), false, None).unwrap_err();
         assert!(
             matches!(
                 err,
@@ -5933,5 +5975,85 @@ pub(crate) mod tests {
             ),
             "{err:?}"
         );
+    }
+
+    /// A scalar load whose high half is zeroed on one arm of a branch and,
+    /// on the other, an SGPR above the ones the hardware initializes that
+    /// the program has not written yet: what the last wave left, which the
+    /// lowering reads as zero.
+    #[test]
+    fn a_high_half_left_over_from_the_last_wave_on_one_path_is_zero() {
+        let words = [
+            0xBE88_0300, // s_mov_b32 s8, s0 (the table)
+            0xBF06_8000, // s_cmp_eq_u32 s0, 0
+            0xBF85_0001, // s_cbranch_scc1 +1
+            0xBE89_0380, // s_mov_b32 s9, 0
+            0xF400_0284,
+            0xFA00_0000, // s_load_dword s10, s[8:9], null
+            S_ENDPGM,
+        ];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let layout = [param(Table, 0, 1)];
+        let l = lanes(&p);
+        // Not knowing which SGPRs the hardware sets, s9 may be one.
+        let err = track(&p, &layout, HwStage::Cs, l.as_ref()).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ShaderError::Unsupported {
+                    what: "an address with an untracked high half",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+        // One user SGPR is all it sets.
+        let r = track_initialized(&p, &layout, HwStage::Cs, l.as_ref(), Some(1)).unwrap();
+        assert_eq!(r.scalar.len(), 1);
+        assert_eq!(r.scalar[0].1, at(0, 0));
+        // The other arm sets s9 to the table's address (s0, which the
+        // hardware sets): no zero there, so the high half stays untracked.
+        let mut words = words;
+        words[3] = 0xBE89_0300; // s_mov_b32 s9, s0
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let l = lanes(&p);
+        let err = track_initialized(&p, &layout, HwStage::Cs, l.as_ref(), Some(1)).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ShaderError::Unsupported {
+                    what: "an address with an untracked high half",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    /// A first-lane scalar address whose per-lane value an instruction
+    /// computes while reading EXEC, itself made from `s_getpc_b64`: EXEC
+    /// picks lanes and holds no address, so the address is not a code
+    /// table's but title memory.
+    #[test]
+    fn exec_does_not_make_a_first_lane_address_a_code_address() {
+        let r = track_words(
+            &[
+                0xBE82_1F00, // s_getpc_b64 s[2:3]
+                0xBEFE_0302, // s_mov_b32 exec_lo, s2
+                0x7E00_0204, // v_mov_b32 v0, s4
+                0x7E02_0205, // v_mov_b32 v1, s5
+                0x7E0C_0500, // v_readfirstlane_b32 s6, v0
+                0x7E0E_0501, // v_readfirstlane_b32 s7, v1
+                0xF400_0203,
+                0xFA00_0000, // s_load_dword s8, s[6:7], null
+                S_ENDPGM,
+            ],
+            &[],
+            HwStage::Cs,
+        );
+        assert_eq!(r.scalar.len(), 1);
+        assert_eq!(r.scalar[0].1.param, MEMORY);
     }
 }

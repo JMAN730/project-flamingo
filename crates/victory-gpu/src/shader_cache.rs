@@ -56,7 +56,18 @@ fn allow_wave32() -> bool {
 fn build(wave32: bool) -> &'static [u8; 32] {
     static BUILDS: [OnceLock<[u8; 32]>; 2] = [const { OnceLock::new() }; 2];
     BUILDS[usize::from(wave32)].get_or_init(|| {
-        let exe = std::env::current_exe().and_then(std::fs::read);
+        // Diagnostics builds: `VICTORY_SHADER_CACHE_AS=<exe>` keys the cache by
+        // that executable instead, so a rebuild that changed no translation
+        // (only logging, say) reuses the translations an earlier build made
+        // rather than starting the world cold. Stale if the translator did
+        // change between the two.
+        let keyed_by = std::env::var_os("VICTORY_SHADER_CACHE_AS")
+            .filter(|_| cfg!(feature = "diagnostics"))
+            .map(std::path::PathBuf::from);
+        if let Some(path) = &keyed_by {
+            tracing::warn!(path = %path.display(), "VICTORY_SHADER_CACHE_AS: shader cache keyed by another executable");
+        }
+        let exe = keyed_by.map_or_else(std::env::current_exe, Ok).and_then(std::fs::read);
         let limit = victory_shader::emit::loop_limit();
         if limit != victory_shader::emit::DEFAULT_LOOP_LIMIT {
             tracing::warn!(

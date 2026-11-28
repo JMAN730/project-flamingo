@@ -565,6 +565,18 @@ struct Lower<'a> {
 // shortcut: a genuine loop of more iterations than this is cut short too.
 pub(super) const LOOP_LIMIT: u32 = 1 << 20;
 
+#[cfg(test)]
+thread_local! {
+    /// Test builds: compare-exchange loops this thread lowered with a pass
+    /// limit.
+    pub(super) static BOUNDED_RETRIES: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// The most passes of a compare-exchange loop the translator adds for a
+/// store the host has no single operation for (see
+/// `Lower::retry_within_limit`).
+pub(super) const RETRY_LIMIT: u32 = 1 << 16;
+
 /// Lane masks read as numbers (`s_bcnt1`, `s_ff1`, `v_mbcnt`, scalar
 /// compares, bit tests) are ballots of the lanes' booleans, taken where the
 /// mask is written: structurisation's `active` masks hold only lanes that
@@ -4258,6 +4270,32 @@ impl<'a> Lower<'a> {
             self.write(inst, Reg::V(reg), r, guard);
             return Ok(());
         }
+        if name == "ds_bpermute_b32" {
+            // Each lane reads the data of the lane its address names
+            // (address / 4, within the wave): 0 from a lane out of EXEC.
+            if self.split.is_some() || (self.console_cf && self.halves) {
+                // shortcut: the two halves of a wave64 on a 32-lane host
+                // do not read each other's lanes here.
+                return Err("a lane permute across the halves of a wave");
+            }
+            self.cross_lane(false)?;
+            let at = self.vgprs(inst, addr.as_ref().ok_or("a permute address")?, 1)?[0];
+            let x = self.vgprs(inst, data.first().ok_or("a permute source")?, 1)?[0];
+            let (two, lanes) = (self.s.m.i32(2), self.s.m.i32(self.wave() - 1));
+            let src = self.s.m.bin(c, Bin::LShr, at, two);
+            let src = self.s.m.bin(c, Bin::And, src, lanes);
+            let r = self.read_lane(x, src);
+            let r = if self.console_cf {
+                let active = self.src_lane_active(src, guard);
+                let zero = self.s.m.i32(0);
+                self.s.m.select(c, active, r, zero)
+            } else {
+                self.active_lane_or_zero(r, src)
+            };
+            let reg = dst_reg.ok_or("a permute result")?;
+            self.write(inst, Reg::V(reg), r, guard);
+            return Ok(());
+        }
         if self.s.lds_dwords == 0 {
             return Err("LDS the program does not allocate");
         }
@@ -6342,11 +6380,35 @@ impl<'a> Lower<'a> {
             &[h, index, off, iu, old, new],
         );
         self.s.m.set_phi(old, vec![(zero, start), (seen, latch)]);
-        let success = self.s.m.cmp(latch, pred::EQ, old, seen);
-        self.s
-            .m
-            .terminate(latch, Term::CondBr(success, done, retry));
+        let lost = self.s.m.cmp(latch, pred::NE, old, seen);
+        let again = self.retry_within_limit(retry, start, latch, lost);
+        self.s.m.terminate(latch, Term::CondBr(again, retry, done));
         self.cur = done;
+    }
+
+    /// Whether a compare-exchange loop goes round again: `lost` (another
+    /// thread got in between) and fewer than [`RETRY_LIMIT`] passes made.
+    /// The loop's header is `retry`, entered from `start`; its backedge
+    /// leaves `latch`. Each lost pass means another thread's store went
+    /// through, so the limit is not reached by contention; it keeps a card
+    /// whose exchange never reports the dword it found (through a null view
+    /// or past a view's end, say) from hanging.
+    pub(super) fn retry_within_limit(
+        &mut self,
+        retry: usize,
+        start: usize,
+        latch: usize,
+        lost: V,
+    ) -> V {
+        let n = self.s.m.phi(retry, self.s.t.i32);
+        let (zero, one) = (self.s.m.i32(0), self.s.m.i32(1));
+        let n1 = self.s.m.bin(latch, Bin::Add, n, one);
+        self.s.m.set_phi(n, vec![(zero, start), (n1, latch)]);
+        let limit = self.s.m.i32(RETRY_LIMIT);
+        let more = self.s.m.cmp(latch, pred::IULT, n1, limit);
+        #[cfg(test)]
+        BOUNDED_RETRIES.with(|n| n.set(n.get() + 1));
+        self.s.m.bin(latch, Bin::And, lost, more)
     }
 
     fn structured_store(&mut self, h: V, addr: V, stride: u32, val: V, bytes: u32) {
@@ -8013,6 +8075,38 @@ impl<'a> Lower<'a> {
                 let (lo, hi) = self.split64(r);
                 self.write(inst, Reg::V(reg), lo, guard);
                 self.write(inst, Reg::V(reg + 1), hi, guard);
+                Ok(())
+            }
+            "v_mad_u64_u32" => {
+                // The 64-bit product of two dwords plus a 64-bit addend; the
+                // carry out is a lane mask (this lane's bit), as an add's.
+                let (a, b) = (s(self, 0)?, s(self, 1)?);
+                let x = self.src64(inst, 2)?;
+                let i64t = self.s.m.int(64);
+                let a = self.s.m.cast(c, Cast::ZExt, a, i64t);
+                let b = self.s.m.cast(c, Cast::ZExt, b, i64t);
+                let product = self.s.m.bin(c, Bin::Mul, a, b);
+                let r = self.s.m.bin(c, Bin::Add, product, x);
+                let carry = self.s.m.cmp(c, pred::IULT, r, x);
+                let Some(Operand::Vector { reg, .. }) = v.dst else {
+                    return Err("a 64-bit result");
+                };
+                let (lo, hi) = self.split64(r);
+                self.write(inst, Reg::V(reg), lo, guard);
+                self.write(inst, Reg::V(reg + 1), hi, guard);
+                if let Some(Operand::Scalar { code, .. }) = v.carry
+                    && let Some(w) = inst.write(Reg::S(code))
+                {
+                    self.lane_bits.insert(w, carry);
+                    if self.split.is_some() {
+                        self.split_lanes_written(inst, code, carry);
+                    }
+                }
+                for &(_, w) in &inst.writes {
+                    self.vals
+                        .entry(w)
+                        .or_insert(Val::Missing("a lane mask read as data"));
+                }
                 Ok(())
             }
             "v_cubeid_f32" | "v_cubesc_f32" | "v_cubetc_f32" | "v_cubema_f32" => {
