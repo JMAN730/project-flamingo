@@ -203,11 +203,15 @@ impl Lower<'_> {
             if no_channels {
                 return Err("an image store of no channels");
             }
-            // shortcut: stores are taken to write all four channels of a
-            // float format (the console converts by the view's format).
-            // The channels `dmask` selects come from consecutive data
-            // registers (halves with d16); the others are written as zero
-            // (RDNA2 ISA, MIMG stores).
+            // The console converts the data registers by the view's format:
+            // an integer for a UINT or SINT view, a float otherwise. The
+            // store takes the typed form of the view's class (from the
+            // host's list, `view_class`). The channels `dmask` selects come
+            // from consecutive data registers (halves with d16: f16 for a
+            // float view, 16-bit integers for an integer one); the others
+            // are written as zero (RDNA2 ISA, MIMG stores).
+            // shortcut: stores are taken to write all four channels (the
+            // view's format keeps those it has).
             let iu = self.s.m.undef(self.s.t.i32);
             let mut cs = vec![iu; 3];
             for (k, slot) in cs.iter_mut().enumerate().take(coords) {
@@ -216,45 +220,70 @@ impl Lower<'_> {
             let Operand::Vector { reg, .. } = *data else {
                 return Err("image store data");
             };
-            let mut vals = Vec::new();
+            let class = self.view_class(src);
+            let (k16, low) = (self.s.m.i32(16), self.s.m.i32(0xFFFF));
+            // Per channel: as a float, as a UINT, as a SINT.
+            let mut vals: [Vec<V>; 3] = Default::default();
             let mut k = 0u8;
             for ch in 0..4u8 {
                 if dmask >> ch & 1 == 0 {
-                    vals.push(self.s.m.f32(0));
+                    vals[0].push(self.s.m.f32(0));
+                    vals[1].push(self.s.m.i32(0));
+                    vals[2].push(self.s.m.i32(0));
                     continue;
                 }
-                // d16: two f16 channels per VGPR, low half first.
+                // d16: two channels per VGPR, low half first.
                 let r = if *d16 { k / 2 } else { k };
                 let v = inst.read(Reg::V(reg + r)).ok_or("image store data")?;
-                vals.push(if *d16 {
+                if *d16 {
                     let mut x = self.i32_of(v)?;
                     if k % 2 == 1 {
-                        let k16 = self.s.m.i32(16);
                         x = self.s.m.bin(self.cur, Bin::LShr, x, k16);
                     }
                     let f32t = self.s.t.f32;
-                    self.s
-                        .op(self.cur, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[x])
+                    vals[0].push(self.s.op(
+                        self.cur,
+                        "legacyF16ToF32",
+                        Attr::ReadNone,
+                        f32t,
+                        131,
+                        &[x],
+                    ));
+                    if class.is_some() {
+                        let u = self.s.m.bin(self.cur, Bin::And, x, low);
+                        let s = self.s.m.bin(self.cur, Bin::Shl, x, k16);
+                        let s = self.s.m.bin(self.cur, Bin::AShr, s, k16);
+                        vals[1].push(u);
+                        vals[2].push(s);
+                    }
                 } else {
-                    self.float_of(v)?
-                });
+                    vals[0].push(self.float_of(v)?);
+                    if class.is_some() {
+                        let x = self.i32_of(v)?;
+                        vals[1].push(x);
+                        vals[2].push(x);
+                    }
+                }
                 k += 1;
             }
-            let h = self.handle(site, src, false, props)?;
+            let handles = self.class_handles(site, src, props, class.is_some())?;
             let at = self.begin_guarded(guard);
-            let mut args = vec![h];
-            args.extend(cs);
-            args.extend(vals);
-            args.push(self.s.m.i8(0xF));
-            let void = self.s.t.void;
-            self.s.op(
-                self.cur,
-                "textureStore.f32",
-                Attr::NoUnwind,
-                void,
-                67,
-                &args,
-            );
+            let mask = self.s.m.i8(0xF);
+            self.by_view_class(class, |l, class| {
+                let n = class as usize;
+                let mut args = vec![handles[n]];
+                args.extend(&cs);
+                args.extend(&vals[n]);
+                args.push(mask);
+                let void = l.s.t.void;
+                let name = if n == 0 {
+                    "textureStore.f32"
+                } else {
+                    "textureStore.i32"
+                };
+                l.s.op(l.cur, name, Attr::NoUnwind, void, 67, &args);
+                Vec::new()
+            });
             self.end_guarded(at, &[]);
             return Ok(());
         }
@@ -689,6 +718,11 @@ impl Lower<'_> {
                     return Err("an image result");
                 };
                 let channels: Vec<u32> = (0..4).filter(|ch| dmask >> ch & 1 != 0).collect();
+                // The host's class of the view, else SQ_IMG_RSRC_WORD1.FORMAT
+                // at bits 20..28 (GFX10), which only a descriptor the program
+                // builds itself holds. (Reading the host's ends the block.)
+                let class = self.view_class(src);
+                let c = self.cur;
                 let mut args = vec![h, mip];
                 args.extend(&cs);
                 args.extend([iu, iu, iu]);
@@ -713,9 +747,9 @@ impl Lower<'_> {
                 let r_i = self
                     .s
                     .op(c, "textureLoad.i32", Attr::ReadOnly, res_i, 66, &args_i);
-                // SQ_IMG_RSRC_WORD1.FORMAT at bits 20..28 (GFX10).
-                let (is_uint, is_sint) = match rsrc {
-                    Operand::Scalar { code, dwords } if *dwords >= 2 => {
+                let (is_uint, is_sint) = match (class, rsrc) {
+                    (Some(class), _) => class,
+                    (None, Operand::Scalar { code, dwords }) if *dwords >= 2 => {
                         let w1 = inst
                             .read(Reg::S(code + 1))
                             .ok_or("an unread image descriptor")?;
@@ -768,6 +802,45 @@ impl Lower<'_> {
                 }
                 for (reg, x) in xs {
                     self.write(inst, Reg::V(reg), x, guard);
+                }
+                return Ok(());
+            }
+            // A view of known class: the typed load of that class (an
+            // integer view's texels are integers in the data registers).
+            let class = self.view_class(src);
+            if class.is_some() {
+                let Operand::Vector { reg, .. } = *data else {
+                    return Err("an image result");
+                };
+                let handles = self.class_handles(site, src, props, true)?;
+                let i32t = self.s.t.i32;
+                let res_i = self
+                    .s
+                    .m
+                    .named_struct("dx.types.ResRet.i32", vec![i32t, i32t, i32t, i32t, i32t]);
+                let res_f = self.s.t.res_ret;
+                let channels: Vec<u32> = (0..4).filter(|ch| dmask >> ch & 1 != 0).collect();
+                let xs = self.by_view_class(class, |l, class| {
+                    let n = class as usize;
+                    let mut args = vec![handles[n], mip];
+                    args.extend(&cs);
+                    args.extend([iu, iu, iu]);
+                    let (name, ret) = if n == 0 {
+                        ("textureLoad.f32", res_f)
+                    } else {
+                        ("textureLoad.i32", res_i)
+                    };
+                    let r = l.s.op(l.cur, name, Attr::ReadOnly, ret, 66, &args);
+                    channels
+                        .iter()
+                        .map(|&ch| {
+                            let x = l.s.m.extract(l.cur, r, ch);
+                            if n == 0 { l.as_int(x) } else { x }
+                        })
+                        .collect()
+                });
+                for (k, x) in xs.into_iter().enumerate() {
+                    self.write(inst, Reg::V(reg + k as u8), x, guard);
                 }
                 return Ok(());
             }
@@ -847,6 +920,79 @@ impl Lower<'_> {
             self.write(inst, Reg::V(reg + k as u8), x, guard);
         }
         Ok(())
+    }
+
+    /// Handles of the image view `src` read at `site` with `props`, by
+    /// numeric class ([`crate::emit::VIEW_CLASS_FLOAT`], `_UINT`, `_SINT`): four
+    /// channels of f32, u32 and i32. Only the float one unless `typed`
+    /// (the others are then the float one, never used).
+    fn class_handles(
+        &mut self,
+        site: Site,
+        src: &Source,
+        props: (u32, u32),
+        typed: bool,
+    ) -> Result<[V; 3], Why> {
+        let float = self.handle(site, src, false, (props.0, 0x409))?;
+        if !typed {
+            return Ok([float; 3]);
+        }
+        let uint = self.handle(site, src, false, (props.0, 0x405))?;
+        let sint = self.handle(site, src, false, (props.0, 0x404))?;
+        Ok([float, uint, sint])
+    }
+
+    /// Runs `body` once per numeric class of a view (`class`: whether it is
+    /// UINT, and whether SINT, from [`Lower::view_class`]), each in a block
+    /// of its own that only that class takes, then joins: the values each
+    /// run returns (the same count and types in every run) become phis. A
+    /// view of unknown class runs the float body alone, in place.
+    pub(super) fn by_view_class(
+        &mut self,
+        class: Option<(V, V)>,
+        mut body: impl FnMut(&mut Self, u32) -> Vec<V>,
+    ) -> Vec<V> {
+        let Some((is_uint, is_sint)) = class else {
+            return body(self, crate::emit::VIEW_CLASS_FLOAT);
+        };
+        let (uint, rest, sint, float, join) = (
+            self.s.m.new_block(),
+            self.s.m.new_block(),
+            self.s.m.new_block(),
+            self.s.m.new_block(),
+            self.s.m.new_block(),
+        );
+        self.s
+            .m
+            .terminate(self.cur, Term::CondBr(is_uint, uint, rest));
+        self.s.m.terminate(rest, Term::CondBr(is_sint, sint, float));
+        // A view chosen per lane may differ in class between lanes: only
+        // some lanes run each of these blocks.
+        if let Some(sp) = &mut self.split {
+            sp.guarded.extend([uint, rest, sint, float]);
+        }
+        let mut ends = Vec::new();
+        for (block, class) in [
+            (uint, crate::emit::VIEW_CLASS_UINT),
+            (sint, crate::emit::VIEW_CLASS_SINT),
+            (float, crate::emit::VIEW_CLASS_FLOAT),
+        ] {
+            self.cur = block;
+            let values = body(self, class);
+            self.s.m.terminate(self.cur, Term::Br(join));
+            ends.push((self.cur, values));
+        }
+        self.cur = join;
+        (0..ends[0].1.len())
+            .map(|k| {
+                let ty = self.s.m.type_of(ends[0].1[k]);
+                let phi = self.s.m.phi(join, ty);
+                self.s
+                    .m
+                    .set_phi(phi, ends.iter().map(|(b, v)| (v[k], *b)).collect());
+                phi
+            })
+            .collect()
     }
 
     /// `image_gather4_l`: DXIL's gathers take no level, so the four texels

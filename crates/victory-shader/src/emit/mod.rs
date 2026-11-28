@@ -776,6 +776,32 @@ pub const VIEW_ADDRESS_ENTRY: u32 = 8;
 /// looks the record up.
 pub const USER_TABLE_SLOTS: u32 = 0x102;
 
+/// `RootType::Other` code of a user-data dword the host computes: the heap
+/// index of its view class list, a raw SRV with one [`VIEW_CLASS_ENTRY`]-
+/// byte entry per slot of the bound view heap: the numeric class of the
+/// format of the host view at that slot ([`VIEW_CLASS_FLOAT`],
+/// [`VIEW_CLASS_UINT`] or [`VIEW_CLASS_SINT`]). The list is in a slot past
+/// the title's, so never 0: a host that does not know this value supplies
+/// 0, which a shader takes as a float view at every slot.
+///
+/// The console's image stores and loads convert by the view's format, so
+/// the same data registers are an integer for a UINT view and a float for
+/// a float one. The host's typed accesses must name the view's type
+/// instead: an image access reads the class of its view here and takes the
+/// typed access of that class.
+pub const USER_VIEW_CLASSES: u32 = 0x103;
+
+/// Bytes per entry of the view class list (see [`USER_VIEW_CLASSES`]).
+pub const VIEW_CLASS_ENTRY: u32 = 4;
+
+/// A view of a float, UNORM or SNORM format, or no texture view (see
+/// [`USER_VIEW_CLASSES`]).
+pub const VIEW_CLASS_FLOAT: u32 = 0;
+/// A view of a UINT format (see [`USER_VIEW_CLASSES`]).
+pub const VIEW_CLASS_UINT: u32 = 1;
+/// A view of a SINT format (see [`USER_VIEW_CLASSES`]).
+pub const VIEW_CLASS_SINT: u32 = 2;
+
 /// One dword of user data and the root parameter that fills it.
 ///
 /// With `root` [`RootType::ResourceHeap`] (and `indexed_buffer` false) the

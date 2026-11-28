@@ -5,7 +5,7 @@
 //! and element count.
 
 use super::{Lower, Val, Why};
-use crate::emit::bitcode::{Attr, Bin, V, pred};
+use crate::emit::bitcode::{Attr, Bin, Cast, Term, V, pred};
 use crate::emit::{self, UNKNOWN_STRUCTURED_STRIDE, UserData};
 use crate::ir::{Inst, Reg};
 use crate::native::RootType;
@@ -157,6 +157,63 @@ impl Lower<'_> {
             bias,
             elements,
         })
+    }
+
+    /// The numeric class of the view `src` names, from the host's list of
+    /// view classes ([`emit::USER_VIEW_CLASSES`]), by the view's slot in the
+    /// title's heap: whether it is UINT, and whether SINT. The console's
+    /// image instructions convert by the view's format, which only the
+    /// descriptor knows; the host's descriptor is not readable, so its class
+    /// comes from the list. None where the program cannot find the view's
+    /// title slot: such accesses stay float.
+    pub(super) fn view_class(&mut self, src: &Source) -> Option<(V, V)> {
+        let (index, _) = self.buffer_heap_index(src).ok()?;
+        let list = self.host_word(RootType::Other(emit::USER_VIEW_CLASSES), 0, 0);
+        let head = self.cur;
+        let zero = self.s.m.i32(0);
+        // A host without the list supplies 0: no list is read.
+        let listed = self.s.m.cmp(head, pred::NE, list, zero);
+        let (read, join) = (self.s.m.new_block(), self.s.m.new_block());
+        self.s.m.terminate(head, Term::CondBr(listed, read, join));
+        let c = read;
+        let table = self.s.heap_handle(c, list, false, false, (11, 0));
+        let invalid = self.s.m.i32(u32::MAX - 15);
+        let limit = self.s.m.i32(emit::VIEW_HEAP_LIMIT);
+        let in_heap = self.s.m.cmp(c, pred::IULT, index, limit);
+        let entry = self.s.m.i32(emit::VIEW_CLASS_ENTRY);
+        let at = self.s.m.bin(c, Bin::Mul, index, entry);
+        // A slot past the list reads 0: float.
+        let at = self.s.m.select(c, in_heap, at, invalid);
+        let (iu, mask, align) = (
+            self.s.m.undef(self.s.t.i32),
+            self.s.m.i8(1),
+            self.s.m.i32(4),
+        );
+        let r = self.s.op(
+            c,
+            "rawBufferLoad.f32",
+            Attr::ReadOnly,
+            self.s.t.res_ret,
+            139,
+            &[table, at, iu, mask, align],
+        );
+        let x = self.s.m.extract(c, r, 0);
+        let read_class = self.s.m.cast(c, Cast::Bitcast, x, self.s.t.i32);
+        self.s.m.terminate(read, Term::Br(join));
+        self.cur = join;
+        let c = join;
+        let class = self.s.m.phi(join, self.s.t.i32);
+        self.s
+            .m
+            .set_phi(class, vec![(read_class, read), (zero, head)]);
+        let (uint, sint) = (
+            self.s.m.i32(emit::VIEW_CLASS_UINT),
+            self.s.m.i32(emit::VIEW_CLASS_SINT),
+        );
+        Some((
+            self.s.m.cmp(c, pred::EQ, class, uint),
+            self.s.m.cmp(c, pred::EQ, class, sint),
+        ))
     }
 
     /// An indexed load of `mask`'s dwords at byte `off` of element `index`

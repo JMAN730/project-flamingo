@@ -1314,6 +1314,9 @@ pub enum View<'a> {
     TextureUav(u32, u32),
     /// An R32_UINT texture UAV (width, height), zeroed (atomics).
     UintTextureUav(u32, u32),
+    /// An R8_UINT texture UAV (width, height), zeroed; read back with each
+    /// texel widened to a dword.
+    ByteTextureUav(u32, u32),
     /// A typed RGBA16F buffer UAV of this many elements, zeroed.
     HalfUav(u32),
     /// A constant buffer of these dwords.
@@ -1414,7 +1417,9 @@ impl Host {
                 Flags: flags,
                 ..Default::default()
             };
-            // Texel words: 4 for RGBA32F, 1 for the 32-bit formats.
+            // Texel words: 4 for RGBA32F, 1 for the 32-bit formats, 0 for
+            // R8_UINT (one byte).
+            let row_bytes = |w: u32, words: u32| (w * (4 * words).max(1)).next_multiple_of(256);
             let footprint_in = |r: &ID3D12Resource, w: u32, h: u32, words: u32, format| {
                 D3D12_TEXTURE_COPY_LOCATION {
                     pResource: std::mem::transmute_copy(r),
@@ -1427,17 +1432,17 @@ impl Host {
                                 Width: w,
                                 Height: h,
                                 Depth: 1,
-                                RowPitch: (w * 4 * words).next_multiple_of(256),
+                                RowPitch: row_bytes(w, words),
                             },
                         },
                     },
                 }
             };
             let footprint_as = |r: &ID3D12Resource, w: u32, h: u32, words: u32| {
-                let format = if words == 1 {
-                    DXGI_FORMAT_R32_UINT
-                } else {
-                    DXGI_FORMAT_R32G32B32A32_FLOAT
+                let format = match words {
+                    0 => DXGI_FORMAT_R8_UINT,
+                    1 => DXGI_FORMAT_R32_UINT,
+                    _ => DXGI_FORMAT_R32G32B32A32_FLOAT,
                 };
                 footprint_in(r, w, h, words, format)
             };
@@ -1639,6 +1644,27 @@ impl Host {
                         )?;
                         uavs.push((t, Some((w, h)), 1, rb));
                     }
+                    View::ByteTextureUav(w, h) => {
+                        let t = make(
+                            D3D12_HEAP_TYPE_DEFAULT,
+                            &texture_as(
+                                w,
+                                h,
+                                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                DXGI_FORMAT_R8_UINT,
+                            ),
+                            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        )?;
+                        dev.CreateUnorderedAccessView(&t, None, None, at);
+                        let pitch = w.next_multiple_of(256);
+                        let rb = make(
+                            D3D12_HEAP_TYPE_READBACK,
+                            &buffer(u64::from(pitch * h), D3D12_RESOURCE_FLAG_NONE),
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                        )?;
+                        // 0 texel words: one byte per texel.
+                        uavs.push((t, Some((w, h)), 0, rb));
+                    }
                     View::Cbv(data) => {
                         let b = upload(data)?;
                         dev.CreateConstantBufferView(
@@ -1769,9 +1795,23 @@ impl Host {
                 let mut p = std::ptr::null_mut();
                 rb.Map(0, None, Some(&mut p)).map_err(err)?;
                 let words = match size {
+                    Some((w, h)) if *n == 0 => {
+                        let pitch = row_bytes(*w, 0) as usize;
+                        (0..*h as usize)
+                            .flat_map(|y| {
+                                std::slice::from_raw_parts(
+                                    p.cast::<u8>().add(y * pitch),
+                                    *w as usize,
+                                )
+                                .iter()
+                                .map(|&b| u32::from(b))
+                                .collect::<Vec<_>>()
+                            })
+                            .collect()
+                    }
                     Some((w, h)) => {
                         let words = *n as usize;
-                        let pitch = (*w as usize * 4 * words).next_multiple_of(256);
+                        let pitch = row_bytes(*w, *n) as usize;
                         (0..*h as usize)
                             .flat_map(|y| {
                                 std::slice::from_raw_parts(

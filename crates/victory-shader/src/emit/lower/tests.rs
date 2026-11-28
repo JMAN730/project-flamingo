@@ -3269,6 +3269,52 @@ fn image_stores_of_some_channels_zero_the_others() {
     assert!(lower_image(&image_words(0x08, 0, 1, false, &addr)).is_err());
 }
 
+/// The console converts an image access's data by its view's format, so an
+/// integer view's texels are integers in the data registers. A store or
+/// load reads its view's class from the host's view class list and takes
+/// the typed access of that class: float, and two integer ones (UINT,
+/// SINT), each in a block only that class runs. Validated with `dxil.dll`
+/// where present.
+#[test]
+fn image_accesses_take_the_typed_form_of_their_view_class() {
+    let mut addr = vec![F_HALF, F_HALF];
+    addr.extend((4..12).map(|_| 0));
+    addr.extend([F_ONE, 5, 0x4040_0000, 0x4080_0000]);
+    let classes = |l: &Lowered| {
+        l.user_data
+            .iter()
+            .any(|u| u.root == RootType::Other(crate::emit::USER_VIEW_CLASSES))
+    };
+    for (op, what, d16) in [
+        (0x08, "textureStore", false),
+        (0x00, "textureLoad", false),
+        (0x08, "textureStore", true),
+        (0x00, "textureLoad", true),
+    ] {
+        let mut words = image_words(op, 0xF, 1, false, &addr);
+        if d16 {
+            // d16 (bit 31 of the second word): two channels per register.
+            let at = words.iter().position(|&w| w == 0x0043_0C02).unwrap();
+            words[at] |= 1 << 31;
+        }
+        let l = lower_image(&words).unwrap_or_else(|e| panic!("{what} d16 {d16}: {e}"));
+        assert!(classes(&l), "{what} d16 {d16}: {:?}", l.user_data);
+        assert!(
+            !calls(&l, &format!("{what}.i32")).is_empty(),
+            "{what} d16 {d16}"
+        );
+        assert!(
+            !calls(&l, &format!("{what}.f32")).is_empty(),
+            "{what} d16 {d16}"
+        );
+        if !d16 {
+            // One integer access for each integer class, one float one.
+            assert_eq!(calls(&l, &format!("{what}.i32")).len(), 2, "{what}");
+            assert_eq!(calls(&l, &format!("{what}.f32")).len(), 1, "{what}");
+        }
+    }
+}
+
 /// The VOP3P integer dot products lower in the form assemblers write
 /// (op_sel_hi all set); op_sel, neg_hi, clamp and constant packed sources
 /// are refused rather than computed wrongly. An LDS store keeps the result

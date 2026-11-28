@@ -1441,6 +1441,11 @@ impl State {
                     values[u.index as usize] = table_slots_ahead(title, fresh);
                     continue;
                 }
+                if u.root == RootType::Other(victory_shader::emit::USER_VIEW_CLASSES) {
+                    // 0 (no list: every view float) where the heap has none.
+                    values[u.index as usize] = self.view_classes(list, to_compute).unwrap_or(0);
+                    continue;
+                }
                 if let RootType::Other(kind) = u.root {
                     values[u.index as usize] = self.host_word(kind, memory.as_ref());
                     continue;
@@ -1865,6 +1870,29 @@ impl State {
             }
         };
         Some(index)
+    }
+
+    /// The slot of the bound view heap's view class list
+    /// (`victory_shader::emit::USER_VIEW_CLASSES`), readable by `list`'s
+    /// shaders.
+    fn view_classes(&self, list: &HostList, compute: bool) -> Option<u32> {
+        let key = self.heaps[0];
+        if key == 0 {
+            return None;
+        }
+        let heap = crate::descriptor::heap(key as This);
+        if heap.samplers() {
+            return None;
+        }
+        let (buffer, slot) = heap.host()?.view_class_list()?;
+        let state = if compute {
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
+        } else {
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
+                | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
+        };
+        list.use_shadow(buffer, state);
+        Some(slot)
     }
 
     /// The slot of the bound view heap's buffer view table

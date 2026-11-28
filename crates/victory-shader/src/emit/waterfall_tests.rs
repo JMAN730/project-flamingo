@@ -232,6 +232,8 @@ fn run_with(
                 RootType::Other(super::USER_VIEW_ADDRESSES) => {
                     table.expect("a buffer view table").1
                 }
+                // No view class list: every view is taken as float.
+                RootType::Other(super::USER_VIEW_CLASSES) => 0,
                 _ => panic!("{u:?}"),
             };
         }
