@@ -801,8 +801,11 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     upload_from(list, resource, texture, 0);
 }
 
-/// Uploads the levels the placed view can sample, starting at `first`.
+/// Uploads the levels the placed view can sample, starting at the title's
+/// mip `first` (a view's `MostDetailedMip`), from the host mip its host view
+/// starts at ([`upload_start`]).
 pub(crate) fn upload_from(list: &HostList, resource: This, texture: &ID3D12Resource, first: u32) {
+    let first = upload_start(first, crate::resource::dropped_mips(resource));
     let host_written = HOST_WRITTEN
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -1418,8 +1421,25 @@ pub(crate) fn live_resident(resource: This) -> Option<(u32, u32)> {
 
 static RESIDENT: Mutex<Option<HashMap<usize, (u32, u32)>>> = Mutex::new(None);
 
-fn first_mip(layout: &victory_formats::texture::Layout, mips: u32, requested: u32) -> u32 {
-    if requested < mips && layout.bytes_from(requested) < layout.size {
+/// The host mip a view from title mip `title_first` starts at, on a host
+/// copy that lacks the title's top `dropped` levels: where its host view
+/// starts (`crate::resource::rebase_mip_range`), so the upload covers every
+/// level that view can sample.
+fn upload_start(title_first: u32, dropped: u32) -> u32 {
+    crate::resource::rebase_mip_range(title_first, u32::MAX, dropped).0
+}
+
+/// The first host subresource to stage for host mip `requested` of a host
+/// copy of `mips` levels that lacks the title's top `skipped` (host mip `m`
+/// is the title's `m + skipped` in `layout`): it, if the title's bytes from
+/// there are a proper suffix of the layout, else the whole chain.
+fn first_mip(
+    layout: &victory_formats::texture::Layout,
+    mips: u32,
+    skipped: u32,
+    requested: u32,
+) -> u32 {
+    if requested < mips && layout.bytes_from(requested + skipped) < layout.size {
         requested
     } else {
         0
@@ -1460,7 +1480,7 @@ fn create_staging(
         && layout.desc.swizzle == victory_formats::texture::Swizzle::LINEAR);
     // Top levels the host copy lost: host mip `m` is the title's `m + skipped`.
     let skipped = crate::resource::dropped_mips(resource);
-    let first = first_mip(&layout, u32::from(d.MipLevels), requested);
+    let first = first_mip(&layout, u32::from(d.MipLevels), skipped, requested);
     let tiled_bytes = layout.bytes_from(first + skipped) as usize;
     let count = if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
         u32::from(d.MipLevels)
@@ -1525,7 +1545,7 @@ fn staging(resource: This, texture: &ID3D12Resource, requested: u32) -> Option<A
         let cache = cache.get_or_insert_with(StagingCache::default);
         if let Some(s) = cache.entries.get(&key).and_then(|ranges| {
             let cached = ranges.first()?;
-            let first = first_mip(&cached.layout, cached.mips, requested);
+            let first = first_mip(&cached.layout, cached.mips, cached.skipped, requested);
             ranges.iter().find(|s| s.first == first)
         }) {
             s.touch();
@@ -1630,6 +1650,47 @@ pub(crate) fn fingerprint_raw(at: u64, len: u64, mips: &[(u64, u64)]) -> Option<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// With top levels dropped, a placed view from title mip `n` uploads
+    /// from the host mip its host view starts at, `n - dropped` (none below
+    /// 0), and staging of that host mip reads the title's bytes from
+    /// `n`: eight title levels, two dropped, a view at title mip 2 starts at
+    /// host mip 0 and stages the whole host chain.
+    #[test]
+    fn a_placed_view_uploads_from_the_host_mip_its_host_view_starts_at() {
+        use victory_formats::texture::{Desc, Dimension, Layout, Swizzle};
+        assert_eq!(upload_start(2, 2), 0);
+        assert_eq!(upload_start(5, 2), 3);
+        assert_eq!(upload_start(1, 2), 0, "a view of dropped levels only");
+        assert_eq!(upload_start(4, 0), 4);
+        for (title, dropped) in [(2, 2), (5, 2), (1, 2), (4, 0)] {
+            assert_eq!(
+                upload_start(title, dropped),
+                crate::resource::rebase_mip_range(title, 3, dropped).0,
+                "the upload starts where the host view does"
+            );
+        }
+        let layout = Layout::new(&Desc {
+            dimension: Dimension::Tex2d,
+            width: 128,
+            height: 128,
+            depth: 1,
+            mips: 8,
+            element_bytes: 4,
+            block: 1,
+            samples: 1,
+            swizzle: Swizzle::LINEAR,
+        })
+        .expect("a layout");
+        let host_mips = 6;
+        // Host mip 0 is the title's 2: the whole host chain, staged whole.
+        assert_eq!(first_mip(&layout, host_mips, 2, upload_start(2, 2)), 0);
+        // Host mip 3 is the title's 5: a suffix of the title's bytes.
+        assert!(layout.bytes_from(5) < layout.size);
+        assert_eq!(first_mip(&layout, host_mips, 2, upload_start(5, 2)), 3);
+        // Past the host chain: the whole chain.
+        assert_eq!(first_mip(&layout, host_mips, 2, host_mips), 0);
+    }
 
     #[test]
     fn a_range_past_the_address_space_is_not_committed() {
