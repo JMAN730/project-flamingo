@@ -3318,7 +3318,7 @@ impl State {
             return;
         };
         for stage in &p.stages {
-            let hash = format!("{}", stage.shader.hash);
+            let hash = stage.shader.hash.to_string();
             if !hashes.contains(&hash) {
                 continue;
             }
