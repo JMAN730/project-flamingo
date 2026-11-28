@@ -1645,7 +1645,15 @@ struct Deferred {
     /// Fills traced by `VICTORY_TRACE_CBV` (diagnostics): stage hash,
     /// scratch CPU address, title address, bytes, scratch GPU address.
     #[cfg(feature = "diagnostics")]
-    traced_fills: Vec<(&'static str, usize, usize, usize, u64)>,
+    #[allow(clippy::type_complexity)]
+    traced_fills: Vec<(
+        &'static str,
+        usize,
+        usize,
+        usize,
+        u64,
+        std::sync::Arc<Mutex<Option<[u8; crate::cbv_trace::COMPARED]>>>,
+    )>,
     /// Things the list's commands use that are given back when the last
     /// holder lets go ([`HostList::hold`]), by address.
     held: std::collections::HashMap<usize, std::sync::Arc<dyn std::any::Any + Send + Sync>>,
@@ -2420,6 +2428,41 @@ impl Host {
     }
 }
 
+/// Where `len` bytes (a multiple of 256) go in a scratch chunk of which
+/// `used` bytes are taken, at a multiple of `align`: their offset and the
+/// bytes taken after them; `None` if they do not fit in the chunk.
+fn scratch_place(used: u64, len: u64, align: u64) -> Option<(u64, u64)> {
+    let at = used.next_multiple_of(align);
+    let end = at.checked_add(len)?;
+    (end <= SCRATCH_CHUNK).then_some((at, end))
+}
+
+#[cfg(test)]
+mod scratch_place_tests {
+    use super::{SCRATCH_CHUNK, scratch_place};
+
+    /// A constant view of 544 bytes at an address off 256 takes 768 bytes
+    /// of scratch at a multiple of 256, and what is placed after it starts
+    /// past all 768: its fill (544 bytes) and its view (768) overlap nothing.
+    #[test]
+    fn unaligned_constants_take_whole_blocks_that_nothing_overlaps() {
+        let len = 544u64.next_multiple_of(256);
+        assert_eq!(len, 768);
+        let (at, used) = scratch_place(100, len, 256).unwrap();
+        assert_eq!((at, used), (256, 1024));
+        let (next, _) = scratch_place(used, 256, 256).unwrap();
+        assert!(next >= at + len);
+        let (placed, _) = scratch_place(used, 512, 512).unwrap();
+        assert_eq!(placed, 1024);
+        // Past the chunk's end: the next chunk.
+        assert_eq!(scratch_place(SCRATCH_CHUNK - 256, len, 256), None);
+        assert_eq!(
+            scratch_place(SCRATCH_CHUNK - len, len, 256),
+            Some((SCRATCH_CHUNK - len, SCRATCH_CHUNK))
+        );
+    }
+}
+
 /// Submissions of lists whose indirect work budget ran out
 /// ([`HostList::budget`]): their indirect records after that ran empty.
 pub(crate) static BUDGET_SPENT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -2431,8 +2474,16 @@ pub(super) fn read_backs(list: &HostList) -> bool {
     list.note_budget_spent();
     let deferred = list.deferred();
     #[cfg(feature = "diagnostics")]
-    for &(hash, scratch, title, len, gpu) in &deferred.traced_fills {
+    for (hash, scratch, title, len, gpu, at_submit) in &deferred.traced_fills {
+        let (hash, scratch, title, len, gpu) = (*hash, *scratch, *title, *len, *gpu);
         let n = len.min(crate::cbv_trace::COMPARED);
+        let title_at_submit = at_submit
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .map_or_else(
+                || "unread".to_owned(),
+                |bytes| crate::cbv_trace::hex(&bytes[..n]),
+            );
         let mut filled = [0u8; crate::cbv_trace::COMPARED];
         let mut now = [0u8; crate::cbv_trace::COMPARED];
         // SAFETY: the list's own scratch upload memory, mapped until reset.
@@ -2449,6 +2500,7 @@ pub(super) fn read_backs(list: &HostList) -> bool {
             address = format_args!("{title:#x}"),
             len,
             scratch = format_args!("{gpu:#x}"),
+            title_at_submit = %title_at_submit,
             filled = %crate::cbv_trace::hex(&filled[..n]),
             title_now = %title_now,
             "cbv trace: after the list ran, the fill's first bytes and title memory's"
@@ -3886,9 +3938,32 @@ impl HostList {
         self.deferred().filled.insert(key, gpu);
         #[cfg(feature = "diagnostics")]
         if let Some(hash) = crate::cbv_trace::on() {
-            self.deferred()
-                .traced_fills
-                .push((hash, to as usize, src as usize, len as usize, gpu));
+            // Title memory's first bytes as the submission prepares the
+            // fill: told apart from the fill's after the run, it shows
+            // whether the fill copied what title memory held then.
+            let at_submit = std::sync::Arc::new(Mutex::new(None));
+            let (snapshot, from, n) = (
+                at_submit.clone(),
+                src as usize,
+                (len as usize).min(crate::cbv_trace::COMPARED),
+            );
+            self.defer_host_read(from as *const u8, n, move || {
+                let mut bytes = [0u8; crate::cbv_trace::COMPARED];
+                let read = crate::shadow::copy_mapped_wide_checked(
+                    bytes.as_mut_ptr(),
+                    from as *const u8,
+                    n,
+                );
+                *snapshot.lock().unwrap_or_else(|e| e.into_inner()) = read.then_some(bytes);
+            });
+            self.deferred().traced_fills.push((
+                hash,
+                to as usize,
+                src as usize,
+                len as usize,
+                gpu,
+                at_submit,
+            ));
         }
         Some(gpu)
     }
@@ -4176,7 +4251,7 @@ impl HostList {
             return Some(made);
         }
         let mut s = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
-        while s.current < s.chunks.len() && s.used.next_multiple_of(align) + len > SCRATCH_CHUNK {
+        while s.current < s.chunks.len() && scratch_place(s.used, len, align).is_none() {
             (s.current, s.used) = (s.current + 1, 0);
         }
         if s.current == s.chunks.len() {
@@ -4188,9 +4263,9 @@ impl HostList {
             s.used = 0;
         }
         let (ref buffer, data, gpu) = s.chunks[s.current];
-        let at = s.used.next_multiple_of(align);
+        let (at, used) = scratch_place(s.used, len, align).unwrap_or((0, len));
         let made = f(buffer, at, gpu + at, (data + at as usize) as *mut u8);
-        s.used = at + len;
+        s.used = used;
         drop(s);
         self.mark_work();
         Some(made)
