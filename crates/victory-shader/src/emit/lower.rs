@@ -1553,21 +1553,15 @@ impl<'a> Lower<'a> {
         let c = self.cur;
         self.s.flags |= flags::WAVE_OPS;
         if op == Op::AddH {
-            // shortcut: the console adds 16-bit floats pairwise, rounding at
-            // each step; the host sums them in f32 and rounds once. The high
-            // half of the result is 0 (the console's keeps a lane's bits).
-            if prefix.is_some() {
-                return Err("a wave prefix of 16-bit floats");
-            }
-            let f32t = self.s.t.f32;
-            let f = self
-                .s
-                .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[x]);
-            let (k, u) = (self.s.m.i8(0), self.s.m.i8(0));
-            let r = self
-                .s
-                .op(c, "waveActiveOp.f32", Attr::NoUnwind, f32t, 119, &[f, k, u]);
-            return Ok(self.f16_nearest(r));
+            // The console adds 16-bit floats in the order of its expansion,
+            // rounding to f16 at each add; a host wave sum has an order of
+            // its own (and an f32 sum rounds once), which can give another
+            // result (2048 + 1 - 2048: 0 on the console, 1 summed in f32).
+            return Err(if prefix.is_some() {
+                "a wave prefix of 16-bit floats"
+            } else {
+                "a whole-wave sum of 16-bit floats"
+            });
         }
         let float = matches!(op, Op::AddF | Op::MinF | Op::MaxF);
         let (i32t, f32t) = (self.s.t.i32, self.s.t.f32);

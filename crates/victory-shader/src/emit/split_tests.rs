@@ -384,10 +384,11 @@ fn a_whole_wave_sum_adds_both_halves() {
 
 /// The compiler's expansion of a whole-wave sum of 16-bit floats in a
 /// branch of the lanes below 40, its identity put into the lanes outside
-/// the mask the section computes (the entry EXEC and the saved one): 40
-/// ones in every lane of the branch.
+/// the mask the section computes (the entry EXEC and the saved one). The
+/// console rounds to f16 at each add of its expansion, in its order; a host
+/// wave sum adds in another, so the sum is refused, not approximated.
 #[test]
-fn a_whole_wave_sum_of_halves_under_a_mask_the_section_makes_adds_both_halves() {
+fn a_whole_wave_sum_of_halves_is_refused() {
     let inside = [
         0x7E0E_02FF,
         0x0000_3C00,           // v_mov_b32 v7, 1.0 (a half)
@@ -420,8 +421,11 @@ fn a_whole_wave_sum_of_halves_under_a_mask_the_section_makes_adds_both_halves() 
     let mut words = branch(v_cmp_lanes_below(40), &inside);
     // The entry EXEC, kept before the branch.
     words.insert(6, sop1(0x04, 20, EXEC)); // s_mov_b64 s[20:21], exec
-    let shader = build(&words, 64, 0);
-    check(&shader, &lanes(|l| if l < 40 { 0x5100 } else { 0 }));
+    let e = lowered(&words, 64, 0).err().expect("refused");
+    assert!(
+        e.to_string().contains("a whole-wave sum of 16-bit floats"),
+        "{e}"
+    );
 }
 
 /// One console wave shares LDS without barriers: each lane writes its id
@@ -940,6 +944,24 @@ fn the_split_filter_takes_prefixes_and_ranges() {
     assert!(!m("0-ff", h));
 }
 
+/// The selection tools apply by hash (`victory translate`) is the one
+/// translation applies: a shader left out of the split is lowered as for a
+/// 64-lane host, any other one as for the host it runs on.
+#[test]
+fn a_shader_left_out_of_the_split_is_lowered_as_for_a_64_lane_host() {
+    with_host_wave64(false, || {
+        assert!(super::with_split_selection(
+            super::SPLIT_LEFT_OUT_WRONG[0],
+            super::host_wave64
+        ));
+        assert!(!super::with_split_selection(
+            "0123456789abcdef",
+            super::host_wave64
+        ));
+        assert!(!super::host_wave64(), "the selection ends with its call");
+    });
+}
+
 /// The shape of a classification pass of a group of many console waves:
 /// in each round, each wave's first active lane alone (`s_ff1_i32_b64` of
 /// EXEC, then `v_cmpx`) writes the wave's count of a compare's lanes (a
@@ -1245,5 +1267,10 @@ fn accesses_to_title_memory_by_address_lower_in_halves() {
     let c = Container::parse(&lowered.dxil).unwrap();
     let psv = c.part(FourCC::PSV0).unwrap().data;
     let min = u32::from_le_bytes(psv[20..24].try_into().unwrap());
-    assert_eq!(min, 32, "the lowering must declare WaveSize(32)");
+    let max = u32::from_le_bytes(psv[24..28].try_into().unwrap());
+    assert_eq!(
+        (min, max),
+        (32, 32),
+        "the lowering must declare WaveSize(32)"
+    );
 }

@@ -242,13 +242,11 @@ fn dpp_lane(d: Dpp, l: u32) -> Option<(u32, bool, bool)> {
 
 fn combine(op: Op, a: Sym, b: Sym) -> Sym {
     match (a, b) {
-        // An f16 add writes the low half only: a value from before the
-        // section passes through it only in that half.
-        (Sym::K(k), x) | (x, Sym::K(k))
-            if op.identity(k) && !(op == Op::AddH && matches!(x, Sym::Own(_) | Sym::Uni(_))) =>
-        {
-            x
-        }
+        // An f16 add writes the low half only and keeps the destination's
+        // high half: the result of adding its identity is not the other
+        // operand, whatever that is (a constant, a value from before the
+        // section, a lane's term).
+        (Sym::K(k), x) | (x, Sym::K(k)) if op.identity(k) && op != Op::AddH => x,
         (
             Sym::Red {
                 op: oa,
@@ -1095,7 +1093,12 @@ mod tests {
             combine(Op::AddH, Sym::Uni(Value(7)), Sym::K(0x8000)),
             Sym::Unknown
         );
-        assert_eq!(combine(Op::AddH, Sym::K(0), Sym::K(5)), Sym::K(5));
+        // A constant's high half is not the result's either: 0xABCD3C00
+        // plus a half zero leaves the destination's high half above 0x3C00.
+        assert_eq!(
+            combine(Op::AddH, Sym::K(0), Sym::K(0xABCD_3C00)),
+            Sym::Unknown
+        );
         assert_eq!(
             combine(Op::AddU, Sym::K(0), Sym::Own(Value(7))),
             Sym::Own(Value(7))

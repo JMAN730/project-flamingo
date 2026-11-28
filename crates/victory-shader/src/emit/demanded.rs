@@ -10,7 +10,9 @@
 //! VGPR an instruction writes passes through to the lanes it leaves out,
 //! so it demands what the result does where the write is guarded, unless
 //! those lanes never run again (EXEC is not widened before the program
-//! ends).
+//! ends). Bits a write keeps (an SDWA destination that preserves the rest,
+//! the other half of a 16-bit result) and registers an M0-relative source
+//! may name are read as operands.
 
 use std::collections::HashMap;
 
@@ -24,10 +26,9 @@ const MAX_ROUNDS: usize = 64;
 /// as the old value of a register written) pass on to anything the program
 /// does; `guarded(b, i)` tells whether instruction `i` of block `b` leaves
 /// some lanes that reach it out (they keep the old value of what it
-/// writes). Values missing from the map demand nothing.
-// shortcut: lowering gives a guarded write whose old value is missing 0 in
-// the lanes it leaves out; so the old value read last is not counted here,
-// as if those lanes never used what they keep.
+/// writes). Values missing from the map demand nothing. The old value a
+/// guarded write keeps reaches an operand wherever the value written does:
+/// the lanes left out may run again and read it.
 pub(super) fn demanded(p: &Program, guarded: &dyn Fn(usize, usize) -> bool) -> HashMap<Value, u32> {
     // All demanded bits, old values included, and those read as operands.
     let mut d: HashMap<Value, u32> = HashMap::new();
@@ -63,6 +64,7 @@ pub(super) fn demanded(p: &Program, guarded: &dyn Fn(usize, usize) -> bool) -> H
         for (b, block) in p.blocks.iter().enumerate().rev() {
             for (i, inst) in block.insts.iter().enumerate().rev() {
                 let out = |r: Reg| inst.write(r).map_or(0, |w| d.get(&w).copied().unwrap_or(0));
+                let read = |r: Reg| inst.write(r).map_or(0, |w| s.get(&w).copied().unwrap_or(0));
                 let old_only = |r: Reg| inst.write(r).is_some() && !named(inst, r);
                 let operands: Vec<(Value, u32)> = match through(inst, &out) {
                     Some(reads) => reads,
@@ -75,11 +77,11 @@ pub(super) fn demanded(p: &Program, guarded: &dyn Fn(usize, usize) -> bool) -> H
                 };
                 // The old value of each VGPR written passes to the lanes a
                 // guarded write leaves out.
-                let olds: Vec<(Value, u32)> = if guarded(b, i) && i < dead_after[b] {
+                let olds: Vec<(Value, u32, u32)> = if guarded(b, i) && i < dead_after[b] {
                     inst.writes
                         .iter()
                         .filter_map(|&(r, _)| match (r, inst.read(r)) {
-                            (Reg::V(_), Some(old)) => Some((old, out(r))),
+                            (Reg::V(_), Some(old)) => Some((old, out(r), read(r))),
                             _ => None,
                         })
                         .collect()
@@ -90,8 +92,9 @@ pub(super) fn demanded(p: &Program, guarded: &dyn Fn(usize, usize) -> bool) -> H
                     changed |= add(&mut d, v, bits);
                     changed |= add(&mut s, v, bits);
                 }
-                for (v, bits) in olds {
+                for (v, bits, operand) in olds {
                     changed |= add(&mut d, v, bits);
+                    changed |= add(&mut s, v, operand);
                 }
             }
             for phi in &block.phis {
@@ -122,8 +125,11 @@ pub(super) fn demanded(p: &Program, guarded: &dyn Fn(usize, usize) -> bool) -> H
 
 /// Whether an operand of `inst` names register `r` (a vector instruction's
 /// sources; any read of another kind of instruction). The accumulator a MAC
-/// or `dot*c` adds to and the old value DPP keeps in lanes its masks leave
-/// out are operands too, though only as the register written.
+/// or `dot*c` adds to, the old value DPP keeps in lanes its masks leave
+/// out and the bits of the destination a partial write keeps are operands
+/// too, though only as the register written. An M0-relative source names
+/// every register from its base up (as `ir` expands it), and a swap reads
+/// its destination.
 fn named(inst: &Inst, r: Reg) -> bool {
     let Fields::Valu(v) = &inst.fields else {
         return true;
@@ -132,9 +138,27 @@ fn named(inst: &Inst, r: Reg) -> bool {
     if inst.write(r).is_some()
         && (v.dpp.is_some()
             || name.contains("mac")
-            || name.starts_with("v_dot") && name.contains("c_"))
+            || name.starts_with("v_dot") && name.contains("c_")
+            || keeps_part(name, v))
     {
         return true;
+    }
+    let x = match r {
+        Reg::V(x) => Some(x),
+        _ => None,
+    };
+    let base = |o: Option<&Operand>| match o {
+        Some(&Operand::Vector { reg, .. }) => Some(reg),
+        _ => None,
+    };
+    let from = |o: Option<&Operand>| matches!((x, base(o)), (Some(x), Some(b)) if x >= b);
+    match name {
+        "v_movrels_b32" | "v_movrelsd_b32" | "v_movrelsd_2_b32" if from(v.src.first()) => {
+            return true;
+        }
+        "v_swaprel_b32" if from(v.src.first()) || from(v.dst.as_ref()) => return true,
+        "v_swap_b32" if x.is_some() && x == base(v.dst.as_ref()) => return true,
+        _ => {}
     }
     v.src.iter().any(|o| match (*o, r) {
         (Operand::Vector { reg, dwords }, Reg::V(x))
@@ -143,6 +167,30 @@ fn named(inst: &Inst, r: Reg) -> bool {
         }
         _ => false,
     })
+}
+
+/// Whether a vector instruction keeps some bits of the VGPR it writes: an
+/// SDWA destination of a byte or word whose other bits are preserved, or
+/// (without SDWA) a 16-bit result, which keeps the other half (GFX10).
+fn keeps_part(name: &str, v: &Valu) -> bool {
+    if let Some(s) = v.sdwa {
+        return s.dst_sel < 6 && s.dst_unused == 2;
+    }
+    if ["v_cmp", "v_pk_", "v_cvt_pk", "v_interp_p1l"]
+        .iter()
+        .any(|p| name.starts_with(p))
+    {
+        return false;
+    }
+    // The result's type is the first one named (`v_cvt_f16_f32` writes a
+    // half, `v_mad_u32_u16` a dword).
+    name.split('_')
+        .find(|t| {
+            t.len() == 3
+                && matches!(t.as_bytes()[0], b'f' | b'i' | b'u' | b'b')
+                && matches!(&t[1..], "16" | "32" | "64")
+        })
+        .is_some_and(|t| t.ends_with("16"))
 }
 
 /// Whether `inst` may read lanes other than its own, whatever EXEC holds
@@ -332,9 +380,62 @@ mod tests {
         let d = demanded(&p, &|_, _| false);
         assert_eq!(d.get(&v0).copied().unwrap_or(0), 0);
         // Read last as the old value of a guarded write, it still demands
-        // nothing (lowering gives such lanes 0); what it is copied to does.
+        // nothing (EXEC is never widened again, so the lanes that keep it
+        // do not run); what it is copied to does.
         let d = demanded(&p, &|_, _| true);
         assert_eq!(d.get(&v0).copied().unwrap_or(0), 0);
+    }
+
+    /// The lanes a guarded write leaves out keep the old value, and once
+    /// EXEC is widened again they read it as an operand.
+    #[test]
+    fn an_old_value_kept_by_a_guarded_write_is_read_once_exec_widens() {
+        let p = program(&[
+            0xBEFE_0381, // s_mov_b32 exec_lo, 1
+            0x7E00_0302, // v_mov_b32 v0, v2 (lane 0 only)
+            0xBEFE_03C1, // s_mov_b32 exec_lo, -1
+            0xE070_1000,
+            0x8000_0000, // buffer_store_dword v0, v0, s[0:3], 0 offen
+        ]);
+        let d = demanded(&p, &|_, i| i == 1);
+        assert_eq!(d.get(&input(&p, Reg::V(0))).copied(), Some(ALL));
+    }
+
+    /// The bits a write keeps are read: an SDWA word preserving the other
+    /// word, a 16-bit result keeping the other half. A whole-dword result
+    /// and an SDWA word that zeroes the rest keep nothing.
+    #[test]
+    fn the_bits_a_partial_write_keeps_are_demanded() {
+        // buffer_store_dword v0, v0, s[0:3], 0 offen
+        let store = [0xE070_1000, 0x8000_0000];
+        let kept = |write: &[u32]| {
+            let p = program(&[write, &store[..]].concat());
+            demanded(&p, &|_, _| false)
+                .get(&input(&p, Reg::V(0)))
+                .copied()
+        };
+        // v_mov_b32_sdwa v0, v2 dst_sel:WORD_0 dst_unused:UNUSED_PRESERVE
+        assert_eq!(kept(&[0x7E00_02F9, 0x0006_1402]), Some(ALL));
+        // v_add_f16 v0, v2, v3
+        assert_eq!(kept(&[0x6400_0702]), Some(ALL));
+        // v_mov_b32_sdwa v0, v2 dst_sel:WORD_0 dst_unused:UNUSED_PAD
+        assert_eq!(kept(&[0x7E00_02F9, 0x0006_0402]), None);
+        // v_cvt_f32_f16 v0, v2
+        assert_eq!(kept(&[0x7E00_1702]), None);
+    }
+
+    /// An M0-relative source names every register from its base up: with
+    /// M0 1, `v_movrelsd_b32 v0, v0` reads v1 as its source.
+    #[test]
+    fn registers_an_m0_relative_source_may_name_are_demanded() {
+        let p = program(&[
+            0xBEFC_0381, // s_mov_b32 m0, 1
+            0x7E00_8900, // v_movrelsd_b32 v0, v0: v[0 + m0] = v[0 + m0]
+            0xE070_1000,
+            0x8000_0101, // buffer_store_dword v1, v1, s[0:3], 0 offen
+        ]);
+        let d = demanded(&p, &|_, _| false);
+        assert_eq!(d.get(&input(&p, Reg::V(1))).copied(), Some(ALL));
     }
 
     /// The accumulator a MAC adds to is read as an operand, though only
