@@ -1407,8 +1407,9 @@ fn crumbs() -> Option<&'static Crumbs> {
 }
 
 /// The recordings of the last submissions, with breadcrumbs: host fence
-/// value, then per list its breadcrumb words and noted commands (moved out
-/// of the list when it is submitted).
+/// value, then per list its breadcrumb words and noted commands (copied
+/// from the list at each submission, since a closed list can be submitted
+/// more than once and its notes are cleared only when it resets).
 #[cfg(feature = "diagnostics")]
 type CrumbRun = (u64, Vec<(u32, Vec<Note>)>);
 
@@ -1416,16 +1417,21 @@ type CrumbRun = (u64, Vec<(u32, Vec<Note>)>);
 static CRUMB_RUNS: Mutex<std::collections::VecDeque<CrumbRun>> =
     Mutex::new(std::collections::VecDeque::new());
 
+/// A recording's noted commands for one submission's breadcrumb report.
+/// The recording keeps its own: its breadcrumb commands run again when it
+/// is submitted again, and that submission's report names them too.
+#[cfg(feature = "diagnostics")]
+fn submitted_notes(notes: &Mutex<Vec<Note>>) -> Vec<Note> {
+    notes.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
 /// Keeps the noted commands of the lists of submission `sub` for the
 /// breadcrumb report.
 #[cfg(feature = "diagnostics")]
 fn keep_crumbs(sub: u64, runs: &[&HostList]) {
     let lists = runs
         .iter()
-        .map(|r| {
-            let notes = std::mem::take(&mut *r.notes.lock().unwrap_or_else(|e| e.into_inner()));
-            (r.crumb.load(Ordering::Relaxed), notes)
-        })
+        .map(|r| (r.crumb.load(Ordering::Relaxed), submitted_notes(&r.notes)))
         .collect();
     let mut kept = CRUMB_RUNS.lock().unwrap_or_else(|e| e.into_inner());
     kept.push_back((sub, lists));

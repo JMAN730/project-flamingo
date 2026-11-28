@@ -3481,3 +3481,20 @@ mod relay_tests {
         assert_eq!(h.d3d12_errors(), errors_before);
     }
 }
+
+/// A closed list can be submitted more than once: each submission's
+/// breadcrumb report gets the list's noted commands, and the list keeps
+/// them until it resets.
+#[cfg(feature = "diagnostics")]
+#[test]
+fn every_submission_of_a_list_gets_its_noted_commands() {
+    let notes: Mutex<Vec<Note>> = Mutex::new(vec![
+        ("a draw".to_owned(), None),
+        ("a copy".to_owned(), Some((0x1000, 16))),
+    ]);
+    let first = submitted_notes(&notes);
+    let second = submitted_notes(&notes);
+    assert_eq!(first.len(), 2);
+    assert_eq!(first, second);
+    assert_eq!(notes.lock().unwrap().len(), 2);
+}
