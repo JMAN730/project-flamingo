@@ -339,6 +339,20 @@ pub(crate) fn take_open(list: usize) -> Vec<(This, u32, u32, u32)> {
         .collect()
 }
 
+/// Forgets every query of heap `this` still open in any host list: the
+/// title released the heap, and the notes of its open queries name it by
+/// address, which a split or a close of their list would otherwise look up
+/// after it is gone.
+// shortcut: such a query is left begun in its host list and not ended (the
+// host heap itself lives on with the list); no title of ours releases a
+// query heap with a query of it open.
+#[cfg(windows)]
+fn forget_heap(this: This) {
+    if let Some(open) = OPEN.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        open.retain(|key, _| key.1 != this as usize);
+    }
+}
+
 /// The host query that query `index` of `this` was begun as in host list
 /// `list`, if it was and has not ended there since, forgetting it.
 #[cfg(windows)]
@@ -395,7 +409,12 @@ extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT
     )
 }
 extern "system" fn release(this: This) -> u32 {
-    object::release_boxed::<Heap>(this)
+    let left = object::release_boxed::<Heap>(this);
+    #[cfg(windows)]
+    if left == 0 {
+        forget_heap(this);
+    }
+    left
 }
 
 /// IUnknown 3, object 4, device child 1.
@@ -491,6 +510,32 @@ mod tests {
         for left in [5, 4, 3, 2, 1, 0] {
             assert_eq!(release(heap), left);
         }
+    }
+
+    /// A heap the title releases takes the notes of its open queries with
+    /// it, in every list, and leaves another heap's alone.
+    #[cfg(windows)]
+    #[test]
+    fn a_released_heap_leaves_no_open_query() {
+        let desc = Desc {
+            kind: OCCLUSION_HEAP,
+            count: 4,
+            nodes: 0,
+        };
+        let mut gone = std::ptr::null();
+        assert_eq!(
+            create(std::ptr::null(), &desc, &HEAP_IIDS[0], &mut gone),
+            S_OK
+        );
+        // Another heap's address, never dereferenced.
+        let other = 0x5157_2000_usize as This;
+        let (a, b) = (0xa200_usize, 0xb200_usize);
+        begun(gone, 0, 1, 1, a);
+        begun(gone, 1, 2, 2, b);
+        begun(other, 0, 1, 1, a);
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(gone, 0x10)(gone), 0);
+        assert_eq!(take_open(b), []);
+        assert_eq!(take_open(a), [(other, 0, 1, 1)]);
     }
 
     /// Two lists recording the same query interleaved (A begins, B begins,
