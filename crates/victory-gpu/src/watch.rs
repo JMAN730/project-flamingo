@@ -5531,7 +5531,6 @@ mod tests {
 
     #[test]
     fn written_pages_are_reported_to_every_asker() {
-        let _views = crate::inplace::view_test_lock();
         let _journal_lock = JOURNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // SAFETY: a fresh write-watched allocation, freed at the end.
         let p = unsafe {
@@ -5574,7 +5573,6 @@ mod tests {
     /// lands and the block counts as written.
     #[test]
     fn kernel_reads_into_guarded_blocks_after_opening() {
-        let _views = crate::inplace::view_test_lock();
         use std::io::{Read, Seek, Write};
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, UnmapViewOfFile,
@@ -5629,7 +5627,6 @@ mod tests {
 
     #[test]
     fn writes_in_partly_committed_view_blocks_are_reported() {
-        let _views = crate::inplace::view_test_lock();
         use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
@@ -5691,7 +5688,6 @@ mod tests {
     /// or mapped since.
     #[test]
     fn a_range_that_begins_in_an_unmapped_block_is_guarded() {
-        let _views = crate::inplace::view_test_lock();
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, MEM_PRESERVE_PLACEHOLDER, MEM_REPLACE_PLACEHOLDER,
             MEM_RESERVE_PLACEHOLDER, MapViewOfFile3, PAGE_NOACCESS, UnmapViewOfFile2,
@@ -5787,7 +5783,6 @@ mod tests {
     /// again (they cannot be guarded) until the runtime maps them.
     #[test]
     fn unmapped_blocks_are_reported_once_until_mapped() {
-        let _views = crate::inplace::view_test_lock();
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, MEM_PRESERVE_PLACEHOLDER, MEM_REPLACE_PLACEHOLDER,
             MEM_RESERVE_PLACEHOLDER, MapViewOfFile3, PAGE_NOACCESS, UnmapViewOfFile2,
@@ -5931,7 +5926,6 @@ mod tests {
     /// guarded view's next check reports the pages written.
     #[test]
     fn a_write_through_another_view_is_reported_at_the_guarded_one() {
-        let _views = crate::inplace::view_test_lock();
         const SIZE: usize = 2 * BLOCK;
         let (section, guarded, other) = two_views(SIZE);
         let pages = |block: usize| (guarded + block * BLOCK) / PAGE;
@@ -5958,7 +5952,6 @@ mod tests {
     /// guarded view checks its pages again (and guards the new view).
     #[test]
     fn a_view_mapped_beside_a_guarded_one_makes_it_check_again() {
-        let _views = crate::inplace::view_test_lock();
         const SIZE: usize = 2 * BLOCK;
         let (section, guarded, other) = two_views(SIZE);
         let pages = |block: usize| (guarded + block * BLOCK) / PAGE;
@@ -5988,7 +5981,6 @@ mod tests {
     ///   while pinned, then re-guards cleanly once the pin expires.
     #[test]
     fn a_write_told_at_one_view_is_reported_at_the_others() {
-        let _views = crate::inplace::view_test_lock();
         const SIZE: usize = 2 * BLOCK;
         let (section, guarded, other) = two_views(SIZE);
         let pages = |block: usize| (guarded + block * BLOCK) / PAGE;
@@ -6033,7 +6025,6 @@ mod tests {
     /// `inplace` knows it is a view.
     #[test]
     fn orphaned_readonly_view_block_is_opened_on_write_fault() {
-        let _views = crate::inplace::view_test_lock();
         use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
         let (section, one, two) = two_views(BLOCK);
         // Ensure the vectored handler is installed, then leave `one` read-only
@@ -6059,7 +6050,6 @@ mod tests {
     /// keep the bytes from before the write.
     #[test]
     fn a_write_is_reported_at_every_checked_view() {
-        let _views = crate::inplace::view_test_lock();
         const SIZE: usize = 2 * BLOCK;
         let (section, one, two) = two_views(SIZE);
         let pages = |view: usize, block: usize| (view + block * BLOCK) / PAGE;
@@ -6107,7 +6097,6 @@ mod tests {
     /// itself: the others stay writable, and nothing looks through them all.
     #[test]
     fn a_page_of_many_views_is_guarded_one_view_at_a_time() {
-        let _views = crate::inplace::view_test_lock();
         let (section, one, two) = two_views(BLOCK);
         let filler = one + (1 << 45);
         for n in 0..MANY_VIEWS {
@@ -6132,7 +6121,6 @@ mod tests {
     /// to overflow. Up there no test has guarded blocks.
     #[test]
     fn ranges_past_the_address_space_end_do_not_overflow() {
-        let _views = crate::inplace::view_test_lock();
         let top = usize::MAX - 16;
         writing(top, PAGE);
         title_memory_remapped(top, usize::MAX);
@@ -6140,7 +6128,6 @@ mod tests {
 
     #[test]
     fn alias_rebound_marks_guarded_block_unclean_and_guards_new_aliases() {
-        let _views = crate::inplace::view_test_lock();
         let (section, a, b) = two_views(BLOCK);
         // Pin `b` initially: guarding `a` MUST leave `a` unclean while `b` is
         // pinned and writable (cannot be guarded yet).
@@ -6199,7 +6186,6 @@ mod tests {
     /// the guarded page changed.
     #[test]
     fn a_busy_or_unguardable_alias_leaves_the_page_changed() {
-        let _views = crate::inplace::view_test_lock();
         use windows_sys::Win32::System::Memory::{
             MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_NOACCESS, VirtualProtect, VirtualQuery,
         };
@@ -6312,7 +6298,6 @@ mod tests {
     /// `GUARDS`, refreshing indexed textures without risking lock inversion.
     #[test]
     fn alias_write_fault_triggers_remapped_without_deadlock() {
-        let _views = crate::inplace::view_test_lock();
         let (section, a, b) = two_views(BLOCK);
         // Guard `a`: `a` is protected+clean, `b` is protected as an alias.
         assert_eq!(guard(a, a + BLOCK), Some(vec![a / PAGE]));
@@ -6339,7 +6324,6 @@ mod tests {
     /// `GetWriteWatch` and its writes are reported.
     #[test]
     fn ask_once_skips_known_guarded_views_and_watches_private_memory() {
-        let _views = crate::inplace::view_test_lock();
         use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
@@ -6430,7 +6414,6 @@ mod tests {
 
     #[test]
     fn lock_free_page_dir_dirty_fast_path_and_ask_once_coherence() {
-        let _views = crate::inplace::view_test_lock();
         let _journal_lock = JOURNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         struct AllocGuard(usize);
         impl Drop for AllocGuard {
@@ -6500,7 +6483,6 @@ mod tests {
 
     #[test]
     fn cold_pages_promote_to_readonly_and_fault_back_on_write() {
-        let _views = crate::inplace::view_test_lock();
         let _journal_lock = JOURNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         struct AllocGuard(usize, usize);
         impl Drop for AllocGuard {
@@ -6589,7 +6571,6 @@ mod tests {
 
     #[test]
     fn coalesced_virtual_protect_handles_mixed_views_and_holes() {
-        let _views = crate::inplace::view_test_lock();
         use windows_sys::Win32::Foundation::CloseHandle;
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, MEM_PRESERVE_PLACEHOLDER, MEM_REPLACE_PLACEHOLDER,
@@ -6689,7 +6670,6 @@ mod tests {
 
     #[test]
     fn concurrent_watch_writes_faults_and_remaps_are_safe() {
-        let _views = crate::inplace::view_test_lock();
         let _journal_lock = JOURNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         const SIZE: usize = 4 * BLOCK;
         let (section, one, two) = two_views(SIZE);
@@ -6761,7 +6741,6 @@ mod tests {
 
     #[test]
     fn try_arm_lazy_under_guards_respects_pins_and_clears_guard_and_cold_state() {
-        let _views = crate::inplace::view_test_lock();
         let _journal_lock = JOURNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (section, one, two) = two_views(2 * BLOCK);
         let b0 = one / BLOCK;
@@ -6854,7 +6833,6 @@ mod tests {
 
     #[test]
     fn wrote_own_epoch_is_monotonic_against_concurrent_higher_epoch() {
-        let _views = crate::inplace::view_test_lock();
         let _journal_lock = JOURNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let page = 0x7df0_0000_0000usize / PAGE;
         DIR.clear_written_range(page, page + 2);
@@ -6879,7 +6857,6 @@ mod tests {
 
     #[test]
     fn watch_lazy_armed_view_is_lock_free_and_preserves_noaccess() {
-        let _views = crate::inplace::view_test_lock();
         use windows_sys::Win32::System::Memory::{
             MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_NOACCESS, PAGE_READWRITE, VirtualProtect,
             VirtualQuery,
@@ -6928,7 +6905,6 @@ mod tests {
 
     #[test]
     fn the_parts_of_a_page_written_since_it_was_taken() {
-        let _views = crate::inplace::view_test_lock();
         let _journal_lock = JOURNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let p7 = 0x7df1_0000_0000usize / PAGE;
         let p9 = p7 + 2;
@@ -6966,7 +6942,6 @@ mod tests {
     /// never taken before is taken whole.
     #[test]
     fn what_is_taken_again_is_what_was_written() {
-        let _views = crate::inplace::view_test_lock();
         let _journal_lock = JOURNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // SAFETY: a fresh write-watched allocation, freed at the end.
         let p = unsafe {
@@ -7039,7 +7014,6 @@ mod tests {
     /// the others stay read-only, are reported written, and take writes of their own.
     #[test]
     fn a_write_opens_the_view_it_goes_through() {
-        let _views = crate::inplace::view_test_lock();
         let (section, one, two) = two_views(BLOCK);
         let page = |view: usize| view / PAGE;
         for view in [one, two] {
@@ -7077,7 +7051,6 @@ mod tests {
     /// and is reported written at every view of its physical page until the rest ends.
     #[test]
     fn a_block_just_written_rests() {
-        let _views = crate::inplace::view_test_lock();
         let (section, one, two) = two_views(BLOCK);
         let page = one / PAGE;
         let rests =
@@ -7113,7 +7086,6 @@ mod tests {
     /// faults, verifying pin/rest semantics and deadlock freedom.
     #[test]
     fn sharded_guards_concurrent_ops_and_cross_shard_boundaries() {
-        let _views = crate::inplace::view_test_lock();
         let _journal_lock = JOURNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // `SHARD_BLOCKS + 4` blocks (1.25 MiB) guarantees every view spans at
         // least two distinct guard shards.
@@ -7316,7 +7288,6 @@ mod tests {
 
     #[test]
     fn allocation_query_recognizes_file_views_and_rejects_nonviews() {
-        let _views = crate::inplace::view_test_lock();
         use std::os::windows::io::AsRawHandle;
         use windows_sys::Win32::Foundation::CloseHandle;
         use windows_sys::Win32::System::Memory::{
@@ -7355,7 +7326,6 @@ mod tests {
     /// a buffer spanning them is: the pages written in each are reported.
     #[test]
     fn a_range_over_several_watched_allocations_is_watched() {
-        let _views = crate::inplace::view_test_lock();
         let _serial = JOURNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (a, b) = loop {
             // SAFETY: a probe reservation, released at once to find room for two.
@@ -7408,7 +7378,6 @@ mod tests {
     /// once committed.
     #[test]
     fn a_range_never_committed_has_no_writes() {
-        let _views = crate::inplace::view_test_lock();
         let _serial = JOURNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // SAFETY: a fresh write-watched reservation, freed at the end.
         let p = unsafe {
@@ -7442,7 +7411,6 @@ mod tests {
     /// read-protected.
     #[test]
     fn guard_handles_unmapped_prefix_and_rejects_committed_private_prefix() {
-        let _views = crate::inplace::view_test_lock();
         let _serial = JOURNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         use windows_sys::Win32::Foundation::CloseHandle;
         use windows_sys::Win32::System::Memory::{
@@ -7550,7 +7518,6 @@ mod tests {
     /// whole address space), and landing it leaves nothing announced.
     #[test]
     fn a_saturated_kernel_read_is_announced_in_one_step() {
-        let _views = crate::inplace::view_test_lock();
         let _serial = JOURNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Kernel half of the address space: no user allocation of another
         // test running at the same time can fall in the announced range.
@@ -7571,7 +7538,6 @@ mod tests {
     /// into one buffer) is one counted entry, and a remap over it drops it.
     #[test]
     fn repeated_announcements_are_counted_and_a_remap_drops_them() {
-        let _views = crate::inplace::view_test_lock();
         let _serial = JOURNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let at = 0xFFFF_9000_0000_0000;
         let range = (at / BLOCK, (at + BLOCK).div_ceil(BLOCK));
@@ -7591,7 +7557,6 @@ mod tests {
     /// the next refresh guards its block again.
     #[test]
     fn an_announced_kernel_read_survives_a_refresh_before_it() {
-        let _views = crate::inplace::view_test_lock();
         let _serial = JOURNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         use std::io::{Read, Seek, Write};
         use windows_sys::Win32::Foundation::CloseHandle;
@@ -7651,7 +7616,6 @@ mod tests {
 
     #[test]
     fn ask_once_coalesces_ranges_and_surfaces_intervening_wrote() {
-        let _views = crate::inplace::view_test_lock();
         let _serial = JOURNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let alloc = WatchedAllocGuard::new(6);
         let p = alloc.base;
@@ -7700,7 +7664,6 @@ mod tests {
 
     #[test]
     fn a_file_read_after_the_submission_query_reaches_every_reader() {
-        let _views = crate::inplace::view_test_lock();
         use std::io::{Read, Seek, Write};
         let _serial = JOURNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let alloc = WatchedAllocGuard::new(1);
@@ -7739,7 +7702,6 @@ mod tests {
 
     #[test]
     fn ask_once_handles_mixed_watched_and_unwatched_ranges() {
-        let _views = crate::inplace::view_test_lock();
         let _serial = JOURNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let alloc = WatchedAllocGuard::new(2);
         let watched = alloc.base;
@@ -7762,7 +7724,6 @@ mod tests {
 
     #[test]
     fn guard_clean_fast_path_returns_empty_and_still_detects_faults() {
-        let _views = crate::inplace::view_test_lock();
         let _serial = JOURNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         use windows_sys::Win32::Foundation::CloseHandle;
         use windows_sys::Win32::System::Memory::{
@@ -7809,7 +7770,6 @@ mod tests {
     /// `RefCell already borrowed`.
     #[test]
     fn with_watch_scratch_is_reentrant_safe() {
-        let _views = crate::inplace::view_test_lock();
         let outer = with_watch_scratch(32, |outer_buf| {
             outer_buf[0] = 0x1111;
             let inner = with_watch_scratch(128, |inner_buf| {
@@ -7825,7 +7785,6 @@ mod tests {
 
     #[test]
     fn cold_promotion_skips_readonly_and_mixed_protection_blocks() {
-        let _views = crate::inplace::view_test_lock();
         use windows_sys::Win32::System::Memory::{
             MEMORY_BASIC_INFORMATION, PAGE_NOACCESS, PAGE_READONLY, VirtualProtect, VirtualQuery,
         };
@@ -7892,7 +7851,6 @@ mod tests {
 
     #[test]
     fn title_memory_remapped_invalidates_ahead_coverage() {
-        let _views = crate::inplace::view_test_lock();
         let _serial = JOURNAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let alloc = WatchedAllocGuard::new(2);
         let base = alloc.base;
@@ -7920,7 +7878,6 @@ mod tests {
 
     #[test]
     fn writes_preserves_reset_dirty_watched_block_when_later_run_fails() {
-        let _views = crate::inplace::view_test_lock();
         use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFileEx,
@@ -8065,7 +8022,6 @@ mod tests {
 
     #[test]
     fn mapped_pages_written_concurrent_readers_never_skip_alias_write() {
-        let _views = crate::inplace::view_test_lock();
         use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
@@ -8144,7 +8100,6 @@ mod tests {
 
     #[test]
     fn alias_rebound_marks_guarded_blocks_unclean_without_unprotecting() {
-        let _views = crate::inplace::view_test_lock();
         use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, FILE_MAP_ALL_ACCESS, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
@@ -8191,7 +8146,6 @@ mod tests {
 
     #[test]
     fn fallback_reopen_unguarded_view_excludes_lazy_armer_on_guard_shard() {
-        let _views = crate::inplace::view_test_lock();
         use std::sync::{Arc, Condvar, Mutex};
         use std::time::Duration;
         use windows_sys::Win32::System::Memory::{
@@ -8345,7 +8299,6 @@ mod mapping_tests {
     /// under way, and such a read waits for the change.
     #[test]
     fn reads_in_place_and_remappings_wait_for_each_other() {
-        let _views = crate::inplace::view_test_lock();
         // A reader holds; the change does not begin until it lets go.
         let changed = Arc::new(AtomicBool::new(false));
         let reading = title_memory_reading(HERE + PAGE / 2, PAGE);
@@ -8395,7 +8348,6 @@ mod mapping_tests {
     /// not of others).
     #[test]
     fn reads_and_remappings_of_other_bytes_go_on() {
-        let _views = crate::inplace::view_test_lock();
         if !by_range() {
             return; // VICTORY_MAPPING_RANGES=0: one lock over all of it
         }
@@ -8452,7 +8404,6 @@ mod mapping_tests {
     /// saturate without overflowing.
     #[test]
     fn empty_and_saturating_ranges_are_safe() {
-        let _views = crate::inplace::view_test_lock();
         assert!(!super::meet(HERE, HERE + PAGE, HERE + 8, HERE + 8));
         assert!(!super::meet(HERE + 8, HERE + 8, HERE, HERE + PAGE));
         assert!(super::meet(0, usize::MAX, HERE, HERE + PAGE));

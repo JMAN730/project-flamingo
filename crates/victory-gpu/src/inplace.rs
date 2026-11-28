@@ -2030,10 +2030,9 @@ pub(crate) fn tick() {
     }
 }
 
-/// Held by every test of this module, `lazy_back` and `watch`: they share
-/// the in-place view registry, its generation, the lazy copy-back table and
-/// the page guards, so run side by side one test's remap or guard makes
-/// another's arming or protection check fail.
+/// Held by every test of this module and of `lazy_back`: they share the
+/// in-place view registry, its generation and the lazy copy-back table, so
+/// run side by side one test's remap makes another's arming fail.
 #[cfg(test)]
 pub(crate) fn view_test_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
