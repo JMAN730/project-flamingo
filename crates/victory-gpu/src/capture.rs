@@ -1,7 +1,9 @@
 //! Presented frames written to PNG files, to see what reaches the screen:
 //! with `VICTORY_CAPTURE=<folder>`, every frame whose number is a power of
 //! two (the frames the log reports) is saved as `frame-<n>.png`, at half
-//! size. Only in builds with diagnostics.
+//! size. `VICTORY_CAPTURE_SECONDS=<from>-<to>` also saves every frame
+//! presented in that span of seconds after the first presented frame. Only
+//! in builds with diagnostics.
 
 use std::path::PathBuf;
 
@@ -48,7 +50,32 @@ pub(crate) fn plane_stats_wanted(frame: u64) -> bool {
 
 /// Whether frame `n` is saved.
 pub(crate) fn wanted(n: u64) -> bool {
-    folder().is_some() && (n.is_power_of_two() || listed(n))
+    folder().is_some() && (n.is_power_of_two() || listed(n) || in_seconds_span())
+}
+
+/// Whether now is inside `VICTORY_CAPTURE_SECONDS=<from>-<to>`, counted from
+/// the first presented frame: frame numbers do not land on the same scene
+/// from run to run, a time on the clock sometimes does.
+fn in_seconds_span() -> bool {
+    static SPAN: std::sync::OnceLock<Option<(f64, f64)>> = std::sync::OnceLock::new();
+    static FIRST: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let first = FIRST.get_or_init(std::time::Instant::now);
+    let span = SPAN.get_or_init(|| {
+        let value = std::env::var("VICTORY_CAPTURE_SECONDS").ok()?;
+        let span = seconds_span(&value);
+        if span.is_none() {
+            tracing::warn!("VICTORY_CAPTURE_SECONDS expects <from>-<to> in seconds, got {value}");
+        }
+        span
+    });
+    span.is_some_and(|(from, to)| (from..=to).contains(&first.elapsed().as_secs_f64()))
+}
+
+/// `<from>-<to>` in seconds, `from` not after `to`.
+fn seconds_span(value: &str) -> Option<(f64, f64)> {
+    let (from, to) = value.split_once('-')?;
+    let (from, to) = (from.trim().parse().ok()?, to.trim().parse().ok()?);
+    (from >= 0.0 && from <= to).then_some((from, to))
 }
 
 /// Saves 8-bit RGBA or BGRA rows (`pitch` bytes apart) as frame `n`.
@@ -819,5 +846,14 @@ mod tests {
             super::to_rgba(87, 1, 1, 4, &[1, 2, 3, 4]),
             Some(vec![3, 2, 1, 255])
         );
+    }
+
+    #[test]
+    fn a_seconds_span_is_two_ordered_numbers() {
+        assert_eq!(super::seconds_span("300-360"), Some((300.0, 360.0)));
+        assert_eq!(super::seconds_span(" 1.5 - 2 "), Some((1.5, 2.0)));
+        assert_eq!(super::seconds_span("360-300"), None);
+        assert_eq!(super::seconds_span("300"), None);
+        assert_eq!(super::seconds_span("a-b"), None);
     }
 }
