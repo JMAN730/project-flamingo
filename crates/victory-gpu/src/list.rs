@@ -1558,7 +1558,7 @@ extern "system" fn begin_query(this: This, heap: This, kind: u32, index: u32) {
         && let Some(list) = host_list(this)
     {
         list.keep(&host_heap);
-        let here = std::sync::Arc::as_ptr(&list) as usize;
+        let here = list.recording();
         let run = crate::query::begins(heap, index, here);
         // SAFETY: an open list; the index is the title's, inside its heap
         // (whose queries the host heap has, and spare ones after them).
@@ -1582,7 +1582,7 @@ extern "system" fn begin_query(this: This, heap: This, kind: u32, index: u32) {
 /// kind, index, run), to go on in the next host list ([`continue_queries`]).
 #[cfg(windows)]
 fn end_open_queries(list: &std::sync::Arc<crate::host::HostList>) -> Vec<(This, u32, u32, u64)> {
-    let open = crate::query::take_open(std::sync::Arc::as_ptr(list) as usize);
+    let open = crate::query::take_open(list.recording());
     let mut ended = Vec::with_capacity(open.len());
     for (heap, kind, index, host_index, run) in open {
         let Some(host_heap) = crate::query::occlusion_heap(heap) else {
@@ -1607,7 +1607,7 @@ fn end_open_queries(list: &std::sync::Arc<crate::host::HostList>) -> Vec<(This, 
 /// are neither ended nor go on.
 #[cfg(windows)]
 fn forget_open_queries(list: &std::sync::Arc<crate::host::HostList>) {
-    let _ = crate::query::take_open(std::sync::Arc::as_ptr(list) as usize);
+    let _ = crate::query::take_open(list.recording());
 }
 
 /// Begins again, in host list `next`, the queries a split ended in the list
@@ -1648,7 +1648,7 @@ fn continue_queries(
                 spare,
             )
         };
-        let here = std::sync::Arc::as_ptr(next) as usize;
+        let here = next.recording();
         crate::query::begun(heap, kind, index, spare, here, run);
         any = true;
     }
@@ -1664,7 +1664,7 @@ extern "system" fn end_query(this: This, heap: This, kind: u32, index: u32) {
         && let Some(host_heap) = crate::query::occlusion_heap(heap)
         && let Some(list) = host_list(this)
     {
-        let here = std::sync::Arc::as_ptr(&list) as usize;
+        let here = list.recording();
         if let Some(host_index) = crate::query::take_begun(heap, index, here) {
             // SAFETY: an open list; the host query was begun in it.
             unsafe {
@@ -1722,7 +1722,7 @@ fn resolve_occlusion(
     let Some(target) = buffer_range(buffer, offset, bytes) else {
         return true;
     };
-    let here = std::sync::Arc::as_ptr(&list) as usize;
+    let here = list.recording();
     let Some(resolve) = crate::query::resolving(heap, kind, first, count, here) else {
         return false;
     };
@@ -3907,7 +3907,7 @@ mod tests {
         }
         let recording = |list: This| {
             let host = host_list(list).expect("host list");
-            std::sync::Arc::as_ptr(&host) as usize
+            host.recording()
         };
 
         let closed = new_list();
