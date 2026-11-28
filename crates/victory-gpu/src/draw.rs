@@ -1833,7 +1833,7 @@ impl State {
         if heap.samplers() {
             return None;
         }
-        crate::descriptor::table::bind(heap.host()?, heap.start, list, !compute)
+        crate::descriptor::table::bind(heap.host()?, key, heap.start, list, !compute)
     }
 
     fn indexed_buffer(
@@ -4162,8 +4162,10 @@ fn readable(
             if let Some(t) = crate::resource::host_resource(*resource as This) {
                 // SAFETY: a live resource.
                 let d = unsafe { t.GetDesc() };
+                // Trace, not debug: in the world it fires for most reads of
+                // most draws and buries the per-draw lines a capture needs.
                 if d.Flags.0 & 7 == 0 {
-                    tracing::debug!(
+                    tracing::trace!(
                         resource = format_args!("{resource:#x}"),
                         ?d,
                         "a shader reads a texture the title fills"
