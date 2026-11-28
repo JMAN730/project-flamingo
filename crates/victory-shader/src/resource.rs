@@ -243,29 +243,59 @@ pub fn track(
     stage: HwStage,
     lanes: Option<&Structured>,
 ) -> Result<Resources, ShaderError> {
-    track_initialized(p, layout, stage, lanes, None)
+    track_initialized(p, layout, stage, lanes, Entry::default())
 }
 
-/// As [`track`], knowing the SGPRs the hardware initializes
-/// ([`crate::NativeProgram::initialized_sgprs`]): a high half that is one
-/// of the SGPRs above them on some path into a join, read before the program
-/// writes it, holds what the last wave left there, which the lowering reads
-/// as zero, so it is zero there as well.
+/// What a wave of the program starts with, as far as tracing uses it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Entry {
+    /// The SGPRs the hardware initializes
+    /// ([`crate::NativeProgram::initialized_sgprs`]).
+    pub initialized_sgprs: Option<u8>,
+    /// Every wave starts with every lane in EXEC: a compute program whose
+    /// group is a whole number of waves.
+    pub full_exec: bool,
+}
+
+impl Entry {
+    pub fn of(native: &crate::NativeProgram) -> Self {
+        let full_exec = match &native.io {
+            crate::native::StageIo::Cs(cs) => {
+                let lanes: u32 = cs.threads.iter().product();
+                lanes != 0 && lanes.is_multiple_of(if native.wave64 { 64 } else { 32 })
+            }
+            _ => false,
+        };
+        Entry {
+            initialized_sgprs: native.initialized_sgprs(),
+            full_exec,
+        }
+    }
+}
+
+/// As [`track`], knowing how a wave starts (`entry`):
+/// - A high half that is one of the SGPRs above the initialized ones on
+///   some path into a join, read before the program writes it, holds what
+///   the last wave left there, which the lowering reads as zero, so it is
+///   zero there as well.
+/// - An `s_cbranch_execz` that tests an EXEC known not to be empty is never
+///   taken, so what reaches a join along it is not joined
+///   ([`untaken_execz`]).
 pub fn track_initialized(
     p: &Program,
     layout: &[RootParam],
     stage: HwStage,
     lanes: Option<&Structured>,
-    initialized: Option<u8>,
+    entry: Entry,
 ) -> Result<Resources, ShaderError> {
     // What is traced only for programs everything else refused is a last
     // chance, so that every other program's resources stay as they were. The
     // refusal reported is the first one.
-    match track_with(p, layout, stage, lanes, false, initialized) {
+    match track_with(p, layout, stage, lanes, false, entry) {
         Err(refusal @ ShaderError::Unsupported { .. })
             if lanes.is_some() && !crate::switch::no_last_chance() =>
         {
-            track_with(p, layout, stage, lanes, true, initialized).map_err(|_| refusal)
+            track_with(p, layout, stage, lanes, true, entry).map_err(|_| refusal)
         }
         result => result,
     }
@@ -278,11 +308,16 @@ fn track_with(
     stage: HwStage,
     lanes: Option<&Structured>,
     leftovers: bool,
-    initialized: Option<u8>,
+    entry: Entry,
 ) -> Result<Resources, ShaderError> {
     let mut t = Tracer::new(p, layout, stage, lanes)?;
     t.leftovers = leftovers;
-    t.initialized = initialized;
+    t.initialized = entry.initialized_sgprs;
+    let untaken = untaken_execz(p, entry.full_exec);
+    if !untaken.is_empty() {
+        t.untaken = untaken;
+        t.origin = t.propagate_copies(t.defs.len())?;
+    }
     let mut out = Resources {
         params: p
             .inputs
@@ -661,6 +696,9 @@ struct Tracer<'a> {
     /// them that the program reads before writing holds what the last wave
     /// left, which the lowering reads as zero.
     initialized: Option<u8>,
+    /// Edges (from block, to block) that are never taken
+    /// ([`untaken_execz`]): a phi takes nothing along them.
+    untaken: std::collections::HashSet<(usize, usize)>,
     /// The descriptor being classified is a vector buffer access's or an
     /// `s_buffer_*`'s: built around an address that traces to no root
     /// parameter, it is title memory ([`MEMORY`]) in a compute program.
@@ -790,6 +828,7 @@ impl<'a> Tracer<'a> {
             uniform_memo: std::cell::RefCell::new(vec![None; n]),
             leftovers: false,
             initialized: None,
+            untaken: Default::default(),
             clamped: std::cell::Cell::new(false),
             buffer_access: std::cell::Cell::new(false),
         };
@@ -814,7 +853,9 @@ impl<'a> Tracer<'a> {
                     let mut args = phi
                         .args
                         .iter()
-                        .filter_map(|a| o[a.0 as usize])
+                        .zip(&block.preds)
+                        .filter(|&(_, &pred)| !self.untaken.contains(&(pred, b)))
+                        .filter_map(|(a, _)| o[a.0 as usize])
                         .filter(|&t| t != own);
                     let new = args
                         .next()
@@ -3651,6 +3692,155 @@ fn lane_of(op: Operand) -> Option<u32> {
     }
 }
 
+/// The edges (from block, to block) an `s_cbranch_execz` never takes: those
+/// where the EXEC it tests is not empty. It is not where it is the wave's
+/// entry EXEC (a wave runs with a lane), or the same value as the EXEC an
+/// earlier `s_cbranch_execz` tested, on the path that did not branch there
+/// (through blocks of one predecessor each, which that test dominates).
+/// Values are the same through copies and, when every wave starts with
+/// every lane (`full_exec`), through `s_wqm` of the entry EXEC and an AND
+/// with it: all lanes, which change nothing.
+pub(crate) fn untaken_execz(
+    p: &Program,
+    full_exec: bool,
+) -> std::collections::HashSet<(usize, usize)> {
+    let mut defs: HashMap<Value, (usize, usize)> = HashMap::new();
+    for (b, block) in p.blocks.iter().enumerate() {
+        for (i, inst) in block.insts.iter().enumerate() {
+            for &(_, v) in &inst.writes {
+                defs.insert(v, (b, i));
+            }
+        }
+    }
+    let dwords: u8 = if p.wave64 { 2 } else { 1 };
+    let entry: Vec<Option<Value>> = (0..dwords)
+        .map(|k| {
+            p.inputs
+                .iter()
+                .find(|i| i.0 == Reg::S(EXEC + k))
+                .map(|i| i.1)
+        })
+        .collect();
+    struct Exec<'a> {
+        p: &'a Program,
+        defs: HashMap<Value, (usize, usize)>,
+        entry: Vec<Option<Value>>,
+        full_exec: bool,
+    }
+    impl Exec<'_> {
+        /// Dword `k` of EXEC as value `v`, through copies and (full) the
+        /// operations that keep every lane; `depth` bounds the search.
+        fn canon(&self, mut v: Value, k: u8, depth: usize) -> Value {
+            for _ in 0..64 {
+                let Some(&(b, i)) = self.defs.get(&v) else {
+                    return v;
+                };
+                let inst = &self.p.blocks[b].insts[i];
+                let w = inst
+                    .writes
+                    .iter()
+                    .position(|w| w.1 == v)
+                    .expect("its write");
+                let operand = |n: usize| match &inst.fields {
+                    Fields::Sop { src, .. } => match src.get(n) {
+                        Some(&Operand::Scalar { code, .. }) => inst.read(Reg::S(code + k)),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                let entry = |x: Option<Value>| {
+                    depth > 0
+                        && x.is_some_and(|x| {
+                            Some(self.canon(x, k, depth - 1)) == self.entry[k as usize]
+                        })
+                };
+                let saveexec = matches!(inst.name(), "s_and_saveexec_b32" | "s_and_saveexec_b64");
+                let next = match inst.name() {
+                    "s_mov_b32" | "s_mov_b64" => match copy_source(inst, w) {
+                        Some(Moved::Value(s)) => Some(s),
+                        _ => None,
+                    },
+                    // Every lane's quad: every lane.
+                    "s_wqm_b32" | "s_wqm_b64" if self.full_exec && entry(operand(0)) => operand(0),
+                    // The saved copy: EXEC as it was.
+                    _ if saveexec && inst.writes[w].0 != Reg::S(EXEC + k) => {
+                        inst.read(Reg::S(EXEC + k))
+                    }
+                    // EXEC AND all lanes.
+                    _ if saveexec && self.full_exec => {
+                        let (old, src) = (inst.read(Reg::S(EXEC + k)), operand(0));
+                        if entry(src) {
+                            old
+                        } else if entry(old) {
+                            src
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                };
+                match next {
+                    Some(n) => v = n,
+                    None => return v,
+                }
+            }
+            v
+        }
+    }
+    let e = Exec {
+        p,
+        defs,
+        entry,
+        full_exec,
+    };
+    let entry = &e.entry;
+    let canon = |v: Value, k: u8| e.canon(v, k, 4);
+    let tested = |b: usize| -> Option<Vec<Value>> {
+        let block = &p.blocks[b];
+        let last = block.insts.last()?;
+        if last.name() != "s_cbranch_execz" {
+            return None;
+        }
+        (0..dwords)
+            .map(|k| last.read(Reg::S(EXEC + k)).map(|v| canon(v, k)))
+            .collect()
+    };
+    let mut out = std::collections::HashSet::new();
+    for (b, block) in p.blocks.iter().enumerate() {
+        let Exit::Branch { taken, not_taken } = block.exit else {
+            continue;
+        };
+        if taken == not_taken {
+            continue;
+        }
+        let Some(exec) = tested(b) else {
+            continue;
+        };
+        let mut known = exec.iter().map(|&v| Some(v)).eq(entry.iter().copied());
+        let mut cur = b;
+        for _ in 0..64 {
+            if known {
+                break;
+            }
+            let [q] = p.blocks[cur].preds[..] else {
+                break;
+            };
+            if let Exit::Branch { taken, not_taken } = p.blocks[q].exit
+                && not_taken == cur
+                && taken != cur
+                && tested(q).is_some_and(|e| e == exec)
+            {
+                known = true;
+            }
+            cur = q;
+        }
+        if known {
+            out.insert((b, taken));
+        }
+    }
+    out
+}
+
 /// What dword `k` of a move's result copies.
 fn copy_source(inst: &Inst, k: usize) -> Option<Moved> {
     let Fields::Sop { src, imm, .. } = &inst.fields else {
@@ -5738,7 +5928,15 @@ pub(crate) mod tests {
         let l = lanes(&p);
         // Not as every other program is traced: the else arm's dwords are
         // computed, not a descriptor.
-        let err = track_with(&p, &layout, HwStage::Cs, l.as_ref(), false, None).unwrap_err();
+        let err = track_with(
+            &p,
+            &layout,
+            HwStage::Cs,
+            l.as_ref(),
+            false,
+            Entry::default(),
+        )
+        .unwrap_err();
         assert!(
             matches!(
                 err,
@@ -5977,6 +6175,107 @@ pub(crate) mod tests {
         );
     }
 
+    /// One user SGPR initialized, waves not known to start full.
+    fn left_over_entry() -> Entry {
+        Entry {
+            initialized_sgprs: Some(1),
+            full_exec: false,
+        }
+    }
+
+    /// A wave32 program that saves EXEC, takes its quads (`s_wqm`), keeps
+    /// lanes below 8 (skipping to the end when none), then ANDs EXEC with
+    /// the saved entry EXEC (`and_entry`; else with lanes below 4) and skips
+    /// the load of a buffer descriptor (table at s4) when that is empty; the
+    /// descriptor is used after the join.
+    fn execz_join_words(and_entry: bool) -> Vec<u32> {
+        vec![
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xBE9A_037E, // s_mov_b32 s26, exec_lo
+            0xBEFE_097E, // s_wqm_b32 exec_lo, exec_lo
+            0x7D88_0088, // v_cmp_gt_u32 vcc_lo, 8, v0
+            0xBE80_3C6A, // s_and_saveexec_b32 s0, vcc_lo
+            0xBF88_0008, // s_cbranch_execz +8 (the end)
+            if and_entry {
+                0xBE86_3C1A // s_and_saveexec_b32 s6, s26
+            } else {
+                0x7D88_0084 // v_cmp_gt_u32 vcc_lo, 4, v0 (then s6 = vcc)
+            },
+            0xBF88_0003, // s_cbranch_execz +3 (the join)
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], null
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0xBEFE_0306, // s_mov_b32 exec_lo, s6 (the join)
+            0xE030_2000,
+            0x8002_0100, // buffer_load_dword v1, v0, s[8:11], 0 idxen
+            S_ENDPGM,
+        ]
+    }
+
+    fn track_execz(words: &[u32], full_exec: bool) -> Result<Resources, ShaderError> {
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let entry = Entry {
+            initialized_sgprs: Some(5),
+            full_exec,
+        };
+        track_initialized(
+            &p,
+            &[param(Table, 4, 1)],
+            HwStage::Cs,
+            lanes(&p).as_ref(),
+            entry,
+        )
+    }
+
+    /// The `s_cbranch_execz` around the load tests EXEC AND the entry EXEC,
+    /// which in waves that start with every lane is the EXEC an earlier
+    /// `s_cbranch_execz` found not empty: it never branches, so after the
+    /// join the descriptor is the loaded one.
+    #[test]
+    fn an_execz_branch_on_an_exec_known_not_empty_joins_nothing() {
+        let words = execz_join_words(true);
+        let r = track_execz(&words, true).unwrap();
+        let buffer = r
+            .descriptors
+            .iter()
+            .find(|d| d.role == Role::Resource)
+            .unwrap();
+        assert!(
+            matches!(buffer.source, Source::Loaded { .. }),
+            "{:?}",
+            buffer.source
+        );
+        // Waves that may start with some lanes only: the AND may empty EXEC.
+        let err = track_execz(&words, false).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ShaderError::Unsupported {
+                    what: "a descriptor neither loaded nor built",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+        // EXEC ANDed with lanes below 4 may be empty.
+        let mut other = execz_join_words(false);
+        // s_and_saveexec_b32 s6, vcc_lo after that compare.
+        other.insert(7, 0xBE86_3C6A);
+        other[5] = 0xBF88_0009; // the end, one further
+        let err = track_execz(&other, true).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ShaderError::Unsupported {
+                    what: "a descriptor neither loaded nor built",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
     /// A scalar load whose high half is zeroed on one arm of a branch and,
     /// on the other, an SGPR above the ones the hardware initializes that
     /// the program has not written yet: what the last wave left, which the
@@ -6009,7 +6308,7 @@ pub(crate) mod tests {
             "{err:?}"
         );
         // One user SGPR is all it sets.
-        let r = track_initialized(&p, &layout, HwStage::Cs, l.as_ref(), Some(1)).unwrap();
+        let r = track_initialized(&p, &layout, HwStage::Cs, l.as_ref(), left_over_entry()).unwrap();
         assert_eq!(r.scalar.len(), 1);
         assert_eq!(r.scalar[0].1, at(0, 0));
         // The other arm sets s9 to the table's address (s0, which the
@@ -6019,7 +6318,8 @@ pub(crate) mod tests {
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let p = crate::ir::build(&code, false, 256).unwrap();
         let l = lanes(&p);
-        let err = track_initialized(&p, &layout, HwStage::Cs, l.as_ref(), Some(1)).unwrap_err();
+        let err =
+            track_initialized(&p, &layout, HwStage::Cs, l.as_ref(), left_over_entry()).unwrap_err();
         assert!(
             matches!(
                 err,

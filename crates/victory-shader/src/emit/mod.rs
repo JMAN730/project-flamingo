@@ -1249,7 +1249,7 @@ fn translate_stages(
         &native.layout,
         native.stage,
         st.as_ref().ok(),
-        native.initialized_sgprs(),
+        resource::Entry::of(native),
     )?;
     let io = io::raise(&p, native)?;
     let st = st?;
@@ -1433,7 +1433,7 @@ fn emit_threaded(
         &native.layout,
         native.stage,
         Some(&st),
-        native.initialized_sgprs(),
+        resource::Entry::of(native),
     )?;
     emit_program(
         Emission {
