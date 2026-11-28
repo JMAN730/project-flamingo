@@ -242,6 +242,10 @@ thread_local! {
     /// Wave32 console-flow lowering for the program being translated on this
     /// thread ([`with_wave_wide`]), when `VICTORY_WAVE_WIDE` is unset.
     static WIDE_HERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// A `VICTORY_WAVE_WIDE_ONLY` list standing in for the process's on this
+    /// thread ([`with_wave_wide_only`]).
+    static ONLY_HERE: std::cell::RefCell<Option<Vec<String>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 fn parse_wave_wide_only(value: Option<&str>) -> Vec<String> {
@@ -281,10 +285,27 @@ fn wave_wide_only_list() -> &'static [String] {
     })
 }
 
+/// The `VICTORY_WAVE_WIDE_ONLY` list in force on this thread: the one
+/// [`with_wave_wide_only`] set, else the process's.
+fn with_only_list<T>(f: impl FnOnce(&[String]) -> T) -> T {
+    ONLY_HERE.with_borrow(|here| f(here.as_deref().unwrap_or(wave_wide_only_list())))
+}
+
 /// Whether `VICTORY_WAVE_WIDE_ONLY=<hash prefix>,...` names the container whose
 /// 16-hex-digit BLAKE3 prefix is `hash`.
 pub fn wave_wide_only(hash: &str) -> bool {
-    matches_wave_wide_only(hash, wave_wide_only_list())
+    with_only_list(|only| matches_wave_wide_only(hash, only))
+}
+
+/// Runs `f` on this thread as if `VICTORY_WAVE_WIDE_ONLY` held `value`
+/// (`None`: as if unset). The variable is read once per process, so this is
+/// how a test of a caller (`victory translate`) chooses the lowering by
+/// container hash. The disk cache key ([`wave_wide_cache_key`]) follows it.
+pub fn with_wave_wide_only<T>(value: Option<&str>, f: impl FnOnce() -> T) -> T {
+    let before = ONLY_HERE.replace(Some(parse_wave_wide_only(value)));
+    let r = f();
+    ONLY_HERE.set(before);
+    r
 }
 
 /// Runs `f` (a translation on this thread) with Wave32 console-flow lowering
@@ -306,10 +327,12 @@ pub fn wave_wide_cache_key() -> Vec<u8> {
         _ => 0u8,
     };
     out.push(mode);
-    for prefix in wave_wide_only_list() {
-        out.extend_from_slice(prefix.as_bytes());
-        out.push(b',');
-    }
+    with_only_list(|only| {
+        for prefix in only {
+            out.extend_from_slice(prefix.as_bytes());
+            out.push(b',');
+        }
+    });
     out
 }
 
@@ -345,13 +368,15 @@ fn console_flow_for_hash(hash: &str) -> bool {
     if let Some(value) = TEST_CONSOLE_FLOW.get() {
         return value;
     }
-    wide_lowering_enabled(
-        hash,
-        wave_wide_env(),
-        wave64_console_flow(),
-        wave_wide_only_list(),
-        WIDE_HERE.get(),
-    )
+    with_only_list(|only| {
+        wide_lowering_enabled(
+            hash,
+            wave_wide_env(),
+            wave64_console_flow(),
+            only,
+            WIDE_HERE.get(),
+        )
+    })
 }
 
 /// The clean-up passes that run over a translated module before it is
