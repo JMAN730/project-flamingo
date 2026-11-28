@@ -268,14 +268,135 @@ static HOST_WRITTEN: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::ne
 
 /// A host copy or resolve writes `resource`.
 pub(crate) fn host_written(resource: This) {
-    {
+    let first = {
         let mut set = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
         set.get_or_insert_with(Default::default)
-            .insert(resource as usize);
+            .insert(resource as usize)
+    };
+    if first && cpu_refresh().is_some() {
+        let print = title_print(resource);
+        WRITTEN_OVER
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_or_insert_with(Default::default)
+            .insert(resource as usize, print);
     }
     // The host mip chain is complete; drop any CPU-streamed resident window
     // so narrowed SRVs remake to the title's full range (#616).
     note_resident(resource, None);
+}
+
+/// `VICTORY_TEXTURE_CPU_REFRESH`: whether a texture the host GPU wrote is
+/// checked for later CPU writes to its title memory, and if so whether one
+/// found is uploaded over the GPU's contents (`1`) or only logged (`0`).
+/// Unset: neither, as before.
+fn cpu_refresh() -> Option<bool> {
+    static ON: OnceLock<Option<bool>> = OnceLock::new();
+    *ON.get_or_init(
+        || match std::env::var("VICTORY_TEXTURE_CPU_REFRESH").as_deref() {
+            Ok("1") => Some(true),
+            Ok("0") => Some(false),
+            _ => None,
+        },
+    )
+}
+
+/// Title memory fingerprints of host-written textures as they were when the
+/// host GPU first wrote them ([`title_print`]), with
+/// `VICTORY_TEXTURE_CPU_REFRESH` set.
+static WRITTEN_OVER: Mutex<Option<HashMap<usize, Option<u64>>>> = Mutex::new(None);
+
+/// A sampled fingerprint of `resource`'s title memory ([`fingerprint_raw`]);
+/// `None` if it cannot be read.
+// shortcut: sampled windows, so a CPU write outside them is not seen.
+fn title_print(resource: This) -> Option<u64> {
+    let (memory, desc) = crate::resource::texture_memory(resource)?;
+    let size = crate::resource::texture_layout(&desc)?.planes[0]
+        .layout
+        .size;
+    fingerprint_raw(memory as u64, size, &[])
+}
+
+/// What an upload of a texture the host GPU wrote does with
+/// `VICTORY_TEXTURE_CPU_REFRESH` (`upload` true: `1`): title memory's
+/// fingerprint when the GPU wrote it, `then`, against `now`.
+#[derive(Debug, PartialEq, Eq)]
+enum AfterGpu {
+    /// Title memory as it was (or unreadable): the GPU's contents stay.
+    Unchanged,
+    /// The CPU wrote it since: uploaded over the GPU's contents.
+    Reupload,
+    /// The CPU wrote it since, but only logging was asked for.
+    KeptGpu,
+}
+
+fn after_gpu(then: Option<u64>, now: Option<u64>, upload: bool) -> AfterGpu {
+    match (then, now) {
+        (Some(then), Some(now)) if then != now => {
+            if upload {
+                AfterGpu::Reupload
+            } else {
+                AfterGpu::KeptGpu
+            }
+        }
+        _ => AfterGpu::Unchanged,
+    }
+}
+
+/// With `VICTORY_TEXTURE_CPU_REFRESH`: whether the host-written `resource`
+/// is to be uploaded from title memory again because the CPU wrote it after
+/// the GPU did (then it is no longer host-written), logging each texture
+/// once for either outcome.
+fn cpu_wrote_after_gpu(resource: This) -> bool {
+    let Some(upload) = cpu_refresh() else {
+        return false;
+    };
+    let then = WRITTEN_OVER
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .and_then(|m| m.get(&(resource as usize)).copied())
+        .flatten();
+    let verdict = after_gpu(then, then.and_then(|_| title_print(resource)), upload);
+    static LOGGED: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
+    let once = |what: &str| {
+        let new = LOGGED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_or_insert_with(Default::default)
+            .insert(resource as usize);
+        if new {
+            tracing::debug!(
+                resource = format_args!("{:#x}", resource as usize),
+                "texture written by the GPU, then by the CPU: {what}"
+            );
+        }
+    };
+    match verdict {
+        AfterGpu::Unchanged => false,
+        AfterGpu::KeptGpu => {
+            once("kept GPU copy");
+            false
+        }
+        AfterGpu::Reupload => {
+            once("re-uploaded");
+            if let Some(set) = HOST_WRITTEN
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_mut()
+            {
+                set.remove(&(resource as usize));
+            }
+            if let Some(m) = WRITTEN_OVER
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_mut()
+            {
+                m.remove(&(resource as usize));
+            }
+            true
+        }
+    }
 }
 
 /// Whether the host GPU wrote `resource` (copy/resolve), so its contents are
@@ -563,6 +684,13 @@ pub(crate) fn forget(resource: usize) {
             set.remove(&resource);
         }
     }
+    if let Some(m) = WRITTEN_OVER
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_mut()
+    {
+        m.remove(&resource);
+    }
     note_resident(resource as This, None);
     crate::descriptor::host::clear_short_read(resource);
     for s in &stagings {
@@ -576,6 +704,90 @@ pub(crate) fn forget(resource: usize) {
     if let Some(through) = through.as_mut() {
         through.remove(&resource);
     }
+}
+
+/// `VICTORY_TEXTURE_RT_UPLOAD=1`: render-target and UAV-capable textures
+/// also take their contents from title memory until the host GPU first
+/// writes them ([`reads_title_memory`]).
+pub(crate) fn rt_upload() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_RT_UPLOAD").is_some_and(|v| v == "1"))
+}
+
+/// The host GPU renders to, clears or writes `resource` (a render target or
+/// depth target bound, a clear): with `VICTORY_TEXTURE_RT_UPLOAD=1` its
+/// contents are the GPU's from then on, as for copies ([`host_written`]).
+pub(crate) fn gpu_target(resource: This) {
+    if rt_upload() && !is_host_written(resource) {
+        host_written(resource);
+    }
+}
+
+/// Where a read of a host texture takes its contents from.
+#[derive(Debug, PartialEq, Eq)]
+enum Source {
+    /// Title memory: uploaded when read.
+    Title,
+    /// The host GPU's: not uploaded.
+    Host,
+    /// A depth texture not written on the host yet: title memory, but
+    /// uploads into depth textures are not made.
+    DepthSkipped,
+}
+
+/// [`Source`] of a texture with host `flags`: `host_written` if the host
+/// GPU wrote it, `rt_upload` for `VICTORY_TEXTURE_RT_UPLOAD=1`.
+fn source(flags: i32, host_written: bool, rt_upload: bool) -> Source {
+    const RENDER_TARGET: i32 = 0x1;
+    const DEPTH_STENCIL: i32 = 0x2;
+    const UNORDERED: i32 = 0x4;
+    if flags & (RENDER_TARGET | DEPTH_STENCIL | UNORDERED) == 0 {
+        Source::Title
+    } else if !rt_upload || host_written {
+        Source::Host
+    } else if flags & DEPTH_STENCIL != 0 {
+        // shortcut: a copy into a depth texture must cover whole
+        // subresources and some depth formats take none from an upload
+        // buffer; such a texture keeps what the host has.
+        Source::DepthSkipped
+    } else {
+        Source::Title
+    }
+}
+
+/// Whether a read of `resource` (host copy `texture`) uploads it from title
+/// memory: one the host GPU does not render to or write ([`title_written`]),
+/// or with `VICTORY_TEXTURE_RT_UPLOAD=1` a render-target or UAV texture the
+/// host GPU has not written yet, logged once per texture.
+pub(crate) fn reads_title_memory(resource: This, texture: &ID3D12Resource) -> bool {
+    if title_written(texture) {
+        return true;
+    }
+    if !rt_upload() {
+        return false;
+    }
+    // SAFETY: a live resource.
+    let flags = unsafe { texture.GetDesc() }.Flags.0;
+    let found = source(flags, is_host_written(resource), true);
+    static LOGGED: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
+    if found != Source::Host
+        && LOGGED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_or_insert_with(Default::default)
+            .insert(resource as usize)
+    {
+        let what = if found == Source::Title {
+            "uploaded from title memory"
+        } else {
+            "a depth texture, not uploaded"
+        };
+        tracing::debug!(
+            resource = format_args!("{:#x}", resource as usize),
+            "render-target or UAV texture read before any GPU write: {what}"
+        );
+    }
+    found == Source::Title
 }
 
 /// Whether `resource`'s host copy takes its contents from title memory:
@@ -812,8 +1024,9 @@ pub(crate) fn upload_from(list: &HostList, resource: This, texture: &ID3D12Resou
         .as_ref()
         .is_some_and(|set| set.contains(&(resource as usize)));
     // shortcut: a texture the host copied into keeps the host's contents
-    // even if the title later writes its memory too.
-    if host_written {
+    // even if the title later writes its memory too, unless
+    // `VICTORY_TEXTURE_CPU_REFRESH=1` finds that it did.
+    if host_written && !cpu_wrote_after_gpu(resource) {
         crate::descriptor::host::clear_short_read(resource as usize);
         return;
     }
@@ -1650,6 +1863,35 @@ pub(crate) fn fingerprint_raw(at: u64, len: u64, mips: &[(u64, u64)]) -> Option<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Textures the host renders to or writes take title memory only with
+    /// `VICTORY_TEXTURE_RT_UPLOAD=1` and only until the host GPU writes
+    /// them; depth textures never; plain textures always.
+    #[test]
+    fn render_targets_take_title_memory_until_the_gpu_writes_them() {
+        let (rt, depth, uav) = (0x1, 0x2, 0x4);
+        assert_eq!(source(0, false, false), Source::Title);
+        assert_eq!(source(0, true, true), Source::Title);
+        for flags in [rt, uav, rt | uav] {
+            assert_eq!(source(flags, false, false), Source::Host);
+            assert_eq!(source(flags, false, true), Source::Title);
+            assert_eq!(source(flags, true, true), Source::Host);
+        }
+        assert_eq!(source(depth, false, true), Source::DepthSkipped);
+        assert_eq!(source(depth, true, true), Source::Host);
+    }
+
+    /// A texture the GPU wrote is uploaded again only when its title memory
+    /// changed since, and only with uploading asked for; one whose memory
+    /// could not be read either time keeps the GPU's contents.
+    #[test]
+    fn a_cpu_write_after_the_gpus_is_uploaded_only_when_asked() {
+        assert_eq!(after_gpu(Some(3), Some(5), true), AfterGpu::Reupload);
+        assert_eq!(after_gpu(Some(3), Some(5), false), AfterGpu::KeptGpu);
+        assert_eq!(after_gpu(Some(3), Some(3), true), AfterGpu::Unchanged);
+        assert_eq!(after_gpu(None, Some(5), true), AfterGpu::Unchanged);
+        assert_eq!(after_gpu(Some(3), None, true), AfterGpu::Unchanged);
+    }
 
     /// With top levels dropped, a placed view from title mip `n` uploads
     /// from the host mip its host view starts at, `n - dropped` (none below

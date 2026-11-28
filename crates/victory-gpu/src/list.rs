@@ -762,7 +762,7 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
                 crate::resource::dropped_mips(dst),
                 crate::resource::dropped_mips(src),
             );
-            if crate::texture::title_written(from) {
+            if crate::texture::reads_title_memory(src, from) {
                 crate::texture::upload(&list, src, from);
             }
             // A depth texture shaders also write: what they wrote, first.
@@ -1081,7 +1081,7 @@ extern "system" fn copy_texture_region(
             let Some(texture) = crate::resource::host_resource(src.resource) else {
                 return;
             };
-            if crate::texture::title_written(texture) {
+            if crate::texture::reads_title_memory(src.resource, texture) {
                 crate::texture::upload(&list, src.resource, texture);
             }
             list.twin_use(src.resource, false, false);
@@ -1401,6 +1401,7 @@ extern "system" fn clear_rtv(
         else {
             return;
         };
+        crate::texture::gpu_target(record.resource);
         let (Some(texture), Some(host)) = (
             crate::resource::host_resource(record.resource),
             crate::host::host(),
@@ -1459,6 +1460,7 @@ extern "system" fn clear_dsv(
         else {
             return;
         };
+        crate::texture::gpu_target(record.resource);
         let (Some(texture), Some(host)) = (
             crate::resource::host_resource(record.resource),
             crate::host::host(),
