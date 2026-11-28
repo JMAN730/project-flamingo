@@ -1763,6 +1763,51 @@ mod tests {
         assert!(registered_as(&heaps, key, id).is_none());
     }
 
+    /// The heap `release_dynamic_of` found stays the registered heap for as
+    /// long as its registry read lasts: a release of the heap waits for the
+    /// read to end, so no heap can take its address between the id check
+    /// and the slot release.
+    #[cfg(windows)]
+    #[test]
+    fn a_heap_is_not_unregistered_while_a_slot_release_reads_it() {
+        let desc = HeapDesc {
+            kind: 0,
+            count: 8,
+            flags: 1,
+            nodes: 1,
+        };
+        let none = Placement {
+            address: 0,
+            size: 0,
+        };
+        let mut made = std::ptr::null();
+        assert_eq!(create(desc, none, &mut made), S_OK);
+        let key = made as usize;
+        let id = heap(made).id;
+        let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+        assert!(registered_as(&heaps, key, id).is_some());
+        let released = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let releasing = {
+            let released = released.clone();
+            std::thread::spawn(move || {
+                let made = key as This;
+                let left = slot::<extern "system" fn(This) -> u32>(made, 0x10)(made);
+                released.store(true, std::sync::atomic::Ordering::SeqCst);
+                left
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(
+            !released.load(std::sync::atomic::Ordering::SeqCst),
+            "the release waited for the read"
+        );
+        assert!(registered_as(&heaps, key, id).is_some());
+        drop(heaps);
+        assert_eq!(releasing.join().expect("release thread"), 0);
+        let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+        assert!(registered_as(&heaps, key, id).is_none());
+    }
+
     /// `heap_bind_id` tracks live shader-visible heaps by creation id, not
     /// address, so a recycled pointer cannot match a remembered bind.
     #[cfg(windows)]
