@@ -243,7 +243,6 @@ fn start(root: &Path, args: Start) -> Result<()> {
         settings,
         env,
         title_args,
-        started,
     };
     let outcome = launch(root, &args.shared.lock, run, &config, &mut held);
     if let Err(e) = lock::release(&args.shared.lock, &run_id) {
@@ -262,7 +261,6 @@ struct Run {
     settings: Settings,
     env: BTreeMap<String, String>,
     title_args: Vec<String>,
-    started: SystemTime,
 }
 
 /// Copies the exe and starts the title, waits for it, and writes the
@@ -280,7 +278,6 @@ fn launch(
         settings,
         env,
         title_args,
-        started,
     } = run;
     // The name of the copy is what `stop` and the lock recognize the
     // process by.
@@ -325,6 +322,9 @@ fn launch(
     let mut child = command
         .spawn()
         .with_context(|| format!("starting {}", copy.display()))?;
+    // The run is timed from here: `held.started` (the run id's time) is
+    // from before the build and the copy.
+    let title_started = SystemTime::now();
 
     held.pid = Some(child.id());
     held.image = Some(image);
@@ -344,6 +344,7 @@ fn launch(
         capture_dir,
         pid: held.pid,
         started: held.started.clone(),
+        title_started: Some(manifest::rfc3339(title_started)),
         end: None,
     };
     // From here on the title runs: whatever fails, wait for it and say how
@@ -415,7 +416,13 @@ fn launch(
             eprintln!("crashes.log was not collected: {e:#}");
             Vec::new()
         });
-    let end = End::new(started, SystemTime::now(), exit_code, ended_by, crashes);
+    let end = End::new(
+        title_started,
+        SystemTime::now(),
+        exit_code,
+        ended_by,
+        crashes,
+    );
     println!(
         "run {} ended after {} s ({:?}), exit code {}",
         held.run_id,
