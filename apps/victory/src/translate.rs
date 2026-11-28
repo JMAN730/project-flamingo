@@ -651,7 +651,13 @@ fn tally_selected(
             // failure is listed after the resources' and I/O's.
             let structured = structure::structure(&program);
             let lanes = structured.as_ref().ok();
-            let res = match resource::track(&program, &p.layout, p.stage, lanes) {
+            let res = match resource::track_initialized(
+                &program,
+                &p.layout,
+                p.stage,
+                lanes,
+                p.initialized_sgprs(),
+            ) {
                 Ok(r) => {
                     tally_resources(p, &r, t);
                     Some(r)

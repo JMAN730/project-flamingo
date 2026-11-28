@@ -208,6 +208,16 @@ impl NativeProgram {
                 .iter()
                 .all(|r| self.stage.user_sgpr(r.user_data) >= 2)
     }
+
+    /// SGPRs the hardware initializes, for a compute or pixel program
+    /// ([`ComputeIo::initialized_sgprs`], [`PsRsrc2::initialized_sgprs`]).
+    pub fn initialized_sgprs(&self) -> Option<u8> {
+        match &self.io {
+            StageIo::Cs(cs) => Some(cs.initialized_sgprs()),
+            StageIo::Ps { rsrc2, .. } => Some(rsrc2.initialized_sgprs()),
+            _ => None,
+        }
+    }
 }
 
 /// What a semantic is, as the stage data names it.
