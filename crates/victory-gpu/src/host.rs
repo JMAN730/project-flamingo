@@ -1642,6 +1642,10 @@ struct Deferred {
     /// Bottom-of-pipe writes, done once the list has run: address, what,
     /// bytes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
+    /// Fills traced by `VICTORY_TRACE_CBV` (diagnostics): stage hash,
+    /// scratch CPU address, title address, bytes, scratch GPU address.
+    #[cfg(feature = "diagnostics")]
+    traced_fills: Vec<(&'static str, usize, usize, usize, u64)>,
     /// Things the list's commands use that are given back when the last
     /// holder lets go ([`HostList::hold`]), by address.
     held: std::collections::HashMap<usize, std::sync::Arc<dyn std::any::Any + Send + Sync>>,
@@ -2426,6 +2430,30 @@ pub(crate) static BUDGET_SPENT: std::sync::atomic::AtomicU64 = std::sync::atomic
 pub(super) fn read_backs(list: &HostList) -> bool {
     list.note_budget_spent();
     let deferred = list.deferred();
+    #[cfg(feature = "diagnostics")]
+    for &(hash, scratch, title, len, gpu) in &deferred.traced_fills {
+        let n = len.min(crate::cbv_trace::COMPARED);
+        let mut filled = [0u8; crate::cbv_trace::COMPARED];
+        let mut now = [0u8; crate::cbv_trace::COMPARED];
+        // SAFETY: the list's own scratch upload memory, mapped until reset.
+        unsafe { std::ptr::copy_nonoverlapping(scratch as *const u8, filled.as_mut_ptr(), n) };
+        let readable =
+            crate::shadow::copy_mapped_wide_checked(now.as_mut_ptr(), title as *const u8, n);
+        let title_now = if readable {
+            crate::cbv_trace::hex(&now[..n])
+        } else {
+            "unreadable".to_owned()
+        };
+        tracing::info!(
+            hash,
+            address = format_args!("{title:#x}"),
+            len,
+            scratch = format_args!("{gpu:#x}"),
+            filled = %crate::cbv_trace::hex(&filled[..n]),
+            title_now = %title_now,
+            "cbv trace: after the list ran, the fill's first bytes and title memory's"
+        );
+    }
     let mut ok = true;
     for rb in &deferred.readbacks {
         let combined = rb.query.as_ref().map(|resolve| {
@@ -3841,11 +3869,27 @@ impl HostList {
     pub(crate) fn fill_scratch(&self, src: *const u8, len: u64) -> Option<u64> {
         let key = (src as usize, len as usize);
         if let Some(&gpu) = self.deferred().filled.get(&key) {
+            #[cfg(feature = "diagnostics")]
+            if let Some(hash) = crate::cbv_trace::on() {
+                tracing::info!(
+                    hash,
+                    address = format_args!("{:#x}", src as usize),
+                    len,
+                    scratch = format_args!("{gpu:#x}"),
+                    "cbv trace: reuses a fill of the same title range from earlier in the list"
+                );
+            }
             return Some(gpu);
         }
         let (gpu, to) = self.scratch(len)?;
         self.defer_fill(to, src, len as usize);
         self.deferred().filled.insert(key, gpu);
+        #[cfg(feature = "diagnostics")]
+        if let Some(hash) = crate::cbv_trace::on() {
+            self.deferred()
+                .traced_fills
+                .push((hash, to as usize, src as usize, len as usize, gpu));
+        }
         Some(gpu)
     }
 

@@ -1384,6 +1384,8 @@ impl State {
     ) -> bool {
         let l = &list.list;
         let t = stage.translated();
+        #[cfg(feature = "diagnostics")]
+        let _cbv_trace = crate::cbv_trace::enter(&stage.shader.hash);
         self.table_failed = false;
         self.bindless_buffers(list, &t.host, from_compute);
         let aliases = self.raw_structured_aliases(&t.host, from_compute);
@@ -3142,6 +3144,19 @@ impl State {
                             break;
                         };
                         host.constant_at(index, gpu, size);
+                        #[cfg(feature = "diagnostics")]
+                        if let Some(hash) = crate::cbv_trace::on() {
+                            tracing::info!(
+                                hash,
+                                slot,
+                                entry = k,
+                                address = format_args!("{address:#x}"),
+                                size,
+                                scratch = format_args!("{gpu:#x}"),
+                                host_index = index,
+                                "cbv trace: fresh table constant view filled from title memory"
+                            );
+                        }
                     }
                     Some(view) => {
                         let aliased = table_aliases.iter().any(|alias| {
