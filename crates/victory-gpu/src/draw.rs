@@ -2611,6 +2611,9 @@ impl State {
             self.targets.iter().map(|t| format!("{t:#x}")).collect()
         };
         let writes: Vec<String> = writes.iter().map(|t| format!("{t:#x}")).collect();
+        if ran {
+            self.dump_reads(compute);
+        }
         let outcome = if ran {
             "ran".to_owned()
         } else {
@@ -3268,6 +3271,87 @@ impl State {
             }
         }
         out
+    }
+
+    /// In frames listed for capture, with `VICTORY_DUMP_READS=<hash>,...`
+    /// (diagnostics builds): for an op whose bound pipeline has one of those
+    /// stage hashes, the title memory behind every buffer and constant view
+    /// its tables give it, as the op is replayed, saved to the capture folder
+    /// as `frame-<n>-<hash>-<k>-s<slot>+<offset>-<address>.bin` (`k` counts
+    /// that program's ops in the frame; at most 4 MiB a view).
+    #[cfg(feature = "diagnostics")]
+    fn dump_reads(&self, compute: bool) {
+        static HASHES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+        static SEEN: std::sync::Mutex<(u64, Vec<(String, u32)>)> =
+            std::sync::Mutex::new((0, Vec::new()));
+        let hashes = HASHES.get_or_init(|| {
+            std::env::var("VICTORY_DUMP_READS")
+                .unwrap_or_default()
+                .split(',')
+                .map(|h| h.trim().to_owned())
+                .filter(|h| !h.is_empty())
+                .collect()
+        });
+        let frame = crate::queue::presented() + 1;
+        if hashes.is_empty() || !crate::capture::listed(frame) {
+            return;
+        }
+        let Some(folder) = crate::capture::folder() else {
+            return;
+        };
+        let Some(p) = self.bound_pipeline(compute) else {
+            return;
+        };
+        for stage in &p.stages {
+            let hash = format!("{}", stage.shader.hash);
+            if !hashes.contains(&hash) {
+                continue;
+            }
+            let k = {
+                let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+                if seen.0 != frame {
+                    *seen = (frame, Vec::new());
+                }
+                let k = seen.1.iter().filter(|(h, _)| *h == hash).count() as u32;
+                seen.1.push((hash.clone(), k));
+                k
+            };
+            let t = stage.translated();
+            for u in &t.used {
+                let (RootType::Table, Some(Root::Table(table))) =
+                    (u.root, self.roots_ref(compute).get(usize::from(u.slot)))
+                else {
+                    continue;
+                };
+                let handle = table + u64::from(u.table_offset_dwords) * 4;
+                let Some(view) = crate::descriptor::view(handle) else {
+                    continue;
+                };
+                let range = match &view {
+                    View::Constant(address, size) => Some((*address, u64::from(*size))),
+                    v => crate::descriptor::host::buffer_range(v),
+                };
+                let Some((address, len)) = range else {
+                    continue;
+                };
+                let mut bytes = vec![0u8; len.min(4 << 20) as usize];
+                if !crate::host::read_into(address as *const u8, &mut bytes) {
+                    tracing::warn!(
+                        address = format_args!("{address:#x}"),
+                        len,
+                        "dump: unreadable"
+                    );
+                    continue;
+                }
+                let name = format!(
+                    "frame-{frame}-{hash}-{k}-s{}+{}-{address:x}.bin",
+                    u.slot, u.table_offset_dwords
+                );
+                if let Err(e) = std::fs::write(folder.join(&name), &bytes) {
+                    tracing::warn!(%name, "dump not written: {e}");
+                }
+            }
+        }
     }
 
     pub(crate) fn draw(
