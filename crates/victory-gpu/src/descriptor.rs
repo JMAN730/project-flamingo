@@ -402,9 +402,21 @@ fn registered_as(heaps: &[(u64, u64, usize)], key: usize, id: u64) -> Option<&He
 /// them.
 #[cfg(windows)]
 pub(crate) fn release_dynamic_of(key: usize, id: u64, first: u32, n: u32) {
+    with_registered(key, id, |heap| {
+        if let Some(Some(host)) = heap.host.get() {
+            host.release(first, n);
+        }
+    });
+}
+
+/// Runs `f` on the title heap at `key` if it is the heap with creation id
+/// `id`, under the registry read that found it: the heap cannot be
+/// unregistered (nor another made at its address) until `f` returns.
+#[cfg(windows)]
+fn with_registered(key: usize, id: u64, f: impl FnOnce(&Heap)) {
     let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
-    if let Some(Some(host)) = registered_as(&heaps, key, id).and_then(|heap| heap.host.get()) {
-        host.release(first, n);
+    if let Some(heap) = registered_as(&heaps, key, id) {
+        f(heap);
     }
 }
 
@@ -1763,10 +1775,10 @@ mod tests {
         assert!(registered_as(&heaps, key, id).is_none());
     }
 
-    /// The heap `release_dynamic_of` found stays the registered heap for as
-    /// long as its registry read lasts: a release of the heap waits for the
-    /// read to end, so no heap can take its address between the id check
-    /// and the slot release.
+    /// The slot release path (`release_dynamic_of`) runs while its registry
+    /// read is held: unregistering a heap, which takes the registry's write
+    /// lock, cannot happen until it returns. Once the heap is released the
+    /// same path finds nothing to release into.
     #[cfg(windows)]
     #[test]
     fn a_heap_is_not_unregistered_while_a_slot_release_reads_it() {
@@ -1784,28 +1796,23 @@ mod tests {
         assert_eq!(create(desc, none, &mut made), S_OK);
         let key = made as usize;
         let id = heap(made).id;
-        let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
-        assert!(registered_as(&heaps, key, id).is_some());
-        let released = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let releasing = {
-            let released = released.clone();
-            std::thread::spawn(move || {
-                let made = key as This;
-                let left = slot::<extern "system" fn(This) -> u32>(made, 0x10)(made);
-                released.store(true, std::sync::atomic::Ordering::SeqCst);
-                left
-            })
-        };
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        assert!(
-            !released.load(std::sync::atomic::Ordering::SeqCst),
-            "the release waited for the read"
-        );
-        assert!(registered_as(&heaps, key, id).is_some());
-        drop(heaps);
-        assert_eq!(releasing.join().expect("release thread"), 0);
-        let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
-        assert!(registered_as(&heaps, key, id).is_none());
+        let mut ran = false;
+        with_registered(key, id, |found| {
+            ran = true;
+            assert_eq!(std::ptr::from_ref(found) as usize, key);
+            assert_eq!(found.id, id);
+            assert!(
+                matches!(
+                    SHADER_HEAPS.try_write(),
+                    Err(std::sync::TryLockError::WouldBlock)
+                ),
+                "no heap can be unregistered during the release"
+            );
+        });
+        assert!(ran);
+        with_registered(key, id + 1, |_| panic!("another id is another heap"));
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(made, 0x10)(made), 0);
+        with_registered(key, id, |_| panic!("a released heap gets no slot"));
     }
 
     /// `heap_bind_id` tracks live shader-visible heaps by creation id, not
