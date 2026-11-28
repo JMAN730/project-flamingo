@@ -22,6 +22,8 @@
 mod adapter;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod cbv_trace;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;

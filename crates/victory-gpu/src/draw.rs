@@ -833,6 +833,7 @@ impl State {
                 }
                 PendingRtv::Live(texture, record) => {
                     self.targets.push(record.resource as usize);
+                    crate::texture::gpu_target(record.resource);
                     #[cfg(feature = "diagnostics")]
                     crate::capture::note_target(record.resource);
                     self.bound_rtvs.push(BoundRtv {
@@ -845,6 +846,7 @@ impl State {
         self.depth = None;
         self.bound_dsv = None;
         if let Some((texture, record)) = dsv {
+            crate::texture::gpu_target(record.resource);
             let desc = record.depth_desc();
             self.depth = Some(DepthTarget {
                 resource: record.resource as usize,
@@ -1384,6 +1386,8 @@ impl State {
     ) -> bool {
         let l = &list.list;
         let t = stage.translated();
+        #[cfg(feature = "diagnostics")]
+        let _cbv_trace = crate::cbv_trace::enter(&stage.shader.hash);
         self.table_failed = false;
         self.bindless_buffers(list, &t.host, from_compute);
         let aliases = self.raw_structured_aliases(&t.host, from_compute);
@@ -1949,11 +1953,16 @@ impl State {
                 };
                 (len >= 4).then_some((s, offset, len))
             } else {
+                // shortcut: a raw view starts on 16 bytes and this binding
+                // has no bias word for the shader. A null view would read 0
+                // and drop the stores, half running the shader over what it
+                // builds (allocators, bounds); dropping the draw leaves that
+                // memory as it was.
                 once!(
                     address = format_args!("{a:#x}"),
-                    "an unaligned raw root view is bound as null"
+                    "an unaligned raw root view: the draw is dropped (a null view would read 0 and drop its stores)"
                 );
-                None
+                return false;
             }
         } else {
             None
@@ -2162,7 +2171,7 @@ impl State {
                     continue;
                 }
                 if let Some(t) = crate::resource::host_resource(held.get()) {
-                    if crate::texture::title_written(t) {
+                    if crate::texture::reads_title_memory(held.get(), t) {
                         crate::texture::PICKING.set(Some(u64::MAX));
                         crate::texture::upload_from(list, held.get(), t, *first);
                         crate::texture::PICKING.set(None);
@@ -3142,6 +3151,19 @@ impl State {
                             break;
                         };
                         host.constant_at(index, gpu, size);
+                        #[cfg(feature = "diagnostics")]
+                        if let Some(hash) = crate::cbv_trace::on() {
+                            tracing::info!(
+                                hash,
+                                slot,
+                                entry = k,
+                                address = format_args!("{address:#x}"),
+                                size,
+                                scratch = format_args!("{gpu:#x}"),
+                                host_index = index,
+                                "cbv trace: fresh table constant view filled from title memory"
+                            );
+                        }
                     }
                     Some(view) => {
                         let aliased = table_aliases.iter().any(|alias| {
@@ -4239,6 +4261,20 @@ fn depth_state(texture: &ID3D12Resource, desc: Option<&D3D12_DEPTH_STENCIL_VIEW_
 /// Gets what a shader reads or writes through a view ready: buffer data
 /// copied, textures moved to the state they need. Returns whether the view
 /// also reads the draw's bound depth target.
+/// The title memory a buffer or constant view reads, brought up to date in
+/// its host copy for a draw or dispatch ([`readable`]). A constant view at a
+/// title slot (not one a fresh table gives scratch memory to) is made on
+/// that host copy, so it is refreshed like a buffer view; without this its
+/// host copy kept whatever an earlier refresh left (zeros for one nothing
+/// else reads).
+fn read_range(view: &View) -> Option<(u64, u64)> {
+    match *view {
+        View::Constant(0, _) => None,
+        View::Constant(address, size) => Some((address, u64::from(size))),
+        _ => crate::descriptor::host::buffer_range(view),
+    }
+}
+
 fn readable(
     list: &HostList,
     u: &UsedResource,
@@ -4251,7 +4287,7 @@ fn readable(
     let view = placed.as_ref().unwrap_or(view);
     // Buffer views read title memory: their range is copied at submission;
     // what shaders write through unordered access goes back to it after.
-    if let Some((address, len)) = crate::descriptor::host::buffer_range(view)
+    if let Some((address, len)) = read_range(view)
         && len > 0
         && let Some(shadow) = crate::shadow::find(address, len)
     {
@@ -4280,7 +4316,7 @@ fn readable(
                 .is_some_and(|source| crate::texture::alias(list, *resource as This, source));
             if !aliased
                 && let Some(t) = crate::resource::host_resource(*resource as This)
-                && crate::texture::title_written(t)
+                && crate::texture::reads_title_memory(*resource as This, t)
             {
                 crate::texture::upload_from(list, *resource as This, t, first_mip);
             }
@@ -4423,6 +4459,18 @@ fn rect_source(first: u32, count: u32, stride: u32, size: u32) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::{expanded_vertices, rect_source};
+
+    /// A constant view read through a title slot names the title memory it
+    /// reads, so its host copy is brought up to date; a null one names none.
+    #[test]
+    fn constant_views_name_the_memory_they_read() {
+        use crate::descriptor::View;
+        assert_eq!(
+            super::read_range(&View::Constant(0x9_74df_0200, 832)),
+            Some((0x9_74df_0200, 832))
+        );
+        assert_eq!(super::read_range(&View::Constant(0, 256)), None);
+    }
 
     /// The pattern a run may have hit: an indirect mesh dispatch of many
     /// records on a host without mesh shaders, the records past the count

@@ -4517,6 +4517,16 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 BufferLocation: gpu,
                 SizeInBytes: size.next_multiple_of(256),
             };
+            #[cfg(feature = "diagnostics")]
+            if let Some(hash) = crate::cbv_trace::on() {
+                tracing::info!(
+                    hash,
+                    address = format_args!("{address:#x}"),
+                    size,
+                    host_copy = format_args!("{gpu:#x}"),
+                    "cbv trace: constant view made at a title slot, on the buffer's host copy"
+                );
+            }
             // SAFETY: a slot of our heap; the range lies in the host copy.
             unsafe { device.CreateConstantBufferView(Some(&desc), at) };
             super::check::note(at, super::check::Kind::cbv(false));
