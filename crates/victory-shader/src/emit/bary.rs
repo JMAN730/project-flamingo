@@ -263,7 +263,26 @@ fn build(
             // still all clip or cull: this stage is the last before the
             // rasterizer, so it passes every component the vertex shader
             // wrote (the pixel input reads its subset of the same row).
+            // The widened output takes the vertex shader's whole component
+            // range, start column included, so the pixel input's columns
+            // must lie inside it and no other output may share those columns.
             if matches!(o.kind, 6 | 7) && outputs[k].cols < o.cols {
+                let (start, end) = (o.col, o.col + o.cols);
+                let read = (outputs[k].col, outputs[k].col + outputs[k].cols);
+                let row = outputs[k].row;
+                let overlaps = outputs.iter().enumerate().any(|(j, e)| {
+                    j != k
+                        && e.row.is_some()
+                        && e.row == row
+                        && e.col < end
+                        && start < e.col + e.cols
+                });
+                if read.0 < start || read.1 > end || overlaps {
+                    return Err(unsupported(
+                        "a barycentric fallback whose clip or cull distances do not line up with the vertex shader's",
+                    ));
+                }
+                outputs[k].col = o.col;
                 outputs[k].cols = o.cols;
                 outputs[k].usage = (1 << o.cols) - 1;
                 sources[k] = (0..o.cols).map(|col| Source::Own { id, col }).collect();
@@ -482,6 +501,39 @@ mod tests {
         let clip = outs.iter().find(|o| o.kind == 6).unwrap();
         assert_eq!(clip.cols, 4);
         assert_eq!(clip.row, Some(8));
+    }
+
+    /// A pixel input reading the last two of four clip distances (columns
+    /// 2 and 3) widens to the vertex shader's columns 0 to 3, not 2 to 5.
+    #[test]
+    fn widened_clip_distances_start_at_the_vertex_shader_s_column() {
+        let mut vs = vs_outputs();
+        vs.push(element("SV_ClipDistance", 0, 6, 9, 2, 4));
+        let mut ps = ps_inputs();
+        ps.push(SigElement {
+            col: 2,
+            ..element("SV_ClipDistance", 0, 6, 9, 8, 2)
+        });
+        let gs = build(vs, &ps).unwrap();
+        let c = Container::parse(&gs).unwrap();
+        let outs = super::super::signature(c.part(FourCC::OSG1).unwrap().data).unwrap();
+        let clip = outs.iter().find(|o| o.kind == 6).unwrap();
+        assert_eq!((clip.col, clip.cols), (0, 4));
+        assert_eq!(clip.row, Some(8));
+    }
+
+    /// Clip distances the pixel shader reads outside the vertex shader's
+    /// columns cannot widen to them: refused, not given a wrong extent.
+    #[test]
+    fn clip_distances_that_do_not_line_up_are_refused() {
+        let mut vs = vs_outputs();
+        vs.push(SigElement {
+            col: 1,
+            ..element("SV_ClipDistance", 0, 6, 9, 2, 3)
+        });
+        let mut ps = ps_inputs();
+        ps.push(element("SV_ClipDistance", 0, 6, 9, 8, 2));
+        assert!(build(vs, &ps).is_err());
     }
 
     /// Refused with a reason: a copy of something the vertex shader does
