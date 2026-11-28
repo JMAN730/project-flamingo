@@ -5784,6 +5784,7 @@ pub(crate) fn aligned(address: u64, len: u64) -> Option<Arc<Shadow>> {
         }
         copies.insert(key, Arc::downgrade(&copy));
     }
+    keep_aligned(&copy);
     tracing::debug!(
         address = format_args!("{address:#x}"),
         len,
@@ -5794,11 +5795,51 @@ pub(crate) fn aligned(address: u64, len: u64) -> Option<Arc<Shadow>> {
 
 /// The copy `aligned` made for this range, if one is still alive.
 pub(crate) fn aligned_existing(address: u64, len: u64) -> Option<Arc<Shadow>> {
-    ALIGNED
+    let copy = ALIGNED
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .get(&(address, len))
-        .and_then(std::sync::Weak::upgrade)
+        .and_then(std::sync::Weak::upgrade)?;
+    keep_aligned(&copy);
+    Some(copy)
+}
+
+/// The most [`aligned`] copies kept alive past the slots that made them,
+/// and the most bytes they may hold together.
+const ALIGNED_KEPT: usize = 256;
+const ALIGNED_KEPT_BYTES: u64 = 256 << 20;
+
+/// The [`aligned`] copies used last, oldest first. A view made for one draw
+/// lives in a slot that is given back after the draw; without these the
+/// next draw of the same view would allocate its copy, and copy the view's
+/// bytes, all over again.
+static ALIGNED_RECENT: Mutex<std::collections::VecDeque<Arc<Shadow>>> =
+    Mutex::new(std::collections::VecDeque::new());
+
+/// Notes `copy` as the [`aligned`] copy used last, and lets go of the ones
+/// used longest ago beyond [`ALIGNED_KEPT`] copies or
+/// [`ALIGNED_KEPT_BYTES`] (a single larger copy is still kept while it is
+/// the last one used).
+fn keep_aligned(copy: &Arc<Shadow>) {
+    let mut gone = Vec::new();
+    {
+        let mut recent = ALIGNED_RECENT.lock().unwrap_or_else(|e| e.into_inner());
+        if recent.back().is_some_and(|last| Arc::ptr_eq(last, copy)) {
+            return;
+        }
+        if let Some(at) = recent.iter().position(|kept| Arc::ptr_eq(kept, copy)) {
+            recent.remove(at);
+        }
+        recent.push_back(copy.clone());
+        let mut bytes: u64 = recent.iter().map(|kept| kept.len).sum();
+        while recent.len() > 1 && (recent.len() > ALIGNED_KEPT || bytes > ALIGNED_KEPT_BYTES) {
+            let Some(old) = recent.pop_front() else { break };
+            bytes -= old.len;
+            gone.push(old);
+        }
+    }
+    // Dropped outside the lock: the last reference frees a host buffer.
+    drop(gone);
 }
 
 /// How many bytes of `[address, address + len)` lie inside the copy that
