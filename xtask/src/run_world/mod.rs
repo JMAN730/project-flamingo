@@ -106,9 +106,14 @@ struct Start {
     /// drops the profile's.
     #[arg(long)]
     keys: Option<String>,
-    /// End the run after this many seconds.
+    /// End the run after this many seconds (default 2700, so that no run
+    /// holds the card for good; 0: no limit).
     #[arg(long)]
     max_seconds: Option<u64>,
+    /// Where the run's copy of the exe and its D3D12 folder go, in a
+    /// folder per run. Default: victory-data\runs in your user folder.
+    #[arg(long)]
+    bin_dir: Option<PathBuf>,
     /// Print what would run and stop: no lock, no build, no title.
     #[arg(long)]
     dry_run: bool,
@@ -162,9 +167,15 @@ fn start(root: &Path, args: Start) -> Result<()> {
     let run_id = manifest::run_id(started, &args.session);
     let run_dir = args.shared.runs_dir.join(&run_id);
     let capture_dir = (settings.build == Build::Diag).then(|| run_dir.join("frames"));
+    let bin_dir = match &args.bin_dir {
+        Some(dir) => dir.clone(),
+        None => default_bin_dir(&args.shared.runs_dir),
+    }
+    .join(&run_id);
     for path in [
         Some(&args.shared.lock),
         Some(&run_dir),
+        Some(&bin_dir),
         capture_dir.as_ref(),
     ]
     .into_iter()
@@ -183,6 +194,11 @@ fn start(root: &Path, args: Start) -> Result<()> {
     ];
     if args.dry_run {
         println!("run {run_id} would start in {}", run_dir.display());
+        println!("  exe copied to {}", bin_dir.display());
+        match settings.max_seconds {
+            Some(max) => println!("  ended after {max} s"),
+            None => println!("  no time limit"),
+        }
         println!(
             "  victory.exe ({}) {}",
             settings.build.name(),
@@ -223,6 +239,7 @@ fn start(root: &Path, args: Start) -> Result<()> {
     lock::acquire(&args.shared.lock, &held, &System)?;
     let run = Run {
         exe,
+        bin_dir,
         settings,
         env,
         title_args,
@@ -240,6 +257,8 @@ fn start(root: &Path, args: Start) -> Result<()> {
 /// What `launch` starts.
 struct Run {
     exe: PathBuf,
+    /// The run's own folder for the copy of the exe.
+    bin_dir: PathBuf,
     settings: Settings,
     env: BTreeMap<String, String>,
     title_args: Vec<String>,
@@ -257,17 +276,16 @@ fn launch(
 ) -> Result<Option<i64>> {
     let Run {
         exe,
+        bin_dir,
         settings,
         env,
         title_args,
         started,
     } = run;
-    let beside = exe.parent().context("the exe has a folder")?;
-    // The copy stays beside the D3D12 folder and its symbols; its name is
-    // what `stop` and the lock recognize the process by.
+    // The name of the copy is what `stop` and the lock recognize the
+    // process by.
     let image = format!("victory-{}.exe", held.run_id);
-    let copy = beside.join(&image);
-    std::fs::copy(&exe, &copy).with_context(|| format!("copying to {}", copy.display()))?;
+    let copy = copy_with_agility(&exe, &bin_dir, &image)?;
 
     let run_dir = held.manifest.parent().expect("set by start").to_path_buf();
     let log = run_dir.join("victory.log");
@@ -332,9 +350,28 @@ fn launch(
 
     let clock = Instant::now();
     let mut ended_by = EndedBy::Title;
+    let mut adapter_checked = false;
     let status = loop {
         if let Some(status) = child.try_wait().context("waiting for the title")? {
             break status;
+        }
+        if !adapter_checked {
+            match adapter_verdict(&head_of(&log)) {
+                None => {}
+                Some(Ok(())) => adapter_checked = true,
+                Some(Err(lacks)) => {
+                    adapter_checked = true;
+                    eprintln!(
+                        "WRONG D3D12: the adapter lacks {lacks}. The title did not load the \
+                         Agility SDK beside {} and got the system's D3D12 instead; the run \
+                         is worthless and is ended. Put the exe folder (--bin-dir) where \
+                         only your user can write.",
+                        copy.display()
+                    );
+                    ended_by = EndedBy::SystemD3d12;
+                    child.kill().context("ending the title")?;
+                }
+            }
         }
         if ended_by == EndedBy::Title
             && settings
@@ -376,10 +413,98 @@ fn launch(
     }
     manifest.end = Some(end);
     manifest.write(&run_dir)?;
-    if let Err(e) = std::fs::remove_file(&copy) {
-        eprintln!("{} was not removed: {e}", copy.display());
+    // Only what this run put there: the folder is named after the run.
+    if let Err(e) = std::fs::remove_dir_all(&bin_dir) {
+        eprintln!("{} was not removed: {e}", bin_dir.display());
+    }
+    if ended_by == EndedBy::SystemD3d12 {
+        bail!("the title ran on the system's D3D12, not the Agility SDK");
     }
     Ok(exit_code)
+}
+
+/// Where exe copies go unless told otherwise: under the user's own folder.
+/// A folder that other users may write to (as `C:\victory-data` is) makes
+/// Windows ignore the `D3D12` folder beside the exe and load the system's
+/// D3D12, which is too old for the title. Without a user folder, `runs_dir`.
+fn default_bin_dir(runs_dir: &Path) -> PathBuf {
+    match std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")) {
+        Some(home) if !home.is_empty() => PathBuf::from(home).join("victory-data").join("runs"),
+        _ => runs_dir.to_path_buf(),
+    }
+}
+
+/// Copies `exe` to `bin_dir` as `image`, with the `D3D12` folder beside it
+/// (the Agility SDK the exe loads from its own folder). Returns the copy.
+fn copy_with_agility(exe: &Path, bin_dir: &Path, image: &str) -> Result<PathBuf> {
+    ensure_outside_repo(bin_dir)?;
+    let from = exe.parent().context("the exe has a folder")?.join("D3D12");
+    let to = bin_dir.join("D3D12");
+    std::fs::create_dir_all(&to).with_context(|| format!("making {}", to.display()))?;
+    let copy = bin_dir.join(image);
+    std::fs::copy(exe, &copy).with_context(|| format!("copying to {}", copy.display()))?;
+    for entry in std::fs::read_dir(&from).with_context(|| format!("reading {}", from.display()))? {
+        let path = entry?.path();
+        if path.is_file() {
+            let name = path.file_name().expect("a listed file has a name");
+            std::fs::copy(&path, to.join(name))
+                .with_context(|| format!("copying {}", path.display()))?;
+        }
+    }
+    Ok(copy)
+}
+
+/// The start of the title's output, where the adapter is reported.
+fn head_of(log: &Path) -> String {
+    use std::io::Read;
+    let mut head = Vec::new();
+    if let Ok(file) = std::fs::File::open(log) {
+        // Enough for everything up to the device; the log grows to megabytes.
+        let _ = file.take(256 * 1024).read_to_end(&mut head);
+    }
+    String::from_utf8_lossy(&head).into_owned()
+}
+
+/// What the title's output so far says about the D3D12 it got: nothing
+/// yet (`None`), fine, or the capabilities the chosen adapter lacks when
+/// shader model 6.6 is among them. Every D3D12 the Agility SDK brings has
+/// shader model 6.6; the one in Windows 10 does not, so lacking it means
+/// the SDK beside the exe was not loaded.
+fn adapter_verdict(output: &str) -> Option<Result<(), String>> {
+    for line in output.lines() {
+        let line = without_colours(line);
+        if let Some((_, rest)) = line.split_once("lacks=") {
+            // `lacks=<what the chosen one lacks> adapters=<every adapter>`.
+            let lacks = rest.split(" adapters=").next().unwrap_or(rest).trim();
+            if lacks.contains("shader model 6.6") {
+                return Some(Err(lacks.to_string()));
+            }
+        }
+        if line.contains("host D3D12 device ready") {
+            return Some(Ok(()));
+        }
+    }
+    None
+}
+
+/// `line` without terminal colour sequences (the log colours field names,
+/// which splits `lacks=` in two).
+fn without_colours(line: &str) -> String {
+    let mut plain = String::with_capacity(line.len());
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            // ESC [ ... up to the letter that ends the sequence.
+            for end in chars.by_ref() {
+                if end.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            plain.push(c);
+        }
+    }
+    plain
 }
 
 /// The title's executable: `name` inside `game_dir`, or the only `.exe`
@@ -704,6 +829,64 @@ mod tests {
         let nothing = "INFO: No tasks are running which match the specified criteria.\r\n";
         assert_eq!(tasklist_image(nothing, 4242), None);
         assert_eq!(tasklist_image("", 4242), None);
+    }
+
+    #[test]
+    fn an_adapter_without_shader_model_6_6_means_the_system_d3d12() {
+        let warn = "WARN victory_gpu::host: no adapter has everything the title needs; \
+                    using the one that runs most adapter=Some GPU ";
+        let ready = "INFO victory_gpu::host: host D3D12 device ready adapter=Some GPU\n";
+        assert_eq!(adapter_verdict("starting\n"), None);
+        assert_eq!(adapter_verdict(ready), Some(Ok(())));
+        // Mesh shaders alone are missing on the card itself: fine.
+        let ours = format!("{warn}lacks=mesh shaders adapters=Some GPU (lacks mesh shaders)\n");
+        assert_eq!(adapter_verdict(&ours), None);
+        assert_eq!(adapter_verdict(&format!("{ours}{ready}")), Some(Ok(())));
+        // Another adapter lacking it does not matter, the chosen one does.
+        let other = format!(
+            "{warn}lacks=mesh shaders adapters=Some GPU (lacks mesh shaders), \
+             Basic (lacks shader model 6.6)\n{ready}"
+        );
+        assert_eq!(adapter_verdict(&other), Some(Ok(())));
+        let system = format!(
+            "{warn}\u{1b}[3mlacks\u{1b}[0m\u{1b}[2m=\u{1b}[0mshader model 6.6, mesh shaders \
+             \u{1b}[3madapters\u{1b}[0m\u{1b}[2m=\u{1b}[0mSome GPU\n{ready}"
+        );
+        assert_eq!(
+            adapter_verdict(&system),
+            Some(Err("shader model 6.6, mesh shaders".into()))
+        );
+    }
+
+    #[test]
+    fn the_exe_is_copied_with_the_agility_folder_beside_it() {
+        let built = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        let exe = built.path().join("victory.exe");
+        std::fs::write(&exe, "exe").unwrap();
+        std::fs::create_dir(built.path().join("D3D12")).unwrap();
+        std::fs::write(built.path().join("D3D12").join("D3D12Core.dll"), "core").unwrap();
+        let run = bin.path().join("run-1");
+        let copy = copy_with_agility(&exe, &run, "victory-run-1.exe").unwrap();
+        assert_eq!(copy, run.join("victory-run-1.exe"));
+        assert_eq!(std::fs::read_to_string(&copy).unwrap(), "exe");
+        assert_eq!(
+            std::fs::read_to_string(run.join("D3D12").join("D3D12Core.dll")).unwrap(),
+            "core"
+        );
+        let inside = Path::new(env!("CARGO_MANIFEST_DIR")).join("bin");
+        assert!(copy_with_agility(&exe, &inside, "victory-x.exe").is_err());
+        assert!(!inside.exists());
+    }
+
+    #[test]
+    fn exe_copies_default_to_the_users_own_folder() {
+        let dir = default_bin_dir(Path::new("runs"));
+        if let Some(home) = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")) {
+            assert_eq!(dir, Path::new(&home).join("victory-data").join("runs"));
+        } else {
+            assert_eq!(dir, Path::new("runs"));
+        }
     }
 
     #[test]

@@ -352,10 +352,22 @@ A run:
    the launcher and the title. While those processes run, another
    `run-world` refuses to start and says who holds the card. A lock whose
    processes are gone is stale and is cleared;
-3. copies the exe to `victory-<run id>.exe` beside the original and starts the
-   title from `game_dir` of `victory.toml` (`--config <file>` names another
-   config; `--title-exe <name>` when the folder has several executables);
-4. waits for the title, then writes how it ended and gives the card back.
+3. copies the exe as `victory-<run id>.exe`, with its `D3D12` folder, to a
+   folder of its own under `victory-data\runs` in your user folder
+   (`--bin-dir`), and starts the title from `game_dir` of `victory.toml`
+   (`--config <file>` names another config; `--title-exe <name>` when the
+   folder has several executables);
+4. reads the adapter line of the title's output. If the adapter lacks shader
+   model 6.6, the title got the system's D3D12 instead of the Agility SDK:
+   the run is ended at once and the command fails;
+5. waits for the title, then writes how it ended and gives the card back. A
+   run is ended after 45 minutes unless `--max-seconds` says otherwise
+   (`0`: no limit), so a forgotten run does not hold the card.
+
+The exe copy goes to the user folder because of where Windows looks for the
+Agility SDK: run from a folder other users may write to (`C:\victory-data`
+was one), the exe did not load the `D3D12` folder beside it and ran on the
+system's D3D12, without shader model 6.6, and the title crashed a minute in.
 
 Everything a run writes goes to `C:\victory-data\runs\<run id>\` (`--runs-dir`),
 which must be outside the repository like every other output folder:

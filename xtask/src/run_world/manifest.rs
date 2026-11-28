@@ -67,6 +67,9 @@ pub enum EndedBy {
     MaxSeconds,
     /// The launcher was gone when `stop` cleaned up; no exit code.
     LauncherGone,
+    /// The launcher ended it: the title got the system's D3D12 instead of
+    /// the Agility SDK beside the exe, so nothing it drew counts.
+    SystemD3d12,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

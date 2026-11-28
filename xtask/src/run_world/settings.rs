@@ -42,6 +42,11 @@ const OWNED: &[&str] = &[
     "VICTORY_KEYS_FILE",
 ];
 
+/// How long a run may hold the card unless told otherwise: longer than the
+/// 30 minutes a run has to survive, short enough that a forgotten run gives
+/// the card back.
+pub const DEFAULT_MAX_SECONDS: u64 = 45 * 60;
+
 /// The most frames a range may list: each one is read back from the GPU.
 const MOST_FRAMES: u64 = 4096;
 
@@ -184,7 +189,7 @@ pub struct Settings {
     pub capture_seconds: Option<SecondsSpan>,
     /// `VICTORY_KEYS`: `<second>:<key>,...`.
     pub keys: Option<String>,
-    /// The run is ended after this many seconds.
+    /// The run is ended after this many seconds; `None`: never.
     pub max_seconds: Option<u64>,
 }
 
@@ -234,7 +239,14 @@ impl Settings {
             capture_frames: frames.as_deref().map(FrameRange::parse).transpose()?,
             capture_seconds: seconds.as_deref().map(SecondsSpan::parse).transpose()?,
             keys,
-            max_seconds: flags.max_seconds.or(profile.max_seconds),
+            // 0 asks for no limit.
+            max_seconds: Some(
+                flags
+                    .max_seconds
+                    .or(profile.max_seconds)
+                    .unwrap_or(DEFAULT_MAX_SECONDS),
+            )
+            .filter(|&max| max > 0),
         };
         ensure!(
             ["series-s", "series-x"].contains(&settings.console.as_str()),
@@ -299,6 +311,27 @@ mod tests {
         assert_eq!(s.env["VICTORY_TIME_SCALE"], "auto");
         assert_eq!(s.env["VICTORY_WAVE64_SPLIT"], "1");
         assert_eq!(s.keys, None);
+        assert_eq!(s.max_seconds, Some(2700));
+    }
+
+    #[test]
+    fn a_run_has_no_time_limit_only_when_zero_is_asked() {
+        let zero = Overrides {
+            max_seconds: Some(0),
+            ..Overrides::default()
+        };
+        assert_eq!(
+            resolved("max_seconds = 600", zero).unwrap().max_seconds,
+            None
+        );
+        let from_profile = resolved("max_seconds = 600", Overrides::default()).unwrap();
+        assert_eq!(from_profile.max_seconds, Some(600));
+        assert_eq!(
+            resolved("max_seconds = 0", Overrides::default())
+                .unwrap()
+                .max_seconds,
+            None
+        );
     }
 
     #[test]
