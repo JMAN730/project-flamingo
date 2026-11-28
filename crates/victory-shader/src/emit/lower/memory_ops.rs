@@ -1558,7 +1558,9 @@ impl Lower<'_> {
                     }
                     // Only the view knows the stride: read it from the host's
                     // table (see `UserData`).
-                    Err(why) if !uav => self.table_load(src, index, off, mask).map_err(|_| why)?,
+                    Err(why) if !uav => self
+                        .table_load(src, index, off, mask, count)
+                        .map_err(|_| why)?,
                     Err(why) => return Err(why),
                 },
                 (None, _) => {
