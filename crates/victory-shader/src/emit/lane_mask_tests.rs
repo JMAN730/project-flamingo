@@ -483,3 +483,38 @@ fn the_lane_the_code_cannot_follow_is_refused() {
     .expect("lowered");
     assert!(e.to_string().contains("s_getpc_b64"), "{e}");
 }
+
+/// A waterfall loop over the lanes' values (`v_readfirstlane`,
+/// `v_cmpx_eq`, `s_andn2_wrexec_b32`, `s_cbranch_execnz` back) leaves SCC
+/// clear: the loop ends when no lane is left. After it EXEC is restored and
+/// `s_cselect_b32 s4, exec_lo, 0` reads that SCC, so s4 is 0 and a select
+/// on it takes its first operand (5) in every lane.
+fn scc_after_a_waterfall() -> Vec<u32> {
+    program(&[
+        0x2C04_0083,                  // v_lshrrev_b32 v2, 3, v0: one value per 8 lanes
+        v_mov_b32(3, 0x87),           // v3 = 7
+        s_mov_b32(3, EXEC_LO),        // s3 = EXEC
+        s_mov_b32(6, EXEC_LO),        // s6: the lanes left
+        0x7E0E_0502,                  // loop: v_readfirstlane_b32 s7, v2
+        0x7DA4_0407,                  // v_cmpx_eq_u32 exec_lo, s7, v2
+        sop1(0x47, 6, 6),             // s_andn2_wrexec_b32 s6, s6: SCC = some lane left
+        0xBF89_FFFC,                  // s_cbranch_execnz loop
+        s_mov_b32(EXEC_LO, 3),        // every lane again
+        sop2(0x0A, 4, EXEC_LO, 0x80), // s_cselect_b32 s4, exec_lo, 0
+        s_mov_b32(VCC_LO, 4),
+        0x0202_0685, // v_cndmask_b32 v1, 5, v3, vcc_lo
+    ])
+}
+
+/// The SCC an EXEC write leaves, read past the branch that tested that EXEC,
+/// is what the branch's edge says: it lowers (and validates).
+#[test]
+fn the_scc_a_waterfall_loop_leaves_is_read_after_it() {
+    build(&scc_after_a_waterfall());
+}
+
+/// The same, run: every lane takes the select's first operand.
+#[test]
+fn the_scc_a_waterfall_loop_leaves_is_clear_after_it_on_hardware() {
+    check(&build(&scc_after_a_waterfall()), &[5; LANES]);
+}

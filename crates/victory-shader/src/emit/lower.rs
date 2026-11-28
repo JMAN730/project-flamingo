@@ -21,6 +21,7 @@ use crate::native::{HwStage, NativeProgram, ResourceType, RootType, StageIo, Usa
 use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source};
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
+mod exec_edge;
 mod memory_ops;
 mod split;
 mod table;
@@ -2375,6 +2376,14 @@ impl<'a> Lower<'a> {
                         .s
                         .op(at, "waveAnyTrue", Attr::NoUnwind, i1, 113, &[bit]);
                     return Ok(Val::Bit(any));
+                }
+                // SCC of an EXEC write, read past a branch that tested it.
+                if w == LANE_MASK
+                    && let Some(k) = self.exec_edge_scc(v)
+                {
+                    let val = Val::Bit(self.s.m.bool(k));
+                    self.vals.insert(v, val);
+                    return Ok(val);
                 }
                 if w == BARYCENTRICS_READ && self.leftovers {
                     // A barycentric none of whose bits reach anything (the
