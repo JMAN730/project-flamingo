@@ -441,6 +441,21 @@ fn mip_count(desc: &ResourceDesc) -> u32 {
 /// Most mip levels the host gives up on a texture it cannot allocate.
 const MAX_MIP_DROP: u32 = 3;
 
+/// What may take top mip levels from a host texture.
+#[cfg_attr(not(windows), allow(dead_code))]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum MipDrop {
+    /// Nothing: a texture the title placed in its own memory, which may
+    /// show a target that keeps every level.
+    None,
+    /// `VICTORY_TEXTURE_MIP_DROP` alone: such a texture when the switch
+    /// asks (its levels are then paired by size where it shows a target).
+    Forced,
+    /// The switch, the levels memory pressure has already cost, and more
+    /// if the host refuses the texture for lack of memory.
+    Pressure,
+}
+
 /// The mip levels every later host texture gives up, raised by each
 /// allocation the host refuses with `E_OUTOFMEMORY`. A process that has
 /// run out of memory for one texture will for the next (the failures
@@ -1185,8 +1200,13 @@ impl Resource {
                 // for: the title's streamed textures are placed ones, and
                 // most of what a card short of video memory has to shed.
                 // (`crate::texture`'s alias copy pairs levels by size.)
-                let mip_drop =
-                    !placed_views().contains(&(this as usize)) || forced_mip_drop(&self.desc) > 0;
+                let mip_drop = if !placed_views().contains(&(this as usize)) {
+                    MipDrop::Pressure
+                } else if forced_mip_drop(&self.desc) > 0 {
+                    MipDrop::Forced
+                } else {
+                    MipDrop::None
+                };
                 let (texture, state, dropped) = host_texture(&self.desc, state, clear, mip_drop)?;
                 Some(std::sync::Arc::new(HostTexture {
                     texture,
@@ -1597,14 +1617,14 @@ pub(crate) fn title_texture(
 /// A host texture like the title's: same description, in GPU memory,
 /// without the console's layout and flags, the state it was made in
 /// (what the transitions that follow start from), and how many top mip
-/// levels it lost to host memory pressure. `mip_drop` is false for placed
-/// views that may alias a full-mip render target or UAV.
+/// levels it lost, to host memory pressure or `VICTORY_TEXTURE_MIP_DROP`,
+/// as `mip_drop` allows.
 #[cfg(windows)]
 fn host_texture(
     desc: &ResourceDesc,
     state: u32,
     clear: *const c_void,
-    mip_drop: bool,
+    mip_drop: MipDrop,
 ) -> Option<(
     windows::Win32::Graphics::Direct3D12::ID3D12Resource,
     u32,
@@ -1748,17 +1768,26 @@ fn host_texture(
             continue;
         }
         tried.push((flags, initial, try_clear));
-        let result = if mip_drop {
-            create_texture_with_auto_mip_drop(&trial, |attempt| {
+        let result = match mip_drop {
+            MipDrop::Pressure => create_texture_with_auto_mip_drop(&trial, |attempt| {
                 let mut made = None;
                 create_one(attempt, initial, try_clear, &mut made)
                     .map(|()| made)
                     .map_err(|e| e.code().0)
             })
-            .map_err(|code| windows::core::Error::from(windows::core::HRESULT(code)))
-        } else {
-            let mut made = None;
-            create_one(&trial, initial, try_clear, &mut made).map(|()| (made, trial, 0u32))
+            .map_err(|code| windows::core::Error::from(windows::core::HRESULT(code))),
+            MipDrop::Forced | MipDrop::None => {
+                // Exactly the levels the switch asks for, whatever the
+                // pressure, and no more if the host is out of memory.
+                let lost = if mip_drop == MipDrop::Forced {
+                    droppable_mips(&trial, forced_mip_drop(&trial).min(MAX_MIP_DROP))
+                } else {
+                    0
+                };
+                let attempt = without_top_mips(&trial, lost);
+                let mut made = None;
+                create_one(&attempt, initial, try_clear, &mut made).map(|()| (made, attempt, lost))
+            }
         };
         match result {
             Ok((made, attempt, lost)) => {
