@@ -2306,12 +2306,18 @@ impl Shadow {
         let sub_n = gpu.len();
         title.clear();
         title.resize(sub_n, 0);
+        // `start` can be another view of the title's memory (a surviving
+        // alias), which is where the bytes are read and written; the merge
+        // goes by the address this copy knows the piece under, which is
+        // what its refresh history is kept by (views share page offsets, so
+        // dwords line up the same).
+        let known_at = self.start as usize + sub_at;
         if via_own {
             if !crate::inplace::read_own_blocking(start + sub_at, title) {
                 return None;
             }
             let old_backup = old.to_vec();
-            if self.merge_piece(start + sub_at, gpu, old, title) {
+            if self.merge_piece(known_at, gpu, old, title) {
                 crate::host::shaders_write(start + sub_at, &title[..]);
                 let Some(shown) = crate::inplace::write_own_blocking(start + sub_at, &title[..])
                 else {
@@ -2325,7 +2331,7 @@ impl Shadow {
         }
         if crate::host::read_into_raw((start + sub_at) as *const u8, title) {
             let mut merged_old = old.to_vec();
-            if self.merge_piece(start + sub_at, gpu, &mut merged_old, title) {
+            if self.merge_piece(known_at, gpu, &mut merged_old, title) {
                 crate::host::shaders_write(start + sub_at, &title[..]);
                 if self.put_back_own(start + sub_at, &title[..]) {
                     old.copy_from_slice(&merged_old);
@@ -2410,6 +2416,25 @@ impl Shadow {
     /// `VICTORY_COPY_BACK_LATE_RULE=1` applies it here anyway, to study
     /// (never where title memory never went to the copy: `held` is then no
     /// record of what the title had, the copy having begun as zeros).
+    /// `address` is the piece's address in this copy's own range, also
+    /// when the bytes are reached through another view of the memory.
+    ///
+    /// The rule as applied here has limits it is left with, being a mode to
+    /// study with and not one the title runs under:
+    /// - What went to the copy is known by page ([`Self::never_copied`]).
+    ///   On a page only part of which did, the rest is under the rule too,
+    ///   with `held` still the copy's first zeros: a GPU write there is
+    ///   left out as a conflict wherever the title's bytes are not zero.
+    /// - The callers cut a piece down to the first and last byte the GPU
+    ///   changed, so the dwords at its two ends can be compared in part
+    ///   only: a title write to the bytes cut off is not seen, and the
+    ///   GPU's bytes of that dword are taken.
+    /// - A page counts as copied once a copy of title bytes to it
+    ///   succeeded, whole segment by whole segment: a segment that failed
+    ///   in part leaves its pages as never copied, though some bytes went.
+    /// - As everywhere on these paths, `held` is the copy as last brought
+    ///   up to date, so a title write between that and the submission is
+    ///   taken for one made while the GPU ran.
     fn take_gpu_writes(&self, address: usize, gpu: &[u8], held: &[u8], title: &mut [u8]) -> bool {
         if late_rule() && !self.never_copied(address, title.len()) {
             return take_gpu_writes(address, gpu, held, title);
@@ -2431,9 +2456,9 @@ impl Shadow {
         changed
     }
 
-    /// Notes that the copy takes title bytes on the pages of title memory
-    /// `[from, to)` (a copy that then fails is made again, or leaves the
-    /// page to the title's side of the copy-back rule).
+    /// Notes that the copy took title bytes on the pages of title memory
+    /// `[from, to)`: called once they are in the copy, so a copy that
+    /// failed leaves a page as never copied.
     fn mark_refreshed(&self, from: usize, to: usize) {
         if from >= to {
             return;
@@ -3300,9 +3325,6 @@ impl Shadow {
         };
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let base = start / PAGE;
-        // Every page of the range is copied here unless it already was (a
-        // page never copied counts as stale).
-        self.mark_refreshed(from.max(start), to.min(end));
         // Acquire `LAZY_STATE` strictly BEFORE `self.copied` (lock order).
         let owned = if crate::lazy_back::active() {
             crate::lazy_back::owned_blocks_with_clean_in(
@@ -3520,6 +3542,11 @@ impl Shadow {
                     }
                     page_ok = true;
                 }
+            }
+            if page_ok {
+                // The reference now holds the title's bytes of this page's
+                // part of the range (a page not stale had them already).
+                self.mark_refreshed(lo, hi);
             }
             if page_ok && (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
                 let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
@@ -3849,7 +3876,6 @@ impl Shadow {
             }
             let off = from - start;
             let len = to - from;
-            self.mark_refreshed(from, to);
             out.push(CopySeg {
                 src: from,
                 dst: (self.data as usize) + off,
@@ -3932,7 +3958,8 @@ impl Shadow {
                             }
                         }
                     }
-                    let (_succeeded, failed, bytes) = partition_copy_segs(&segs, &ok);
+                    let (succeeded, failed, bytes) = partition_copy_segs(&segs, &ok);
+                    self.mark_refreshed_segs(&succeeded);
                     let all_ok = failed.is_empty();
                     // Invalidate ReBAR hashes for every chunk that wrote VRAM,
                     // including successful chunks of a partially failed segment.
@@ -4002,10 +4029,20 @@ impl Shadow {
         }
     }
 
+    /// Notes the title bytes of the copied `segs` as taken into the copy
+    /// ([`Self::mark_refreshed`]): for card copies with their bytes being
+    /// published, under the same lock.
+    fn mark_refreshed_segs(&self, segs: &[CopySeg]) {
+        for seg in segs {
+            self.mark_refreshed(seg.src, seg.src + seg.len);
+        }
+    }
+
     /// Post-copy metadata invalidation for non-mirrored `segs`, acquiring each
     /// per-shadow lock at most once. `touched_rebar` includes any chunk that may
     /// have written VRAM even when another chunk of the same segment failed.
     fn finish_copy_segs(&self, start: usize, succeeded: &[CopySeg], touched_rebar: &[CopySeg]) {
+        self.mark_refreshed_segs(succeeded);
         if let Some(rebar) = &self.rebar {
             rebar.mark_dirty_segs(start, touched_rebar);
         }
@@ -6511,14 +6548,65 @@ mod tests {
         assert_eq!(title, rewritten, "the title's newer dword stays");
         // A range reaching into a refreshed page is under the rule too.
         assert!(!shadow.never_copied(second - 4, 8));
+    }
 
-        // The copy runs mark the pages they copy to.
+    /// The copy runs note a page as holding title bytes once the bytes are
+    /// in the copy, not when the copy is planned.
+    #[cfg(windows)]
+    #[test]
+    fn a_copy_run_marks_its_pages_once_the_bytes_are_copied() {
+        if host().is_none() {
+            return;
+        }
+        let title = vec![0x11u8; 2 * PAGE];
+        let mut side = vec![0u8; 2 * PAGE];
+        let address = title.as_ptr() as usize;
+        let Some(shadow) =
+            Shadow::new_card_sized_for_test(side.as_mut_ptr(), address as u64, side.len() as u64)
+        else {
+            return;
+        };
         let mut segs = Vec::new();
         assert_eq!(
             shadow.push_copy_segs(&[(address, address + 4)], &mut segs),
             4
         );
+        assert!(shadow.never_copied(address, 8), "planned, not yet copied");
+        assert_eq!(shadow.copy_runs(&[(address, address + 4)]), 4);
         assert!(!shadow.never_copied(address, 8));
+        assert!(
+            shadow.never_copied(address + PAGE, 8),
+            "only the page copied"
+        );
+    }
+
+    /// A relay merge that reaches the title's bytes through another view of
+    /// its memory still goes by this copy's own record of what it took: on
+    /// a page that never took title bytes the GPU's changed bytes land as
+    /// they are, as they would through the copy's own address.
+    #[cfg(windows)]
+    #[test]
+    fn a_merge_through_another_view_goes_by_the_copys_own_refresh_history() {
+        // A range no memory of the test is at; the view is elsewhere.
+        let Some(shadow) = Shadow::new_rebar_for_test(0x7100_0000, PAGE as u64, 0) else {
+            return;
+        };
+        let mut view = [9u32, 0];
+        let gpu = 7u32.to_le_bytes();
+        let mut old = [0u8; 4];
+        let (mut title, mut wrote_fallback) = (Vec::new(), false);
+        let written = shadow.apply_rebar_relay_subrange(
+            view.as_mut_ptr() as usize,
+            0,
+            &gpu,
+            &mut old,
+            &mut title,
+            false,
+            &mut wrote_fallback,
+        );
+        assert_eq!(written, Some(4));
+        assert_eq!(view, [7, 0], "nothing says the title wrote the 9");
+        assert_eq!(old, gpu);
     }
 
     /// The refresh of a range earlier lists write (`update_busy`) puts the
@@ -8209,6 +8297,10 @@ mod tests {
             assert_eq!(
                 copied, 0,
                 "failed segment must not be counted as fully copied"
+            );
+            assert!(
+                shadow.never_copied(va0, len),
+                "a failed copy leaves no page noted as holding title bytes"
             );
             // VRAM bytes for chunks 0..2 were already modified to `0x22`.
             let vram_p0 = shadow.read_test_bytes(va0 as u64, 64);
