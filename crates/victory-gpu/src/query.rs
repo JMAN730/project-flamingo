@@ -5,7 +5,9 @@
 //! A host query may not span host lists, and a title's list can be cut into
 //! several (a memory wait, a hoist). A query open at a cut is ended there
 //! and goes on in the next host list as one of the spare queries; resolving
-//! it combines the parts ([`combined`]).
+//! it combines the parts ([`combined`]). With no spare query left it is cut
+//! short there, and resolves as passed rather than hide what the draws
+//! after the cut would have shown.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use crate::object::{self, E_INVALIDARG, HRESULT, Iid, Object, QUERY_HEAP, Table, This, guid};
@@ -59,6 +61,9 @@ struct Parts {
     free: Vec<u32>,
     /// Title query to the spare host queries its result continues in.
     of: std::collections::HashMap<u32, Vec<u32>>,
+    /// Title queries cut short: no spare host query was left at a cut, so
+    /// the draws after it are in no host query.
+    short: std::collections::HashSet<u32>,
 }
 
 #[cfg(any(windows, test))]
@@ -68,6 +73,7 @@ impl Parts {
         Self {
             free: (count..count.saturating_add(spare)).rev().collect(),
             of: Default::default(),
+            short: Default::default(),
         }
     }
 
@@ -77,14 +83,30 @@ impl Parts {
         if let Some(parts) = self.of.remove(&index) {
             self.free.extend(parts.into_iter().rev());
         }
+        self.short.remove(&index);
     }
 
     /// A spare host query for the next part of title query `index`, if one
-    /// is left.
+    /// is left; with none the query is cut short.
     fn continues(&mut self, index: u32) -> Option<u32> {
-        let spare = self.free.pop()?;
+        let Some(spare) = self.free.pop() else {
+            self.short.insert(index);
+            return None;
+        };
         self.of.entry(index).or_default().push(spare);
         Some(spare)
+    }
+
+    /// The title queries of `first..first + count` that were cut short, as
+    /// places in that range, in order.
+    fn cut_short(&self, first: u32, count: u32) -> Vec<u32> {
+        let mut places: Vec<u32> = self
+            .short
+            .iter()
+            .filter_map(|index| index.checked_sub(first).filter(|&place| place < count))
+            .collect();
+        places.sort_unstable();
+        places
     }
 
     /// The parts of the title queries `first..first + count`, as (place in
@@ -111,9 +133,18 @@ const BINARY_OCCLUSION: u32 = 1;
 /// The `results` of resolved occlusion queries of kind `kind` (8 bytes
 /// each) with the results of their later parts taken in: `extra` holds one
 /// 8-byte result per entry of `places`, which names the result it belongs
-/// to. Sample counts add up; a binary query passed if any part did.
+/// to. Sample counts add up; a binary query passed if any part did. The
+/// results `short` names are of queries cut short, whose later draws no
+/// part counted: one that counted nothing says one sample passed, so the
+/// title does not hide what those draws may have shown.
 #[cfg(any(windows, test))]
-pub(crate) fn combined(kind: u32, results: &[u8], extra: &[u8], places: &[u32]) -> Vec<u8> {
+pub(crate) fn combined(
+    kind: u32,
+    results: &[u8],
+    extra: &[u8],
+    places: &[u32],
+    short: &[u32],
+) -> Vec<u8> {
     let mut out = results.to_vec();
     for (part, &place) in extra.as_chunks::<8>().0.iter().zip(places) {
         let Some(whole) = out.as_chunks_mut::<8>().0.get_mut(place as usize) else {
@@ -126,6 +157,13 @@ pub(crate) fn combined(kind: u32, results: &[u8], extra: &[u8], places: &[u32]) 
             so_far.saturating_add(part)
         };
         *whole = both.to_le_bytes();
+    }
+    for &place in short {
+        if let Some(whole) = out.as_chunks_mut::<8>().0.get_mut(place as usize)
+            && *whole == [0; 8]
+        {
+            *whole = 1u64.to_le_bytes();
+        }
     }
     out
 }
@@ -218,9 +256,12 @@ pub(crate) fn occlusion_heap(
 
 /// Title query `index` of `this` begins anew: the parts of its last run
 /// ([`continues`]) are no longer its result.
-// shortcut: by recording order, as [`parts`] reads them: a resolve recorded
-// before a later begin of the same query and run after it, or two lists
-// recording the same query at once, can combine the wrong parts.
+// shortcut: by recording order, as [`parts`] reads them, not by the order
+// the lists run in: a resolve recorded before a later begin of the same
+// query and run after it, two lists recording the same query at once, or a
+// begin recorded in a list that runs later or never (the earlier run's
+// spare queries are freed, so a resolve recorded after it reads that run
+// without its later parts) can combine the wrong parts.
 #[cfg(windows)]
 pub(crate) fn starts_over(this: This, index: u32) {
     if let Some(queries) = host_queries(this) {
@@ -230,7 +271,8 @@ pub(crate) fn starts_over(this: This, index: u32) {
 }
 
 /// A spare host query for title query `index` of `this` to go on in after
-/// its host list was cut, if one is left.
+/// its host list was cut, if one is left; with none the query is noted as
+/// cut short ([`parts`]).
 #[cfg(windows)]
 pub(crate) fn continues(this: This, index: u32) -> Option<u32> {
     let mut parts = host_queries(this)?
@@ -241,12 +283,13 @@ pub(crate) fn continues(this: This, index: u32) -> Option<u32> {
 }
 
 /// The later parts of the title queries `first..first + count` of `this`,
-/// as (place in that range, host query), in order.
+/// as (place in that range, host query), in order, and the places of the
+/// queries among them that were cut short.
 #[cfg(windows)]
-pub(crate) fn parts(this: This, first: u32, count: u32) -> Vec<(u32, u32)> {
-    host_queries(this).map_or_else(Vec::new, |queries| {
+pub(crate) fn parts(this: This, first: u32, count: u32) -> (Vec<(u32, u32)>, Vec<u32>) {
+    host_queries(this).map_or_else(Default::default, |queries| {
         let parts = queries.parts.lock().unwrap_or_else(|e| e.into_inner());
-        parts.within(first, count)
+        (parts.within(first, count), parts.cut_short(first, count))
     })
 }
 
@@ -501,24 +544,57 @@ mod tests {
         // Query 0 has no later part, query 1 has two, query 2 has one.
         let (extra, places) = (bytes(&[5, 7, 0]), [1, 1, 2]);
         assert_eq!(
-            combined(0, &bytes(&[3, 10, 0]), &extra, &places),
+            combined(0, &bytes(&[3, 10, 0]), &extra, &places, &[]),
             bytes(&[3, 22, 0])
         );
         assert_eq!(
-            combined(BINARY_OCCLUSION, &bytes(&[1, 0, 0]), &extra, &places),
+            combined(BINARY_OCCLUSION, &bytes(&[1, 0, 0]), &extra, &places, &[]),
             bytes(&[1, 1, 0])
         );
         let late = bytes(&[0, 0, 1]);
         assert_eq!(
-            combined(BINARY_OCCLUSION, &bytes(&[0, 1, 0]), &late, &places),
+            combined(BINARY_OCCLUSION, &bytes(&[0, 1, 0]), &late, &places, &[]),
             bytes(&[0, 1, 1])
         );
         // A count does not wrap, and a part outside the results is left out.
         assert_eq!(
-            combined(0, &bytes(&[u64::MAX]), &bytes(&[2, 9]), &[0, 4]),
+            combined(0, &bytes(&[u64::MAX]), &bytes(&[2, 9]), &[0, 4], &[]),
             bytes(&[u64::MAX])
         );
-        assert_eq!(combined(0, &bytes(&[4, 6]), &[], &[]), bytes(&[4, 6]));
+        assert_eq!(combined(0, &bytes(&[4, 6]), &[], &[], &[]), bytes(&[4, 6]));
+    }
+
+    /// A query cut short with nothing counted before the cut resolves as
+    /// passed, of either kind: the draws after the cut are in no host
+    /// query. One that counted samples keeps its count, and queries not cut
+    /// short keep a zero.
+    #[test]
+    fn a_query_cut_short_does_not_resolve_as_hidden() {
+        let bytes =
+            |values: &[u64]| -> Vec<u8> { values.iter().flat_map(|v| v.to_le_bytes()).collect() };
+        for kind in [0, BINARY_OCCLUSION] {
+            assert_eq!(
+                combined(kind, &bytes(&[0, 0, 1, 0]), &[], &[], &[1, 2, 9]),
+                bytes(&[0, 1, 1, 0])
+            );
+        }
+        assert_eq!(
+            combined(0, &bytes(&[0, 40]), &bytes(&[0]), &[0], &[0, 1]),
+            bytes(&[1, 40])
+        );
+
+        // The query that finds no spare host query at a cut is the one cut
+        // short, until it begins anew.
+        let mut parts = Parts::new(8, 1);
+        assert_eq!(parts.continues(3), Some(8));
+        assert!(parts.cut_short(0, 8).is_empty());
+        assert_eq!(parts.continues(6), None);
+        assert_eq!(parts.continues(2), None);
+        assert_eq!(parts.cut_short(0, 8), [2, 6]);
+        assert_eq!(parts.cut_short(5, 3), [1], "places from the first resolved");
+        assert!(parts.cut_short(3, 3).is_empty());
+        parts.starts_over(6);
+        assert_eq!(parts.cut_short(0, 8), [2]);
     }
 
     /// Each cut of a query's host list takes one spare host query, which

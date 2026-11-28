@@ -1609,7 +1609,7 @@ fn continue_queries(
         let Some(spare) = crate::query::continues(heap, index) else {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| {
-                tracing::warn!("no spare host query for an occlusion query open across a list split: it counts only the draws before the split");
+                tracing::warn!("no spare host query for an occlusion query open across a list split: it counts only the draws before the split, and as seen if those were none");
             });
             continue;
         };
@@ -1670,7 +1670,8 @@ extern "system" fn end_query(this: This, heap: This, kind: u32, index: u32) {
 /// last one ended before the list runs, or 0 if none was. A query that
 /// went on past a split of its host list ([`continue_queries`]) has
 /// further parts in spare host queries: those are resolved behind the
-/// others and combined into its result before the copy. False if `heap` has
+/// others and combined into its result before the copy; one cut short
+/// there for want of a spare query is not left at zero. False if `heap` has
 /// no host occlusion heap.
 #[cfg(windows)]
 fn resolve_occlusion(
@@ -1695,7 +1696,7 @@ fn resolve_occlusion(
     let Some(target) = buffer_range(buffer, offset, bytes) else {
         return true;
     };
-    let parts = crate::query::parts(heap, first, count);
+    let (parts, short) = crate::query::parts(heap, first, count);
     let Some((staging, data)) = list.readback(host, bytes + 8 * parts.len() as u64) else {
         return true;
     };
@@ -1713,11 +1714,11 @@ fn resolve_occlusion(
         }
     }
     let len = bytes as usize;
-    if parts.is_empty() {
+    if parts.is_empty() && short.is_empty() {
         list.defer_readback(target, data, len, len, 1, len, len);
     } else {
         let places = parts.iter().map(|&(place, _)| place).collect();
-        list.defer_query_results(target, data, count as usize, kind, places);
+        list.defer_query_results(target, data, count as usize, kind, places, short);
     }
     #[cfg(feature = "diagnostics")]
     {
@@ -3807,7 +3808,7 @@ mod tests {
         let after = host_list(list).expect("host list");
         assert!(!std::sync::Arc::ptr_eq(&before, &after), "the wait split");
         assert_eq!(
-            crate::query::parts(heap, 0, 4),
+            crate::query::parts(heap, 0, 4).0,
             [(0, 4), (1, 6), (2, 5)],
             "each open query goes on as a spare host query past the title's 4"
         );
@@ -3835,7 +3836,7 @@ mod tests {
         // are not part of this result.
         let again = new_list();
         begin_query(again, heap, OCCLUSION, 0);
-        assert_eq!(crate::query::parts(heap, 0, 4), [(1, 6), (2, 5)]);
+        assert_eq!(crate::query::parts(heap, 0, 4).0, [(1, 6), (2, 5)]);
         draw(again);
         end_query(again, heap, OCCLUSION, 0);
         resolve_queries(again, heap, OCCLUSION, 0, 1, results, 0);

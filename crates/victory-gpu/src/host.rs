@@ -1596,8 +1596,9 @@ struct Readback {
     /// For occlusion query results whose queries went on past a cut of
     /// their host list: the query kind, and for each further 8-byte result
     /// that follows the `total` bytes at `src`, the result it is combined
-    /// into before the copy ([`crate::query::combined`]).
-    query_parts: Option<(u32, Vec<u32>)>,
+    /// into before the copy, then the results of queries cut short
+    /// ([`crate::query::combined`]).
+    query_parts: Option<(u32, Vec<u32>, Vec<u32>)>,
 }
 
 /// What a list does on the CPU when it is submitted: copies between host
@@ -2409,7 +2410,7 @@ pub(super) fn read_backs(list: &HostList) -> bool {
     let deferred = list.deferred();
     let mut ok = true;
     for rb in &deferred.readbacks {
-        let combined = rb.query_parts.as_ref().map(|(kind, places)| {
+        let combined = rb.query_parts.as_ref().map(|(kind, places, short)| {
             // SAFETY: the list has run; its readback memory holds the
             // `total` bytes of results and 8 more for each later part
             // (`defer_query_results`), mapped until the list is reset.
@@ -2417,7 +2418,7 @@ pub(super) fn read_backs(list: &HostList) -> bool {
                 std::slice::from_raw_parts(rb.src as *const u8, rb.total + 8 * places.len())
             };
             let (results, extra) = resolved.split_at(rb.total);
-            crate::query::combined(*kind, results, extra, places)
+            crate::query::combined(*kind, results, extra, places, short)
         });
         let src = combined
             .as_ref()
@@ -4018,7 +4019,8 @@ impl HostList {
     /// readback memory at `src` into title memory at `dst` once the list
     /// has run, each combined with the results of its later parts: one
     /// further result follows the `count` for each entry of `places`, which
-    /// names the result it belongs to.
+    /// names the result it belongs to. `short` names the results of queries
+    /// cut short.
     pub(crate) fn defer_query_results(
         &self,
         dst: *mut u8,
@@ -4026,6 +4028,7 @@ impl HostList {
         count: usize,
         kind: u32,
         places: Vec<u32>,
+        short: Vec<u32>,
     ) {
         let total = count * 8;
         self.mark_work();
@@ -4037,7 +4040,7 @@ impl HostList {
             lines: 1,
             row_bytes: total,
             total,
-            query_parts: Some((kind, places)),
+            query_parts: Some((kind, places, short)),
         });
     }
 
