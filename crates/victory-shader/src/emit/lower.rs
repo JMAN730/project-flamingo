@@ -111,7 +111,7 @@ pub(crate) struct Lowered {
     pub d16_kept_high_halves: u32,
     /// Test builds: returning LDS atomics whose old value is 0 outside the
     /// program's LDS (split halves).
-    #[cfg(test)]
+    #[cfg(all(test, windows))]
     pub lds_atomics_zero_outside: u32,
     /// Test builds: constant byte offsets of `s_buffer_load_dword*`.
     #[cfg(test)]
@@ -1920,7 +1920,7 @@ impl<'a> Lower<'a> {
             unaligned_typed_loads: self.s.unaligned_typed_loads,
             #[cfg(test)]
             d16_kept_high_halves: self.s.d16_kept_high_halves,
-            #[cfg(test)]
+            #[cfg(all(test, windows))]
             lds_atomics_zero_outside: self.s.lds_atomics_zero_outside,
             #[cfg(test)]
             smem_buffer_bytes: std::mem::take(&mut self.s.smem_buffer_bytes),
@@ -4465,7 +4465,7 @@ impl<'a> Lower<'a> {
         };
         let r = match inside {
             Some(inside) => {
-                #[cfg(test)]
+                #[cfg(all(test, windows))]
                 {
                     self.s.lds_atomics_zero_outside += 1;
                 }
