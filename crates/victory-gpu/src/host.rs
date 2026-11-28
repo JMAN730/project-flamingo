@@ -888,6 +888,7 @@ pub(crate) struct HostList {
 
 impl Drop for HostList {
     fn drop(&mut self) {
+        crate::query::forget_list(std::ptr::from_ref(self) as usize);
         self.release_kept();
         self.release_epoch();
     }
@@ -1593,12 +1594,10 @@ struct Readback {
     lines: usize,
     row_bytes: usize,
     total: usize,
-    /// For occlusion query results whose queries went on past a cut of
-    /// their host list: the query kind, and for each further 8-byte result
-    /// that follows the `total` bytes at `src`, the result it is combined
-    /// into before the copy, then the results of queries cut short
-    /// ([`crate::query::combined`]).
-    query_parts: Option<(u32, Vec<u32>, Vec<u32>)>,
+    /// For occlusion query results: the resolve, whose spare query results
+    /// follow the `total` bytes at `src` and are combined into them before
+    /// the copy ([`crate::query::Resolve`]).
+    query: Option<std::sync::Arc<crate::query::Resolve>>,
 }
 
 /// What a list does on the CPU when it is submitted: copies between host
@@ -1638,6 +1637,9 @@ struct Deferred {
     /// Bottom-of-pipe writes, done once the list has run: address, what,
     /// bytes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
+    /// Things the list's commands use that are given back when the last
+    /// holder lets go ([`HostList::hold`]), by address.
+    held: std::collections::HashMap<usize, std::sync::Arc<dyn std::any::Any + Send + Sync>>,
     /// Monotonic count of deferred title-memory copies (`defer_copy`) recorded
     /// since reset, used to partition fresh-table CBV snapshot reuse across
     /// intervening buffer writes.
@@ -1964,6 +1966,11 @@ impl Host {
         let behind = late && relay::flying();
         if !behind {
             crate::inplace::tick();
+        }
+        // The order these lists reach the host queue in: occlusion query
+        // resolves choose the parts of the runs submitted before them.
+        for list in runs {
+            crate::query::submitting(std::ptr::from_ref(*list) as usize);
         }
         let this_submission = relay::STARTED.fetch_add(1, Ordering::AcqRel) + 1;
         crate::shadow::preparing(this_submission);
@@ -2410,15 +2417,14 @@ pub(super) fn read_backs(list: &HostList) -> bool {
     let deferred = list.deferred();
     let mut ok = true;
     for rb in &deferred.readbacks {
-        let combined = rb.query_parts.as_ref().map(|(kind, places, short)| {
+        let combined = rb.query.as_ref().map(|resolve| {
+            let spares = resolve.spares().1 as usize;
             // SAFETY: the list has run; its readback memory holds the
-            // `total` bytes of results and 8 more for each later part
+            // `total` bytes of results and 8 more for each spare query
             // (`defer_query_results`), mapped until the list is reset.
-            let resolved = unsafe {
-                std::slice::from_raw_parts(rb.src as *const u8, rb.total + 8 * places.len())
-            };
-            let (results, extra) = resolved.split_at(rb.total);
-            crate::query::combined(*kind, results, extra, places, short)
+            let resolved =
+                unsafe { std::slice::from_raw_parts(rb.src as *const u8, rb.total + 8 * spares) };
+            resolve.combined(resolved)
         });
         let src = combined
             .as_ref()
@@ -2772,6 +2778,16 @@ impl HostList {
         }
     }
 
+    /// Holds `what` until the list is reset or dropped, which is after its
+    /// last submission has run: what gives back a resource when its last
+    /// holder lets go (a buffer view table's raw view slot) is not given
+    /// back while this list may still use it. Holding the same thing again
+    /// changes nothing.
+    pub(crate) fn hold(&self, what: std::sync::Arc<dyn std::any::Any + Send + Sync>) {
+        let at = std::sync::Arc::as_ptr(&what).cast::<()>() as usize;
+        self.deferred().held.entry(at).or_insert(what);
+    }
+
     /// Keeps dynamic descriptor slots alive until this host list finishes
     /// executing and is recycled or dropped.
     pub(crate) fn keep_dynamic(&self, slots: Vec<(usize, u32, u32)>) {
@@ -3093,6 +3109,9 @@ impl HostList {
     /// Clears per-recording tracking state shared between [`Self::reset`] and
     /// [`Self::release_for_pool`].
     fn clear_tracking(&self) {
+        // The recording is over: its occlusion query runs that no later
+        // list resolves are let go.
+        crate::query::forget_list(std::ptr::from_ref(self) as usize);
         self.release_kept();
         self.shadow_states
             .lock()
@@ -4011,24 +4030,21 @@ impl HostList {
             lines,
             row_bytes,
             total,
-            query_parts: None,
+            query: None,
         });
     }
 
-    /// Copies `count` occlusion query results of kind `kind` from the
-    /// readback memory at `src` into title memory at `dst` once the list
-    /// has run, each combined with the results of its later parts: one
-    /// further result follows the `count` for each entry of `places`, which
-    /// names the result it belongs to. `short` names the results of queries
-    /// cut short.
+    /// Copies `count` occlusion query results from the readback memory at
+    /// `src` into title memory at `dst` once the list has run, each
+    /// combined with the results of its later parts as `resolve` chose them
+    /// when the list was submitted: one further result follows the `count`
+    /// for each spare query.
     pub(crate) fn defer_query_results(
         &self,
         dst: *mut u8,
         src: *const u8,
         count: usize,
-        kind: u32,
-        places: Vec<u32>,
-        short: Vec<u32>,
+        resolve: std::sync::Arc<crate::query::Resolve>,
     ) {
         let total = count * 8;
         self.mark_work();
@@ -4040,7 +4056,7 @@ impl HostList {
             lines: 1,
             row_bytes: total,
             total,
-            query_parts: Some((kind, places, short)),
+            query: Some(resolve),
         });
     }
 
