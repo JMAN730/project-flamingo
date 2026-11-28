@@ -95,6 +95,82 @@ fn a_mesh_program_joins_a_dead_mask_dword_with_data() {
     draws_the_sample(sample::mesh_with(&extra));
 }
 
+/// `s_not_b32 s20, exec_lo` in the lanes below 10 of a wave32 program:
+/// the 22 lanes that do not run there, counted after EXEC is restored, less
+/// 22, added to the position's w (1.0 + 0). A mask holding lanes elsewhere.
+const LANES_ELSEWHERE: [u32; 8] = [
+    0x7D88_0000 | 1 << 9 | (0x80 + 10), // v_cmp_gt_u32 vcc_lo, 10, v1: lanes below 10
+    sop1(0x3C, 16, VCC_LO),             // s_and_saveexec_b32 s16, vcc_lo
+    sop1(0x07, 20, EXEC_LO),            // s_not_b32 s20, exec_lo
+    sop2(0x10, EXEC_LO, EXEC_LO, 16),   // s_or_b32 exec_lo, exec_lo, s16
+    sop1(0x0F, 20, 20),                 // s_bcnt1_i32_b32 s20, s20
+    sop2(0x01, 20, 20, 0x80 + 22),      // s_sub_u32 s20, s20, 22
+    V_CVT_F32_U32_V13_S20,
+    V_ADD_F32_V6_V13,
+];
+
+/// The lowest set lane of a compare in every lane (a lane number, 0), added
+/// to the position's w (1.0 + 0).
+const LANE_NUMBER: [u32; 4] = [
+    V_CMP_ALL,
+    sop1(0x13, 20, VCC_LO), // s_ff1_i32_b32 s20, vcc_lo
+    V_CVT_F32_U32_V13_S20,
+    V_ADD_F32_V6_V13,
+];
+
+/// The compute half of a wave32 mesh program declares the console's wave
+/// size, so lanes are numbered like the console's there: a lane number read
+/// from a mask lowers (and validates), where a mesh shader refuses it.
+#[test]
+fn a_wave32_mesh_program_reads_a_lane_number_from_a_mask_as_a_compute_pass() {
+    assert!(
+        sample::mesh_error_wave32(&LANE_NUMBER).is_some(),
+        "a mesh shader refuses it"
+    );
+    let (fallback, _) = sample::fallback_of(&LANE_NUMBER, false).expect("the compute half");
+    validates("compute half", &fallback.compute);
+}
+
+/// A mask holding lanes that do not run where it is written, counted in
+/// the compute half of a wave32 mesh program: a ballot there, with the
+/// lanes it leaves out set, as compute programs read such masks.
+#[test]
+fn a_wave32_mesh_program_counts_a_mask_of_lanes_elsewhere_as_a_compute_pass() {
+    let (fallback, _) = sample::fallback_of(&LANES_ELSEWHERE, false).expect("the compute half");
+    validates("compute half", &fallback.compute);
+}
+
+/// A wave64 mesh program on a host without 64-lane waves cannot run its
+/// console wave whole in the compute half, so its lane numbers stay
+/// refused; with 64-lane waves they lower.
+#[test]
+fn a_wave64_mesh_program_reads_a_lane_number_as_a_compute_pass_only_with_64_lane_waves() {
+    let narrow = super::with_host_wave64(false, || sample::fallback_of(&LANE_NUMBER, true));
+    let e = narrow.expect_err("refused on a 32-lane host");
+    assert!(e.to_string().contains("lane mask"), "{e}");
+    let (fallback, _) = super::with_host_wave64(true, || sample::fallback_of(&LANE_NUMBER, true))
+        .expect("the compute half with 64-lane waves");
+    validates("compute half", &fallback.compute);
+}
+
+/// Both wave32 programs above, drawn by the host without mesh shaders: the
+/// sample's texels.
+#[test]
+fn wave32_mesh_programs_reading_masks_draw_the_sample_without_mesh_shaders() {
+    for extra in [&LANE_NUMBER[..], &LANES_ELSEWHERE[..]] {
+        let (fallback, ps) = sample::fallback_of(extra, false).expect("the compute half");
+        draws(None, fallback, ps);
+    }
+}
+
+fn validates(what: &str, shader: &super::HostShader) {
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy)
+            .unwrap_or_else(|e| panic!("{what}: DXIL validation failed: {e}"));
+    }
+}
+
 fn draws_the_sample(
     sample::MeshSample {
         mesh,
@@ -102,6 +178,12 @@ fn draws_the_sample(
         pixel: ps,
     }: sample::MeshSample,
 ) {
+    draws(Some(&mesh), fallback, ps);
+}
+
+/// Draws `fallback` (and `mesh`, as a mesh shader, where the host runs
+/// those) with `ps`, against the sample's texels.
+fn draws(mesh: Option<&super::HostShader>, fallback: super::MeshFallback, ps: super::HostShader) {
     // Three vertices of 4 + 4 dwords; one primitive of its indices and 2.
     let buffer = &fallback.buffer;
     assert_eq!((buffer.vertex_dwords, buffer.primitive_dwords), (8, 3));
@@ -110,12 +192,13 @@ fn draws_the_sample(
 
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         let shaders = [
-            ("mesh", &mesh),
-            ("compute half", &fallback.compute),
-            ("vertex half", &fallback.vertex),
-            ("pixel", &ps),
+            ("mesh", mesh),
+            ("compute half", Some(&fallback.compute)),
+            ("vertex half", Some(&fallback.vertex)),
+            ("pixel", Some(&ps)),
         ];
         for (what, shader) in shaders {
+            let Some(shader) = shader else { continue };
             let mut copy = shader.dxil.clone();
             v.validate(&mut copy)
                 .unwrap_or_else(|e| panic!("{what}: DXIL validation failed: {e}"));
@@ -154,7 +237,8 @@ fn draws_the_sample(
         }
         ran += 1;
         // The same program as a mesh shader, where the host runs those.
-        match host.mesh_pipeline(&mesh, &ps) {
+        let Some(mesh) = mesh else { continue };
+        match host.mesh_pipeline(mesh, &ps) {
             Ok((root, pso)) => {
                 let got = host
                     .draw(&root, &pso, &draw(SIZE))

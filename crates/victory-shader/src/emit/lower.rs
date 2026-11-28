@@ -457,6 +457,10 @@ struct Lower<'a> {
     /// Compute code that reads other lanes: thread ids follow the host
     /// lanes, so lane n is console lane n.
     console_lanes: bool,
+    /// A mesh program stored into a buffer whose host compute pass runs
+    /// the console's waves (see `Lower::new`): its masks and lanes are
+    /// read as a compute program's.
+    mesh_lanes: bool,
     doubled_lane_reads: bool,
     /// Retry a compute shader with numeric selects only when the normal
     /// translation needs one. Unused selects need no fixed wave size.
@@ -926,9 +930,29 @@ impl<'a> Lower<'a> {
         let mut halves = false;
         let mut wants_console_flow = false;
         let mut no_console_flow = None;
-        if let StageIo::Cs(cs) = x.native.io {
-            s.threads = Some(cs.threads);
-            s.lds_dwords = cs.lds_bytes() / 4;
+        // A mesh program stored into a buffer runs as a compute pass on the
+        // host, whose wave size it can declare: its lanes can be the
+        // console's like a compute program's, when the host runs its console
+        // wave whole. Only as the last chance's second attempt, after the
+        // counts of `MaskData::Count`, so that every mesh program translated
+        // otherwise keeps its code.
+        let console_group = match &x.native.io {
+            StageIo::Cs(cs) => Some((cs.threads, cs.lds_bytes() / 4)),
+            StageIo::Ms(ms)
+                if x.mesh_buffer
+                    && second
+                    && leftovers
+                    && wave_mode == WaveMode::Original
+                    && (!x.native.wave64 || super::host_wave64()) =>
+            {
+                Some(([ms.threads, 1, 1], ms.lds_bytes.div_ceil(4)))
+            }
+            _ => None,
+        };
+        let mesh_lanes = console_group.is_some() && x.native.stage == HwStage::Ms;
+        if let Some((group, lds_dwords)) = console_group {
+            s.threads = Some(group);
+            s.lds_dwords = lds_dwords;
             // Code reading other lanes needs the console's wave size and
             // lane order; so do lane masks read as numbers, and LDS shared
             // within one wave, where the console compiler leaves out barriers.
@@ -982,7 +1006,7 @@ impl<'a> Lower<'a> {
             };
             console_lanes = reads_whole || masks_held || insts().any(in_half);
             let wave = if x.native.wave64 { 64 } else { 32 };
-            let threads = cs.threads.iter().product::<u32>();
+            let threads = group.iter().product::<u32>();
             let one_wave = threads <= wave;
             // A wave64 compute group of exactly 32 threads has no upper-half
             // threads. When whole-wave Active reductions are its only
@@ -1026,7 +1050,7 @@ impl<'a> Lower<'a> {
                 && !doubled_lane_reads
                 && x.native.wave64;
             if needs_wave64 && wave_mode != WaveMode::Original {
-                no_console_flow = if cs.threads.iter().product::<u32>() > 64 {
+                no_console_flow = if group.iter().product::<u32>() > 64 {
                     Some(
                         "console wave64 lanes in a group of more than 64 threads on a host without 64-lane waves",
                     )
@@ -1192,6 +1216,7 @@ impl<'a> Lower<'a> {
             writes_uavs,
             src0: None,
             console_lanes,
+            mesh_lanes,
             doubled_lane_reads,
             numeric_selects,
             second,
@@ -1212,6 +1237,7 @@ impl<'a> Lower<'a> {
             half_outputs: half_outputs(&x.native.io, &x.outputs),
             mask_data: match x.native.stage {
                 HwStage::Cs => MaskData::Console,
+                HwStage::Ms if mesh_lanes => MaskData::Console,
                 HwStage::Ps | HwStage::Vs => MaskData::Host,
                 // A third chance only (see `lower_with_wave32`): the first
                 // two leave a program's code as it was.
@@ -2503,7 +2529,7 @@ impl<'a> Lower<'a> {
         // Compute only, where host lane n is console lane n.
         let outside = !self.x.st.active.contains(&lo)
             && self.x.st.outside.contains(&lo)
-            && matches!(self.x.native.io, StageIo::Cs(_));
+            && (matches!(self.x.native.io, StageIo::Cs(_)) || self.mesh_lanes);
         if !self.x.st.active.contains(&lo) && !outside {
             return Err("a lane mask holding lanes elsewhere read as data");
         }
@@ -3696,7 +3722,7 @@ impl<'a> Lower<'a> {
     /// the console's wave size (lanes are thread ids in group order there).
     /// Pixel lanes match only within a quad.
     fn cross_lane(&mut self, quad: bool) -> Result<(), Why> {
-        if self.s.mesh.is_some() {
+        if self.s.mesh.is_some() && !self.mesh_lanes {
             // shortcut: no wave size for mesh shaders in SM 6.6, so host
             // lanes cannot follow the console's; emulate through group-shared
             // memory if mesh programs turn out to need these.
@@ -3844,6 +3870,13 @@ impl<'a> Lower<'a> {
     /// primitive index.
     fn mesh_thread(&mut self) -> V {
         if let Some(f) = self.flat {
+            return f;
+        }
+        if self.mesh_lanes && self.console_lanes {
+            // Relabelled like a compute thread, so that its host lane is
+            // its console lane.
+            let f = self.console_flat();
+            self.flat = Some(f);
             return f;
         }
         let e = self.s.entry;
