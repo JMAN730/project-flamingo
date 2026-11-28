@@ -802,6 +802,11 @@ fn record(handle: u64, view: View) {
     mirror(handle);
 }
 
+/// How many view entries [`forget`] has made stale: a descriptor slot still
+/// holding one names no view from then on, though its bytes are unchanged
+/// (the buffer view table looks again when this moves).
+pub(crate) static FORGOTTEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// The title released `resource`: the views naming it go stale.
 pub(crate) fn forget(resource: usize) {
     let mut views = VIEWS.write().unwrap_or_else(|e| e.into_inner());
@@ -818,6 +823,7 @@ pub(crate) fn forget(resource: usize) {
             // The view's other resource (a counter) keeps a stale entry, which
             // `forget` of that resource skips.
             views.free.push(i);
+            FORGOTTEN.fetch_add(1, std::sync::atomic::Ordering::Release);
         }
     }
     drop(views);
