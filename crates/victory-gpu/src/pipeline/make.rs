@@ -22,7 +22,10 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use super::{Shader, Translated};
-use victory_shader::emit::{StructuredBinding, translate_with_view_strides_for_hash};
+use victory_shader::emit::{
+    StructuredBinding, translate_mesh_fallback_with_view_strides,
+    translate_with_view_strides_for_hash,
+};
 use victory_shader::{ResourceType, RootType, UsedResource};
 
 type Strides = Vec<(StructuredBinding, u32)>;
@@ -135,87 +138,145 @@ impl Pending {
                     return Some(shader.clone());
                 }
                 let accessed = std::cell::RefCell::new(BTreeSet::new());
-                let (host, mut used) = translate_with_view_strides_for_hash(
+                let view_stride = |binding: StructuredBinding, _: bool| {
+                    let i = self
+                        .strides
+                        .binary_search_by_key(&binding, |&(key, _)| key)
+                        .ok()?;
+                    let stride = self.strides[i].1;
+                    accessed.borrow_mut().insert((binding, stride));
+                    Some(stride)
+                };
+                // A mesh program on a host without mesh shaders runs as a
+                // compute pass ([`Shader::mesh_fallback`]), translated here
+                // with the same views: the specialized shader keeps no
+                // container to translate it from later.
+                let fallback = (shader.stage == "mesh" && !host.mesh_shaders()).then(|| {
+                    translate_mesh_fallback_with_view_strides(&shader.container, &view_stride)
+                        .map_err(|error| {
+                            tracing::warn!(
+                                ?shader,
+                                %error,
+                                "mesh shader with bound structured views does not translate \
+                                 for a host without mesh shaders; its pipelines' draws are dropped"
+                            );
+                        })
+                        .ok()
+                });
+                let translated = translate_with_view_strides_for_hash(
                     &shader.container,
                     host.supports_wave32(),
                     &shader.hash,
-                    &|binding, _| {
-                        let i = self
-                            .strides
-                            .binary_search_by_key(&binding, |&(key, _)| key)
-                            .ok()?;
-                        let stride = self.strides[i].1;
-                        accessed.borrow_mut().insert((binding, stride));
-                        Some(stride)
-                    },
+                    &view_stride,
                 )
                 .map_err(|error| {
                     tracing::warn!(?shader, %error, "shader with bound structured views refused");
-                })
-                .ok()?;
-                // Include exact slots absent from the console metadata so draw
-                // binding snapshots and transitions the views that lowering reads.
-                for (binding, stride) in accessed.into_inner() {
-                    let kind = if binding.uav {
-                        ResourceType::Uav
-                    } else {
-                        ResourceType::Srv
-                    };
-                    if let Some(entry) = used.iter_mut().find(|u| {
-                        u.root == RootType::Table
-                            && u.slot == binding.slot
-                            && u.table_offset_dwords == binding.offset_dwords
-                            && u.kind == kind
-                    }) {
-                        entry.stride = stride;
-                    } else {
-                        let user_data = host
-                            .user_data
-                            .iter()
-                            .find(|u| u.root == RootType::Table && u.slot == binding.slot)?
-                            .index;
-                        used.push(UsedResource {
-                            kind,
-                            root: RootType::Table,
-                            table_offset_dwords: binding.offset_dwords,
-                            lower_bound: 0,
-                            stride,
-                            dwords: 4,
-                            user_data: user_data.try_into().ok()?,
-                            slot: binding.slot,
-                        });
-                    }
+                });
+                // The mesh program as the host runs it is the fallback alone.
+                if translated.is_err() && !matches!(fallback, Some(Some(_))) {
+                    return None;
                 }
-                let (does_store, addr_store) = victory_shader::Container::parse(&shader.container)
-                    .ok()
-                    .and_then(|c| {
-                        c.part(victory_shader::FourCC::DXIL)
-                            .map(|p| p.data.to_vec())
-                    })
-                    .and_then(|dxil| victory_shader::native_programs(&dxil).ok())
-                    .map_or((true, true), |programs| {
-                        (
-                            programs.is_empty() || programs.iter().any(super::stores),
-                            programs.is_empty() || programs.iter().any(super::stores_by_address),
-                        )
-                    });
-                Some(Arc::new(Shader {
-                    stage: shader.stage,
-                    hash: shader.hash.clone(),
-                    container: Vec::new(),
-                    translated: OnceLock::from(Some(Translated {
+                let accessed = accessed.into_inner();
+                let (does_store, addr_store) = native_stores(&shader.container);
+                let facts = |(host, mut used): (victory_shader::emit::HostShader, Vec<_>)| {
+                    // Include exact slots absent from the console metadata so
+                    // draw binding snapshots and transitions the views that
+                    // lowering reads.
+                    with_accessed(&mut used, &host.user_data, &accessed)?;
+                    Some(Translated {
                         host,
                         used,
                         stores: does_store,
                         address_stores: addr_store,
+                    })
+                };
+                let translated = match translated {
+                    Ok(t) => Some(facts(t)?),
+                    Err(()) => None,
+                };
+                let mesh_fallback = match fallback {
+                    Some(Some((f, used))) => OnceLock::from(Some(super::MeshFallback {
+                        compute: facts((f.compute, used))?,
+                        vertex: f.vertex,
+                        buffer: f.buffer,
                     })),
-                    mesh_fallback: OnceLock::new(),
+                    Some(None) => OnceLock::from(None),
+                    None => OnceLock::new(),
+                };
+                Some(Arc::new(Shader {
+                    stage: shader.stage,
+                    hash: shader.hash.clone(),
+                    container: Vec::new(),
+                    translated: OnceLock::from(translated),
+                    mesh_fallback,
                     #[cfg(feature = "diagnostics")]
                     wave64: OnceLock::new(),
                 }))
             })
             .collect()
     }
+}
+
+/// Whether the console programs of `container` can store to buffer memory,
+/// and by address ([`super::stores`], [`super::stores_by_address`]); both
+/// for a container whose programs are not known.
+fn native_stores(container: &[u8]) -> (bool, bool) {
+    victory_shader::Container::parse(container)
+        .ok()
+        .and_then(|c| {
+            c.part(victory_shader::FourCC::DXIL)
+                .map(|p| p.data.to_vec())
+        })
+        .and_then(|dxil| victory_shader::native_programs(&dxil).ok())
+        .map_or((true, true), |programs| {
+            (
+                programs.is_empty() || programs.iter().any(super::stores),
+                programs.is_empty() || programs.iter().any(super::stores_by_address),
+            )
+        })
+}
+
+/// Gives `used` (a translation's console resources) the structured views
+/// its lowering read, `accessed` as (binding, stride): an entry for the same
+/// table slot and offset takes the view's stride, and a view the console
+/// metadata does not name is added, bound through the root parameter of
+/// its slot's table in `user_data`. None if a view's slot has no table.
+fn with_accessed(
+    used: &mut Vec<UsedResource>,
+    user_data: &[victory_shader::emit::UserData],
+    accessed: &BTreeSet<(StructuredBinding, u32)>,
+) -> Option<()> {
+    for &(binding, stride) in accessed {
+        let kind = if binding.uav {
+            ResourceType::Uav
+        } else {
+            ResourceType::Srv
+        };
+        if let Some(entry) = used.iter_mut().find(|u| {
+            u.root == RootType::Table
+                && u.slot == binding.slot
+                && u.table_offset_dwords == binding.offset_dwords
+                && u.kind == kind
+        }) {
+            entry.stride = stride;
+        } else {
+            let user_data = user_data
+                .iter()
+                .find(|u| u.root == RootType::Table && u.slot == binding.slot)?
+                .index;
+            used.push(UsedResource {
+                kind,
+                root: RootType::Table,
+                table_offset_dwords: binding.offset_dwords,
+                lower_bound: 0,
+                stride,
+                dwords: 4,
+                user_data: user_data.try_into().ok()?,
+                slot: binding.slot,
+            });
+        }
+    }
+    Some(())
 }
 
 /// Why a pipeline has no host pipeline (diagnostics): its shaders that do
@@ -610,6 +671,58 @@ fn drained() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The structured views a specialized translation read go into its
+    /// resources: an entry the console metadata has takes the view's stride,
+    /// and one it lacks is added through that translation's own root
+    /// parameter for the slot (a mesh program and its compute fallback each
+    /// have theirs); a view whose slot has no table refuses.
+    #[test]
+    fn read_views_join_the_resources_of_the_translation_that_read_them() {
+        let table = |slot: u8, index: u32| victory_shader::emit::UserData {
+            indexed_buffer: false,
+            index,
+            slot,
+            root: RootType::Table,
+            dword: 0,
+        };
+        let listed = UsedResource {
+            kind: ResourceType::Srv,
+            root: RootType::Table,
+            table_offset_dwords: 8,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 2,
+            slot: 1,
+        };
+        let known = StructuredBinding {
+            slot: 1,
+            offset_dwords: 8,
+            uav: false,
+        };
+        let unlisted = StructuredBinding {
+            slot: 3,
+            offset_dwords: 4,
+            uav: true,
+        };
+        let accessed = BTreeSet::from([(known, 16), (unlisted, 12)]);
+        for index in [5, 9] {
+            let mut used = vec![listed];
+            assert_eq!(
+                with_accessed(&mut used, &[table(1, 2), table(3, index)], &accessed),
+                Some(())
+            );
+            assert_eq!(used.len(), 2);
+            assert_eq!((used[0].stride, used[0].user_data), (16, 2));
+            let added = used[1];
+            assert_eq!(added.kind, ResourceType::Uav);
+            assert_eq!((added.slot, added.table_offset_dwords), (3, 4));
+            assert_eq!((added.stride, u32::from(added.user_data)), (12, index));
+        }
+        let mut used = Vec::new();
+        assert_eq!(with_accessed(&mut used, &[table(1, 2)], &accessed), None);
+    }
 
     /// A first use queues the pipeline and, within the budget, gets the
     /// worker's answer (here: no host pipeline for no shaders).

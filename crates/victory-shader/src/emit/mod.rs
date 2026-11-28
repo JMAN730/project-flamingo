@@ -1151,18 +1151,42 @@ pub fn translate_mesh_for_pixel(
 /// Translates the mesh program of a console shader container for a host
 /// without mesh shaders.
 pub fn translate_mesh_fallback(container: &[u8]) -> Result<MeshFallback, ShaderError> {
+    mesh_fallback_of(container, None)
+}
+
+/// As [`translate_mesh_fallback`], with structured views for table entries
+/// whose stride only the bound view knows, as
+/// [`translate_with_view_strides`] resolves them. Returns the resource
+/// metadata used for host binding alongside.
+pub fn translate_mesh_fallback_with_view_strides(
+    container: &[u8],
+    view_stride: ViewStride<'_>,
+) -> Result<(MeshFallback, Vec<crate::UsedResource>), ShaderError> {
     let c = Container::parse(container)?;
+    let used = mesh_program(&c)?.used;
+    Ok((mesh_fallback_of(container, Some(view_stride))?, used))
+}
+
+fn mesh_program(c: &Container<'_>) -> Result<NativeProgram, ShaderError> {
     let dxil = c
         .part(FourCC::DXIL)
         .ok_or(ShaderError::Malformed("no DXIL part"))?;
-    let native = crate::native_programs(dxil.data)?
+    crate::native_programs(dxil.data)?
         .into_iter()
         .find(|p| p.stage == HwStage::Ms)
         .ok_or(ShaderError::Unsupported {
             offset: 0,
             what: "a mesh fallback of a container without a mesh program",
-        })?;
-    let (compute, buffer) = translate_stages(&c, &native, true, "", None, None, true)?;
+        })
+}
+
+fn mesh_fallback_of(
+    container: &[u8],
+    view_stride: Option<ViewStride<'_>>,
+) -> Result<MeshFallback, ShaderError> {
+    let c = Container::parse(container)?;
+    let native = mesh_program(&c)?;
+    let (compute, buffer) = translate_stages(&c, &native, true, "", None, view_stride, true)?;
     mesh_fallback(compute, buffer)
 }
 
