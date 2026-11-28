@@ -2416,10 +2416,15 @@ impl Host {
     }
 }
 
+/// Submissions of lists whose indirect work budget ran out
+/// ([`HostList::budget`]): their indirect records after that ran empty.
+pub(crate) static BUDGET_SPENT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Copies a finished list's texture-to-buffer and texture readbacks into title memory.
 /// Returns `false` if lazy materialization failed for any readback destination;
 /// rows that could not be materialized or written are never counted in `COPY_BACK[1]`.
 pub(super) fn read_backs(list: &HostList) -> bool {
+    list.note_budget_spent();
     let deferred = list.deferred();
     let mut ok = true;
     for rb in &deferred.readbacks {
@@ -4169,6 +4174,27 @@ impl HostList {
         }
         // SAFETY: a live buffer.
         Some(unsafe { buffer.GetGPUVirtualAddress() })
+    }
+
+    /// After the list ran: counts it in [`BUDGET_SPENT`] if its indirect
+    /// work budget ([`Self::budget`]) ran out, so indirect records after that
+    /// point ran empty, logging at powers of two.
+    fn note_budget_spent(&self) {
+        let Some(Some((_, data))) = self.budget.get() else {
+            return;
+        };
+        // SAFETY: the list's own mapped word; the list has run.
+        let used = unsafe { (*data as *const u32).read_volatile() };
+        // `BUDGET` in `shaders/argument_clamp.hlsl` (`indirect_budget` models it).
+        if used >= 1 << 31 {
+            let n = BUDGET_SPENT.fetch_add(1, Ordering::Relaxed) + 1;
+            if n.is_power_of_two() {
+                tracing::warn!(
+                    lists = n,
+                    "a list spent its indirect work budget: its later indirect draws and dispatches ran empty"
+                );
+            }
+        }
     }
 
     /// A shader that can store to buffers is bound.
