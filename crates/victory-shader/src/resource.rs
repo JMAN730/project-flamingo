@@ -50,6 +50,29 @@ pub const MEMORY: usize = usize::MAX - 1;
 
 /// The reasons an address traces to no root parameter for which the
 /// address is then taken as it stands ([`MEMORY`]).
+/// Whether an instruction's result is memory contents (a load, or an
+/// atomic's returned old value), not computed from its operands.
+fn is_load(name: &str) -> bool {
+    const LOADS: [&str; 15] = [
+        "s_load",
+        "s_buffer_load",
+        "buffer_load",
+        "buffer_atomic",
+        "tbuffer_load",
+        "global_load",
+        "global_atomic",
+        "flat_load",
+        "flat_atomic",
+        "scratch_load",
+        "ds_read",
+        "ds_load",
+        "image_load",
+        "image_sample",
+        "image_gather",
+    ];
+    LOADS.iter().any(|p| name.starts_with(p))
+}
+
 const RAW: [&str; 5] = [
     "an address not from a root parameter",
     "an address from a root parameter that is no address",
@@ -1511,15 +1534,24 @@ impl<'a> Tracer<'a> {
         if self.reads_code_address(lo) {
             return Err(why);
         }
+        // The lowering reads the address from the SGPRs as the wave holds
+        // it, so whatever the per-lane value traces to (a root view, a
+        // select of scalar values, a pointer loaded from memory), title
+        // memory at that address is what the console reads. Only a clamped
+        // sum (the clamp the console applies is not the title's) and a code
+        // table stay refused.
         self.clamped.set(false);
         match self.address(self.vorigin(lo), hi, Sum::constant(0)) {
             Err(raw) if RAW.contains(&raw) => self.by_address(raw).map_err(|_| why),
-            _ => Err(why),
+            _ if self.clamped.get() => Err(why),
+            _ => self.by_address(RAW[0]).map_err(|_| why),
         }
     }
 
     /// Whether `v` may be computed from what `s_getpc_b64` writes (through
-    /// any instruction or join; past a bound, taken to be).
+    /// any instruction or join; past a bound, taken to be). What a load
+    /// returns is data, whatever address it came from, so the search stops
+    /// at loads: a pointer read from a code table is a title address.
     fn reads_code_address(&self, v: Value) -> bool {
         let mut seen = std::collections::HashSet::new();
         let mut todo = vec![v];
@@ -1527,12 +1559,16 @@ impl<'a> Tracer<'a> {
             if !seen.insert(v) {
                 continue;
             }
-            if seen.len() > 512 {
+            if seen.len() > 4096 {
                 return true;
             }
             if let Some(inst) = self.def(v) {
-                if inst.name() == "s_getpc_b64" {
+                let name = inst.name();
+                if name == "s_getpc_b64" {
                     return true;
+                }
+                if is_load(name) {
+                    continue;
                 }
                 todo.extend(inst.reads.iter().map(|r| r.1));
             } else if let Some((b, i)) = self.phis[v.0 as usize] {
@@ -4191,6 +4227,26 @@ pub(crate) mod tests {
             r.scalar
         );
         assert_eq!(r.scalar.len(), 2);
+    }
+
+    /// A scalar load at the first lane of a per-lane select between two
+    /// scalar values (the form a ray-tracing traversal uses to pick a node
+    /// address): the SGPRs hold the address the wave reads, so it is title
+    /// memory whatever the select traces to.
+    #[test]
+    fn a_scalar_load_at_a_first_lane_select_of_scalars_is_title_memory() {
+        let words = [
+            0xD501_0000, // v_cndmask_b32 v0, s0, s2, s4
+            0x0010_0400,
+            0x7E0C_0500, // v_readfirstlane_b32 s6, v0
+            0xBE87_0380, // s_mov_b32 s7, 0
+            0xF400_0203, // s_load_dword s8, s[6:7], 0
+            0xFA00_0000,
+            S_ENDPGM,
+        ];
+        let r = track_words(&words, &[], HwStage::Cs);
+        assert_eq!(r.scalar.len(), 1, "{:?}", r.scalar);
+        assert_eq!(r.scalar[0].1.param, MEMORY);
     }
 
     /// A scalar load of a table in the code, at an address a VGPR sum builds
