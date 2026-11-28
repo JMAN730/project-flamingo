@@ -15,10 +15,10 @@ The Windows executable can also be launched under Proton on x86-64 Linux. See
 For a pinned Linux development environment, run `nix develop` (or `nix-shell`).
 See [Linux development with Nix](docs/linux-proton.md#development-with-nix).
 
-## Status (2026-11-23)
+## Status (2026-11-28)
 
 **Not playable yet.** The title boots, runs its menus at its own 30 fps and
-loads the world, where rendering fails.
+loads the world, where the picture is still dark.
 
 | Stage | State |
 |-------|-------|
@@ -28,7 +28,20 @@ loads the world, where rendering fails.
 | Loading into the world (about 50 s) | works |
 | The world (first mission's intro) | reached and runs with indirect draws; its title card renders, the scene after it is still dark; 0.5-1.8 s per frame |
 
-Tested on one machine: Windows 11, AMD RX 6700 XT.
+Tested on two machines:
+
+| Machine | World today |
+|---------|-------------|
+| Windows 11, AMD RX 6700 XT (the reference machine) | as in the table above (measured 2026-11-23) |
+| Windows 10, NVIDIA GTX 1080 (8 GB, no mesh shaders, 32-lane waves), Agility SDK runtime | loads and holds at about 2 s per frame, and has run 15 minutes without a crash or device removal. The geometry pass is right (shapes, hair and clothing, normal-map detail); the lit target and the presented frame are near black, because about 60 of the compute programs that shade materials are refused or dropped (200 to 300 dispatches a frame) |
+
+The GTX 1080 runs need the Series S profile and switches that are off by
+default: `--console series-s`, `VICTORY_TEXTURE_MIP_DROP=2` with
+`VICTORY_TEXTURE_MIP_DROP_MIN_SIZE=256` (the world's textures do not fit in
+8 GB otherwise), `VICTORY_WAVE64_SPLIT=1`, `VICTORY_TIME_SCALE=auto`, and a
+diagnostics build that skips three pipelines with `VICTORY_SKIP_PIPELINES`.
+[docs/research/frame-rate.md](docs/research/frame-rate.md) records how each
+was found.
 
 > **Warning.** Entering the world on a real GPU can currently hang it, and
 > Windows then resets the display driver (every monitor goes black for a
@@ -54,7 +67,7 @@ What each part does today and what it still needs:
 | Input | XInput pads, keyboard, keyboard stand-in pad | Trigger rumble |
 | Audio | Menu, video and loading sound; XMA voices and Opus streams decode; convolution reverb is wet | DSP FFT/IFFT transforms stay silent; Opus results unverified against the title |
 | GPU: menus | Draws, compute and presentation on host D3D12; only changed title memory is copied | Frame pacing drifts on one screen in release builds |
-| GPU: world | Mesh pipelines, shader-written buffers, descriptor lifetimes, indirect execution (arguments clamped), pipelines made by worker threads and kept on disk | Most of the scene is still missing (untranslated shaders drop draws); frames take seconds; real queries, depth bounds, HDR and scaling are missing |
+| GPU: world | Mesh pipelines (a compute and vertex fallback on GPUs without mesh shaders), shader-written buffers, descriptor lifetimes, indirect execution (arguments clamped), pipelines made by worker threads and kept on disk | Most of the scene is still missing (untranslated shaders drop draws); frames take seconds; real queries, depth bounds, HDR and scaling are missing |
 | Shaders | Console GPU code recompiled to DXIL at first use, cached on disk. Menus: all. World: mesh 8,191 of 8,506, vertex/pixel 10,617 of 12,346, compute 1,643 of 2,539 | Merged geometry stages, the ray-tracing builder's shaders; some compute programs need a GPU with 64-lane waves |
 | Textures | Console tiled layouts and detiling for the modes the title uses | Render-target metadata planes |
 | Series S mode | Runs through the menus to the loading screen | The world, as above |
