@@ -1951,11 +1951,16 @@ impl State {
                 };
                 (len >= 4).then_some((s, offset, len))
             } else {
+                // shortcut: a raw view starts on 16 bytes and this binding
+                // has no bias word for the shader. A null view would read 0
+                // and drop the stores, half running the shader over what it
+                // builds (allocators, bounds); dropping the draw leaves that
+                // memory as it was.
                 once!(
                     address = format_args!("{a:#x}"),
-                    "an unaligned raw root view is bound as null"
+                    "an unaligned raw root view: the draw is dropped (a null view would read 0 and drop its stores)"
                 );
-                None
+                return false;
             }
         } else {
             None
