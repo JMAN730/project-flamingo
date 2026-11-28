@@ -381,6 +381,33 @@ pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
     }
 }
 
+/// The title heap at `key`, if it is registered as shader-visible under
+/// `heaps` (a guard of [`SHADER_HEAPS`]) and has creation id `id`: not one
+/// made later at the same address. Live while the guard is held.
+#[cfg(windows)]
+fn registered_as(heaps: &[(u64, u64, usize)], key: usize, id: u64) -> Option<&Heap> {
+    heaps
+        .iter()
+        .find(|&&(_, _, h)| h == key)
+        // SAFETY: registered heaps are live (removed in `Drop`, under the
+        // write lock the caller's read guard excludes).
+        .map(|&(_, _, h)| unsafe { &*(h as *const Heap) })
+        .filter(|heap| id != 0 && heap.id == id)
+}
+
+/// Gives back dynamic slots of the host heap behind the title heap at
+/// `key` if it is still the heap with creation id `id`
+/// ([`heap_bind_id`]), checked and released under one read of the heap
+/// registry, so a heap made at the same address in between is not given
+/// them.
+#[cfg(windows)]
+pub(crate) fn release_dynamic_of(key: usize, id: u64, first: u32, n: u32) {
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+    if let Some(Some(host)) = registered_as(&heaps, key, id).and_then(|heap| heap.host.get()) {
+        host.release(first, n);
+    }
+}
+
 /// Gives back a batch of dynamic slot ranges `(heap, first, n)` under at most
 /// one `SHADER_HEAPS` lock, one `HostHeap::next` lock per contiguous heap run,
 /// and a single `retire_executing_batch` call for all displaced resources.
@@ -1703,6 +1730,37 @@ mod tests {
             slot::<extern "system" fn(This) -> u32>(recycled, 0x10)(recycled),
             0
         );
+    }
+
+    /// A slot given back by heap address and creation id finds the heap only
+    /// while that heap is registered with that id: not under another id, not
+    /// after its release, and never for id 0.
+    #[cfg(windows)]
+    #[test]
+    fn slots_go_back_only_to_the_heap_they_were_taken_from() {
+        let desc = HeapDesc {
+            kind: 0,
+            count: 8,
+            flags: 1,
+            nodes: 1,
+        };
+        let none = Placement {
+            address: 0,
+            size: 0,
+        };
+        let mut made = std::ptr::null();
+        assert_eq!(create(desc, none, &mut made), S_OK);
+        let key = made as usize;
+        let id = heap(made).id;
+        {
+            let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+            assert!(registered_as(&heaps, key, id).is_some());
+            assert!(registered_as(&heaps, key, id + 1).is_none());
+            assert!(registered_as(&heaps, key, 0).is_none());
+        }
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(made, 0x10)(made), 0);
+        let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+        assert!(registered_as(&heaps, key, id).is_none());
     }
 
     /// `heap_bind_id` tracks live shader-visible heaps by creation id, not

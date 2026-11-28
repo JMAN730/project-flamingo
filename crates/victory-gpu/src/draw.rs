@@ -1833,7 +1833,7 @@ impl State {
         if heap.samplers() {
             return None;
         }
-        crate::descriptor::table::bind(heap.host()?, heap.start, list, !compute)
+        crate::descriptor::table::bind(heap.host()?, key, heap.start, list, !compute)
     }
 
     fn indexed_buffer(
