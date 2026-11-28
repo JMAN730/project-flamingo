@@ -339,8 +339,12 @@ pub fn read(path: &Path) -> Result<Option<Lock>> {
     }
 }
 
-/// Gives the card back, if the lock is still that of `run_id`.
+/// Gives the card back, if the lock is still that of `run_id`. The look
+/// and the removal happen under the guard: without it, another run could
+/// clear this lock as stale and write its own between the two, and its
+/// fresh lock would be the one removed.
 pub fn release(path: &Path, run_id: &str) -> Result<()> {
+    let _guard = Guard::take(path, GUARD_WAIT)?;
     if read(path)?.is_some_and(|held| held.run_id == run_id) {
         std::fs::remove_file(path).with_context(|| format!("removing {}", path.display()))?;
     }
@@ -547,6 +551,54 @@ pub mod tests {
         let seen = request_stop(&path, "a").unwrap().unwrap();
         assert_eq!((seen.pid, seen.stop_requested), (Some(20), true));
         assert!(seen.title_runs(&table(&[(20, "victory-a.exe")])));
+    }
+
+    #[test]
+    fn a_release_that_races_a_new_claim_never_removes_the_new_lock() {
+        for _ in 0..20 {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("card.lock");
+            // The old run's processes are gone, so the new run may clear
+            // its lock as stale while the old run is still releasing it.
+            acquire(&path, &lock("old", Some(20)), &table(&[])).unwrap();
+            std::thread::scope(|scope| {
+                let path = &path;
+                let releasers: Vec<_> = (0..6)
+                    .map(|_| scope.spawn(move || release(path, "old").unwrap()))
+                    .collect();
+                let claim = scope.spawn(move || {
+                    let mut new = lock("new", None);
+                    new.launcher_pid = 100;
+                    acquire(path, &new, &table(&[(100, "xtask.exe")])).unwrap();
+                });
+                let more: Vec<_> = (0..6)
+                    .map(|_| scope.spawn(move || release(path, "old").unwrap()))
+                    .collect();
+                claim.join().unwrap();
+                for releaser in releasers.into_iter().chain(more) {
+                    releaser.join().unwrap();
+                }
+            });
+            assert_eq!(read(&path).unwrap().unwrap().run_id, "new");
+            assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+        }
+    }
+
+    #[test]
+    fn while_another_run_claims_the_card_a_release_waits_and_removes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("card.lock");
+        acquire(&path, &lock("a", None), &table(&[])).unwrap();
+        let guard = Guard::take(&path, Duration::ZERO).unwrap();
+        std::thread::scope(|scope| {
+            let releasing = scope.spawn(|| release(&path, "a").unwrap());
+            std::thread::sleep(Duration::from_millis(100));
+            assert!(!releasing.is_finished());
+            assert_eq!(read(&path).unwrap().unwrap().run_id, "a");
+            drop(guard);
+            releasing.join().unwrap();
+        });
+        assert_eq!(read(&path).unwrap(), None);
     }
 
     #[test]
