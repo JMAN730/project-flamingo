@@ -3329,10 +3329,13 @@ fn a_mask_read_after_two_loop_exits_is_not_balloted_at_one() {
     ];
     let lowered = lower_words(words, 1 << 1).expect("lower");
     assert_eq!(lowered.mask_ballots_after_loop, 0);
-    if let Ok(mut v) = super::super::validator::Validator::load(
-        super::super::validator::Validator::default_path().as_deref(),
-    ) {
-        v.validate(&mut lowered.dxil.clone())
-            .expect("DXIL validation failed");
+    #[cfg(windows)]
+    {
+        if let Ok(mut v) = super::super::validator::Validator::load(
+            super::super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut lowered.dxil.clone())
+                .expect("DXIL validation failed");
+        }
     }
 }

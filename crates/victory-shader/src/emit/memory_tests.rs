@@ -116,12 +116,16 @@ fn lowered_by_address(words: &[u32]) -> lower::Lowered {
     let lowered = lower_compute(&native);
     assert!(lowered.root_srvs.contains(&SLOT_MEMORY));
     assert_eq!(lowered.root_uavs, [SLOT_FAULTS]);
-    match super::validator::Validator::load(super::validator::Validator::default_path().as_deref())
+    #[cfg(windows)]
     {
-        Ok(mut v) => v
-            .validate(&mut lowered.dxil.clone())
-            .expect("DXIL validation failed"),
-        Err(e) => eprintln!("{e}; validation skipped"),
+        match super::validator::Validator::load(
+            super::validator::Validator::default_path().as_deref(),
+        ) {
+            Ok(mut v) => v
+                .validate(&mut lowered.dxil.clone())
+                .expect("DXIL validation failed"),
+            Err(e) => eprintln!("{e}; validation skipped"),
+        }
     }
     lowered
 }
