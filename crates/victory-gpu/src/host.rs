@@ -7568,14 +7568,23 @@ pub fn display_hdr_info() -> Option<HdrDisplayInfo> {
     }
 }
 
-fn desired_color_space(format: DXGI_FORMAT, hdr_active: bool) -> DXGI_COLOR_SPACE_TYPE {
-    if !hdr_active {
-        return DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
+/// The color space DXGI gives a new swap chain of `format`: scRGB (linear)
+/// for half floats, sRGB-like gamma 2.2 otherwise.
+fn default_color_space(format: DXGI_FORMAT) -> DXGI_COLOR_SPACE_TYPE {
+    if format == DXGI_FORMAT_R16G16B16A16_FLOAT {
+        DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709
+    } else {
+        DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709
     }
+}
+
+/// The color space a swap chain of `format` presents in. Half floats are
+/// always scRGB, which DWM shows on SDR and HDR displays alike; gamma 2.2 is
+/// not a color space DXGI presents half floats in.
+fn desired_color_space(format: DXGI_FORMAT, hdr_active: bool) -> DXGI_COLOR_SPACE_TYPE {
     match format {
-        DXGI_FORMAT_R10G10B10A2_UNORM => DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020,
-        DXGI_FORMAT_R16G16B16A16_FLOAT => DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709,
-        _ => DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709,
+        DXGI_FORMAT_R10G10B10A2_UNORM if hdr_active => DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020,
+        _ => default_color_space(format),
     }
 }
 
@@ -8171,7 +8180,7 @@ impl Host {
                 width,
                 height,
                 format,
-                color_space: DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709,
+                color_space: default_color_space(format),
                 copy,
                 hwnd,
                 meter: Meter::new(),

@@ -12,6 +12,29 @@ fn present_result_distinguishes_occlusion_from_success_and_failure() {
     );
 }
 
+/// Half-float swap chains stay scRGB on SDR and HDR displays: gamma 2.2 is
+/// not a half-float presentation color space, and it is not DXGI's default.
+#[test]
+fn half_float_swap_chains_present_as_scrgb_on_any_display() {
+    let fp16 = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    let scrgb = DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709;
+    let g22 = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
+    assert_eq!(default_color_space(fp16), scrgb);
+    assert_eq!(desired_color_space(fp16, false), scrgb);
+    assert_eq!(desired_color_space(fp16, true), scrgb);
+    for format in [DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM] {
+        assert_eq!(default_color_space(format), g22);
+        assert_eq!(desired_color_space(format, true), g22);
+    }
+    let ten = DXGI_FORMAT_R10G10B10A2_UNORM;
+    assert_eq!(default_color_space(ten), g22);
+    assert_eq!(desired_color_space(ten, false), g22);
+    assert_eq!(
+        desired_color_space(ten, true),
+        DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020
+    );
+}
+
 #[test]
 fn shadow_buffer_transitions_between_writes_and_reads() {
     let uav = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
