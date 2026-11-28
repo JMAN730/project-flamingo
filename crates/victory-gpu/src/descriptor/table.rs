@@ -65,9 +65,7 @@ impl Drop for Alias {
     fn drop(&mut self) {
         RELEASED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let (key, id) = self.heap;
-        if id != 0 && crate::descriptor::heap_bind_id(key) == id {
-            crate::descriptor::release_dynamic(key, self.slot, 1);
-        }
+        crate::descriptor::release_dynamic_of(key, id, self.slot, 1);
     }
 }
 
