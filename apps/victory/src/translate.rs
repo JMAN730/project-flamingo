@@ -686,7 +686,7 @@ fn tally_selected(
                 &p.layout,
                 p.stage,
                 lanes,
-                p.initialized_sgprs(),
+                resource::Entry::of(p),
             ) {
                 Ok(r) => {
                     tally_resources(p, &r, t);
