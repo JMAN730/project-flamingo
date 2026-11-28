@@ -190,7 +190,8 @@ victory inspect <exe|dll> [--imports] [--exports]
 victory census [paths...] [--missing] [--strict]
 victory lib-exports <import.lib> [--list]
 victory shader-info [paths...] [--verbose] [--disasm]
-victory translate [paths...] [--validate] [--pipelines] [--list] [--jobs N]
+victory translate [paths...] [--validate] [--pipelines] [--mesh-fallback]
+                  [--barycentric-fallback] [--list] [--jobs N] [--hash H,...]
 victory run <exe> [--execute] [--unimplemented trap|zero] [--strict]
             [--console series-x|series-s] [-- <title arguments>]
 victory config
@@ -198,6 +199,8 @@ victory config
 
 `translate --jobs N` requires a positive worker count. Omit it to use the
 default worker count.
+`translate --hash H` translates only the containers whose runtime hash (the
+16 hex digits the runtime logs a shader by) is one of those given.
 
 Logging: `VICTORY_LOG=victory_loader=trace,info` (a release build logs
 info and above).
@@ -351,7 +354,9 @@ A run:
    holds the session name, the run id, the start time and the process ids of
    the launcher and the title. While those processes run, another
    `run-world` refuses to start and says who holds the card. A lock whose
-   processes are gone is stale and is cleared;
+   processes are gone is stale and is cleared. Reading, clearing, writing and
+   releasing the lock happen while a second file, `card.lock.guard`, exists for a
+   moment, so two runs that start together cannot both get the card;
 3. copies the exe as `victory-<run id>.exe`, with its `D3D12` folder, to a
    folder of its own under `victory-data\runs` in your user folder
    (`--bin-dir`), and starts the title from `game_dir` of `victory.toml`
@@ -374,8 +379,10 @@ which must be outside the repository like every other output folder:
 `victory.log` (the title's output), `frames\` (captured frames),
 `crashes.log` (what the run appended to the title's `crashes.log`, if
 anything) and `manifest.json`: the commit and whether the tree had changes,
-the build, the arguments, every variable that was set, the start and end
-times, the exit code, what ended the run and where the crash report is.
+the build, the arguments, every variable that was set, when the run was
+asked for, when the title was started and when it ended (the run's length
+counts from the title's start, not from the build before it), the exit code,
+what ended the run and where the crash report is.
 
 The defaults are the environment world runs are known to work with on an 8 GB
 card: `--console series-s`, `VICTORY_SKIP_PIPELINES=5d113aa6830760b6,caa78b8ca62bc3d6,5552dac6a2b7a1fd`,

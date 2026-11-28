@@ -97,7 +97,7 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
         .or_insert_with(|| {
             Arc::new(Shader {
                 stage,
-                hash: full.to_hex()[..16].to_owned(),
+                hash: victory_shader::runtime_hash(bytes),
                 container: bytes.to_vec(),
                 #[cfg(windows)]
                 translated: OnceLock::new(),
@@ -1062,6 +1062,16 @@ pub fn save_pipeline_cache() {
 
 #[cfg(test)]
 mod tests {
+    /// The hash a shader is logged by is the one `victory translate --hash`
+    /// selects containers by.
+    #[test]
+    fn a_shader_is_logged_by_its_runtime_hash() {
+        let bytes = b"DXBC: a synthetic container".to_vec();
+        let shader = super::shader("pixel", &bytes);
+        assert_eq!(shader.hash, victory_shader::runtime_hash(&bytes));
+        assert_eq!(shader.hash, blake3::hash(&bytes).to_hex()[..16]);
+    }
+
     #[cfg(all(windows, feature = "diagnostics"))]
     #[test]
     fn skip_stages_names_known_stages_only() {

@@ -66,6 +66,18 @@ struct HostQueries {
 #[cfg(windows)]
 const SPARE_QUERIES: u32 = 64;
 
+/// A new host list's recording id, which the query tracking here knows its
+/// recordings by ([`begins`], [`resolving`], [`submitting`],
+/// [`forget_list`]). Never 0 (a run's "recording over"). Not the list's
+/// address: a finished list is moved out of its `Arc` before it is
+/// recycled, and its recording must still be forgotten under the id its
+/// queries were noted with.
+#[cfg(any(windows, test))]
+pub(crate) fn next_recording() -> usize {
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// One begin of a title query: the spare host queries holding its later
 /// parts, in order, and whether it was cut short.
 #[cfg(any(windows, test))]
@@ -754,6 +766,46 @@ static FUNCTIONS: Table<24> = {
 mod tests {
     use super::*;
     use crate::object::{E_NOINTERFACE, E_POINTER, S_FALSE, S_OK, slot};
+
+    /// Recording ids are never 0 (a run whose recording is over) and never
+    /// repeat.
+    #[test]
+    fn recording_ids_are_distinct_and_nonzero() {
+        let ids: Vec<usize> = (0..64).map(|_| next_recording()).collect();
+        assert!(ids.iter().all(|&id| id != 0));
+        let unique: std::collections::HashSet<_> = ids.iter().collect();
+        assert_eq!(unique.len(), ids.len());
+    }
+
+    /// A list's recording is forgotten under the id its runs were noted
+    /// with, so superseded runs give their spare queries back however many
+    /// recordings come and go; forgotten under any other key (the address a
+    /// recycled list was moved to) they keep them, and the spares run out.
+    #[test]
+    fn forgotten_recordings_give_their_spares_back() {
+        let mut parts = Parts::new(1, 2);
+        for _ in 0..10 {
+            let list = next_recording();
+            let run = parts.begins(0, list);
+            assert!(parts.continues(run).is_some(), "a spare is left");
+            parts.submitted(list);
+            parts.forget(list);
+        }
+        // Only the last submitted run still holds its spare.
+        assert_eq!(parts.free.len(), 1);
+        assert_eq!(parts.runs.len(), 1);
+
+        let mut parts = Parts::new(1, 2);
+        let mut cut = false;
+        for _ in 0..10 {
+            let list = next_recording();
+            let run = parts.begins(0, list);
+            cut |= parts.continues(run).is_none();
+            parts.submitted(list);
+            parts.forget(list ^ 0x8000);
+        }
+        assert!(cut, "forgotten under the wrong key, the spares run out");
+    }
 
     #[test]
     fn null_descriptions_are_rejected() {

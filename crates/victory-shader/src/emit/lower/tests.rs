@@ -259,6 +259,20 @@ fn ds_swizzle_b32_zeros_inactive_source_lanes() {
     assert!(lowered.wave_ops, "ds_swizzle_b32 uses wave operations");
 }
 
+/// `ds_bpermute_b32` gives each lane the data of the lane its address names,
+/// and 0 from a lane out of EXEC: a lane read behind a ballot.
+#[test]
+fn ds_bpermute_b32_reads_the_lane_its_address_names() {
+    // s_mov_b32 exec_lo, 0x5555; ds_bpermute_b32 v1, v0, v2 (address v0, data v2).
+    let words = [0xBEFE_03FF, 0x0000_5555, 0xDACC_0000, 0x0100_0200, S_ENDPGM];
+    let lowered = lower_words(&words, 0).expect("ds_bpermute_b32 lowers");
+    assert!(
+        lowered.has_wave_ballot,
+        "a source lane out of EXEC must read as 0"
+    );
+    assert!(lowered.wave_ops, "ds_bpermute_b32 uses wave operations");
+}
+
 /// A wave64 mesh shader's quad swizzle asks the ballot about the source's
 /// host lane (quad-local, from `waveGetLaneIndex`), not its console lane
 /// number: console lanes 32..63 have no bit in a wave32 host's ballot.
@@ -3338,4 +3352,63 @@ fn a_mask_read_after_two_loop_exits_is_not_balloted_at_one() {
                 .expect("DXIL validation failed");
         }
     }
+}
+
+#[test]
+fn a_descriptor_read_for_the_address_of_a_structure_in_title_memory_lowers() {
+    // A buffer descriptor from the table at s0 that no memory instruction
+    // takes: the program masks its base address out of words 0 and 1 (40
+    // bits, 256-byte aligned) and reads a header dword of the structure
+    // there, as programs that walk a ray-tracing structure do. Words 0 and
+    // 1 come from the host's list of view addresses; the header read goes
+    // through the title-memory directory.
+    let words = [
+        0xBE84_0300, // s_mov_b32 s4, s0
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF408_0202,
+        0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], null
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x870C_FF08,
+        0xFFFF_FF00, // s_and_b32 s12, s8, 0xffffff00
+        0x870D_FF09,
+        0x0000_00FF, // s_and_b32 s13, s9, 0xff
+        0x880C_B00C, // s_or_b32 s12, s12, 48
+        0xF400_0386,
+        0xFA00_0000, // s_load_dword s14, s[12:13], null
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x7E02_020E, // v_mov_b32 v1, s14
+        0xD834_0000,
+        0x0000_0100, // ds_write_b32 v0, v1
+        S_ENDPGM,
+    ];
+    let used = vec![UsedResource {
+        kind: ResourceType::Srv,
+        root: RootType::Table,
+        table_offset_dwords: 0,
+        lower_bound: 0,
+        stride: 4,
+        dwords: 4,
+        user_data: 0,
+        slot: 0,
+    }];
+    let l = lower_with(&words, vec![root(RootType::Table, 0, 0)], used).unwrap();
+    let reads = |root| l.user_data.iter().any(|u| u.root == root);
+    assert!(reads(RootType::ResourceHeap), "{:?}", l.user_data);
+    assert!(
+        reads(RootType::Other(crate::emit::USER_VIEW_ADDRESSES)),
+        "{:?}",
+        l.user_data
+    );
+    assert!(
+        reads(RootType::Other(crate::emit::USER_MEMORY_BASE)),
+        "{:?}",
+        l.user_data
+    );
+    // The record is looked up at the title's slot, wherever the host bound
+    // its copy of the root table.
+    assert!(
+        reads(RootType::Other(crate::emit::USER_TABLE_SLOTS)),
+        "{:?}",
+        l.user_data
+    );
 }

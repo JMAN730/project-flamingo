@@ -91,6 +91,16 @@ fn expected() -> Vec<u32> {
         .collect()
 }
 
+/// Each store's compare-exchange loop stops after a limit of passes, so a
+/// card whose exchange never reports the dword it found cannot hang in it.
+#[test]
+fn each_byte_and_halfword_store_retries_within_a_limit() {
+    let before = super::lower::BOUNDED_RETRIES.with(|n| n.get());
+    shader();
+    let bounded = super::lower::BOUNDED_RETRIES.with(|n| n.get()) - before;
+    assert_eq!(bounded, 4, "one bounded loop per narrow store");
+}
+
 #[test]
 fn byte_and_halfword_stores_translate() {
     let shader = shader();

@@ -100,6 +100,10 @@ enum Command {
         /// Positive worker thread count (default: every logical core).
         #[arg(long)]
         jobs: Option<NonZeroUsize>,
+        /// Only the containers with these runtime hashes: the 16 hex digits
+        /// the runtime logs a shader by (comma-separated or repeated).
+        #[arg(long)]
+        hash: Vec<String>,
     },
     /// Run each wave64 compute program found as a 32-lane host's two-half
     /// lowering makes it, against the variants that must agree with it, on
@@ -204,6 +208,7 @@ fn dispatch(command: Command) -> Result<()> {
             barycentric_fallback,
             list,
             jobs,
+            hash,
         } => translate::run(
             paths,
             validate,
@@ -211,6 +216,7 @@ fn dispatch(command: Command) -> Result<()> {
             (mesh_fallback, barycentric_fallback),
             list,
             jobs.map(NonZeroUsize::get),
+            hash,
         ),
         #[cfg(windows)]
         Command::SplitDiff {

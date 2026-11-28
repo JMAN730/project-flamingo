@@ -44,9 +44,18 @@ impl Lower<'_> {
         })
     }
 
-    /// The heap index of the buffer descriptor `src` and whether it may
-    /// differ between lanes, as [`Lower::handle`] takes them.
+    /// The slot of the buffer descriptor `src` in the title's heap, where
+    /// the host's buffer view table holds its record, and whether it may
+    /// differ between lanes. Not the index [`Lower::handle`] takes: through
+    /// a root table the host bound a copy of, that one is the copy's slot.
     pub(super) fn buffer_heap_index(&mut self, src: &Source) -> Result<(V, bool), Why> {
+        let outer = std::mem::replace(&mut self.title_slots, true);
+        let index = self.buffer_heap_index_in(src);
+        self.title_slots = outer;
+        index
+    }
+
+    fn buffer_heap_index_in(&mut self, src: &Source) -> Result<(V, bool), Why> {
         match src {
             Source::Loaded { load, first } => {
                 let index = self.heap_index(*load, *first, false)?;
@@ -209,6 +218,91 @@ impl Lower<'_> {
             139,
             &[t.handle, byte, iu, mask, align],
         ))
+    }
+
+    /// A buffer descriptor (`count` of its words from the first) that no
+    /// memory instruction takes, read only as data, as programs that walk a
+    /// ray-tracing structure through title memory read its base address:
+    /// words 0 and 1 from the slot's entry in the host's view address list
+    /// ([`emit::USER_VIEW_ADDRESSES`]) in the GFX10 layout (word 0 the low
+    /// address dword, word 1 bits 0-15 the high one and bits 16-29 the
+    /// stride), the stride and word 2 (the record count) from the slot's
+    /// record in the buffer view table. A slot the host has no address for
+    /// reads address 0, which no title memory holds.
+    // shortcut: word 3 (format and bounds checking) has no host value:
+    // reading it stops the program.
+    pub(super) fn view_address_data(
+        &mut self,
+        inst: &Inst,
+        code: u8,
+        count: u32,
+        src: &Source,
+    ) -> Result<(), Why> {
+        if crate::switch::no_buffer_table() {
+            return Err("a descriptor read only as data");
+        }
+        let (index, _) = self.buffer_heap_index(src)?;
+        let c = self.cur;
+        let slot = self.buffer_table_slot()?;
+        let table = self.s.heap_handle(c, slot, false, false, (11, 0));
+        let list = self.host_word(RootType::Other(emit::USER_VIEW_ADDRESSES), 0, 0);
+        let invalid = self.s.m.i32(u32::MAX - 15);
+        let limit = self.s.m.i32(emit::VIEW_HEAP_LIMIT);
+        let in_heap = self.s.m.cmp(c, pred::IULT, index, limit);
+        let iu = self.s.m.undef(self.s.t.i32);
+        let align = self.s.m.i32(4);
+        let load = |l: &mut Self, at: V, mask: u8| {
+            let mask = l.s.m.i8(mask);
+            l.s.op(
+                c,
+                "rawBufferLoad.f32",
+                Attr::ReadOnly,
+                l.s.t.res_ret,
+                139,
+                &[table, at, iu, mask, align],
+            )
+        };
+        let size = self.s.m.i32(emit::BUFFER_TABLE_RECORD);
+        let at = self.s.m.bin(c, Bin::Mul, index, size);
+        let at = self.s.m.select(c, in_heap, at, invalid);
+        let record = load(self, at, 0xF);
+        let entry = self.s.m.i32(emit::VIEW_ADDRESS_ENTRY);
+        let at = self.s.m.bin(c, Bin::Mul, index, entry);
+        let at = self.s.m.bin(c, Bin::Add, list, at);
+        let zero = self.s.m.i32(0);
+        let listed = self.s.m.cmp(c, pred::NE, list, zero);
+        let known = self.s.m.bin(c, Bin::And, listed, in_heap);
+        let at = self.s.m.select(c, known, at, invalid);
+        let address = load(self, at, 0x3);
+        let word = |l: &mut Self, r: V, k: u32| {
+            let x = l.s.m.extract(c, r, k);
+            l.as_int(x)
+        };
+        let (stride, elements) = (word(self, record, 1), word(self, record, 3));
+        let (low, high) = (word(self, address, 0), word(self, address, 1));
+        let k = |l: &mut Self, v: u32| l.s.m.i32(v);
+        let (k16, k3fff, kffff) = (k(self, 16), k(self, 0x3FFF), k(self, 0xFFFF));
+        let high = self.s.m.bin(c, Bin::And, high, kffff);
+        let stride = self.s.m.bin(c, Bin::And, stride, k3fff);
+        let stride = self.s.m.bin(c, Bin::Shl, stride, k16);
+        let word1 = self.s.m.bin(c, Bin::Or, high, stride);
+        for k in 0..count {
+            let reg = Reg::S(code + k as u8);
+            match k {
+                0 => self.write(inst, reg, low, None),
+                1 => self.write(inst, reg, word1, None),
+                2 => self.write(inst, reg, elements, None),
+                _ => {
+                    if let Some(v) = inst.write(reg) {
+                        self.vals.insert(
+                            v,
+                            Val::Missing("a descriptor's address or format read as data"),
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// A buffer descriptor the program reads as data whose stride only its
