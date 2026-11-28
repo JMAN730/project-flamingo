@@ -50,25 +50,44 @@ pub(crate) fn plane_stats_wanted(frame: u64) -> bool {
 
 /// Whether frame `n` is saved.
 pub(crate) fn wanted(n: u64) -> bool {
-    folder().is_some() && (n.is_power_of_two() || listed(n) || in_seconds_span())
+    static FIRST: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    wanted_at(n, folder().is_some(), listed(n), asked_span(), &FIRST)
 }
 
-/// Whether now is inside `VICTORY_CAPTURE_SECONDS=<from>-<to>`, counted from
-/// the first presented frame: frame numbers do not land on the same scene
-/// from run to run, a time on the clock sometimes does.
-fn in_seconds_span() -> bool {
+/// `wanted`, from what was asked for. `first` is the clock of
+/// `VICTORY_CAPTURE_SECONDS`: it starts at the first frame asked about,
+/// before anything else is looked at, so that frames saved for their
+/// number do not push the span of seconds back.
+fn wanted_at(
+    n: u64,
+    capturing: bool,
+    listed: bool,
+    span: Option<(f64, f64)>,
+    first: &std::sync::OnceLock<std::time::Instant>,
+) -> bool {
+    let elapsed = first
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_secs_f64();
+    capturing
+        && (n.is_power_of_two()
+            || listed
+            || span.is_some_and(|(from, to)| (from..=to).contains(&elapsed)))
+}
+
+/// `VICTORY_CAPTURE_SECONDS=<from>-<to>`, counted from the first presented
+/// frame: frame numbers do not land on the same scene from run to run, a
+/// time on the clock sometimes does.
+fn asked_span() -> Option<(f64, f64)> {
     static SPAN: std::sync::OnceLock<Option<(f64, f64)>> = std::sync::OnceLock::new();
-    static FIRST: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-    let first = FIRST.get_or_init(std::time::Instant::now);
-    let span = SPAN.get_or_init(|| {
+    *SPAN.get_or_init(|| {
         let value = std::env::var("VICTORY_CAPTURE_SECONDS").ok()?;
         let span = seconds_span(&value);
         if span.is_none() {
             tracing::warn!("VICTORY_CAPTURE_SECONDS expects <from>-<to> in seconds, got {value}");
         }
         span
-    });
-    span.is_some_and(|(from, to)| (from..=to).contains(&first.elapsed().as_secs_f64()))
+    })
 }
 
 /// `<from>-<to>` in seconds, `from` not after `to`.
@@ -870,6 +889,28 @@ mod tests {
             super::to_rgba(87, 1, 1, 4, &[1, 2, 3, 4]),
             Some(vec![3, 2, 1, 255])
         );
+    }
+
+    #[test]
+    fn the_seconds_clock_starts_at_the_first_frame_whatever_selects_it() {
+        use std::sync::OnceLock;
+        use std::time::{Duration, Instant};
+        // A frame saved for its number, one not saved, and capture off:
+        // each starts the clock.
+        for (n, capturing, listed) in [(1, true, false), (3, true, true), (3, false, false)] {
+            let first = OnceLock::new();
+            super::wanted_at(n, capturing, listed, Some((3.0, 6.0)), &first);
+            assert!(first.get().is_some(), "frame {n}");
+        }
+        // Frame 3 is neither a power of two nor listed: only the span saves it.
+        let now = Instant::now();
+        let ago = |secs| OnceLock::from(now.checked_sub(Duration::from_secs(secs)).unwrap());
+        let span = Some((3.0, 6.0));
+        assert!(!super::wanted_at(3, true, false, span, &ago(1)));
+        assert!(super::wanted_at(3, true, false, span, &ago(4)));
+        assert!(!super::wanted_at(3, true, false, span, &ago(8)));
+        assert!(!super::wanted_at(3, false, false, span, &ago(4)));
+        assert!(!super::wanted_at(3, true, false, None, &ago(4)));
     }
 
     #[test]

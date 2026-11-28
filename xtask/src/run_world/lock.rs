@@ -9,6 +9,7 @@
 use std::fs::OpenOptions;
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -132,62 +133,123 @@ pub fn inspect(path: &Path, processes: &dyn Processes) -> Result<Found> {
     })
 }
 
-/// Claims the card for `lock`: fails while a live lock exists, clears a
-/// stale one. The file is created exclusively, so of two runs that start
-/// together only one gets it.
-pub fn acquire(path: &Path, lock: &Lock, processes: &dyn Processes) -> Result<()> {
-    for _ in 0..3 {
-        match create(path, lock) {
-            Ok(()) => return Ok(()),
-            Err(e) if e.kind() == ErrorKind::AlreadyExists => {}
-            Err(e) => return Err(e).with_context(|| format!("creating {}", path.display())),
+/// How long a run waits for another that is claiming the card right now.
+const GUARD_WAIT: Duration = Duration::from_secs(10);
+
+/// The right to look at the lock file and replace it: a second file,
+/// `<lock>.guard`, made exclusively and removed when dropped. It is held
+/// only while the lock is read, cleared and written (milliseconds), never
+/// during a run. Without it, two runs that both find a stale lock could
+/// each clear the other's fresh one and both start a title.
+struct Guard(PathBuf);
+
+impl Guard {
+    fn take(lock: &Path, wait: Duration) -> Result<Self> {
+        let mut name = lock.file_name().unwrap_or_default().to_os_string();
+        name.push(".guard");
+        let path = lock.with_file_name(name);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("making {}", parent.display()))?;
         }
-        match inspect(path, processes)? {
-            Found::Free => {}
-            Found::Live(held) => bail!(
-                "the card is taken: session {} holds {} since {} (run {}, title pid {}). \
-                 Wait for it, or end it with `cargo xtask run-world stop`",
-                held.session,
-                path.display(),
-                held.started,
-                held.run_id,
-                held.pid.map_or("not started".into(), |p| p.to_string()),
-            ),
-            Found::BarePid {
-                pid,
-                text,
-                image: Some(image),
-            } => bail!(
-                "the card is taken: {} holds `{text}` and pid {pid} ({image}) still runs. \
-                 Wait for it, or end it with `cargo xtask run-world stop`",
-                path.display(),
-            ),
-            Found::BarePid {
-                pid,
-                text,
-                image: None,
-            } => {
-                clear_stale(path, &text)?;
-                println!("cleared a stale lock: pid {pid} is gone");
+        let start = Instant::now();
+        loop {
+            match OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(mut file) => {
+                    // Who holds it, for whoever finds it left behind.
+                    let _ = write!(file, "{}", std::process::id());
+                    return Ok(Self(path));
+                }
+                Err(e) if e.kind() == ErrorKind::AlreadyExists => {}
+                // Windows refuses a name whose file is being deleted.
+                Err(e) if e.kind() == ErrorKind::PermissionDenied => {}
+                Err(e) => return Err(e).with_context(|| format!("creating {}", path.display())),
             }
-            Found::Stale(stale) => {
-                clear_stale(path, &text(&stale))?;
-                println!(
-                    "cleared a stale lock: run {} of session {} (its processes are gone)",
-                    stale.run_id, stale.session
+            if start.elapsed() >= wait {
+                // Not removed for the holder: taking it away from a run
+                // that is only slow would bring the race back.
+                bail!(
+                    "{} is held: another run-world is claiming the card. If none is \
+                     running (one was killed in the act), delete that file",
+                    path.display()
                 );
             }
-            Found::Unreadable(why) => bail!(
-                "{} is not a lock this tool wrote ({why}); look at it and delete it by hand \
-                 if no run is using the card",
-                path.display()
-            ),
+            std::thread::sleep(Duration::from_millis(20));
         }
     }
-    bail!(
-        "{} keeps changing under us: another run is starting",
-        path.display()
-    )
+}
+
+impl Drop for Guard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Claims the card for `lock`: fails while a live lock exists, clears a
+/// stale one. Looking, clearing and writing happen under the guard, so of
+/// two runs that start together only one gets the card.
+pub fn acquire(path: &Path, lock: &Lock, processes: &dyn Processes) -> Result<()> {
+    acquire_within(path, lock, processes, GUARD_WAIT)
+}
+
+fn acquire_within(
+    path: &Path,
+    lock: &Lock,
+    processes: &dyn Processes,
+    wait: Duration,
+) -> Result<()> {
+    let _guard = Guard::take(path, wait)?;
+    match inspect(path, processes)? {
+        Found::Free => {}
+        Found::Live(held) => bail!(
+            "the card is taken: session {} holds {} since {} (run {}, title pid {}). \
+             Wait for it, or end it with `cargo xtask run-world stop`",
+            held.session,
+            path.display(),
+            held.started,
+            held.run_id,
+            held.pid.map_or("not started".into(), |p| p.to_string()),
+        ),
+        Found::BarePid {
+            pid,
+            text,
+            image: Some(image),
+        } => bail!(
+            "the card is taken: {} holds `{text}` and pid {pid} ({image}) still runs. \
+             Wait for it, or end it with `cargo xtask run-world stop`",
+            path.display(),
+        ),
+        Found::BarePid {
+            pid,
+            text,
+            image: None,
+        } => {
+            remove_if_same(path, &text)?;
+            println!("cleared a stale lock: pid {pid} is gone");
+        }
+        Found::Stale(stale) => {
+            remove_if_same(path, &text_of(&stale))?;
+            println!(
+                "cleared a stale lock: run {} of session {} (its processes are gone)",
+                stale.run_id, stale.session
+            );
+        }
+        Found::Unreadable(why) => bail!(
+            "{} is not a lock this tool wrote ({why}); look at it and delete it by hand \
+             if no run is using the card",
+            path.display()
+        ),
+    }
+    // Exclusive all the same: a tool that does not know the guard may have
+    // written its own lock since we looked.
+    match create(path, lock) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == ErrorKind::AlreadyExists => bail!(
+            "{} appeared while the card was being claimed: something else took it",
+            path.display()
+        ),
+        Err(e) => Err(e).with_context(|| format!("creating {}", path.display())),
+    }
 }
 
 fn create(path: &Path, lock: &Lock) -> std::io::Result<()> {
@@ -195,33 +257,31 @@ fn create(path: &Path, lock: &Lock) -> std::io::Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
-    file.write_all(text(lock).as_bytes())
+    file.write_all(text_of(lock).as_bytes())
 }
 
-fn text(lock: &Lock) -> String {
+fn text_of(lock: &Lock) -> String {
     serde_json::to_string_pretty(lock).expect("a lock is plain data")
 }
 
-/// Removes the lock file if it still holds `stale`. The file is moved
-/// aside first and looked at again, so a lock another run created in the
-/// meantime is put back instead of deleted.
+/// Removes the lock file if it still holds `stale`, under the guard.
 pub fn clear_stale(path: &Path, stale: &str) -> Result<()> {
-    let aside = path.with_extension(format!("stale-{}", std::process::id()));
-    match std::fs::rename(path, &aside) {
-        Ok(()) => {}
+    let _guard = Guard::take(path, GUARD_WAIT)?;
+    remove_if_same(path, stale)
+}
+
+/// Removes the lock file if it holds `stale`; refuses if it now holds
+/// something else. The caller holds the guard.
+fn remove_if_same(path: &Path, stale: &str) -> Result<()> {
+    let now = match std::fs::read_to_string(path) {
+        Ok(now) => now,
         Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(e).with_context(|| format!("moving {} aside", path.display())),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+    if !same_lock(&now, stale) {
+        bail!("another run took the card while a stale lock was being cleared");
     }
-    let moved = std::fs::read_to_string(&aside).unwrap_or_default();
-    if same_lock(&moved, stale) {
-        std::fs::remove_file(&aside).with_context(|| format!("removing {}", aside.display()))
-    } else {
-        // Somebody else's fresh lock: give it back.
-        std::fs::hard_link(&aside, path)
-            .and_then(|()| std::fs::remove_file(&aside))
-            .with_context(|| format!("restoring {}", path.display()))?;
-        bail!("another run took the card while a stale lock was being cleared")
-    }
+    std::fs::remove_file(path).with_context(|| format!("removing {}", path.display()))
 }
 
 /// Whether two lock texts say the same, however they are laid out and
@@ -231,18 +291,43 @@ fn same_lock(a: &str, b: &str) -> bool {
     a.trim() == b.trim() || (lock(a).is_some() && lock(a) == lock(b))
 }
 
-/// Rewrites the lock of run `lock.run_id` (to add the title's pid, or the
-/// stop request). Fails if the file now belongs to another run.
-pub fn update(path: &Path, lock: &Lock) -> Result<()> {
-    let held = read(path)?;
-    if held.as_ref().map(|h| &h.run_id) != Some(&lock.run_id) {
+/// Records in the lock of run `run_id` that the run is to stop, and
+/// returns the lock as it then is; `None` if the file is not that run's
+/// any more. Under the guard, like `publish_title`: whichever of the two
+/// comes second sees what the first wrote, so a stop asked for while the
+/// title is being started is not lost. Either `stop` finds the title's
+/// pid here and ends it, or the launcher finds the request when it
+/// publishes the pid and ends its own child.
+pub fn request_stop(path: &Path, run_id: &str) -> Result<Option<Lock>> {
+    let _guard = Guard::take(path, GUARD_WAIT)?;
+    let Some(mut held) = read(path)?.filter(|held| held.run_id == run_id) else {
+        return Ok(None);
+    };
+    held.stop_requested = true;
+    std::fs::write(path, text_of(&held)).with_context(|| format!("writing {}", path.display()))?;
+    Ok(Some(held))
+}
+
+/// Whether a stop was asked of run `run_id`.
+pub fn stop_requested(path: &Path, run_id: &str) -> Result<bool> {
+    Ok(read(path)?.is_some_and(|held| held.run_id == run_id && held.stop_requested))
+}
+
+/// Writes the title's pid and image of `lock` into the lock file, keeping
+/// a stop request made in the meantime, and says whether there is one.
+/// Fails if the file now belongs to another run.
+pub fn publish_title(path: &Path, lock: &mut Lock) -> Result<bool> {
+    let _guard = Guard::take(path, GUARD_WAIT)?;
+    let Some(held) = read(path)?.filter(|held| held.run_id == lock.run_id) else {
         bail!(
             "{} no longer belongs to run {}",
             path.display(),
             lock.run_id
         );
-    }
-    std::fs::write(path, text(lock)).with_context(|| format!("writing {}", path.display()))
+    };
+    lock.stop_requested |= held.stop_requested;
+    std::fs::write(path, text_of(lock)).with_context(|| format!("writing {}", path.display()))?;
+    Ok(lock.stop_requested)
 }
 
 /// The lock at `path`, if the file exists and reads as one.
@@ -376,9 +461,92 @@ pub mod tests {
         let path = dir.path().join("card.lock");
         // The file no longer holds what was judged stale: another run's.
         acquire(&path, &lock("fresh", Some(20)), &table(&[])).unwrap();
-        assert!(clear_stale(&path, &text(&lock("old", Some(7)))).is_err());
+        assert!(clear_stale(&path, &text_of(&lock("old", Some(7)))).is_err());
         assert_eq!(read(&path).unwrap().unwrap().run_id, "fresh");
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn while_another_run_claims_the_card_nothing_is_cleared() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("card.lock");
+        acquire(&path, &lock("old", Some(20)), &table(&[])).unwrap();
+        let guard = Guard::take(&path, Duration::ZERO).unwrap();
+        assert!(dir.path().join("card.lock.guard").is_file());
+        let wait = Duration::from_millis(60);
+        let refused = acquire_within(&path, &lock("b", None), &table(&[]), wait).unwrap_err();
+        assert!(refused.to_string().contains("card.lock.guard"), "{refused}");
+        assert_eq!(read(&path).unwrap().unwrap().run_id, "old");
+        drop(guard);
+        assert!(!dir.path().join("card.lock.guard").exists());
+        acquire(&path, &lock("b", None), &table(&[])).unwrap();
+        assert_eq!(read(&path).unwrap().unwrap().run_id, "b");
+    }
+
+    #[test]
+    fn of_many_runs_that_find_a_stale_lock_together_one_gets_the_card() {
+        for _ in 0..20 {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("card.lock");
+            acquire(&path, &lock("old", Some(20)), &table(&[])).unwrap();
+            // Every racer's launcher runs, so whichever lock is written is
+            // live; the old lock's processes are gone.
+            let winners: Vec<String> = std::thread::scope(|scope| {
+                let racers: Vec<_> = (0..8u32)
+                    .map(|i| {
+                        let path = &path;
+                        scope.spawn(move || {
+                            let mut mine = lock(&format!("racer-{i}"), None);
+                            mine.launcher_pid = 100 + i;
+                            let running: Vec<(u32, &str)> =
+                                (0..8).map(|j| (100 + j, "xtask.exe")).collect();
+                            acquire(path, &mine, &table(&running))
+                                .ok()
+                                .map(|()| mine.run_id)
+                        })
+                    })
+                    .collect();
+                racers
+                    .into_iter()
+                    .filter_map(|racer| racer.join().unwrap())
+                    .collect()
+            });
+            assert_eq!(winners.len(), 1, "{winners:?}");
+            assert_eq!(read(&path).unwrap().unwrap().run_id, winners[0]);
+            assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+        }
+    }
+
+    #[test]
+    fn a_stop_asked_before_the_title_has_a_pid_reaches_the_launcher() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("card.lock");
+        // The launcher holds the card and is still copying the exe.
+        acquire(&path, &lock("a", None), &table(&[])).unwrap();
+        assert!(!stop_requested(&path, "a").unwrap());
+        let seen = request_stop(&path, "a").unwrap().unwrap();
+        assert_eq!(seen.pid, None);
+        // Checked before the title is started...
+        assert!(stop_requested(&path, "a").unwrap());
+        assert!(!stop_requested(&path, "other").unwrap());
+        // ...and if it was started all the same, publishing its pid does
+        // not wipe the request: the launcher is told and the file keeps it.
+        let mut started = lock("a", Some(20));
+        assert!(publish_title(&path, &mut started).unwrap());
+        assert!(started.stop_requested);
+        let kept = read(&path).unwrap().unwrap();
+        assert_eq!((kept.pid, kept.stop_requested), (Some(20), true));
+    }
+
+    #[test]
+    fn a_stop_asked_after_the_pid_is_published_finds_the_pid() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("card.lock");
+        acquire(&path, &lock("a", None), &table(&[])).unwrap();
+        assert!(!publish_title(&path, &mut lock("a", Some(20))).unwrap());
+        let seen = request_stop(&path, "a").unwrap().unwrap();
+        assert_eq!((seen.pid, seen.stop_requested), (Some(20), true));
+        assert!(seen.title_runs(&table(&[(20, "victory-a.exe")])));
     }
 
     #[test]
@@ -394,9 +562,11 @@ pub mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("card.lock");
         acquire(&path, &lock("a", None), &table(&[])).unwrap();
-        update(&path, &lock("a", Some(20))).unwrap();
+        assert!(!publish_title(&path, &mut lock("a", Some(20))).unwrap());
         assert_eq!(read(&path).unwrap().unwrap().pid, Some(20));
-        assert!(update(&path, &lock("b", Some(30))).is_err());
+        assert!(publish_title(&path, &mut lock("b", Some(30))).is_err());
+        assert_eq!(request_stop(&path, "b").unwrap(), None);
+        assert!(!stop_requested(&path, "a").unwrap());
         release(&path, "b").unwrap();
         assert!(path.is_file());
         release(&path, "a").unwrap();

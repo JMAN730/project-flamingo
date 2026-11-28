@@ -248,6 +248,16 @@ fn record(table: u64, k: u32) -> [u32; 3] {
     unsafe { ((table + u64::from(k) * 32) as *const [u32; 3]).read_unaligned() }
 }
 
+/// What a shader adds to a heap slot it found through a root table to get
+/// the title's slot (`victory_shader::emit::USER_TABLE_SLOTS`): the title's
+/// table is `title` bytes into its heap, and the shader was given `fresh`
+/// instead when the list bound its own copy of the table
+/// ([`State::tables_with_strides`]), whose slots the buffer view table has
+/// no records for. Wrapping, as the shader's sum is.
+fn table_slots_ahead(title: u32, fresh: Option<u32>) -> u32 {
+    fresh.map_or(0, |fresh| (title / 32).wrapping_sub(fresh / 32))
+}
+
 struct FreshTableEntry {
     heap: usize,
     copy_gen: u64,
@@ -1396,6 +1406,12 @@ impl State {
                 &mut heap_values[..]
             };
             for u in &t.host.user_data {
+                if u.root == RootType::Other(victory_shader::emit::USER_TABLE_SLOTS) {
+                    let fresh = self.made.iter().find(|m| m.0 == u.slot).map(|m| m.1);
+                    let title = self.user_value(from_compute, u.slot, RootType::Table, 0);
+                    values[u.index as usize] = table_slots_ahead(title, fresh);
+                    continue;
+                }
                 if let RootType::Other(kind) = u.root {
                     values[u.index as usize] = self.host_word(kind, memory.as_ref());
                     continue;
@@ -4293,6 +4309,30 @@ fn rect_source(first: u32, count: u32, stride: u32, size: u32) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::{expanded_vertices, rect_source};
+
+    /// A slot found through a list's own copy of a root table is looked up
+    /// in the buffer view table at the title's slot, whichever lies first.
+    #[test]
+    fn a_copied_tables_slots_map_back_to_the_titles() {
+        use super::table_slots_ahead;
+        // The title's own table: nothing to add.
+        assert_eq!(table_slots_ahead(0x1240, None), 0);
+        // What the shader computes: the slot of the byte it was given plus
+        // the entry's own offset, then the correction.
+        let slot = |given: u32, entry_bytes: u32, ahead: u32| {
+            (given.wrapping_add(entry_bytes) >> 5).wrapping_add(ahead)
+        };
+        for (title, fresh) in [(0x1240u32, 0x0200_0000u32), (0x0200_0000, 0x40), (96, 96)] {
+            let ahead = table_slots_ahead(title, Some(fresh));
+            for entry_bytes in [0, 32, 40, 0x520] {
+                assert_eq!(
+                    slot(fresh, entry_bytes, ahead),
+                    (title + entry_bytes) >> 5,
+                    "{title:#x} {fresh:#x} {entry_bytes:#x}"
+                );
+            }
+        }
+    }
 
     /// A constant view's note shows its first four values when its memory
     /// is readable, and only the view when it is not (#357).
