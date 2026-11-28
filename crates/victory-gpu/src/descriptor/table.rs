@@ -9,8 +9,10 @@
 //! gives it, per slot, a raw view holding the view's bytes, the stride (0
 //! for a raw view), the view's first byte in that raw view and its element
 //! count. Raw views are made per window of a title buffer's host copy
-//! ([`Shadow`]), shared by every slot whose view lies in it, and kept for
-//! the heap's life.
+//! ([`Shadow`]), shared by every slot whose view lies in it, and kept while
+//! a record names it: one no record names is dropped from the table, and its
+//! heap slot is given back once every host list that bound the table while
+//! it was there has finished ([`Alias`]).
 //!
 //! shortcut: only shader resource views of buffers get records (a slot with
 //! another view reads zeros). As for other buffers read through directly
@@ -37,6 +39,111 @@ use crate::shadow::Shadow;
 const WINDOW: u64 = 1 << 28;
 
 const RECORD: usize = victory_shader::emit::BUFFER_TABLE_RECORD as usize;
+
+/// Raw views made and given back over the run, across every table: what
+/// the "buffer view table bound" log line reports, to see whether they grow.
+static MADE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static RELEASED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// One raw view of a window of a host copy, in a dynamic slot of its heap.
+/// The table holds one reference while a record names it, and each host
+/// list that bound the table while it was there holds another until it is
+/// reset or dropped ([`HostList::hold`]): the slot is given back with the
+/// last, so no list that may still run reads a slot made again for another
+/// view.
+struct Alias {
+    slot: u32,
+    shadow: Arc<Shadow>,
+    /// The title heap (address and creation id,
+    /// [`crate::descriptor::heap_bind_id`]) whose host heap the slot is in:
+    /// a heap released since, or another made at its address, is not given
+    /// the slot.
+    heap: (usize, u64),
+}
+
+impl Drop for Alias {
+    fn drop(&mut self) {
+        RELEASED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let (key, id) = self.heap;
+        if id != 0 && crate::descriptor::heap_bind_id(key) == id {
+            crate::descriptor::release_dynamic(key, self.slot, 1);
+        }
+    }
+}
+
+/// A copy buffer and the start of a window in it.
+type AliasKey = (usize, u64);
+
+/// The raw views of a table by copy and window, each with how many title
+/// slots' records name it, and which one each slot's record names.
+struct Aliases<V> {
+    by_key: HashMap<AliasKey, (V, u32)>,
+    of_slot: Vec<Option<AliasKey>>,
+}
+
+impl<V> Aliases<V> {
+    fn new(slots: usize) -> Self {
+        Self {
+            by_key: HashMap::new(),
+            of_slot: vec![None; slots],
+        }
+    }
+
+    fn get(&self, key: &AliasKey) -> Option<&V> {
+        self.by_key.get(key).map(|(v, _)| v)
+    }
+
+    /// A new raw view, named by no record yet.
+    fn insert(&mut self, key: AliasKey, value: V) {
+        self.by_key.insert(key, (value, 0));
+    }
+
+    /// Title slot `index`'s record now names the raw view `key` (None: no
+    /// raw view). One that no record names any more stays until
+    /// [`Self::prune`], so another slot changed in the same look can still
+    /// find it.
+    fn name(&mut self, index: usize, key: Option<AliasKey>) {
+        let Some(was) = self.of_slot.get_mut(index) else {
+            return;
+        };
+        if *was == key {
+            return;
+        }
+        if let Some(old) = was.take()
+            && let Some((_, uses)) = self.by_key.get_mut(&old)
+        {
+            *uses -= 1;
+        }
+        if let Some(new) = key
+            && let Some((_, uses)) = self.by_key.get_mut(&new)
+        {
+            *uses += 1;
+            *was = key;
+        }
+    }
+
+    /// Takes out the raw views no record names.
+    fn prune(&mut self) -> Vec<V> {
+        let unused: Vec<AliasKey> = self
+            .by_key
+            .iter()
+            .filter(|(_, (_, uses))| *uses == 0)
+            .map(|(&key, _)| key)
+            .collect();
+        unused
+            .into_iter()
+            .filter_map(|key| self.by_key.remove(&key).map(|(v, _)| v))
+            .collect()
+    }
+
+    fn len(&self) -> usize {
+        self.by_key.len()
+    }
+
+    fn values(&self) -> impl Iterator<Item = &V> {
+        self.by_key.values().map(|(v, _)| v)
+    }
+}
 
 /// The raw view of a host copy a buffer view lies in: where it starts in
 /// the copy, how long it is, and where the buffer view starts in it.
@@ -78,7 +185,10 @@ pub(crate) struct BufferTable {
     /// How many slots list a view.
     listed: usize,
     /// Raw views of host copies, by copy buffer and window.
-    aliases: HashMap<(usize, u64), (u32, Arc<Shadow>)>,
+    aliases: Aliases<Arc<Alias>>,
+    /// The title heap this table's host heap is behind (address and
+    /// creation id), for the slots of its raw views.
+    title_heap: (usize, u64),
     /// The heap's write count `made` was last brought up to date at
     /// ([`HostHeap`]'s `writes`; `u64::MAX` before the first time).
     seen: u64,
@@ -96,7 +206,7 @@ pub(crate) struct BufferTable {
 unsafe impl Send for BufferTable {}
 
 impl BufferTable {
-    fn new(heap: &HostHeap) -> Option<Self> {
+    fn new(heap: &HostHeap, title_heap: (usize, u64)) -> Option<Self> {
         let count = heap.count() as usize;
         let bytes = (count * RECORD).max(RECORD) as u64;
         let (buffer, data) = host()?.shared_buffer(bytes.next_multiple_of(1 << 16))?;
@@ -112,7 +222,8 @@ impl BufferTable {
             slot,
             made: vec![0; count],
             listed: 0,
-            aliases: HashMap::new(),
+            aliases: Aliases::new(count),
+            title_heap,
             seen: u64::MAX,
             fresh: Vec::new(),
             starved: false,
@@ -127,34 +238,43 @@ impl BufferTable {
     }
 
     /// The raw view holding `len` bytes at `offset` of `shadow`'s copy
-    /// (`left` more to its end from there), and the offset in it; made on
-    /// first use.
+    /// (`left` more to its end from there): its key, its slot and the offset
+    /// in it; made on first use.
     fn alias(
         &mut self,
         heap: &HostHeap,
         shadow: &Arc<Shadow>,
         (offset, len, left): (u64, u64, u64),
-    ) -> Option<(u32, u32)> {
+    ) -> Option<(AliasKey, u32, u32)> {
         let w = window(offset, len, left)?;
         let key = (shadow.buffer.as_raw() as usize, w.start);
-        if let Some(&(slot, _)) = self.aliases.get(&key) {
-            return Some((slot, w.bias));
+        if let Some(alias) = self.aliases.get(&key) {
+            return Some((key, alias.slot, w.bias));
         }
         let Some(slot) = heap.dynamic(1) else {
             self.starved = true;
             return None;
         };
         heap.raw_at(slot, shadow, w.start, w.len);
-        self.aliases.insert(key, (slot, shadow.clone()));
-        Some((slot, w.bias))
+        MADE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.aliases.insert(
+            key,
+            Arc::new(Alias {
+                slot,
+                shadow: shadow.clone(),
+                heap: self.title_heap,
+            }),
+        );
+        Some((key, slot, w.bias))
     }
 
     /// Brings the records up to date with what the title's slots hold,
-    /// unless no slot of the heap changed since the last time.
-    fn sync(&mut self, heap: &HostHeap, start: u64) {
+    /// unless no slot of the heap changed since the last time. Returns the
+    /// raw views no record names any more, taken out of the table.
+    fn sync(&mut self, heap: &HostHeap, start: u64) -> Vec<Arc<Alias>> {
         let writes = heap.writes.load(std::sync::atomic::Ordering::Acquire);
         if writes == self.seen {
-            return;
+            return Vec::new();
         }
         self.seen = writes;
         let mut again = false;
@@ -177,16 +297,19 @@ impl BufferTable {
                 .flatten()
                 .and_then(|view| super::host::selected_buffer(&view));
             self.starved = false;
-            let record = read.and_then(|read| {
+            let made = read.and_then(|read| {
                 let offset = read.shadow.offset(read.address);
                 let left = read.shadow.left(read.address);
-                let (alias, bias) = self.alias(heap, &read.shadow, (offset, read.bytes, left))?;
+                let (key, alias, bias) =
+                    self.alias(heap, &read.shadow, (offset, read.bytes, left))?;
                 // A raw view (stride 0) counts bytes; the shader drops its index.
                 let elements = u32::try_from(read.bytes / u64::from(read.stride.max(1))).ok()?;
                 self.fresh
                     .push((read.shadow.clone(), read.address, read.bytes));
-                Some([alias, read.stride, bias, elements])
+                Some((key, [alias, read.stride, bias, elements]))
             });
+            self.aliases.name(index as usize, made.map(|(key, _)| key));
+            let record = made.map(|(_, record)| record);
             let before = self.read(index)[3] != 0 && was != 0;
             match (before, record.is_some()) {
                 (false, true) => self.listed += 1,
@@ -204,6 +327,7 @@ impl BufferTable {
         if again {
             self.seen = u64::MAX;
         }
+        self.aliases.prune()
     }
 
     fn read(&self, index: u32) -> [u32; 4] {
@@ -213,28 +337,40 @@ impl BufferTable {
 }
 
 /// The heap slot of the buffer view table of `heap` (the host heap of the
-/// title view heap at `start`), its records brought up to date and the
-/// copies they name readable by `list`'s shaders (`graphics`: pixel
-/// shaders too). None if the host cannot make it.
-pub(crate) fn bind(heap: &HostHeap, start: u64, list: &HostList, graphics: bool) -> Option<u32> {
-    let mut table = heap.buffer_table.lock().unwrap_or_else(|e| e.into_inner());
-    if table.is_none() {
-        *table = Some(BufferTable::new(heap)?);
+/// title view heap `key`, whose slots are at `start`), its records brought
+/// up to date and the copies they name readable by `list`'s shaders
+/// (`graphics`: pixel shaders too). None if the host cannot make it.
+pub(crate) fn bind(
+    heap: &HostHeap,
+    key: usize,
+    start: u64,
+    list: &HostList,
+    graphics: bool,
+) -> Option<u32> {
+    let mut guard = heap.buffer_table.lock().unwrap_or_else(|e| e.into_inner());
+    if guard.is_none() {
+        let title_heap = (key, crate::descriptor::heap_bind_id(key));
+        *guard = Some(BufferTable::new(heap, title_heap)?);
         tracing::info!(slots = heap.count(), "buffer view table made");
     }
-    let table = table.as_mut()?;
+    let table = guard.as_mut()?;
     let started = std::time::Instant::now();
-    table.sync(heap, start);
+    // Raw views no record names any more: let go of once the table's lock
+    // is (the lists that bound the table while they were in it hold them
+    // until they finish).
+    let unnamed = table.sync(heap, start);
     let state = if graphics {
         D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
     } else {
         D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
     };
     list.use_shadow(&table.buffer, state);
-    // Every copy a listed view lies in, readable by the shaders; views
-    // listed since the last time copied.
-    for (_, shadow) in table.aliases.values() {
-        list.use_shadow(&shadow.buffer, state);
+    // Every copy a listed view lies in, readable by the shaders and its raw
+    // view's slot kept while the list may run; views listed since the last
+    // time copied.
+    for alias in table.aliases.values() {
+        list.use_shadow(&alias.shadow.buffer, state);
+        list.hold(alias.clone());
     }
     for (shadow, address, len) in table.fresh.drain(..) {
         shadow.refresh_as(list, address, len, state);
@@ -246,11 +382,16 @@ pub(crate) fn bind(heap: &HostHeap, start: u64, list: &HostList, graphics: bool)
             binds = n,
             views = table.listed,
             raw_views = table.aliases.len(),
+            raw_views_made = MADE.load(std::sync::atomic::Ordering::Relaxed),
+            raw_views_released = RELEASED.load(std::sync::atomic::Ordering::Relaxed),
             us = started.elapsed().as_micros() as u64,
             "buffer view table bound"
         );
     }
-    Some(table.slot)
+    let slot = table.slot;
+    drop(guard);
+    drop(unnamed);
+    Some(slot)
 }
 
 #[cfg(test)]
@@ -285,6 +426,49 @@ mod tests {
     fn a_copy_ending_inside_a_block_is_viewed_to_the_block_end() {
         let w = window(8, 4, 6).expect("a window");
         assert_eq!((w.start, w.len, w.bias), (0, 16, 8));
+    }
+
+    /// A raw view stays while some slot's record names it and is taken out
+    /// once none does, not before the look that changed them ends.
+    #[test]
+    fn raw_views_no_record_names_are_taken_out() {
+        let (a, b) = ((1, 0), (1, WINDOW));
+        let mut aliases = Aliases::new(4);
+        aliases.insert(a, "a");
+        aliases.name(0, Some(a));
+        aliases.name(1, Some(a));
+        assert!(aliases.prune().is_empty());
+        // Slot 0 moves to a new raw view, slot 1 to no view: `a` is named
+        // by none, but slot 2 finds it before the prune.
+        aliases.insert(b, "b");
+        aliases.name(0, Some(b));
+        aliases.name(1, None);
+        aliases.name(2, Some(a));
+        assert!(aliases.prune().is_empty());
+        aliases.name(2, None);
+        assert_eq!(aliases.prune(), ["a"]);
+        assert_eq!(aliases.len(), 1);
+        // Naming the same raw view again counts it once.
+        aliases.name(0, Some(b));
+        aliases.name(0, None);
+        assert_eq!(aliases.prune(), ["b"]);
+        assert_eq!(aliases.len(), 0);
+    }
+
+    /// A raw view made but named by no record (its record could not be
+    /// made) goes at the next prune; a name of a key not in the table, or
+    /// of a slot past the table, changes nothing.
+    #[test]
+    fn a_raw_view_named_by_none_does_not_stay() {
+        let mut aliases = Aliases::new(2);
+        aliases.insert((7, 0), 7);
+        aliases.name(0, Some((8, 0)));
+        aliases.name(9, Some((7, 0)));
+        assert_eq!(aliases.prune(), [7]);
+        aliases.insert((8, 0), 8);
+        aliases.name(0, Some((8, 0)));
+        assert!(aliases.prune().is_empty());
+        assert_eq!(aliases.values().copied().collect::<Vec<_>>(), [8]);
     }
 
     #[test]
