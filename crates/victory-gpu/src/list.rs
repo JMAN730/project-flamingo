@@ -155,6 +155,11 @@ impl Drop for List {
             .get_mut()
             .unwrap_or_else(|e| e.into_inner())
             .take();
+        // The list's address can be another host list's next: no query
+        // open in this one may be found under it.
+        if let Some(current) = current.as_ref() {
+            forget_open_queries(current);
+        }
         if let Some(pending) = segments
             .iter()
             .filter_map(|s| match s {
@@ -454,6 +459,9 @@ extern "system" fn close(this: This) -> HRESULT {
         let mut state = list.state.lock().unwrap_or_else(|e| e.into_inner());
         finish_hoist(&mut segments, &mut state);
         if let Some(host) = host.as_ref() {
+            // A query the title left open ends here: a host list does not
+            // close with one open, and no later recording may end it.
+            let _ = end_open_queries(host);
             host.close();
         }
     }
@@ -476,6 +484,11 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
         let mut segments = list.segments.lock().unwrap_or_else(|e| e.into_inner());
         let mut state = list.state.lock().unwrap_or_else(|e| e.into_inner());
         let _ = state.end_hoist();
+        // A list reset while open drops its commands, open queries too: an
+        // end in the next recording has no begin to match.
+        if let Some(current) = host.as_ref() {
+            forget_open_queries(current);
+        }
         if let Some(pending) = segments
             .iter()
             .filter_map(|s| match s {
@@ -1589,13 +1602,24 @@ fn end_open_queries(list: &std::sync::Arc<crate::host::HostList>) -> Vec<(This, 
     ended
 }
 
+/// Forgets the occlusion queries still open in host list `list`, whose
+/// recording the title drops (a reset or the release of its list): they
+/// are neither ended nor go on.
+#[cfg(windows)]
+fn forget_open_queries(list: &std::sync::Arc<crate::host::HostList>) {
+    let _ = crate::query::take_open(std::sync::Arc::as_ptr(list) as usize);
+}
+
 /// Begins again, in host list `next`, the queries a split ended in the list
 /// before it ([`end_open_queries`]): each goes on as a spare host query
 /// that the title's own end then ends, and its resolve combines the parts
 /// ([`resolve_occlusion`]). Returns whether any query went on.
-// shortcut: with no spare host query left (or no new host list, where the
-// caller drops them), a query counts only what was drawn before the split;
-// the title's own end, recorded in the next host list, finds nothing to end.
+// shortcut: with no spare host query left, a query counts only what was
+// drawn before the split, and resolves as one sample passed if that was
+// nothing (`crate::query::combined`): seen rather than wrongly hidden, but
+// not measured. With no new host list, where the caller drops them, it
+// keeps the count from before the split. In both the title's own end,
+// recorded in the next host list, finds nothing to end.
 #[cfg(windows)]
 fn continue_queries(
     next: &std::sync::Arc<crate::host::HostList>,
@@ -3847,6 +3871,65 @@ mod tests {
 
         drop((before, after));
         for object in [list, again, allocator, queue, results, heap] {
+            assert_eq!(release(object), 0);
+        }
+    }
+
+    /// A query the title leaves open does not outlive the recording it was
+    /// begun in: closing the list ends it, and releasing the list forgets
+    /// it, so nothing is left for a host list later made at that address.
+    /// Needs a host GPU.
+    #[cfg(windows)]
+    #[test]
+    fn a_query_left_open_ends_with_its_recording() {
+        if crate::host::host().is_none() {
+            return; // no host GPU here
+        }
+        let null = std::ptr::null();
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        let mut allocator = null;
+        assert_eq!(
+            create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
+            S_OK
+        );
+        let new_list = || {
+            let mut list = null;
+            assert_eq!(
+                create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list),
+                S_OK
+            );
+            list
+        };
+        let heap = crate::query::test_occlusion_heap(4);
+        if crate::query::occlusion_heap(heap).is_none() {
+            assert_eq!(release(heap), 0);
+            assert_eq!(release(allocator), 0);
+            return; // the host made no occlusion heap
+        }
+        let recording = |list: This| {
+            let host = host_list(list).expect("host list");
+            std::sync::Arc::as_ptr(&host) as usize
+        };
+
+        let closed = new_list();
+        begin_query(closed, heap, OCCLUSION, 1);
+        let at = recording(closed);
+        assert_eq!(close(closed), S_OK);
+        assert!(
+            crate::query::take_open(at).is_empty(),
+            "the close ended the query"
+        );
+
+        let dropped = new_list();
+        begin_query(dropped, heap, BINARY_OCCLUSION, 2);
+        let at = recording(dropped);
+        assert_eq!(release(dropped), 0);
+        assert!(
+            crate::query::take_open(at).is_empty(),
+            "the release forgot the query"
+        );
+
+        for object in [closed, allocator, heap] {
             assert_eq!(release(object), 0);
         }
     }

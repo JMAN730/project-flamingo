@@ -297,9 +297,10 @@ pub(crate) fn parts(this: This, first: u32, count: u32) -> (Vec<(u32, u32)>, Vec
 /// index): the query's kind and the host query it runs as (its own index,
 /// or a spare one after a cut). Each recording list pairs its own
 /// `BeginQuery` and `EndQuery`, so lists recording the same query at once
-/// do not end each other's.
-// shortcut: a list reset between a title's begin and end keeps the entry,
-// which an end in its next recording would then match.
+/// do not end each other's. An entry lasts no longer than the recording it
+/// was made in: a split or the title's close ends the query, and a reset or
+/// the release of the list forgets it ([`take_open`]), so a later recording
+/// in a host list at the same address finds none of them.
 #[cfg(windows)]
 static OPEN: std::sync::Mutex<Option<OpenQueries>> = std::sync::Mutex::new(None);
 
@@ -319,7 +320,8 @@ pub(crate) fn begun(this: This, kind: u32, index: u32, host_index: u32, list: us
 
 /// The queries begun in host list `list` and not ended there, as (heap,
 /// kind, index, host query), forgetting them: the list is about to be
-/// closed, and a query may not stay open past the end of its list.
+/// closed or dropped, and a query may not stay open past the end of its
+/// list.
 #[cfg(windows)]
 pub(crate) fn take_open(list: usize) -> Vec<(This, u32, u32, u32)> {
     let mut open = OPEN.lock().unwrap_or_else(|e| e.into_inner());
