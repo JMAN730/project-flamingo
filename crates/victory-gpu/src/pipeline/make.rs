@@ -597,6 +597,25 @@ fn complete(speculative: bool) {
     }
 }
 
+/// Stack reserved for each pipeline worker: 64 MiB of address space, of
+/// which only the pages used are committed. The host driver compiles on
+/// the worker, and NVIDIA's compiler recurses past Rust's default 2 MiB on
+/// some of the title's compute programs (fork issue 383). It catches that
+/// overflow and refuses the pipeline as out of memory, but the thread's
+/// guard page is spent, so the next deep compile on the same worker runs
+/// off the end of its stack and the process ends without a report.
+///
+/// shortcut: 64 MiB was enough on the drivers seen; nobody measured how
+/// deep the compiler goes.
+const WORKER_STACK: usize = 64 << 20;
+
+/// The builder for pipeline worker `i`.
+fn worker_thread(i: usize) -> std::thread::Builder {
+    std::thread::Builder::new()
+        .name(format!("victory-pipelines-{i}"))
+        .stack_size(WORKER_STACK)
+}
+
 /// Starts the workers (half the logical processors, 2 to 8) on first use.
 fn workers() -> bool {
     static RUNNING: OnceLock<bool> = OnceLock::new();
@@ -611,35 +630,32 @@ fn workers() -> bool {
         let mut running = false;
         let workers = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
         for i in 0..workers {
-            let spawned = std::thread::Builder::new()
-                .name(format!("victory-pipelines-{i}"))
-                .spawn(|| {
-                    // Below the title's own threads (loading, recording),
-                    // and the streaming one, which is below normal itself
-                    // (`VICTORY_PIPELINE_LOWEST=0`: level with it, as before).
-                    let lowest =
-                        std::env::var_os("VICTORY_PIPELINE_LOWEST").is_none_or(|v| v != "0");
-                    // SAFETY: a plain call on our own thread.
-                    unsafe {
-                        use windows::Win32::System::Threading::*;
-                        let priority = if lowest {
-                            THREAD_PRIORITY_LOWEST
-                        } else {
-                            THREAD_PRIORITY_BELOW_NORMAL
-                        };
-                        let _ = SetThreadPriority(GetCurrentThread(), priority);
+            let spawned = worker_thread(i).spawn(|| {
+                // Below the title's own threads (loading, recording),
+                // and the streaming one, which is below normal itself
+                // (`VICTORY_PIPELINE_LOWEST=0`: level with it, as before).
+                let lowest = std::env::var_os("VICTORY_PIPELINE_LOWEST").is_none_or(|v| v != "0");
+                // SAFETY: a plain call on our own thread.
+                unsafe {
+                    use windows::Win32::System::Threading::*;
+                    let priority = if lowest {
+                        THREAD_PRIORITY_LOWEST
+                    } else {
+                        THREAD_PRIORITY_BELOW_NORMAL
+                    };
+                    let _ = SetThreadPriority(GetCurrentThread(), priority);
+                }
+                loop {
+                    let job = next();
+                    job.pending.make();
+                    complete(job.speculative);
+                    if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
+                        drained();
+                    } else {
+                        super::library::save(false);
                     }
-                    loop {
-                        let job = next();
-                        job.pending.make();
-                        complete(job.speculative);
-                        if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
-                            drained();
-                        } else {
-                            super::library::save(false);
-                        }
-                    }
-                });
+                }
+            });
             if let Err(e) = spawned {
                 tracing::warn!(error = %e, "no pipeline worker");
             } else {
@@ -671,6 +687,27 @@ fn drained() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A pipeline worker has its 64 MiB of stack, not the runtime's 2 MiB
+    /// default nor the executable's 16 MiB.
+    #[test]
+    fn pipeline_workers_reserve_64_mib_of_stack() {
+        let reserved = worker_thread(0)
+            .spawn(|| {
+                let (mut low, mut high) = (0, 0);
+                // SAFETY: writes the calling thread's stack bounds.
+                unsafe {
+                    windows_sys::Win32::System::Threading::GetCurrentThreadStackLimits(
+                        &mut low, &mut high,
+                    )
+                };
+                high - low
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+        assert!(reserved >= WORKER_STACK, "{reserved:#x} bytes of stack");
+    }
 
     /// The structured views a specialized translation read go into its
     /// resources: an entry the console metadata has takes the view's stride,
