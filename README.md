@@ -201,6 +201,9 @@ victory config
 default worker count.
 `translate --hash H` translates only the containers whose runtime hash (the
 16 hex digits the runtime logs a shader by) is one of those given.
+With `VICTORY_WAVE64_SPLIT=1`, `translate` lowers Wave64 programs as two
+32-lane halves (as the runtime does on a 32-lane GPU); this needs no
+device, so it works with or without `--pipelines`.
 
 Logging: `VICTORY_LOG=victory_loader=trace,info` (a release build logs
 info and above).

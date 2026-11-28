@@ -442,6 +442,12 @@ impl Checks {
     }
 }
 
+/// Whether `VICTORY_WAVE64_SPLIT` (its value) asks for the two-half
+/// lowering of Wave64 programs: set to anything but `0`.
+fn split_requested(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_some_and(|v| v != "0")
+}
+
 pub fn run(
     paths: Vec<PathBuf>,
     validate: bool,
@@ -476,15 +482,16 @@ pub fn run(
                 .map_or("dxil.dll".into(), |p| p.display().to_string())
         );
     }
+    // As the running title does on a 32-lane host (`victory-gpu`'s
+    // `supports_wave32`): `VICTORY_WAVE64_SPLIT=1` runs Wave64 programs as
+    // two 32-lane halves instead of declaring `WaveSize(64)`. It needs no
+    // device, so the split lowering can be translated and validated offline.
+    // shortcut: with `--pipelines`, assumes the host has 32-lane waves.
+    if split_requested(std::env::var_os("VICTORY_WAVE64_SPLIT").as_deref()) {
+        victory_shader::emit::set_host_wave64(false);
+    }
     if pipelines {
         Host::new(false).map_err(anyhow::Error::msg)?;
-        // As the running title does on a 32-lane host (`victory-gpu`'s
-        // `supports_wave32`): `VICTORY_WAVE64_SPLIT=1` runs Wave64 programs as
-        // two 32-lane halves instead of declaring `WaveSize(64)`.
-        // shortcut: assumes the host has 32-lane waves.
-        if std::env::var_os("VICTORY_WAVE64_SPLIT").is_some_and(|v| v != "0") {
-            victory_shader::emit::set_host_wave64(false);
-        }
     }
     let pairs: Vec<(String, String)> = std::env::var("VICTORY_PAIRS")
         .unwrap_or_default()
@@ -1297,6 +1304,17 @@ mod offline {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `VICTORY_WAVE64_SPLIT` asks for the two halves when set to anything
+    /// but `0`, whether or not `--pipelines` is given.
+    #[test]
+    fn the_split_variable_is_on_unless_unset_or_zero() {
+        use std::ffi::OsStr;
+        assert!(!super::split_requested(None));
+        assert!(!super::split_requested(Some(OsStr::new("0"))));
+        assert!(super::split_requested(Some(OsStr::new("1"))));
+        assert!(super::split_requested(Some(OsStr::new(""))));
+    }
 
     /// `--hash` picks containers by the hash the runtime logs them by, in
     /// either case; with none given, every container is translated.
