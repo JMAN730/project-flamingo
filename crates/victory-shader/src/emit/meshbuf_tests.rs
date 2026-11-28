@@ -156,10 +156,10 @@ fn a_wave64_mesh_program_reads_a_lane_number_as_a_compute_pass_only_with_64_lane
 /// Both wave32 programs above, drawn by the host without mesh shaders: the
 /// sample's texels.
 #[test]
-fn wave32_mesh_programs_reading_masks_draw_the_sample_without_mesh_shaders() {
+fn wave32_mesh_programs_reading_masks_draw_the_sample_without_mesh_shaders_on_hardware() {
     for extra in [&LANE_NUMBER[..], &LANES_ELSEWHERE[..]] {
         let (fallback, ps) = sample::fallback_of(extra, false).expect("the compute half");
-        draws(None, fallback, ps);
+        draws(None, fallback, ps, true);
     }
 }
 
@@ -178,12 +178,18 @@ fn draws_the_sample(
         pixel: ps,
     }: sample::MeshSample,
 ) {
-    draws(Some(&mesh), fallback, ps);
+    draws(Some(&mesh), fallback, ps, false);
 }
 
 /// Draws `fallback` (and `mesh`, as a mesh shader, where the host runs
-/// those) with `ps`, against the sample's texels.
-fn draws(mesh: Option<&super::HostShader>, fallback: super::MeshFallback, ps: super::HostShader) {
+/// those) with `ps`, against the sample's texels. `wave32`: the compute half
+/// declares a 32-lane wave, so devices without one are skipped.
+fn draws(
+    mesh: Option<&super::HostShader>,
+    fallback: super::MeshFallback,
+    ps: super::HostShader,
+    wave32: bool,
+) {
     // Three vertices of 4 + 4 dwords; one primitive of its indices and 2.
     let buffer = &fallback.buffer;
     assert_eq!((buffer.vertex_dwords, buffer.primitive_dwords), (8, 3));
@@ -212,6 +218,13 @@ fn draws(mesh: Option<&super::HostShader>, fallback: super::MeshFallback, ps: su
             eprintln!("no SM 6.6 {label} device; skipped");
             continue;
         };
+        // A compute half that reads masks declares the console's 32-lane
+        // wave; WARP (4 lanes, what a runner without a GPU gives for both)
+        // cannot run it.
+        if wave32 && !super::lane_mask_tests::runs_wave32(&host) {
+            eprintln!("{label} device has no 32-lane wave; skipped");
+            continue;
+        }
         let ((compute_root, compute_pso), (root, pso)) = host
             .mesh_fallback_pipelines(&fallback, &ps)
             .unwrap_or_else(|e| panic!("{label}: fallback pipelines: {e}"));
