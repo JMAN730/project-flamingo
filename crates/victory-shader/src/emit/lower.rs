@@ -564,6 +564,18 @@ struct Lower<'a> {
 // shortcut: a genuine loop of more iterations than this is cut short too.
 pub(super) const LOOP_LIMIT: u32 = 1 << 20;
 
+#[cfg(test)]
+thread_local! {
+    /// Test builds: compare-exchange loops this thread lowered with a pass
+    /// limit.
+    pub(super) static BOUNDED_RETRIES: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// The most passes of a compare-exchange loop the translator adds for a
+/// store the host has no single operation for (see
+/// `Lower::retry_within_limit`).
+pub(super) const RETRY_LIMIT: u32 = 1 << 16;
+
 /// Lane masks read as numbers (`s_bcnt1`, `s_ff1`, `v_mbcnt`, scalar
 /// compares, bit tests) are ballots of the lanes' booleans, taken where the
 /// mask is written: structurisation's `active` masks hold only lanes that
@@ -6359,11 +6371,35 @@ impl<'a> Lower<'a> {
             &[h, index, off, iu, old, new],
         );
         self.s.m.set_phi(old, vec![(zero, start), (seen, latch)]);
-        let success = self.s.m.cmp(latch, pred::EQ, old, seen);
-        self.s
-            .m
-            .terminate(latch, Term::CondBr(success, done, retry));
+        let lost = self.s.m.cmp(latch, pred::NE, old, seen);
+        let again = self.retry_within_limit(retry, start, latch, lost);
+        self.s.m.terminate(latch, Term::CondBr(again, retry, done));
         self.cur = done;
+    }
+
+    /// Whether a compare-exchange loop goes round again: `lost` (another
+    /// thread got in between) and fewer than [`RETRY_LIMIT`] passes made.
+    /// The loop's header is `retry`, entered from `start`; its backedge
+    /// leaves `latch`. Each lost pass means another thread's store went
+    /// through, so the limit is not reached by contention; it keeps a card
+    /// whose exchange never reports the dword it found (through a null view
+    /// or past a view's end, say) from hanging.
+    pub(super) fn retry_within_limit(
+        &mut self,
+        retry: usize,
+        start: usize,
+        latch: usize,
+        lost: V,
+    ) -> V {
+        let n = self.s.m.phi(retry, self.s.t.i32);
+        let (zero, one) = (self.s.m.i32(0), self.s.m.i32(1));
+        let n1 = self.s.m.bin(latch, Bin::Add, n, one);
+        self.s.m.set_phi(n, vec![(zero, start), (n1, latch)]);
+        let limit = self.s.m.i32(RETRY_LIMIT);
+        let more = self.s.m.cmp(latch, pred::IULT, n1, limit);
+        #[cfg(test)]
+        BOUNDED_RETRIES.with(|n| n.set(n.get() + 1));
+        self.s.m.bin(latch, Bin::And, lost, more)
     }
 
     fn structured_store(&mut self, h: V, addr: V, stride: u32, val: V, bytes: u32) {
