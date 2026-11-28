@@ -513,9 +513,10 @@ pub(crate) fn recorded_parts(this: This, first: u32, count: u32) -> Vec<(u32, u3
 /// One resolve of occlusion queries recorded in a host list: it resolves
 /// the title's queries and every spare host query, and once the list has
 /// run combines with each result the parts of the run chosen for it when
-/// the list was submitted.
-// shortcut: a list submitted again before its last submission's results
-// were copied back copies them with the parts chosen for the new one.
+/// the list was submitted. Each submission of the list chooses anew, and
+/// each copy back takes the choices in the order the submissions were made
+/// ([`Choices`]), so a list submitted again before an earlier submission's
+/// results were copied back copies those with that submission's parts.
 #[cfg(windows)]
 pub(crate) struct Resolve {
     parts: std::sync::Arc<std::sync::Mutex<Parts>>,
@@ -527,7 +528,7 @@ pub(crate) struct Resolve {
     spare: u32,
     /// Per place, a run begun earlier in the resolve's own host list.
     fixed: Vec<Option<u64>>,
-    chosen: std::sync::Mutex<Chosen>,
+    chosen: std::sync::Mutex<Choices>,
 }
 
 #[cfg(windows)]
@@ -544,7 +545,10 @@ impl Resolve {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .chosen(self.first, &self.fixed);
-        *self.chosen.lock().unwrap_or_else(|e| e.into_inner()) = chosen;
+        self.chosen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .submitted(chosen);
     }
 
     /// The results as the title reads them, from `resolved`: the title's
@@ -552,8 +556,41 @@ impl Resolve {
     pub(crate) fn combined(&self, resolved: &[u8]) -> Vec<u8> {
         let split = (self.count as usize * 8).min(resolved.len());
         let (results, spares) = resolved.split_at(split);
-        let chosen = self.chosen.lock().unwrap_or_else(|e| e.into_inner());
+        let chosen = self
+            .chosen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .copied_back();
         picked(self.kind, results, spares, self.spare_first, &chosen)
+    }
+}
+
+/// The parts a resolve chose at each submission of its list whose results
+/// are not copied back yet, oldest first, and the last one copied back,
+/// for a copy back with no submission of its own to match.
+#[cfg(any(windows, test))]
+#[derive(Debug, Default)]
+struct Choices {
+    pending: std::collections::VecDeque<Chosen>,
+    last: Chosen,
+}
+
+#[cfg(any(windows, test))]
+impl Choices {
+    /// The list was submitted again: `chosen` is that submission's.
+    fn submitted(&mut self, chosen: Chosen) {
+        self.pending.push_back(chosen);
+    }
+
+    /// The results of the oldest submission not copied back yet are being
+    /// copied back: its choice (none chosen: no part).
+    fn copied_back(&mut self) -> Chosen {
+        if let Some(chosen) = self.pending.pop_front() {
+            self.last.clone_from(&chosen);
+            chosen
+        } else {
+            self.last.clone()
+        }
     }
 }
 
@@ -1047,6 +1084,22 @@ mod tests {
         parts.forget(other);
         assert_eq!(parts.chosen(0, &[None]).0, [(0, 2)]);
         assert_eq!(parts.free, [3]);
+    }
+
+    /// A list submitted twice before either submission's results are copied
+    /// back copies each with its own submission's choice, in order; a copy
+    /// back past the last submission keeps the last choice.
+    #[test]
+    fn each_copy_back_takes_its_own_submissions_choice() {
+        let mut choices = Choices::default();
+        assert_eq!(choices.copied_back(), (vec![], vec![]));
+        choices.submitted((vec![(0, 4)], vec![]));
+        choices.submitted((vec![], vec![1]));
+        assert_eq!(choices.copied_back(), (vec![(0, 4)], vec![]));
+        assert_eq!(choices.copied_back(), (vec![], vec![1]));
+        assert_eq!(choices.copied_back(), (vec![], vec![1]));
+        choices.submitted((vec![(1, 5)], vec![]));
+        assert_eq!(choices.copied_back(), (vec![(1, 5)], vec![]));
     }
 
     /// Resolved spare results are picked by spare query: each chosen part's
