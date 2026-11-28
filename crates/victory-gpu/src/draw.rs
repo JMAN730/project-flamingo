@@ -4239,6 +4239,20 @@ fn depth_state(texture: &ID3D12Resource, desc: Option<&D3D12_DEPTH_STENCIL_VIEW_
 /// Gets what a shader reads or writes through a view ready: buffer data
 /// copied, textures moved to the state they need. Returns whether the view
 /// also reads the draw's bound depth target.
+/// The title memory a buffer or constant view reads, brought up to date in
+/// its host copy for a draw or dispatch ([`readable`]). A constant view at a
+/// title slot (not one a fresh table gives scratch memory to) is made on
+/// that host copy, so it is refreshed like a buffer view; without this its
+/// host copy kept whatever an earlier refresh left (zeros for one nothing
+/// else reads).
+fn read_range(view: &View) -> Option<(u64, u64)> {
+    match *view {
+        View::Constant(0, _) => None,
+        View::Constant(address, size) => Some((address, u64::from(size))),
+        _ => crate::descriptor::host::buffer_range(view),
+    }
+}
+
 fn readable(
     list: &HostList,
     u: &UsedResource,
@@ -4251,7 +4265,7 @@ fn readable(
     let view = placed.as_ref().unwrap_or(view);
     // Buffer views read title memory: their range is copied at submission;
     // what shaders write through unordered access goes back to it after.
-    if let Some((address, len)) = crate::descriptor::host::buffer_range(view)
+    if let Some((address, len)) = read_range(view)
         && len > 0
         && let Some(shadow) = crate::shadow::find(address, len)
     {
@@ -4423,6 +4437,18 @@ fn rect_source(first: u32, count: u32, stride: u32, size: u32) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::{expanded_vertices, rect_source};
+
+    /// A constant view read through a title slot names the title memory it
+    /// reads, so its host copy is brought up to date; a null one names none.
+    #[test]
+    fn constant_views_name_the_memory_they_read() {
+        use crate::descriptor::View;
+        assert_eq!(
+            super::read_range(&View::Constant(0x9_74df_0200, 832)),
+            Some((0x9_74df_0200, 832))
+        );
+        assert_eq!(super::read_range(&View::Constant(0, 256)), None);
+    }
 
     /// The pattern a run may have hit: an indirect mesh dispatch of many
     /// records on a host without mesh shaders, the records past the count
