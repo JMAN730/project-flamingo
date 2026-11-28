@@ -80,6 +80,16 @@ enum RawAccess {
     ReadWrite,
 }
 
+/// The records of an indirect mesh dispatch of up to `max` that a host
+/// without mesh shaders runs, and so clamps and charges to the list's
+/// budget: the first alone (`dispatch_mesh_without_mesh_shaders`'s
+/// one-record parts), none of `max == 0`.
+// shortcut: as the fallback runs only the first record, a dispatch whose
+// count asks for more draws only its first.
+fn mesh_fallback_records(max: u32) -> u32 {
+    max.min(1)
+}
+
 /// A raw UAV exposes whole dwords, and D3D12 stores the element count in a u32.
 fn writable_root_bytes(remaining: u64) -> Option<u64> {
     u32::try_from(remaining / 4).ok().map(|n| u64::from(n) * 4)
@@ -2236,10 +2246,16 @@ impl State {
         let made_gpu = unsafe { made.GetGPUVirtualAddress() };
         // Both passes bind compute pipelines of their own. The clamp leaves
         // the title's records as they are: its copy is what the pass reads.
+        // Only the records this runs are clamped and charged to the list's
+        // budget: what the title left in the others (stale records of an
+        // earlier frame) would spend it, and later indirect work in the list
+        // would run empty.
+        let count = counter.map(|(s, at)| (&s.buffer, s.offset(at)));
         let Some(clamped) = crate::indirect::clamp_uav(
             list,
             (&args.buffer, args.offset(arguments)),
-            (MESH, stride, max),
+            count,
+            (MESH, stride, mesh_fallback_records(max)),
         ) else {
             self.host_pipeline = 0;
             self.host_roots[1] = 0;
@@ -2287,7 +2303,6 @@ impl State {
         // own stages were bound, and their twins noted, before this one.)
         list.twins_written();
         self.ensure_depth_state(list);
-        let count = counter.map(|(s, at)| (&s.buffer, s.offset(at)));
         let (unordered, read) = (
             D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
@@ -4324,6 +4339,30 @@ fn rect_source(first: u32, count: u32, stride: u32, size: u32) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::{expanded_vertices, rect_source};
+
+    /// The pattern a run may have hit: an indirect mesh dispatch of many
+    /// records on a host without mesh shaders, the records past the count
+    /// holding an earlier frame's (65535, 1, 1). Charging all of them spends
+    /// the list's budget and later indirect work runs empty; charging only
+    /// the record the fallback runs leaves it.
+    #[test]
+    fn a_mesh_fallback_charges_only_the_record_it_runs() {
+        use crate::indirect_budget::Budget;
+        // A mesh group counts as 128 threads.
+        let stale = 65_535 * 128;
+        let later = 1 << 20;
+        let charge = |records: u32| {
+            let mut budget = Budget::default();
+            for _ in 0..records {
+                budget.admit(stale);
+            }
+            budget.admit(later)
+        };
+        assert!(!charge(1024), "every record charged: later work runs empty");
+        assert_eq!(super::mesh_fallback_records(1024), 1);
+        assert!(charge(super::mesh_fallback_records(1024)));
+        assert_eq!(super::mesh_fallback_records(0), 0);
+    }
 
     /// A slot found through a list's own copy of a root table is looked up
     /// in the buffer view table at the title's slot, whichever lies first.
