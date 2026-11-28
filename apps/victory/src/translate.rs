@@ -1591,6 +1591,142 @@ mod tests {
         assert_eq!(lock(&seen).len(), 2);
     }
 
+    fn le_words(w: &[u32]) -> Vec<u8> {
+        w.iter().flat_map(|v| v.to_le_bytes()).collect()
+    }
+
+    /// A container whose `ACCC` part holds a 64-lane wave64 compute program
+    /// that reads its first lane and stores to a UAV of its one root table,
+    /// beside a `STAT` part of `stat` (which tells two such apart).
+    fn wave64_compute_container(stat: u8) -> Vec<u8> {
+        // Version 2: one table (u0) at 0x24, its range at 0x2c.
+        let rts0 = le_words(&[2, 1, 0x18, 0, 0, 0, 0, 0, 0x24, 1, 0x2C, 1, 1, 0, 0, 0, !0]);
+        let code = le_words(&[
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], null
+            0x3408_0082, // v_lshlrev_b32 v4, 2, v0
+            0x7E04_0500, // v_readfirstlane_b32 s2, v0
+            0x7E04_0281, // v_mov_b32 v2, 1
+            0x4A04_0402, // v_add_nc_u32 v2, s2, v2
+            0xE070_1000,
+            0x8002_0204, // buffer_store_dword v2, v4, s[8:11], 0 offen
+            0xBF81_0000, // s_endpgm
+        ]);
+        // 64x1x1 threads, wave64; RSRC1 8 VGPRs, RSRC2 5 user SGPRs (the
+        // table in s4).
+        let mut settings = le_words(&[0, 0, 0]);
+        for v in [64u16, 1, 1, 0] {
+            settings.extend_from_slice(&v.to_le_bytes());
+        }
+        settings.extend(le_words(&[1, 5 << 1]));
+        // One used-resource record (tag 0x41): a UAV in the table at its
+        // start, four descriptor dwords, user data 4, slot 0.
+        let mut record = le_words(&[0x41]);
+        record.extend_from_slice(&[3, 3, 0, 0]);
+        record.extend(le_words(&[0, 0, 0]));
+        record.extend_from_slice(&[4, 4, 0, 0]);
+        record.extend(le_words(&[!0, 0]));
+        let mut resources = le_words(&[0x403, (0x18 + record.len() - 0x14) as u32, 0, 0, 0, 0]);
+        resources.extend(record);
+        let blobs = [
+            (0u32, settings),
+            (1, vec![0; 20]),
+            (6, code),
+            (7, resources),
+        ];
+        let mut at = 0x10 + 16 * blobs.len();
+        let total = at + blobs.iter().map(|(_, b)| b.len()).sum::<usize>();
+        let mut accc = b"FSPX".to_vec();
+        accc.extend(le_words(&[1, blobs.len() as u32, total as u32]));
+        for (kind, b) in &blobs {
+            accc.extend(le_words(&[*kind, at as u32, b.len() as u32, 0]));
+            at += b.len();
+        }
+        for (_, b) in &blobs {
+            accc.extend_from_slice(b);
+        }
+        dxbc(&[(b"RTS0", &rts0), (b"ACCC", &accc), (b"STAT", &[stat; 4])])
+    }
+
+    /// The (minimum, maximum) wave size an emitted shader declares.
+    fn wave_sizes(shader: &emit::HostShader) -> (u32, u32) {
+        let c = Container::parse(&shader.dxil).unwrap();
+        let psv = c.part(FourCC::PSV0).unwrap().data;
+        let at = |k: usize| u32::from_le_bytes(psv[k..k + 4].try_into().unwrap());
+        (at(20), at(24))
+    }
+
+    /// Two containers that share their program part (and differ in a `STAT`
+    /// part), and the 16-digit hash prefix of the first.
+    fn two_containers_sharing_a_program() -> (Vec<u8>, Vec<u8>, String) {
+        let (a, b) = (wave64_compute_container(1), wave64_compute_container(2));
+        let program = |bytes| {
+            Container::parse(bytes)
+                .unwrap()
+                .part(victory_shader::accc::ACCC)
+                .unwrap()
+                .data
+                .to_vec()
+        };
+        assert_eq!(program(&a), program(&b));
+        let prefix = blake3::hash(&a).to_hex()[..16].to_owned();
+        (a, b, prefix)
+    }
+
+    /// `a` then `b` through [`translate`]: both are tallied and emitted, and
+    /// the wave sizes each declares come back in that order.
+    fn wave_sizes_of(a: &[u8], b: &[u8]) -> Vec<(u32, u32)> {
+        let seen = Mutex::new(HashSet::new());
+        let mut t = Tally::default();
+        let kept = Kept::default();
+        let mut checks = Checks {
+            keep: Some(kept.clone()),
+            ..no_checks()
+        };
+        for (offset, data) in [(0, a), (0x100, b)] {
+            let source = Source::Raw { offset, data };
+            translate(&source, Path::new("synth.bin"), &seen, &mut t, &mut checks);
+        }
+        assert_eq!((t.containers, t.duplicates), (2, 0));
+        assert_eq!(t.cs_emitted, 2, "{:#?}", t.failure_lines());
+        let kept = lock(&kept);
+        let labels: Vec<_> = kept.iter().map(|k| &k.0).collect();
+        assert_eq!(labels, ["synth.bin@0x0 Cs", "synth.bin@0x100 Cs"]);
+        kept.iter().map(|(_, s)| wave_sizes(s)).collect()
+    }
+
+    /// The named container lowers with Wave32 console flow; the other as for
+    /// a 64-lane host, which declares no wave size.
+    const ONLY_THE_FIRST_WIDE: [(u32, u32); 2] = [(32, 32), (0, u32::MAX)];
+
+    /// Two containers sharing their program part lower differently when
+    /// `VICTORY_WAVE_WIDE_ONLY` names only one of them: the tool hands the
+    /// lowering each container's own digest. Were containers told apart by
+    /// their program part, the second would be a duplicate (or lower as the
+    /// first does).
+    #[test]
+    fn the_lowering_is_chosen_by_each_containers_own_hash() {
+        let (a, b, prefix) = two_containers_sharing_a_program();
+        let sizes = emit::with_wave_wide_only(Some(&prefix), || wave_sizes_of(&a, &b));
+        assert_eq!(sizes, ONLY_THE_FIRST_WIDE);
+    }
+
+    /// As [`the_lowering_is_chosen_by_each_containers_own_hash`], with
+    /// `VICTORY_WAVE_WIDE_ONLY` unset and the built-in allowlist naming the
+    /// first container (it names only the title's, so the test sets it).
+    #[test]
+    fn the_built_in_allowlist_chooses_by_each_containers_own_hash() {
+        let (a, b, prefix) = two_containers_sharing_a_program();
+        let sizes = emit::with_wave_wide_only(None, || {
+            emit::with_wave_wide_allowlist(&[&prefix], || wave_sizes_of(&a, &b))
+        });
+        assert_eq!(sizes, ONLY_THE_FIRST_WIDE);
+        // Without it, neither is on the list.
+        let sizes = emit::with_wave_wide_only(None, || wave_sizes_of(&a, &b));
+        assert_eq!(sizes, [(0, u32::MAX); 2]);
+    }
+
     /// A pixel shader as the emitter hands it over, whose feature flags
     /// (`SFI0`) ask for the host's barycentrics or do not.
     fn pixel_shader(barycentrics: bool) -> emit::HostShader {

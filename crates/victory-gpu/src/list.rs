@@ -1558,7 +1558,8 @@ extern "system" fn begin_query(this: This, heap: This, kind: u32, index: u32) {
         && let Some(list) = host_list(this)
     {
         list.keep(&host_heap);
-        crate::query::starts_over(heap, index);
+        let here = std::sync::Arc::as_ptr(&list) as usize;
+        let run = crate::query::begins(heap, index, here);
         // SAFETY: an open list; the index is the title's, inside its heap
         // (whose queries the host heap has, and spare ones after them).
         unsafe {
@@ -1568,8 +1569,7 @@ extern "system" fn begin_query(this: This, heap: This, kind: u32, index: u32) {
                 index,
             )
         };
-        let here = std::sync::Arc::as_ptr(&list) as usize;
-        crate::query::begun(heap, kind, index, index, here);
+        crate::query::begun(heap, kind, index, index, here, run);
         mark_work(this);
     }
     #[cfg(not(windows))]
@@ -1579,12 +1579,12 @@ extern "system" fn begin_query(this: This, heap: This, kind: u32, index: u32) {
 /// Ends the occlusion queries still open in host list `list`, which is
 /// about to be closed in the middle of the title's list (a split): a host
 /// query may not stay open past the end of its list. Returns them as (heap,
-/// kind, index), to go on in the next host list ([`continue_queries`]).
+/// kind, index, run), to go on in the next host list ([`continue_queries`]).
 #[cfg(windows)]
-fn end_open_queries(list: &std::sync::Arc<crate::host::HostList>) -> Vec<(This, u32, u32)> {
+fn end_open_queries(list: &std::sync::Arc<crate::host::HostList>) -> Vec<(This, u32, u32, u64)> {
     let open = crate::query::take_open(std::sync::Arc::as_ptr(list) as usize);
     let mut ended = Vec::with_capacity(open.len());
-    for (heap, kind, index, host_index) in open {
+    for (heap, kind, index, host_index, run) in open {
         let Some(host_heap) = crate::query::occlusion_heap(heap) else {
             continue;
         };
@@ -1597,7 +1597,7 @@ fn end_open_queries(list: &std::sync::Arc<crate::host::HostList>) -> Vec<(This, 
                 host_index,
             )
         };
-        ended.push((heap, kind, index));
+        ended.push((heap, kind, index, run));
     }
     ended
 }
@@ -1623,14 +1623,14 @@ fn forget_open_queries(list: &std::sync::Arc<crate::host::HostList>) {
 #[cfg(windows)]
 fn continue_queries(
     next: &std::sync::Arc<crate::host::HostList>,
-    ended: Vec<(This, u32, u32)>,
+    ended: Vec<(This, u32, u32, u64)>,
 ) -> bool {
     let mut any = false;
-    for (heap, kind, index) in ended {
+    for (heap, kind, index, run) in ended {
         let Some(host_heap) = crate::query::occlusion_heap(heap) else {
             continue;
         };
-        let Some(spare) = crate::query::continues(heap, index) else {
+        let Some(spare) = crate::query::continues(heap, run) else {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| {
                 tracing::warn!("no spare host query for an occlusion query open across a list split: it counts only the draws before the split, and as seen if those were none");
@@ -1639,7 +1639,8 @@ fn continue_queries(
         };
         next.keep(&host_heap);
         // SAFETY: an open list; `spare` is one of the host heap's spare
-        // queries, which only this query uses until it begins anew.
+        // queries, which only this run of the query uses
+        // (`crate::query`).
         unsafe {
             next.list.BeginQuery(
                 &host_heap,
@@ -1648,7 +1649,7 @@ fn continue_queries(
             )
         };
         let here = std::sync::Arc::as_ptr(next) as usize;
-        crate::query::begun(heap, kind, index, spare, here);
+        crate::query::begun(heap, kind, index, spare, here, run);
         any = true;
     }
     any
@@ -1693,10 +1694,11 @@ extern "system" fn end_query(this: This, heap: This, kind: u32, index: u32) {
 /// host query has a result from the heap's start (`crate::query`), the
 /// last one ended before the list runs, or 0 if none was. A query that
 /// went on past a split of its host list ([`continue_queries`]) has
-/// further parts in spare host queries: those are resolved behind the
-/// others and combined into its result before the copy; one cut short
-/// there for want of a spare query is not left at zero. False if `heap` has
-/// no host occlusion heap.
+/// further parts in spare host queries: every spare query is resolved
+/// behind the others, and the parts of the run submitted last before this
+/// list (`crate::query::Resolve`) are combined into its result before the
+/// copy; one cut short there for want of a spare query is not left at
+/// zero. False if `heap` has no host occlusion heap.
 #[cfg(windows)]
 fn resolve_occlusion(
     this: This,
@@ -1720,30 +1722,27 @@ fn resolve_occlusion(
     let Some(target) = buffer_range(buffer, offset, bytes) else {
         return true;
     };
-    let (parts, short) = crate::query::parts(heap, first, count);
-    let Some((staging, data)) = list.readback(host, bytes + 8 * parts.len() as u64) else {
+    let here = std::sync::Arc::as_ptr(&list) as usize;
+    let Some(resolve) = crate::query::resolving(heap, kind, first, count, here) else {
+        return false;
+    };
+    let (spare_first, spares) = resolve.spares();
+    let Some((staging, data)) = list.readback(host, bytes + 8 * u64::from(spares)) else {
         return true;
     };
     list.keep(&host_heap);
     let kind_d3d = windows::Win32::Graphics::Direct3D12::D3D12_QUERY_TYPE(kind as i32);
     // SAFETY: an open list; every query of the host heap has a result; the
-    // readback buffer holds `bytes` and 8 more for each later part.
+    // readback buffer holds `bytes` and 8 more for each spare query.
     unsafe {
         list.list
             .ResolveQueryData(&host_heap, kind_d3d, first, count, &staging, 0);
-        for (nth, &(_, spare)) in parts.iter().enumerate() {
-            let at = bytes + 8 * nth as u64;
+        if spares != 0 {
             list.list
-                .ResolveQueryData(&host_heap, kind_d3d, spare, 1, &staging, at);
+                .ResolveQueryData(&host_heap, kind_d3d, spare_first, spares, &staging, bytes);
         }
     }
-    let len = bytes as usize;
-    if parts.is_empty() && short.is_empty() {
-        list.defer_readback(target, data, len, len, 1, len, len);
-    } else {
-        let places = parts.iter().map(|&(place, _)| place).collect();
-        list.defer_query_results(target, data, count as usize, kind, places, short);
-    }
+    list.defer_query_results(target, data, count as usize, resolve);
     #[cfg(feature = "diagnostics")]
     {
         let n = u64::from(count);
@@ -3832,7 +3831,7 @@ mod tests {
         let after = host_list(list).expect("host list");
         assert!(!std::sync::Arc::ptr_eq(&before, &after), "the wait split");
         assert_eq!(
-            crate::query::parts(heap, 0, 4).0,
+            crate::query::recorded_parts(heap, 0, 4),
             [(0, 4), (1, 6), (2, 5)],
             "each open query goes on as a spare host query past the title's 4"
         );
@@ -3860,7 +3859,7 @@ mod tests {
         // are not part of this result.
         let again = new_list();
         begin_query(again, heap, OCCLUSION, 0);
-        assert_eq!(crate::query::parts(heap, 0, 4).0, [(1, 6), (2, 5)]);
+        assert_eq!(crate::query::recorded_parts(heap, 0, 4), [(1, 6), (2, 5)]);
         draw(again);
         end_query(again, heap, OCCLUSION, 0);
         resolve_queries(again, heap, OCCLUSION, 0, 1, results, 0);
