@@ -194,5 +194,9 @@ fn lanes_storing_the_same_byte_leave_one_lanes_value() {
             assert_eq!(word & !0xFF, 0, "{name}: {word:#x}");
         }
     }
-    assert!(ran > 0, "no SM 6.6 device available");
+    if ran == 0 {
+        // A GPU test without the capability says so and returns (see the
+        // code standards), rather than failing on that machine.
+        eprintln!("skipped: lanes storing the same byte needs an SM 6.6 device");
+    }
 }

@@ -157,7 +157,14 @@ impl Lower<'_> {
     // shortcut: an offset past the element's stride reads into the next
     // element, or past the view into the memory after it, as far as the
     // raw view holding it reaches.
-    pub(super) fn table_load(&mut self, src: &Source, index: V, off: V, mask: V) -> Result<V, Why> {
+    pub(super) fn table_load(
+        &mut self,
+        src: &Source,
+        index: V,
+        off: V,
+        mask: V,
+        count: u32,
+    ) -> Result<V, Why> {
         let t = self.table_buffer(src)?;
         let c = self.cur;
         let start = self.s.m.bin(c, Bin::Mul, index, t.stride);
@@ -171,8 +178,17 @@ impl Lower<'_> {
         // what it bounds. A slot with no record (a null view, an index past
         // the table) reads as stride 0 and count 0: every byte is past it,
         // so the load reads zeros, never the table's own record.
+        // A raw view bounds the last byte the load reads, not its first: a
+        // vector load that runs past the view's end must not read the
+        // neighbouring memory the alias window around it holds.
+        // shortcut: such a load reads zeros in every component, where the
+        // console keeps the components still inside the view.
         let past_element = self.s.m.cmp(c, pred::IUGE, index, t.elements);
-        let past_byte = self.s.m.cmp(c, pred::IUGE, within, t.elements);
+        let bytes = self.s.m.i32(4 * count.max(1));
+        let end = self.s.m.bin(c, Bin::Add, within, bytes);
+        let end_wrapped = self.s.m.cmp(c, pred::IULT, end, within);
+        let past_end = self.s.m.cmp(c, pred::IUGT, end, t.elements);
+        let past_byte = self.s.m.bin(c, Bin::Or, past_end, end_wrapped);
         let structured = self.s.m.cmp(c, pred::NE, t.stride, zero);
         let past = self.s.m.select(c, structured, past_element, past_byte);
         let wrapped = self.s.m.bin(c, Bin::Or, product_wrapped, offset_wrapped);
