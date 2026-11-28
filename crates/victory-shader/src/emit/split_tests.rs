@@ -1190,6 +1190,53 @@ fn lds_reads_out_of_bounds_read_0() {
     }
 }
 
+/// Returning LDS atomics outside the program's LDS return 0, as an
+/// out-of-bounds console read does, not what a dropped write left in the
+/// dword such writes go to: every lane writes 1000 out of bounds, then
+/// adds 1000 there, exchanges it, or compares it with 1000, and adds lane
+/// 40's thread id (a lane read across the halves).
+#[test]
+fn lds_atomics_out_of_bounds_return_0() {
+    let start = |body: &mut Vec<u32>| {
+        body.extend(v_readlane_b32(4, 0, 40));
+        body.extend([
+            0x3404_0082, // v_lshlrev_b32 v2, 2, v0
+            0x4A04_04FF, // v_add_nc_u32 v2, 0x10000, v2: past the program's LDS
+            0x1_0000,
+            0x7E06_02FF, // v_mov_b32 v3, 1000
+            1000,
+        ]);
+        body.extend(ds(0x0D, 2, 3, 0)); // ds_write_b32 v2, v3
+        body.push(0xBF8C_C07F); // s_waitcnt lgkmcnt(0)
+    };
+    // (opcode, data1): ds_add_rtn_u32, ds_wrxchg_rtn_b32, ds_cmpst_rtn_b32.
+    for (op, data1) in [(0x20, 0), (0x2D, 0), (0x30, 3)] {
+        let mut body = Vec::new();
+        start(&mut body);
+        let [w0, w1] = ds(op, 2, 3, 1); // v1 = op(v2, v3[, v3])
+        body.extend([w0, w1 | data1 << 16]);
+        body.extend([
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0x4A02_0204, // v_add_nc_u32 v1, s4, v1
+        ]);
+        for threads in [64, 128] {
+            let l = lowered(&program(&body), threads, 1).expect("lower");
+            assert_eq!(
+                l.lds_atomics_zero_outside, 1,
+                "op {op:#x}, {threads} threads"
+            );
+            let shader = build(&program(&body), threads, 1);
+            check(&shader, &group(threads, |t| t / 64 * 64 + 40));
+        }
+    }
+    // Without a result (ds_add_u32) there is no old value to zero.
+    let mut body = Vec::new();
+    start(&mut body);
+    body.extend(ds(0x00, 2, 3, 0)); // ds_add_u32 v2, v3
+    let l = lowered(&program(&body), 64, 1).expect("lower");
+    assert_eq!(l.lds_atomics_zero_outside, 0);
+}
+
 /// Title memory by address (`resource::MEMORY`) in a wave64 program split
 /// into halves: a buffer load and store through a descriptor built around
 /// a pointer the program loads, and a global load and store at that

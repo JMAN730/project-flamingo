@@ -109,6 +109,10 @@ pub(crate) struct Lowered {
     /// Test builds: d16 format loads that kept the destination's high half.
     #[cfg(test)]
     pub d16_kept_high_halves: u32,
+    /// Test builds: returning LDS atomics whose old value is 0 outside the
+    /// program's LDS (split halves).
+    #[cfg(test)]
+    pub lds_atomics_zero_outside: u32,
     /// Test builds: constant byte offsets of `s_buffer_load_dword*`.
     #[cfg(test)]
     pub smem_buffer_bytes: Vec<u32>,
@@ -1912,6 +1916,8 @@ impl<'a> Lower<'a> {
             unaligned_typed_loads: self.s.unaligned_typed_loads,
             #[cfg(test)]
             d16_kept_high_halves: self.s.d16_kept_high_halves,
+            #[cfg(test)]
+            lds_atomics_zero_outside: self.s.lds_atomics_zero_outside,
             #[cfg(test)]
             smem_buffer_bytes: std::mem::take(&mut self.s.smem_buffer_bytes),
             #[cfg(test)]
@@ -4430,7 +4436,20 @@ impl<'a> Lower<'a> {
             Some((_, v)) => self.i32_of(v).unwrap_or(self.s.m.i32(0)),
             None => self.s.m.i32(0),
         };
-        let p = dword(self, offset);
+        let at_byte = byte_addr(self, offset);
+        // Split, an atomic outside the program's LDS works on the dword
+        // writes drop into (see `split_lds_index`); the old value it
+        // returns is the console's out-of-bounds read, 0, not that dword's.
+        let inside = match self.split.as_ref().map(|sp| sp.lds_bound) {
+            Some(bound) if dst_reg.is_some() => {
+                let (c, two) = (self.cur, self.s.m.i32(2));
+                let index = self.s.m.bin(c, Bin::LShr, at_byte, two);
+                let n = self.s.m.i32(bound);
+                Some(self.s.m.cmp(c, pred::IULT, index, n))
+            }
+            _ => None,
+        };
+        let p = dword_at(self, at_byte);
         let at = self.begin_guarded(guard);
         let r = match rmw {
             Some(op) => self.s.m.atomic(self.cur, op, p, v0),
@@ -4439,6 +4458,17 @@ impl<'a> Lower<'a> {
                 .s
                 .m
                 .cmpxchg(self.cur, p, v0, v1.ok_or("an LDS compare")?),
+        };
+        let r = match inside {
+            Some(inside) => {
+                #[cfg(test)]
+                {
+                    self.s.lds_atomics_zero_outside += 1;
+                }
+                let zero = self.s.m.i32(0);
+                self.s.m.select(self.cur, inside, r, zero)
+            }
+            None => r,
         };
         let r = self.end_guarded(at, &[(r, outside)])[0];
         if let Some(reg) = dst_reg {
