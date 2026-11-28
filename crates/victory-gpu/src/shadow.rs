@@ -6192,6 +6192,7 @@ mod tests {
 
     #[test]
     fn a_buffer_sized_past_the_address_space_ends_at_its_top() {
+        let _views = crate::inplace::view_tests_lock();
         let start = u64::MAX - 0x0fff;
         register(usize::MAX, start, u64::MAX);
         let end = BUFFERS
@@ -6205,6 +6206,7 @@ mod tests {
 
     #[test]
     fn a_buffer_too_big_to_round_to_a_shadow_size_gets_no_copy() {
+        let _views = crate::inplace::view_tests_lock();
         // The end saturates at the top, so rounding its length up to 64 KiB
         // would overflow: no copy, before any host allocation.
         register(usize::MAX - 1, 0x1000, u64::MAX);
@@ -6215,6 +6217,7 @@ mod tests {
 
     #[test]
     fn concurrent_aligned_views_share_the_copy_refreshed_at_submission() {
+        let _views = crate::inplace::view_tests_lock();
         if crate::host::host().is_none() {
             return;
         }
@@ -6258,6 +6261,7 @@ mod tests {
     /// outside it.
     #[test]
     fn a_refresh_covers_the_views_bytes_inside_its_copy() {
+        let _views = crate::inplace::view_tests_lock();
         // The hit-detection view: 3136 bytes of 56-byte elements, 48 bytes
         // into its buffer, in a copy that starts at the view.
         assert_eq!(range_inside(0x3000_0030, 3136, 0x3000_0030, 3136), 3136);
@@ -6277,6 +6281,7 @@ mod tests {
     /// an empty range is neither.
     #[test]
     fn a_refresh_that_copies_nothing_is_counted_as_skipped() {
+        let _views = crate::inplace::view_tests_lock();
         assert_eq!(skipped(0, 0), None);
         assert_eq!(skipped(4 << 20, 0), Some(4 << 20));
         assert_eq!(skipped(4 << 20, 1), None);
@@ -6287,6 +6292,7 @@ mod tests {
 
     #[test]
     fn partial_match_leaves_unchecked_bytes_visible() {
+        let _views = crate::inplace::view_tests_lock();
         let mut unchanged = UnchangedPages::default();
         let before = vec![0; PAGE];
         let mut host = before.clone();
@@ -6301,6 +6307,7 @@ mod tests {
 
     #[test]
     fn snapshot_edges_are_cacheable_and_survive_later_ranges() {
+        let _views = crate::inplace::view_tests_lock();
         let mut unchanged = UnchangedPages::default();
         unchanged.begin(PAGE - 3, PAGE + 4);
         assert!(!unchanged.differs(PAGE - 3, &[1; 3], &[1; 3]));
@@ -6315,6 +6322,7 @@ mod tests {
 
     #[test]
     fn next_submission_checks_the_same_page_again() {
+        let _views = crate::inplace::view_tests_lock();
         let mut unchanged = UnchangedPages::default();
         unchanged.begin(0, 4);
         assert!(!unchanged.differs(0, &[0; 4], &[0; 4]));
@@ -6345,6 +6353,7 @@ mod tests {
 
     #[test]
     fn overlapping_ranges_match_uncached_comparisons() {
+        let _views = crate::inplace::view_tests_lock();
         let before = vec![0; 4 * PAGE];
         let mut host = before.clone();
         for at in [2, PAGE - 1, PAGE + 5, 3 * PAGE + 7] {
@@ -6371,6 +6380,7 @@ mod tests {
     #[test]
     #[ignore = "synthetic CPU release benchmark"]
     fn benchmark_overlapping_copy_back() {
+        let _views = crate::inplace::view_tests_lock();
         use std::hint::black_box;
         use std::time::{Duration, Instant};
 
@@ -6419,6 +6429,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn unregister_drops_shadow_immediately_when_idle() {
+        let _views = crate::inplace::view_tests_lock();
         let _rebar = lock_rebar_gpu_test();
         let _retire = crate::host::isolated_retire_scope();
         if host().is_none() {
@@ -6440,6 +6451,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn bytes_reads_the_copy_inside_the_buffer_only() {
+        let _views = crate::inplace::view_tests_lock();
         let _rebar = lock_rebar_gpu_test();
         let _retire = crate::host::isolated_retire_scope();
         if host().is_none() {
@@ -6472,6 +6484,7 @@ mod tests {
     /// the title's bytes and counts a conflict.
     #[test]
     fn copy_back_leaves_dwords_the_title_rewrote_to_the_title() {
+        let _views = crate::inplace::view_tests_lock();
         let held = [0u8; 12];
         let mut gpu = held;
         gpu[1] = 0xaa; // dword 0: only the GPU wrote it
@@ -6498,6 +6511,7 @@ mod tests {
     /// boundary splits its first and last dwords there.
     #[test]
     fn copy_back_dwords_follow_title_addresses() {
+        let _views = crate::inplace::view_tests_lock();
         let held = [0u8; 6];
         let mut gpu = held;
         gpu[0] = 1; // title 0x1002: the dword 0x1000..0x1004
@@ -6518,6 +6532,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn one_submission_copies_back_and_syncs_the_copy() {
+        let _views = crate::inplace::view_tests_lock();
         let _rebar = lock_rebar_gpu_test();
         let _retire = crate::host::isolated_retire_scope();
         if host().is_none() {
@@ -6559,6 +6574,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn a_refreshed_page_keeps_the_titles_newer_write() {
+        let _views = crate::inplace::view_tests_lock();
         if host().is_none() {
             return;
         }
@@ -6596,6 +6612,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn a_copy_run_marks_its_pages_once_the_bytes_are_copied() {
+        let _views = crate::inplace::view_tests_lock();
         if host().is_none() {
             return;
         }
@@ -6628,6 +6645,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn a_merge_through_another_view_goes_by_the_copys_own_refresh_history() {
+        let _views = crate::inplace::view_tests_lock();
         // A range no memory of the test is at; the view is elsewhere.
         let Some(shadow) = Shadow::new_rebar_for_test(0x7100_0000, PAGE as u64, 0) else {
             return;
@@ -6658,6 +6676,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn a_page_update_busy_refreshed_keeps_the_titles_newer_write() {
+        let _views = crate::inplace::view_tests_lock();
         use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
@@ -6774,6 +6793,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn unregister_retires_shadow_until_active_epoch_finishes() {
+        let _views = crate::inplace::view_tests_lock();
         let _rebar = lock_rebar_gpu_test();
         let _retire = crate::host::isolated_retire_scope();
         let Some(host) = host() else {
@@ -6807,6 +6827,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn unregister_drops_new_shadow_despite_older_pinned_list() {
+        let _views = crate::inplace::view_tests_lock();
         let _rebar = lock_rebar_gpu_test();
         let _retire = crate::host::isolated_retire_scope();
         let Some(host) = host() else {
@@ -6837,6 +6858,7 @@ mod tests {
 
     #[test]
     fn rebar_budget_reservation_enforces_cap_and_releases() {
+        let _views = crate::inplace::view_tests_lock();
         let used = AtomicU64::new(0);
         assert!(!try_reserve_rebar(&used, 64, 0));
         assert!(!try_reserve_rebar(&used, 0, 1024));
@@ -6851,6 +6873,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn rebar_loose_budget_is_isolated_and_releases_on_drop() {
+        let _views = crate::inplace::view_tests_lock();
         let _rebar = REBAR_GPU_TEST.lock().unwrap_or_else(|e| e.into_inner());
         let _retire = crate::host::isolated_retire_scope();
         let Some(h) = host() else {
@@ -6968,6 +6991,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn rebar_mark_dirty_spans_restores_failed_readback_pieces() {
+        let _views = crate::inplace::view_tests_lock();
         let _rebar = lock_rebar_gpu_test();
         let _retire = crate::host::isolated_retire_scope();
         let Some(h) = host() else {
@@ -7002,6 +7026,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn rebar_failed_copy_back_keeps_pending_and_preserves_gpu_bytes_on_refresh() {
+        let _views = crate::inplace::view_tests_lock();
         let _rebar = lock_rebar_gpu_test();
         let _retire = crate::host::isolated_retire_scope();
         let Some(h) = host() else {
@@ -7047,6 +7072,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn rebar_shadow_gpu_write_round_trips_and_preserves_concurrent_cpu_writes() {
+        let _views = crate::inplace::view_tests_lock();
         use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATE_COPY_DEST;
 
         let _rebar = lock_rebar_gpu_test();
@@ -7131,6 +7157,7 @@ mod tests {
 
     #[test]
     fn rebar_dirty_bits_marks_and_coalesces_across_word_boundaries() {
+        let _views = crate::inplace::view_tests_lock();
         let mut bits = RebarDirtyBits::new(140);
         assert!(bits.take_runs().is_empty());
 
@@ -7151,6 +7178,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn rebar_gpu_hash_compare_skips_unchanged_pieces_and_merges_concurrent_writes() {
+        let _views = crate::inplace::view_tests_lock();
         use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATE_COPY_DEST;
 
         let _rebar = REBAR_GPU_TEST.lock().unwrap_or_else(|e| e.into_inner());
@@ -7330,6 +7358,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn concurrent_find_reads_share_the_same_shadow_under_rwlock() {
+        let _views = crate::inplace::view_tests_lock();
         let _rebar = lock_rebar_gpu_test();
         let _retire = crate::host::isolated_retire_scope();
         if host().is_none() {
@@ -7359,6 +7388,7 @@ mod tests {
     /// and leading entries before the range must not stall the scan.
     #[test]
     fn stale_pages_include_uncopied_pages_absent_from_write_watch() {
+        let _views = crate::inplace::view_tests_lock();
         let base = 0x100usize;
         // Pages 0..4: page 0 copied at t=5, page 1 never copied (0), page 2
         // copied at t=5, page 3 copied at t=10.
@@ -7379,6 +7409,7 @@ mod tests {
 
     #[test]
     fn loose_budget_scales_across_ram_tiers() {
+        let _views = crate::inplace::view_tests_lock();
         assert_eq!(loose_budget_for_ram(None), 256 * MIB);
         assert_eq!(loose_budget_for_ram(Some(8 * GIB)), 128 * MIB);
         assert_eq!(loose_budget_for_ram(Some(16 * GIB)), 128 * MIB);
@@ -7391,6 +7422,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn loose_evicts_lru_idle_windows_over_budget_and_skips_in_use_or_pending() {
+        let _views = crate::inplace::view_tests_lock();
         let _rebar = lock_rebar_gpu_test();
         let _retire = crate::host::isolated_retire_scope();
         let Some(host) = host() else {
@@ -7513,6 +7545,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn reregistering_a_title_buffer_retires_its_old_shadow_by_epoch() {
+        let _views = crate::inplace::view_tests_lock();
         let _rebar = lock_rebar_gpu_test();
         let _retire = crate::host::isolated_retire_scope();
         let Some(h) = host() else {
@@ -7554,6 +7587,7 @@ mod tests {
 
     #[test]
     fn wide_copy_is_default_on_multicore_and_can_be_overridden() {
+        let _views = crate::inplace::view_tests_lock();
         assert!(wide_copy_enabled(None, Some(4)));
         assert!(wide_copy_enabled(None, Some(16)));
         assert!(!wide_copy_enabled(None, Some(2)));
@@ -7565,6 +7599,7 @@ mod tests {
 
     #[test]
     fn chunk_copy_segs_preserves_boundaries_and_mirror_offsets() {
+        let _views = crate::inplace::view_tests_lock();
         let segs = [
             CopySeg {
                 src: 0x1000,
@@ -7615,6 +7650,7 @@ mod tests {
 
     #[test]
     fn parallel_shadow_update_preserves_boundaries_unmapped_pages_and_pending_gaps() {
+        let _views = crate::inplace::view_tests_lock();
         use windows_sys::Win32::System::Memory::{
             MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc,
             VirtualFree,
@@ -7706,6 +7742,7 @@ mod tests {
 
     #[test]
     fn parallel_shadow_update_rebar_mirror_syncs_mirror_and_vram() {
+        let _views = crate::inplace::view_tests_lock();
         let Some(h) = host() else {
             return;
         };
@@ -7763,6 +7800,7 @@ mod tests {
 
     #[test]
     fn wide_refresh_reentrancy_and_batch_do_not_deadlock() {
+        let _views = crate::inplace::view_tests_lock();
         let Some(h) = host() else {
             return;
         };
@@ -7835,6 +7873,7 @@ mod tests {
 
     #[test]
     fn card_limits_scales_default_budget_for_high_vram_and_honors_override() {
+        let _views = crate::inplace::view_tests_lock();
         const MIB: u64 = 1 << 20;
         const GIB: u64 = 1 << 30;
         assert_eq!(
@@ -7863,6 +7902,7 @@ mod tests {
 
     #[test]
     fn card_piece_runs_and_inflight_slot_math_agree() {
+        let _views = crate::inplace::view_tests_lock();
         let joined_runs = joined_piece_runs(vec![
             CardSpan {
                 first: 5,
@@ -7917,6 +7957,7 @@ mod tests {
 
     #[test]
     fn first_and_last_difference_find_exact_edges() {
+        let _views = crate::inplace::view_tests_lock();
         let mut a = vec![0x5au8; 257];
         let mut b = a.clone();
         assert_eq!(first_difference(&a, &b), None);
@@ -7931,6 +7972,7 @@ mod tests {
 
     #[test]
     fn parts_written_cuts_64k_pages_into_4k_runs() {
+        let _views = crate::inplace::view_tests_lock();
         const PART: usize = 4 << 10;
         let base = 0x2000_0000usize;
         let bits = (1u16 << 1) | (1u16 << 2) | (1u16 << 15);
@@ -7956,6 +7998,7 @@ mod tests {
 
     #[test]
     fn relay_merge_rebar_merges_gpu_writes_without_touching_concurrent_cpu_writes() {
+        let _views = crate::inplace::view_tests_lock();
         let mut title = vec![0x10u8; 4096];
         let Some(shadow) = Shadow::new_rebar_for_test(title.as_mut_ptr() as u64, 4096, 0x10) else {
             return;
@@ -7975,6 +8018,7 @@ mod tests {
 
     #[test]
     fn relay_merge_rebar_parallel_scan_merges_large_buffer_across_chunks() {
+        let _views = crate::inplace::view_tests_lock();
         const N: usize = 8 << 20;
         let mut title = vec![0x22u8; N];
         let Some(shadow) = Shadow::new_rebar_for_test(title.as_mut_ptr() as u64, N as u64, 0x22)
@@ -8005,6 +8049,7 @@ mod tests {
 
     #[test]
     fn title_writes_under_a_busy_range_are_copied_for_rebar_mirror() {
+        let _views = crate::inplace::view_tests_lock();
         use windows_sys::Win32::System::Memory::{
             MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
         };
@@ -8051,6 +8096,7 @@ mod tests {
 
     #[test]
     fn card_shadow_test_helper_creates_and_tracks_dirty_ranges() {
+        let _views = crate::inplace::view_tests_lock();
         let _retire = crate::host::isolated_retire_scope();
         let mut backing = vec![0x55u8; 64 << 10];
         let mut side = vec![0x55u8; 64 << 10];
@@ -8083,6 +8129,7 @@ mod tests {
 
     #[test]
     fn refresh_batch_materializes_deferred_lazy_block_instead_of_zeroing() {
+        let _views = crate::inplace::view_tests_lock();
         use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
@@ -8209,6 +8256,7 @@ mod tests {
 
     #[test]
     fn materialize_rebar_spans_ignores_inverted_span_without_underflow() {
+        let _views = crate::inplace::view_tests_lock();
         use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
@@ -8280,6 +8328,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn wide_rebar_copy_partial_failure_with_failed_retry_invalidates_written_hashes() {
+        let _views = crate::inplace::view_tests_lock();
         use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
@@ -8412,6 +8461,7 @@ mod tests {
 
     #[test]
     fn collect_stale_does_not_acknowledge_excluded_lazy_owned_cpu_write() {
+        let _views = crate::inplace::view_tests_lock();
         use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
@@ -8535,6 +8585,7 @@ mod tests {
 
     #[test]
     fn evict_over_budget_drains_and_evicts_idle_deferred_windows() {
+        let _views = crate::inplace::view_tests_lock();
         use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
@@ -8634,6 +8685,7 @@ mod tests {
 
     #[test]
     fn stale_and_merge_ranges_under_writes_scope_to_conflicting_subranges_only() {
+        let _views = crate::inplace::view_tests_lock();
         use windows_sys::Win32::System::Memory::{
             MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
         };
@@ -8715,6 +8767,7 @@ mod tests {
 
     #[test]
     fn rebar_merge_ranges_under_writes_handles_many_strided_runs_without_consuming_runs_left() {
+        let _views = crate::inplace::view_tests_lock();
         use windows_sys::Win32::System::Memory::{
             MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
         };
@@ -8810,6 +8863,7 @@ mod tests {
 
     #[test]
     fn merge_ranges_under_writes_records_fallback_reasons() {
+        let _views = crate::inplace::view_tests_lock();
         use windows_sys::Win32::System::Memory::{
             MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
         };
@@ -8901,6 +8955,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn card_busy_refresh_coalesces_current_submission_constants() {
+        let _views = crate::inplace::view_tests_lock();
         use windows_sys::Win32::System::Memory::{
             MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
         };
@@ -8964,6 +9019,7 @@ mod tests {
 
     #[test]
     fn card_busy_refresh_preserves_bytes_from_older_flights() {
+        let _views = crate::inplace::view_tests_lock();
         let mut flights = Flights::default();
         let shared = (108, 120);
         let older_only = (128, 133);
@@ -9002,6 +9058,7 @@ mod tests {
     /// byte diffs strictly inside its subrange and preserves GPU writes there.
     #[test]
     fn card_busy_page_runs_coalesces_unprotected_and_preserves_older_gpu_writes() {
+        let _views = crate::inplace::view_tests_lock();
         let base = 0x10_0000usize;
         let held = vec![0u8; PAGE];
         let mut title = held.clone();
@@ -9051,6 +9108,7 @@ mod tests {
     /// prunes landed sends cleanly.
     #[test]
     fn card_sent_index_skips_only_newer_sends_and_prunes_in_order() {
+        let _views = crate::inplace::view_tests_lock();
         let mut sent = CardSent::default();
         sent.push_sorted(5, vec![(10, 20), (100, 120)]);
         // 4,096 strided ranges in send 7 across 1 MiB.
@@ -9093,6 +9151,7 @@ mod tests {
     /// while merging shader writes cleanly.
     #[test]
     fn card_merge_relay_indexed_sent_skips_only_ranges_after_fetched() {
+        let _views = crate::inplace::view_tests_lock();
         const LEN: usize = 2 * PIECE;
         let base: Vec<u8> = (0..LEN)
             .map(|i| (i.wrapping_mul(17) ^ (i >> 8)) as u8)
@@ -9163,6 +9222,7 @@ mod tests {
     ///   calling `copy_back_done` STRICTLY BEFORE clearing `settling` and notifying.
     #[test]
     fn card_sent_busy_and_before_lock_order_stress() {
+        let _views = crate::inplace::view_tests_lock();
         use std::sync::atomic::{AtomicBool, AtomicU64};
         use std::sync::{Barrier, Condvar};
 
@@ -9390,6 +9450,7 @@ mod tests {
 
     #[test]
     fn relay_merge_rebar_preserves_mirror_and_returns_none_on_materialization_or_read_failure() {
+        let _views = crate::inplace::view_tests_lock();
         use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
@@ -9478,6 +9539,7 @@ mod tests {
 
     #[test]
     fn mirrored_copy_seg_never_writes_partial_prefix_when_lazy_can_arm() {
+        let _views = crate::inplace::view_tests_lock();
         use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
@@ -9585,6 +9647,7 @@ mod tests {
 
     #[test]
     fn failed_wide_card_refresh_preserves_staging_baseline_and_keeps_good_segments() {
+        let _views = crate::inplace::view_tests_lock();
         use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
@@ -9679,6 +9742,7 @@ mod tests {
 
     #[test]
     fn apply_rebar_relay_subrange_short_write_fails_and_preserves_unwritten_mirror() {
+        let _views = crate::inplace::view_tests_lock();
         use windows_sys::Win32::System::Memory::{
             MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READONLY, PAGE_READWRITE, VirtualAlloc,
             VirtualFree, VirtualProtect,
@@ -9801,6 +9865,7 @@ mod tests {
 
     #[test]
     fn update_busy_reports_failure_when_page_backed_by_other_shadows_lazy_block() {
+        let _views = crate::inplace::view_tests_lock();
         use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, FILE_MAP_WRITE, MEM_RELEASE, MEM_RESERVE,
@@ -9923,6 +9988,7 @@ mod tests {
 
     #[test]
     fn update_busy_reports_failure_when_page_armed_after_ownership_check() {
+        let _views = crate::inplace::view_tests_lock();
         use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
@@ -10064,6 +10130,7 @@ mod tests {
 
     #[test]
     fn card_staging_publication_and_dirty_marking_are_atomic_with_relay_merge() {
+        let _views = crate::inplace::view_tests_lock();
         use std::sync::{Barrier, Condvar};
         use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
         use windows_sys::Win32::System::Memory::{
@@ -10235,6 +10302,7 @@ mod tests {
 
     #[test]
     fn lock_and_read_retries_when_page_materialized_between_failed_read_and_block_lookup() {
+        let _views = crate::inplace::view_tests_lock();
         use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
@@ -10322,6 +10390,7 @@ mod tests {
 
     #[test]
     fn merge_ranges_under_writes_reports_lazy_failed_page_without_skipping_other_pages() {
+        let _views = crate::inplace::view_tests_lock();
         use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, FILE_MAP_WRITE, MEM_RELEASE, MEM_RESERVE,
