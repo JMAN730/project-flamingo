@@ -13,7 +13,13 @@ use crate::object::{self, DESCRIPTOR_HEAP, E_INVALIDARG, HRESULT, Iid, Object, T
 use crate::resource::{Memory, PAGEABLE_IIDS};
 
 #[cfg(windows)]
+// Outside diagnostics builds only the notes are made (and do nothing).
+#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+pub(crate) mod check;
+#[cfg(windows)]
 pub(crate) mod host;
+#[cfg(windows)]
+pub(crate) mod table;
 
 /// Next creation id for [`Heap::id`]. `0` is reserved for "no heap";
 /// the renderer root-view heap key uses `u64::MAX`.
@@ -201,7 +207,9 @@ impl Heap {
         let end = start.saturating_add(mirrored_count as usize * step as usize);
         let desc_fast = host::descriptor_fast();
         let mut last_watch = self.sync_watch.lock().unwrap_or_else(|e| e.into_inner());
-        let mirrored = if let Some((now, pages)) = crate::watch::writes(start, end, false) {
+        // Guarded: a heap in mapped view memory is not write-watched, and
+        // without guards every bind would compare every slot.
+        let mirrored = if let Some((now, pages)) = crate::watch::writes(start, end, true) {
             let prev = *last_watch;
             let mirrored = if desc_fast {
                 let mut page_ranges: Vec<(usize, usize)> = Vec::new();
@@ -370,6 +378,45 @@ pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
         && let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get()
     {
         host.release(first, n);
+    }
+}
+
+/// The title heap at `key`, if it is registered as shader-visible under
+/// `heaps` (a guard of [`SHADER_HEAPS`]) and has creation id `id`: not one
+/// made later at the same address. Live while the guard is held.
+#[cfg(windows)]
+fn registered_as(heaps: &[(u64, u64, usize)], key: usize, id: u64) -> Option<&Heap> {
+    heaps
+        .iter()
+        .find(|&&(_, _, h)| h == key)
+        // SAFETY: registered heaps are live (removed in `Drop`, under the
+        // write lock the caller's read guard excludes).
+        .map(|&(_, _, h)| unsafe { &*(h as *const Heap) })
+        .filter(|heap| id != 0 && heap.id == id)
+}
+
+/// Gives back dynamic slots of the host heap behind the title heap at
+/// `key` if it is still the heap with creation id `id`
+/// ([`heap_bind_id`]), checked and released under one read of the heap
+/// registry, so a heap made at the same address in between is not given
+/// them.
+#[cfg(windows)]
+pub(crate) fn release_dynamic_of(key: usize, id: u64, first: u32, n: u32) {
+    with_registered(key, id, |heap| {
+        if let Some(Some(host)) = heap.host.get() {
+            host.release(first, n);
+        }
+    });
+}
+
+/// Runs `f` on the title heap at `key` if it is the heap with creation id
+/// `id`, under the registry read that found it: the heap cannot be
+/// unregistered (nor another made at its address) until `f` returns.
+#[cfg(windows)]
+fn with_registered(key: usize, id: u64, f: impl FnOnce(&Heap)) {
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+    if let Some(heap) = registered_as(&heaps, key, id) {
+        f(heap);
     }
 }
 
@@ -755,6 +802,11 @@ fn record(handle: u64, view: View) {
     mirror(handle);
 }
 
+/// How many view entries [`forget`] has made stale: a descriptor slot still
+/// holding one names no view from then on, though its bytes are unchanged
+/// (the buffer view table looks again when this moves).
+pub(crate) static FORGOTTEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// The title released `resource`: the views naming it go stale.
 pub(crate) fn forget(resource: usize) {
     let mut views = VIEWS.write().unwrap_or_else(|e| e.into_inner());
@@ -771,6 +823,7 @@ pub(crate) fn forget(resource: usize) {
             // The view's other resource (a counter) keeps a stale entry, which
             // `forget` of that resource skips.
             views.free.push(i);
+            FORGOTTEN.fetch_add(1, std::sync::atomic::Ordering::Release);
         }
     }
     drop(views);
@@ -1695,6 +1748,77 @@ mod tests {
             slot::<extern "system" fn(This) -> u32>(recycled, 0x10)(recycled),
             0
         );
+    }
+
+    /// A slot given back by heap address and creation id finds the heap only
+    /// while that heap is registered with that id: not under another id, not
+    /// after its release, and never for id 0.
+    #[cfg(windows)]
+    #[test]
+    fn slots_go_back_only_to_the_heap_they_were_taken_from() {
+        let desc = HeapDesc {
+            kind: 0,
+            count: 8,
+            flags: 1,
+            nodes: 1,
+        };
+        let none = Placement {
+            address: 0,
+            size: 0,
+        };
+        let mut made = std::ptr::null();
+        assert_eq!(create(desc, none, &mut made), S_OK);
+        let key = made as usize;
+        let id = heap(made).id;
+        {
+            let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+            assert!(registered_as(&heaps, key, id).is_some());
+            assert!(registered_as(&heaps, key, id + 1).is_none());
+            assert!(registered_as(&heaps, key, 0).is_none());
+        }
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(made, 0x10)(made), 0);
+        let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+        assert!(registered_as(&heaps, key, id).is_none());
+    }
+
+    /// The slot release path (`release_dynamic_of`) runs while its registry
+    /// read is held: unregistering a heap, which takes the registry's write
+    /// lock, cannot happen until it returns. Once the heap is released the
+    /// same path finds nothing to release into.
+    #[cfg(windows)]
+    #[test]
+    fn a_heap_is_not_unregistered_while_a_slot_release_reads_it() {
+        let desc = HeapDesc {
+            kind: 0,
+            count: 8,
+            flags: 1,
+            nodes: 1,
+        };
+        let none = Placement {
+            address: 0,
+            size: 0,
+        };
+        let mut made = std::ptr::null();
+        assert_eq!(create(desc, none, &mut made), S_OK);
+        let key = made as usize;
+        let id = heap(made).id;
+        let mut ran = false;
+        with_registered(key, id, |found| {
+            ran = true;
+            assert_eq!(std::ptr::from_ref(found) as usize, key);
+            assert_eq!(found.id, id);
+            assert!(
+                matches!(
+                    SHADER_HEAPS.try_write(),
+                    Err(std::sync::TryLockError::WouldBlock)
+                ),
+                "no heap can be unregistered during the release"
+            );
+        });
+        assert!(ran);
+        with_registered(key, id + 1, |_| panic!("another id is another heap"));
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(made, 0x10)(made), 0);
+        with_registered(key, id, |_| panic!("a released heap gets no slot"));
     }
 
     /// `heap_bind_id` tracks live shader-visible heaps by creation id, not

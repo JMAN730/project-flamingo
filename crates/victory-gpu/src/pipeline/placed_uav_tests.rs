@@ -87,6 +87,7 @@ fn store_shader() -> Arc<Shader> {
             stores: does_store,
             address_stores: addr_store,
         })),
+        mesh_fallback: OnceLock::new(),
         wave64: OnceLock::new(),
     })
 }

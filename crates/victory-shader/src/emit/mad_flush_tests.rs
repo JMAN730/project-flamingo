@@ -108,6 +108,7 @@ fn lower_mad_mul2() -> HostShader {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        mesh_buffer: false,
     })
     .expect("lower");
 
@@ -120,6 +121,7 @@ fn lower_mad_mul2() -> HostShader {
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
+        structured_srvs: Vec::new(),
     }
 }
 

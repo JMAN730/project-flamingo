@@ -1,8 +1,8 @@
 //! Host pipelines are made by workers, not by the title thread that first
 //! records a draw with them. Translating a shader and the host driver's
 //! compile take from milliseconds to seconds each (structurisation of the
-//! biggest compute programs ~0.4 s, some driver compiles 3.4 s), and Grand
-//! Theft Auto VI's first world frame wants over 1,200 new pipelines: made
+//! biggest compute programs ~0.4 s, some driver compiles 3.4 s), and the
+//! title's first world frame wants over 1,200 new pipelines: made
 //! on its recording threads, that frame took more than 30 s and the
 //! title's GPU watchdog ended the run (decision 0007, "Pipelines made off
 //! the title's threads").
@@ -22,7 +22,10 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use super::{Shader, Translated};
-use victory_shader::emit::{StructuredBinding, translate_with_view_strides_for_hash};
+use victory_shader::emit::{
+    StructuredBinding, translate_mesh_fallback_with_view_strides,
+    translate_with_view_strides_for_hash,
+};
 use victory_shader::{ResourceType, RootType, UsedResource};
 
 type Strides = Vec<(StructuredBinding, u32)>;
@@ -135,86 +138,145 @@ impl Pending {
                     return Some(shader.clone());
                 }
                 let accessed = std::cell::RefCell::new(BTreeSet::new());
-                let (host, mut used) = translate_with_view_strides_for_hash(
+                let view_stride = |binding: StructuredBinding, _: bool| {
+                    let i = self
+                        .strides
+                        .binary_search_by_key(&binding, |&(key, _)| key)
+                        .ok()?;
+                    let stride = self.strides[i].1;
+                    accessed.borrow_mut().insert((binding, stride));
+                    Some(stride)
+                };
+                // A mesh program on a host without mesh shaders runs as a
+                // compute pass ([`Shader::mesh_fallback`]), translated here
+                // with the same views: the specialized shader keeps no
+                // container to translate it from later.
+                let fallback = (shader.stage == "mesh" && !host.mesh_shaders()).then(|| {
+                    translate_mesh_fallback_with_view_strides(&shader.container, &view_stride)
+                        .map_err(|error| {
+                            tracing::warn!(
+                                ?shader,
+                                %error,
+                                "mesh shader with bound structured views does not translate \
+                                 for a host without mesh shaders; its pipelines' draws are dropped"
+                            );
+                        })
+                        .ok()
+                });
+                let translated = translate_with_view_strides_for_hash(
                     &shader.container,
                     host.supports_wave32(),
                     &shader.hash,
-                    &|binding, _| {
-                        let i = self
-                            .strides
-                            .binary_search_by_key(&binding, |&(key, _)| key)
-                            .ok()?;
-                        let stride = self.strides[i].1;
-                        accessed.borrow_mut().insert((binding, stride));
-                        Some(stride)
-                    },
+                    &view_stride,
                 )
                 .map_err(|error| {
                     tracing::warn!(?shader, %error, "shader with bound structured views refused");
-                })
-                .ok()?;
-                // Include exact slots absent from the console metadata so draw
-                // binding snapshots and transitions the views that lowering reads.
-                for (binding, stride) in accessed.into_inner() {
-                    let kind = if binding.uav {
-                        ResourceType::Uav
-                    } else {
-                        ResourceType::Srv
-                    };
-                    if let Some(entry) = used.iter_mut().find(|u| {
-                        u.root == RootType::Table
-                            && u.slot == binding.slot
-                            && u.table_offset_dwords == binding.offset_dwords
-                            && u.kind == kind
-                    }) {
-                        entry.stride = stride;
-                    } else {
-                        let user_data = host
-                            .user_data
-                            .iter()
-                            .find(|u| u.root == RootType::Table && u.slot == binding.slot)?
-                            .index;
-                        used.push(UsedResource {
-                            kind,
-                            root: RootType::Table,
-                            table_offset_dwords: binding.offset_dwords,
-                            lower_bound: 0,
-                            stride,
-                            dwords: 4,
-                            user_data: user_data.try_into().ok()?,
-                            slot: binding.slot,
-                        });
-                    }
+                });
+                // The mesh program as the host runs it is the fallback alone.
+                if translated.is_err() && !matches!(fallback, Some(Some(_))) {
+                    return None;
                 }
-                let (does_store, addr_store) = victory_shader::Container::parse(&shader.container)
-                    .ok()
-                    .and_then(|c| {
-                        c.part(victory_shader::FourCC::DXIL)
-                            .map(|p| p.data.to_vec())
-                    })
-                    .and_then(|dxil| victory_shader::native_programs(&dxil).ok())
-                    .map_or((true, true), |programs| {
-                        (
-                            programs.is_empty() || programs.iter().any(super::stores),
-                            programs.is_empty() || programs.iter().any(super::stores_by_address),
-                        )
-                    });
-                Some(Arc::new(Shader {
-                    stage: shader.stage,
-                    hash: shader.hash.clone(),
-                    container: Vec::new(),
-                    translated: OnceLock::from(Some(Translated {
+                let accessed = accessed.into_inner();
+                let (does_store, addr_store) = native_stores(&shader.container);
+                let facts = |(host, mut used): (victory_shader::emit::HostShader, Vec<_>)| {
+                    // Include exact slots absent from the console metadata so
+                    // draw binding snapshots and transitions the views that
+                    // lowering reads.
+                    with_accessed(&mut used, &host.user_data, &accessed)?;
+                    Some(Translated {
                         host,
                         used,
                         stores: does_store,
                         address_stores: addr_store,
+                    })
+                };
+                let translated = match translated {
+                    Ok(t) => Some(facts(t)?),
+                    Err(()) => None,
+                };
+                let mesh_fallback = match fallback {
+                    Some(Some((f, used))) => OnceLock::from(Some(super::MeshFallback {
+                        compute: facts((f.compute, used))?,
+                        vertex: f.vertex,
+                        buffer: f.buffer,
                     })),
+                    Some(None) => OnceLock::from(None),
+                    None => OnceLock::new(),
+                };
+                Some(Arc::new(Shader {
+                    stage: shader.stage,
+                    hash: shader.hash.clone(),
+                    container: Vec::new(),
+                    translated: OnceLock::from(translated),
+                    mesh_fallback,
                     #[cfg(feature = "diagnostics")]
                     wave64: OnceLock::new(),
                 }))
             })
             .collect()
     }
+}
+
+/// Whether the console programs of `container` can store to buffer memory,
+/// and by address ([`super::stores`], [`super::stores_by_address`]); both
+/// for a container whose programs are not known.
+fn native_stores(container: &[u8]) -> (bool, bool) {
+    victory_shader::Container::parse(container)
+        .ok()
+        .and_then(|c| {
+            c.part(victory_shader::FourCC::DXIL)
+                .map(|p| p.data.to_vec())
+        })
+        .and_then(|dxil| victory_shader::native_programs(&dxil).ok())
+        .map_or((true, true), |programs| {
+            (
+                programs.is_empty() || programs.iter().any(super::stores),
+                programs.is_empty() || programs.iter().any(super::stores_by_address),
+            )
+        })
+}
+
+/// Gives `used` (a translation's console resources) the structured views
+/// its lowering read, `accessed` as (binding, stride): an entry for the same
+/// table slot and offset takes the view's stride, and a view the console
+/// metadata does not name is added, bound through the root parameter of
+/// its slot's table in `user_data`. None if a view's slot has no table.
+fn with_accessed(
+    used: &mut Vec<UsedResource>,
+    user_data: &[victory_shader::emit::UserData],
+    accessed: &BTreeSet<(StructuredBinding, u32)>,
+) -> Option<()> {
+    for &(binding, stride) in accessed {
+        let kind = if binding.uav {
+            ResourceType::Uav
+        } else {
+            ResourceType::Srv
+        };
+        if let Some(entry) = used.iter_mut().find(|u| {
+            u.root == RootType::Table
+                && u.slot == binding.slot
+                && u.table_offset_dwords == binding.offset_dwords
+                && u.kind == kind
+        }) {
+            entry.stride = stride;
+        } else {
+            let user_data = user_data
+                .iter()
+                .find(|u| u.root == RootType::Table && u.slot == binding.slot)?
+                .index;
+            used.push(UsedResource {
+                kind,
+                root: RootType::Table,
+                table_offset_dwords: binding.offset_dwords,
+                lower_bound: 0,
+                stride,
+                dwords: 4,
+                user_data: user_data.try_into().ok()?,
+                slot: binding.slot,
+            });
+        }
+    }
+    Some(())
 }
 
 /// Why a pipeline has no host pipeline (diagnostics): its shaders that do
@@ -249,6 +311,21 @@ static DONE: (Mutex<()>, Condvar) = (Mutex::new(()), Condvar::new());
 
 /// Waiting allowed per title frame, over all threads.
 const BUDGET: Duration = Duration::from_millis(500);
+
+/// The wait budget per title frame: [`BUDGET`], or in diagnostics builds
+/// `VICTORY_PIPELINE_WAIT_MS` (a large value makes every first use wait for
+/// its pipeline, so no draw or dispatch of a chain is dropped while the rest
+/// runs; a debugging aid for data a half-run chain leaves behind).
+fn budget() -> Duration {
+    static BUDGET_SET: OnceLock<Duration> = OnceLock::new();
+    *BUDGET_SET.get_or_init(|| {
+        std::env::var("VICTORY_PIPELINE_WAIT_MS")
+            .ok()
+            .filter(|_| cfg!(feature = "diagnostics"))
+            .and_then(|v| v.trim().parse().ok())
+            .map_or(BUDGET, Duration::from_millis)
+    })
+}
 
 /// Pipelines queued and not made yet.
 static WAITING: AtomicU64 = AtomicU64::new(0);
@@ -342,7 +419,7 @@ fn wait(p: &Pending, frame: u64) {
     if FRAME.swap(frame, Ordering::Relaxed) != frame {
         WAITED_US.store(0, Ordering::Relaxed);
     }
-    let left = BUDGET.saturating_sub(Duration::from_micros(WAITED_US.load(Ordering::Relaxed)));
+    let left = budget().saturating_sub(Duration::from_micros(WAITED_US.load(Ordering::Relaxed)));
     let started = Instant::now();
     let (lock, done) = &DONE;
     let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -520,6 +597,25 @@ fn complete(speculative: bool) {
     }
 }
 
+/// Stack reserved for each pipeline worker: 64 MiB of address space, of
+/// which only the pages used are committed. The host driver compiles on
+/// the worker, and NVIDIA's compiler recurses past Rust's default 2 MiB on
+/// some of the title's compute programs (fork issue 383). It catches that
+/// overflow and refuses the pipeline as out of memory, but the thread's
+/// guard page is spent, so the next deep compile on the same worker runs
+/// off the end of its stack and the process ends without a report.
+///
+/// shortcut: 64 MiB was enough on the drivers seen; nobody measured how
+/// deep the compiler goes.
+const WORKER_STACK: usize = 64 << 20;
+
+/// The builder for pipeline worker `i`.
+fn worker_thread(i: usize) -> std::thread::Builder {
+    std::thread::Builder::new()
+        .name(format!("victory-pipelines-{i}"))
+        .stack_size(WORKER_STACK)
+}
+
 /// Starts the workers (half the logical processors, 2 to 8) on first use.
 fn workers() -> bool {
     static RUNNING: OnceLock<bool> = OnceLock::new();
@@ -534,35 +630,32 @@ fn workers() -> bool {
         let mut running = false;
         let workers = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
         for i in 0..workers {
-            let spawned = std::thread::Builder::new()
-                .name(format!("victory-pipelines-{i}"))
-                .spawn(|| {
-                    // Below the title's own threads (loading, recording),
-                    // and the streaming one, which is below normal itself
-                    // (`VICTORY_PIPELINE_LOWEST=0`: level with it, as before).
-                    let lowest =
-                        std::env::var_os("VICTORY_PIPELINE_LOWEST").is_none_or(|v| v != "0");
-                    // SAFETY: a plain call on our own thread.
-                    unsafe {
-                        use windows::Win32::System::Threading::*;
-                        let priority = if lowest {
-                            THREAD_PRIORITY_LOWEST
-                        } else {
-                            THREAD_PRIORITY_BELOW_NORMAL
-                        };
-                        let _ = SetThreadPriority(GetCurrentThread(), priority);
+            let spawned = worker_thread(i).spawn(|| {
+                // Below the title's own threads (loading, recording),
+                // and the streaming one, which is below normal itself
+                // (`VICTORY_PIPELINE_LOWEST=0`: level with it, as before).
+                let lowest = std::env::var_os("VICTORY_PIPELINE_LOWEST").is_none_or(|v| v != "0");
+                // SAFETY: a plain call on our own thread.
+                unsafe {
+                    use windows::Win32::System::Threading::*;
+                    let priority = if lowest {
+                        THREAD_PRIORITY_LOWEST
+                    } else {
+                        THREAD_PRIORITY_BELOW_NORMAL
+                    };
+                    let _ = SetThreadPriority(GetCurrentThread(), priority);
+                }
+                loop {
+                    let job = next();
+                    job.pending.make();
+                    complete(job.speculative);
+                    if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
+                        drained();
+                    } else {
+                        super::library::save(false);
                     }
-                    loop {
-                        let job = next();
-                        job.pending.make();
-                        complete(job.speculative);
-                        if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
-                            drained();
-                        } else {
-                            super::library::save(false);
-                        }
-                    }
-                });
+                }
+            });
             if let Err(e) = spawned {
                 tracing::warn!(error = %e, "no pipeline worker");
             } else {
@@ -594,6 +687,79 @@ fn drained() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A pipeline worker has its 64 MiB of stack, not the runtime's 2 MiB
+    /// default nor the executable's 16 MiB.
+    #[test]
+    fn pipeline_workers_reserve_64_mib_of_stack() {
+        let reserved = worker_thread(0)
+            .spawn(|| {
+                let (mut low, mut high) = (0, 0);
+                // SAFETY: writes the calling thread's stack bounds.
+                unsafe {
+                    windows_sys::Win32::System::Threading::GetCurrentThreadStackLimits(
+                        &mut low, &mut high,
+                    )
+                };
+                high - low
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+        assert!(reserved >= WORKER_STACK, "{reserved:#x} bytes of stack");
+    }
+
+    /// The structured views a specialized translation read go into its
+    /// resources: an entry the console metadata has takes the view's stride,
+    /// and one it lacks is added through that translation's own root
+    /// parameter for the slot (a mesh program and its compute fallback each
+    /// have theirs); a view whose slot has no table refuses.
+    #[test]
+    fn read_views_join_the_resources_of_the_translation_that_read_them() {
+        let table = |slot: u8, index: u32| victory_shader::emit::UserData {
+            indexed_buffer: false,
+            index,
+            slot,
+            root: RootType::Table,
+            dword: 0,
+        };
+        let listed = UsedResource {
+            kind: ResourceType::Srv,
+            root: RootType::Table,
+            table_offset_dwords: 8,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 2,
+            slot: 1,
+        };
+        let known = StructuredBinding {
+            slot: 1,
+            offset_dwords: 8,
+            uav: false,
+        };
+        let unlisted = StructuredBinding {
+            slot: 3,
+            offset_dwords: 4,
+            uav: true,
+        };
+        let accessed = BTreeSet::from([(known, 16), (unlisted, 12)]);
+        for index in [5, 9] {
+            let mut used = vec![listed];
+            assert_eq!(
+                with_accessed(&mut used, &[table(1, 2), table(3, index)], &accessed),
+                Some(())
+            );
+            assert_eq!(used.len(), 2);
+            assert_eq!((used[0].stride, used[0].user_data), (16, 2));
+            let added = used[1];
+            assert_eq!(added.kind, ResourceType::Uav);
+            assert_eq!((added.slot, added.table_offset_dwords), (3, 4));
+            assert_eq!((added.stride, u32::from(added.user_data)), (12, index));
+        }
+        let mut used = Vec::new();
+        assert_eq!(with_accessed(&mut used, &[table(1, 2)], &accessed), None);
+    }
 
     /// A first use queues the pipeline and, within the budget, gets the
     /// worker's answer (here: no host pipeline for no shaders).

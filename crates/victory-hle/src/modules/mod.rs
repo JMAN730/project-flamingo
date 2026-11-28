@@ -14,6 +14,7 @@ pub mod apu;
 /// Portable sample-rate conversion used by the Windows-gated APU.
 pub(crate) mod apu_resample;
 pub mod audio;
+pub mod clock;
 pub mod d3d12x;
 pub mod display;
 pub mod dsp;
@@ -37,6 +38,7 @@ pub mod net;
 pub(crate) mod paths;
 pub mod speech;
 pub mod storage;
+pub(crate) mod thread_stacks;
 pub mod xasync;
 pub mod xg;
 pub mod xgame;
@@ -94,5 +96,10 @@ pub(crate) fn all() -> Vec<HleModule> {
     all.push(xmem::module());
     #[cfg(windows)]
     all.push(xsystem::module());
+    // Only with `VICTORY_TIME_SCALE` (diagnostics): otherwise the title's
+    // clock imports stay the host's.
+    if clock::enabled() {
+        all.push(clock::module());
+    }
     all
 }

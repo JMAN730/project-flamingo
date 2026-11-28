@@ -441,6 +441,21 @@ fn mip_count(desc: &ResourceDesc) -> u32 {
 /// Most mip levels the host gives up on a texture it cannot allocate.
 const MAX_MIP_DROP: u32 = 3;
 
+/// What may take top mip levels from a host texture.
+#[cfg_attr(not(windows), allow(dead_code))]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum MipDrop {
+    /// Nothing: a texture the title placed in its own memory, which may
+    /// show a target that keeps every level.
+    None,
+    /// `VICTORY_TEXTURE_MIP_DROP` alone: such a texture when the switch
+    /// asks (its levels are then paired by size where it shows a target).
+    Forced,
+    /// The switch, the levels memory pressure has already cost, and more
+    /// if the host refuses the texture for lack of memory.
+    Pressure,
+}
+
 /// The mip levels every later host texture gives up, raised by each
 /// allocation the host refuses with `E_OUTOFMEMORY`. A process that has
 /// run out of memory for one texture will for the next (the failures
@@ -470,6 +485,59 @@ fn droppable_mips(desc: &ResourceDesc, wanted: u32) -> u32 {
             block == 1 || (w % block == 0 && h % block == 0)
         })
         .unwrap_or(0)
+}
+
+/// The top mip levels `VICTORY_TEXTURE_MIP_DROP` asks a host copy of
+/// `desc` to give up before any memory pressure, for cards with less video
+/// memory than the title's world needs: only power-of-two textures at
+/// least `VICTORY_TEXTURE_MIP_DROP_MIN_SIZE` (1024) on both axes. Smaller
+/// ones are a sliver of the memory but collapse to a few texels; other
+/// sizes are mostly screen-sized artwork (loading screens, video frames,
+/// the interface) the title copies whole, which a lost level would leave a
+/// flat colour. [`droppable_mips`] still decides what the texture can lose.
+fn forced_mip_drop(desc: &ResourceDesc) -> u32 {
+    static WANTED: std::sync::OnceLock<(u32, u64)> = std::sync::OnceLock::new();
+    let &(wanted, min_size) = WANTED.get_or_init(|| {
+        let number = |name| {
+            std::env::var(name)
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+        };
+        let wanted = number("VICTORY_TEXTURE_MIP_DROP").map_or(0, |v| v.min(3) as u32);
+        let min_size = number("VICTORY_TEXTURE_MIP_DROP_MIN_SIZE")
+            .filter(|&v| v > 0)
+            .unwrap_or(1024);
+        (wanted, min_size)
+    });
+    if wanted == 0 {
+        return 0;
+    }
+    forced_mip_drop_for(desc, wanted, min_size)
+}
+
+/// [`forced_mip_drop`] for `wanted` levels and a size floor of `min_size`.
+fn forced_mip_drop_for(desc: &ResourceDesc, wanted: u32, min_size: u64) -> u32 {
+    let pot = desc.width.is_power_of_two() && desc.height.is_power_of_two();
+    if !pot || desc.width < min_size || u64::from(desc.height) < min_size {
+        return 0;
+    }
+    wanted
+}
+
+/// A title subresource of a texture with `title_mips` levels a layer as the
+/// host copy's that lacks the top `dropped` ones; `None` for a level the
+/// host copy does not have.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn map_subresource(title_sub: u32, title_mips: u32, dropped: u32) -> Option<u32> {
+    if dropped == 0 || title_mips == 0 {
+        return Some(title_sub);
+    }
+    let (layer, mip) = (title_sub / title_mips, title_sub % title_mips);
+    if mip < dropped {
+        return None;
+    }
+    let host_mips = title_mips.saturating_sub(dropped).max(1);
+    Some(layer * host_mips + mip - dropped)
 }
 
 /// A view's `(most_detailed, levels)` of a title texture, as the same
@@ -511,7 +579,11 @@ fn create_texture_with_auto_mip_drop<T>(
     mut create: impl FnMut(&ResourceDesc) -> Result<T, HRESULT>,
 ) -> Result<(T, ResourceDesc, u32), HRESULT> {
     use std::sync::atomic::Ordering::Relaxed;
-    let mut dropped = droppable_mips(desc, PRESSURE.load(Relaxed).min(MAX_MIP_DROP));
+    let wanted = PRESSURE
+        .load(Relaxed)
+        .max(forced_mip_drop(desc))
+        .min(MAX_MIP_DROP);
+    let mut dropped = droppable_mips(desc, wanted);
     loop {
         let attempt = without_top_mips(desc, dropped);
         match create(&attempt) {
@@ -1122,7 +1194,19 @@ impl Resource {
                 let clear = clear
                     .as_ref()
                     .map_or(std::ptr::null(), |c| std::ptr::from_ref(c).cast::<c_void>());
-                let mip_drop = !placed_views().contains(&(this as usize));
+                // A texture the title placed in its own memory keeps its
+                // levels under memory pressure (it may show a full target),
+                // but gives up the ones `VICTORY_TEXTURE_MIP_DROP` asks
+                // for: the title's streamed textures are placed ones, and
+                // most of what a card short of video memory has to shed.
+                // (`crate::texture`'s alias copy pairs levels by size.)
+                let mip_drop = if !placed_views().contains(&(this as usize)) {
+                    MipDrop::Pressure
+                } else if forced_mip_drop(&self.desc) > 0 {
+                    MipDrop::Forced
+                } else {
+                    MipDrop::None
+                };
                 let (texture, state, dropped) = host_texture(&self.desc, state, clear, mip_drop)?;
                 Some(std::sync::Arc::new(HostTexture {
                     texture,
@@ -1482,6 +1566,18 @@ pub(crate) fn dropped_mips(this: This) -> u32 {
     resource(this).host(this).map_or(0, |h| h.dropped)
 }
 
+/// Title subresource `sub` of texture `this` as its host copy's subresource
+/// ([`map_subresource`]); `None` for a level the host copy lost.
+#[cfg(windows)]
+pub(crate) fn host_subresource(this: This, sub: u32) -> Option<u32> {
+    if this.is_null() {
+        return Some(sub);
+    }
+    let r = resource(this);
+    let dropped = r.host(this).map_or(0, |h| h.dropped);
+    map_subresource(sub, mip_count(&r.desc), dropped)
+}
+
 /// Width, height and format of single-sampled 2D texture `this` (`None` for
 /// buffers, non-2D or multisampled textures), for `crate::texback`'s kinds.
 #[cfg(windows)]
@@ -1521,14 +1617,14 @@ pub(crate) fn title_texture(
 /// A host texture like the title's: same description, in GPU memory,
 /// without the console's layout and flags, the state it was made in
 /// (what the transitions that follow start from), and how many top mip
-/// levels it lost to host memory pressure. `mip_drop` is false for placed
-/// views that may alias a full-mip render target or UAV.
+/// levels it lost, to host memory pressure or `VICTORY_TEXTURE_MIP_DROP`,
+/// as `mip_drop` allows.
 #[cfg(windows)]
 fn host_texture(
     desc: &ResourceDesc,
     state: u32,
     clear: *const c_void,
-    mip_drop: bool,
+    mip_drop: MipDrop,
 ) -> Option<(
     windows::Win32::Graphics::Direct3D12::ID3D12Resource,
     u32,
@@ -1537,6 +1633,24 @@ fn host_texture(
     use windows::Win32::Graphics::Direct3D12::*;
     const PC_FLAGS: u32 = 0xf; // render target, depth, UAV, no shader access
     if desc.dimension == BUFFER {
+        return None;
+    }
+    // `VICTORY_NO_TEXTURES=1`: textures shaders only read get no host copy,
+    // so their views are null (they sample as zero). Render targets, depth
+    // and unordered-access textures keep theirs. For cards with less video
+    // memory than the world needs (about 8.6 GB of textures at its load).
+    // shortcut: a texture the title flags read-only but fills by a copy
+    // loses that content too.
+    static NO_TEXTURES: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if desc.flags & 7 == 0
+        && *NO_TEXTURES.get_or_init(|| {
+            let on = std::env::var_os("VICTORY_NO_TEXTURES").is_some_and(|v| v != "0");
+            if on {
+                tracing::info!("VICTORY_NO_TEXTURES: read-only textures get no host copy");
+            }
+            on
+        })
+    {
         return None;
     }
     let host = crate::host::host()?;
@@ -1586,9 +1700,23 @@ fn host_texture(
         };
         value
     });
-    let heap = D3D12_HEAP_PROPERTIES {
-        Type: D3D12_HEAP_TYPE_DEFAULT,
-        ..Default::default()
+    // Textures shaders only read go to system memory the GPU maps once video
+    // memory is near its budget: slower to sample, but a card with less
+    // video memory than the console's (the world keeps about 12 GB of
+    // targets and textures) keeps running instead of losing its device.
+    let read_only = d.flags & (RENDER_TARGET | DEPTH | UNORDERED) == 0;
+    let heap = if read_only && crate::host::video_memory_tight() {
+        D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_CUSTOM,
+            CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE,
+            MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
+            ..Default::default()
+        }
+    } else {
+        D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        }
     };
     // Not every host GPU offers every use of every format (NVIDIA: no
     // unordered access to BGRA8, no B4G4R4A4 render targets, where the
@@ -1640,17 +1768,26 @@ fn host_texture(
             continue;
         }
         tried.push((flags, initial, try_clear));
-        let result = if mip_drop {
-            create_texture_with_auto_mip_drop(&trial, |attempt| {
+        let result = match mip_drop {
+            MipDrop::Pressure => create_texture_with_auto_mip_drop(&trial, |attempt| {
                 let mut made = None;
                 create_one(attempt, initial, try_clear, &mut made)
                     .map(|()| made)
                     .map_err(|e| e.code().0)
             })
-            .map_err(|code| windows::core::Error::from(windows::core::HRESULT(code)))
-        } else {
-            let mut made = None;
-            create_one(&trial, initial, try_clear, &mut made).map(|()| (made, trial, 0u32))
+            .map_err(|code| windows::core::Error::from(windows::core::HRESULT(code))),
+            MipDrop::Forced | MipDrop::None => {
+                // Exactly the levels the switch asks for, whatever the
+                // pressure, and no more if the host is out of memory.
+                let lost = if mip_drop == MipDrop::Forced {
+                    droppable_mips(&trial, forced_mip_drop(&trial).min(MAX_MIP_DROP))
+                } else {
+                    0
+                };
+                let attempt = without_top_mips(&trial, lost);
+                let mut made = None;
+                create_one(&attempt, initial, try_clear, &mut made).map(|()| (made, attempt, lost))
+            }
         };
         match result {
             Ok((made, attempt, lost)) => {
@@ -1700,6 +1837,11 @@ fn host_texture(
         }
         return None;
     };
+    #[cfg(feature = "diagnostics")]
+    crate::host::note_vram(
+        usize::from(d.flags & (RENDER_TARGET | DEPTH) == 0),
+        &texture,
+    );
     crate::host::name(&texture, || {
         format!(
             "texture {}x{} f{} flags {:#x}",
@@ -2163,6 +2305,12 @@ fn targets() -> std::sync::MutexGuard<'static, std::collections::BTreeMap<u64, u
     TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// The description of the render target at `address`, if it is one.
+#[cfg(windows)]
+pub(crate) fn present_plane_desc(address: usize) -> Option<crate::present_params::PlaneDesc> {
+    PresentTarget::retain(address).map(|target| target.desc())
+}
+
 /// A recognized renderable resource retained for an optional present overlay.
 #[cfg(windows)]
 pub(crate) struct PresentTarget(object::Held);
@@ -2179,6 +2327,20 @@ impl PresentTarget {
         // SAFETY: a resource in the table must acquire this same lock before
         // its allocation can be freed. try_new refuses an object in Drop.
         unsafe { object::Held::try_new(address as This) }.map(Self)
+    }
+
+    /// The title's description of the target, for the present log.
+    pub(crate) fn desc(&self) -> crate::present_params::PlaneDesc {
+        let d = resource(self.0.get()).desc;
+        crate::present_params::PlaneDesc {
+            format: d.format,
+            width: d.width,
+            height: d.height,
+            mips: d.mip_levels,
+            samples: d.sample_count,
+            dimension: d.dimension,
+            flags: d.flags,
+        }
     }
 
     /// An ignored plane should not acquire a host texture just by being
@@ -4346,5 +4508,67 @@ void main() {
             assert_eq!(synthetic_oom_above(), 8);
         }
         assert_eq!(synthetic_oom_above(), 64);
+    }
+
+    /// `VICTORY_TEXTURE_MIP_DROP` reaches only power-of-two textures at
+    /// least the size floor on both axes; what they can lose is then
+    /// `droppable_mips`'s to say.
+    #[test]
+    fn forced_mip_drop_takes_large_power_of_two_textures() {
+        let square = texture(1024, 1024, 28, 10);
+        assert_eq!(forced_mip_drop_for(&square, 1, 1024), 1);
+        assert_eq!(
+            forced_mip_drop_for(&texture(2048, 1024, 28, 11), 2, 1024),
+            2
+        );
+        // Screen-sized artwork and the interface keep every level.
+        assert_eq!(
+            forced_mip_drop_for(&texture(1920, 1080, 28, 11), 1, 1024),
+            0
+        );
+        assert_eq!(forced_mip_drop_for(&texture(1280, 720, 28, 10), 1, 1024), 0);
+        // Below the floor on either axis.
+        assert_eq!(forced_mip_drop_for(&texture(512, 512, 28, 9), 1, 1024), 0);
+        assert_eq!(forced_mip_drop_for(&texture(2048, 512, 28, 11), 1, 1024), 0);
+        assert_eq!(forced_mip_drop_for(&square, 1, 2048), 0);
+        assert_eq!(
+            forced_mip_drop_for(&texture(2048, 2048, 28, 12), 1, 2048),
+            1
+        );
+        // Targets, single-level textures and buffers are left to `droppable_mips`.
+        let mut target = square;
+        target.flags = 1;
+        assert_eq!(
+            droppable_mips(&target, forced_mip_drop_for(&target, 1, 1024)),
+            0
+        );
+        let mut single = square;
+        single.mip_levels = 1;
+        assert_eq!(
+            droppable_mips(&single, forced_mip_drop_for(&single, 1, 1024)),
+            0
+        );
+        assert_eq!(droppable_mips(&buffer(1024), 1), 0);
+    }
+
+    /// Title subresources of a texture that lost its top levels: the lost
+    /// ones have no host subresource, the others count from the host's
+    /// largest level, per layer.
+    #[test]
+    fn subresources_map_past_dropped_levels() {
+        // 8 title levels a layer, 2 dropped: 6 on the host.
+        const MIPS: u32 = 8;
+        const DROPPED: u32 = 2;
+        assert_eq!(map_subresource(0, MIPS, DROPPED), None);
+        assert_eq!(map_subresource(1, MIPS, DROPPED), None);
+        assert_eq!(map_subresource(2, MIPS, DROPPED), Some(0));
+        assert_eq!(map_subresource(7, MIPS, DROPPED), Some(5));
+        // Layer 1.
+        assert_eq!(map_subresource(8, MIPS, DROPPED), None);
+        assert_eq!(map_subresource(10, MIPS, DROPPED), Some(6));
+        // Layer 3, level 4.
+        assert_eq!(map_subresource(28, MIPS, DROPPED), Some(20));
+        // Nothing dropped.
+        assert_eq!(map_subresource(15, MIPS, 0), Some(15));
     }
 }

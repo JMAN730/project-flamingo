@@ -7,6 +7,8 @@ mod census;
 mod inspect;
 mod run;
 mod shader;
+#[cfg(windows)]
+mod split_diff;
 mod translate;
 
 use std::num::NonZeroUsize;
@@ -83,12 +85,46 @@ enum Command {
         /// Also create a host D3D12 pipeline for each emitted shader.
         #[arg(long)]
         pipelines: bool,
+        /// Also emit each mesh program as hosts without mesh shaders run it
+        /// (a compute and a vertex shader), with the same checks.
+        #[arg(long)]
+        mesh_fallback: bool,
+        /// Also emit each pixel program as hosts without barycentrics run it
+        /// (behind a geometry shader), with the same checks, and compare the
+        /// programs that need no barycentrics with their plain emission.
+        #[arg(long)]
+        barycentric_fallback: bool,
         /// Include runtime hashes and duplicate DXIL containers in the per-program listing.
         #[arg(long)]
         list: bool,
         /// Positive worker thread count (default: every logical core).
         #[arg(long)]
         jobs: Option<NonZeroUsize>,
+        /// Only the containers with these runtime hashes: the 16 hex digits
+        /// the runtime logs a shader by (comma-separated or repeated).
+        #[arg(long)]
+        hash: Vec<String>,
+    },
+    /// Run each wave64 compute program found as a 32-lane host's two-half
+    /// lowering makes it, against the variants that must agree with it, on
+    /// synthetic inputs; report the programs whose outputs differ.
+    #[cfg(windows)]
+    SplitDiff {
+        paths: Vec<PathBuf>,
+        /// The report (hashes and counts only), outside the repository.
+        #[arg(long)]
+        out: PathBuf,
+        /// Only these comma-separated hash prefixes.
+        #[arg(long)]
+        only: Option<String>,
+        /// Thread groups per dispatch, x: 1 (a dispatch of no groups runs
+        /// nothing, and nothing would agree with nothing) to 65535, the
+        /// most a dispatch takes in a dimension.
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=65535))]
+        groups: u32,
+        /// Translate and plan the bindings only.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
@@ -168,15 +204,28 @@ fn dispatch(command: Command) -> Result<()> {
             paths,
             validate,
             pipelines,
+            mesh_fallback,
+            barycentric_fallback,
             list,
             jobs,
+            hash,
         } => translate::run(
             paths,
             validate,
             pipelines,
+            (mesh_fallback, barycentric_fallback),
             list,
             jobs.map(NonZeroUsize::get),
+            hash,
         ),
+        #[cfg(windows)]
+        Command::SplitDiff {
+            paths,
+            out,
+            only,
+            groups,
+            dry_run,
+        } => split_diff::run(paths, out, only, [groups, 1, 1], dry_run),
         Command::Run {
             exe,
             unimplemented,

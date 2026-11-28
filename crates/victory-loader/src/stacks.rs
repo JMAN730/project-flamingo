@@ -1,6 +1,7 @@
 //! Where every thread is: `VICTORY_STACKS=<seconds>[,<seconds>...]` prints
 //! each thread's unwound stack as `module+rva` that many seconds after
-//! [`dump_stacks_on_schedule`], to find what a title waits on.
+//! [`dump_stacks_on_schedule`], to find what a title waits on, with how
+//! deep each thread's stack has ever gone.
 
 use std::ffi::c_void;
 
@@ -109,11 +110,12 @@ pub fn dump_stacks() {
         if thread.is_null() {
             continue;
         }
-        let (frames, (priority, base)) = frames_of(thread);
+        let (frames, (priority, base), stack) = frames_of(thread);
         eprintln!(
-            "  thread {id} \"{}\" start {} priority {priority} (base {base})",
+            "  thread {id} \"{}\" start {} priority {priority} (base {base}){}",
             name_of(thread),
-            locate(start_of(thread))
+            locate(start_of(thread)),
+            stack_text(stack)
         );
         for (i, pc) in frames.into_iter().enumerate() {
             eprintln!("    #{i:<2} {}", locate(pc as usize));
@@ -123,8 +125,31 @@ pub fn dump_stacks() {
     }
 }
 
-/// The thread's frames and its current and base scheduling priority (0-31).
-fn frames_of(thread: HANDLE) -> (Vec<u64>, (i32, i32)) {
+/// How a thread's stack is used: `stack <peak> of <reserved> KiB`, the
+/// peak being what was ever committed (Windows never decommits a stack, so
+/// this is the deepest the thread has gone, to the page, plus its guard).
+fn stack_text(stack: StackUse) -> String {
+    match stack {
+        Some((used, reserved)) => format!(", stack {} of {} KiB", used >> 10, reserved >> 10),
+        None => String::new(),
+    }
+}
+
+/// From a TEB's stack fields (base, limit, deallocation stack): the bytes
+/// ever committed and the bytes reserved, or `None` if they do not nest.
+fn stack_use(base: usize, limit: usize, deallocation: usize) -> StackUse {
+    (deallocation <= limit && limit <= base).then(|| (base - limit, base - deallocation))
+}
+
+/// `TEB.DeallocationStack` on x86-64: the start of the stack reservation.
+const TEB_DEALLOCATION_STACK: usize = 0x1478;
+
+/// Bytes of stack ever committed and reserved ([`stack_use`]).
+type StackUse = Option<(usize, usize)>;
+
+/// The thread's frames, its current and base scheduling priority (0-31)
+/// and its stack use.
+fn frames_of(thread: HANDLE) -> (Vec<u64>, (i32, i32), StackUse) {
     let mut frames = Vec::with_capacity(MAX_FRAMES);
     let mut info: BasicInfo = BasicInfo {
         exit_status: 0,
@@ -138,7 +163,7 @@ fn frames_of(thread: HANDLE) -> (Vec<u64>, (i32, i32)) {
     // the query and the read below.
     // SAFETY: a thread of this process that is not this one.
     if unsafe { SuspendThread(thread) } == u32::MAX {
-        return (frames, (0, 0));
+        return (frames, (0, 0), None);
     }
     // SAFETY: writes `info`, whose layout and size are the system's.
     let status = unsafe {
@@ -153,11 +178,20 @@ fn frames_of(thread: HANDLE) -> (Vec<u64>, (i32, i32)) {
     if status != 0 || info.teb.is_null() {
         // SAFETY: suspended above.
         unsafe { ResumeThread(thread) };
-        return (frames, (0, 0));
+        return (frames, (0, 0), None);
     }
     // SAFETY: the TEB of a suspended thread of this process: its NT_TIB
     // holds the stack base at +8 and the stack limit at +0x10.
     let (high, low) = unsafe { (info.teb.add(1).read(), info.teb.add(2).read()) };
+    // SAFETY: the same TEB; `DeallocationStack` is a pointer-sized field.
+    let deallocation = unsafe {
+        info.teb
+            .cast::<u8>()
+            .add(TEB_DEALLOCATION_STACK)
+            .cast::<usize>()
+            .read()
+    };
+    let stack = stack_use(high, low, deallocation);
     // SAFETY: zeroed is a valid CONTEXT.
     let mut context = Aligned(unsafe { std::mem::zeroed() });
     context.0.ContextFlags = CONTEXT_FULL_AMD64;
@@ -170,7 +204,7 @@ fn frames_of(thread: HANDLE) -> (Vec<u64>, (i32, i32)) {
         }
         ResumeThread(thread);
     }
-    (frames, (info.priority, info.base_priority))
+    (frames, (info.priority, info.base_priority), stack)
 }
 
 fn start_of(thread: HANDLE) -> usize {
@@ -225,15 +259,34 @@ mod tests {
             )
         };
         assert!(!thread.is_null());
-        let (frames, _) = frames_of(thread);
+        let (frames, _, stack) = frames_of(thread);
         // Waiting in the kernel, several frames down from the thread start.
         assert!(frames.len() >= 3, "{frames:?}");
+        let (used, reserved) = stack.expect("the parked thread's stack");
+        assert!(used > 0 && used < reserved, "{used:#x} of {reserved:#x}");
+        assert!(reserved >= 2 << 20, "Rust's default reserve: {reserved:#x}");
         assert!(start_of(thread) != 0);
         // SAFETY: opened above.
         unsafe { CloseHandle(thread) };
         dump_stacks();
         stop_tx.send(()).unwrap();
         parked.join().unwrap();
+    }
+
+    #[test]
+    fn stack_use_is_committed_and_reserved_from_the_top() {
+        assert_eq!(stack_use(0x10_0000, 0xf_c000, 0), Some((0x4000, 0x10_0000)));
+        assert_eq!(
+            stack_use(0x10_0000, 0x10_0000, 0x8_0000),
+            Some((0, 0x8_0000))
+        );
+        assert_eq!(stack_use(0x10_0000, 0x7_0000, 0x8_0000), None);
+        assert_eq!(stack_use(0x10_0000, 0x11_0000, 0), None);
+        assert_eq!(
+            stack_text(Some((0x4000, 0x10_0000))),
+            ", stack 16 of 1024 KiB"
+        );
+        assert_eq!(stack_text(None), "");
     }
 
     /// Times no `Duration` holds are left out instead of panicking the dump

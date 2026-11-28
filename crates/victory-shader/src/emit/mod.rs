@@ -56,6 +56,16 @@
 //! * **Texture atomics** use a scalar integer UAV. The host binds R32_UINT
 //!   for 32-bit operations and R32G32_UINT for 64-bit operations. The latter
 //!   require SM 6.6 atomic support on typed and descriptor-heap resources.
+//! * **Barycentrics** (last chance only): a pixel shader that computes the
+//!   weights it interpolates with, or reads the barycentric registers as
+//!   data, gets `SV_Barycentrics` (SM 6.1; the host's weights of the second
+//!   and third vertex are the console's i and j) and the attribute at each
+//!   vertex (`GetAttributeAtVertex`, the input declared constant). The
+//!   pipeline needs `D3D12_FEATURE_DATA_D3D12_OPTIONS3.BarycentricsSupported`.
+//!   For a host without it, [`translate_without_barycentrics`] reads the
+//!   values at each vertex and the weights from inputs that the geometry
+//!   shader [`barycentric_gs`] adds (see `bary.rs`); a program that needs
+//!   neither comes out the same either way.
 //!
 //! Entry points: [`translate`] (container bytes as the title passes them
 //! at pipeline creation → [`HostShader`]), [`emit`] (the same with the
@@ -79,16 +89,24 @@
 //!   DXIL byte limit, the pipeline keeps only the varyings its pixel shader
 //!   declares and the rasterizer system values.
 
+mod bary;
+#[cfg(all(test, windows))]
+mod barycentric_tests;
 mod bitcode;
 #[cfg(test)]
 mod bvh_tests;
+#[cfg(all(test, windows))]
+mod code_table_tests;
 mod container;
+mod demanded;
 #[cfg(all(test, windows))]
 mod diff_tests;
 #[cfg(test)]
 mod half_src_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
+#[cfg(all(test, windows))]
+mod image_store_tests;
 #[cfg(all(test, windows))]
 mod image_tests;
 #[cfg(all(test, windows))]
@@ -102,14 +120,30 @@ mod lower;
 mod mad_flush_tests;
 #[cfg(test)]
 mod memory_tests;
+mod meshbuf;
+#[cfg(all(test, windows))]
+mod meshbuf_tests;
 #[cfg(test)]
 mod mtbuf_tests;
+#[cfg(all(test, windows))]
+mod narrow_store_tests;
+pub mod probe;
 mod rect;
 #[cfg(test)]
 mod root_uav_tests;
+#[cfg(test)]
+mod root_view_tests;
+#[cfg(any(test, feature = "samples"))]
+pub mod sample;
 mod sampler;
+pub use bary::barycentric_gs;
+pub use meshbuf::MeshBuffer;
 pub use rect::rect_list_gs;
 mod shader;
+#[cfg(all(windows, any(test, feature = "host")))]
+pub mod split_diff;
+#[cfg(all(test, windows))]
+mod split_tests;
 mod threading;
 #[cfg(windows)]
 pub mod validator;
@@ -127,8 +161,8 @@ use crate::{ShaderError, io, ir, resource, structure};
 
 pub use sampler::StaticSampler;
 pub use shader::{
-    MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY,
-    USER_DATA_SPACE, USER_MEMORY_BASE,
+    MEMORY_FAULTS, MEMORY_PAGES, MESH_BUFFER_SPACE, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS,
+    SLOT_MEMORY, USER_DATA_SPACE, USER_MEMORY_BASE,
 };
 
 /// Resource heap indices at or past this go to slot 0 in translated
@@ -208,6 +242,14 @@ thread_local! {
     /// Wave32 console-flow lowering for the program being translated on this
     /// thread ([`with_wave_wide`]), when `VICTORY_WAVE_WIDE` is unset.
     static WIDE_HERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// A `VICTORY_WAVE_WIDE_ONLY` list standing in for the process's on this
+    /// thread ([`with_wave_wide_only`]).
+    static ONLY_HERE: std::cell::RefCell<Option<Vec<String>>> =
+        const { std::cell::RefCell::new(None) };
+    /// Hashes standing in for the built-in allowlist on this thread
+    /// ([`with_wave_wide_allowlist`]).
+    static ALLOW_HERE: std::cell::RefCell<Option<Vec<String>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 fn parse_wave_wide_only(value: Option<&str>) -> Vec<String> {
@@ -247,10 +289,40 @@ fn wave_wide_only_list() -> &'static [String] {
     })
 }
 
+/// The `VICTORY_WAVE_WIDE_ONLY` list in force on this thread: the one
+/// [`with_wave_wide_only`] set, else the process's.
+fn with_only_list<T>(f: impl FnOnce(&[String]) -> T) -> T {
+    ONLY_HERE.with_borrow(|here| f(here.as_deref().unwrap_or(wave_wide_only_list())))
+}
+
 /// Whether `VICTORY_WAVE_WIDE_ONLY=<hash prefix>,...` names the container whose
 /// 16-hex-digit BLAKE3 prefix is `hash`.
 pub fn wave_wide_only(hash: &str) -> bool {
-    matches_wave_wide_only(hash, wave_wide_only_list())
+    with_only_list(|only| matches_wave_wide_only(hash, only))
+}
+
+/// Runs `f` on this thread as if `VICTORY_WAVE_WIDE_ONLY` held `value`
+/// (`None`: as if unset). The variable is read once per process, so this is
+/// how a test of a caller (`victory translate`) chooses the lowering by
+/// container hash. The disk cache key ([`wave_wide_cache_key`]) follows it.
+pub fn with_wave_wide_only<T>(value: Option<&str>, f: impl FnOnce() -> T) -> T {
+    let before = ONLY_HERE.replace(Some(parse_wave_wide_only(value)));
+    let r = f();
+    ONLY_HERE.set(before);
+    r
+}
+
+/// Runs `f` on this thread with `hashes` (16-hex-digit container prefixes)
+/// in place of the built-in allowlist of [`WAVE_WIDE_ALLOWLIST`], which only
+/// the title's containers match: how a test of a caller (`victory
+/// translate`) sees that list choose the lowering by container hash. The
+/// disk cache key ([`wave_wide_cache_key`]) follows it.
+pub fn with_wave_wide_allowlist<T>(hashes: &[&str], f: impl FnOnce() -> T) -> T {
+    let list = hashes.iter().map(|h| h.to_ascii_lowercase()).collect();
+    let before = ALLOW_HERE.replace(Some(list));
+    let r = f();
+    ALLOW_HERE.set(before);
+    r
 }
 
 /// Runs `f` (a translation on this thread) with Wave32 console-flow lowering
@@ -272,10 +344,18 @@ pub fn wave_wide_cache_key() -> Vec<u8> {
         _ => 0u8,
     };
     out.push(mode);
-    for prefix in wave_wide_only_list() {
-        out.extend_from_slice(prefix.as_bytes());
-        out.push(b',');
-    }
+    with_only_list(|only| {
+        for prefix in only {
+            out.extend_from_slice(prefix.as_bytes());
+            out.push(b',');
+        }
+    });
+    ALLOW_HERE.with_borrow(|here| {
+        for hash in here.iter().flatten() {
+            out.push(b'+');
+            out.extend_from_slice(hash.as_bytes());
+        }
+    });
     out
 }
 
@@ -301,9 +381,14 @@ fn wide_lowering_enabled(
     if wide_here {
         return true;
     }
-    WAVE_WIDE_ALLOWLIST
-        .iter()
-        .any(|&allowed| hash.eq_ignore_ascii_case(allowed))
+    ALLOW_HERE.with_borrow(|here| match here {
+        Some(list) => list
+            .iter()
+            .any(|allowed| hash.eq_ignore_ascii_case(allowed)),
+        None => WAVE_WIDE_ALLOWLIST
+            .iter()
+            .any(|&allowed| hash.eq_ignore_ascii_case(allowed)),
+    })
 }
 
 fn console_flow_for_hash(hash: &str) -> bool {
@@ -311,13 +396,15 @@ fn console_flow_for_hash(hash: &str) -> bool {
     if let Some(value) = TEST_CONSOLE_FLOW.get() {
         return value;
     }
-    wide_lowering_enabled(
-        hash,
-        wave_wide_env(),
-        wave64_console_flow(),
-        wave_wide_only_list(),
-        WIDE_HERE.get(),
-    )
+    with_only_list(|only| {
+        wide_lowering_enabled(
+            hash,
+            wave_wide_env(),
+            wave64_console_flow(),
+            only,
+            WIDE_HERE.get(),
+        )
+    })
 }
 
 /// The clean-up passes that run over a translated module before it is
@@ -339,6 +426,38 @@ pub fn shader_opt() -> u32 {
         } else {
             bitcode::opt::ALL
         }
+    })
+}
+
+/// [`fixes`] bit: spill-table loads read their own codes (`ir::spill_loads`).
+pub const FIX_SPILL: u32 = 1;
+/// [`fixes`] bit: indexed access through a root descriptor as a raw access,
+/// and root descriptors the resource list leaves out as root views.
+pub const FIX_ROOT_INDEX: u32 = 2;
+/// [`fixes`] bit: byte and halfword buffer stores.
+pub const FIX_NARROW_STORE: u32 = 4;
+
+/// Translator changes that are off unless switched on, while they are being
+/// bisected in the world: `VICTORY_SHADER_SPILL_FIX=1` ([`FIX_SPILL`]),
+/// `VICTORY_SHADER_ROOT_INDEX=1` ([`FIX_ROOT_INDEX`]),
+/// `VICTORY_SHADER_NARROW_STORE=1` ([`FIX_NARROW_STORE`]). Tests run with
+/// all of them. The value is part of the translation, so the shader cache
+/// must key on it (`victory-gpu`'s does).
+pub fn fixes() -> u32 {
+    static FIXES: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    if cfg!(test) {
+        return FIX_SPILL | FIX_ROOT_INDEX | FIX_NARROW_STORE;
+    }
+    *FIXES.get_or_init(|| {
+        let on = |name: &str| std::env::var(name).is_ok_and(|v| v.trim() == "1");
+        [
+            ("VICTORY_SHADER_SPILL_FIX", FIX_SPILL),
+            ("VICTORY_SHADER_ROOT_INDEX", FIX_ROOT_INDEX),
+            ("VICTORY_SHADER_NARROW_STORE", FIX_NARROW_STORE),
+        ]
+        .into_iter()
+        .filter(|&(name, _)| on(name))
+        .fold(0, |bits, (_, bit)| bits | bit)
     })
 }
 
@@ -428,12 +547,117 @@ pub struct HostShader {
     /// Root UAVs (raw buffers) the shader reads and writes: `u<index>` in
     /// [`ROOT_CBV_SPACE`].
     pub root_uavs: Vec<u8>,
+    /// The table entries the shader reads as structured buffers. A raw view
+    /// the title binds at one of them needs a structured alias on the host:
+    /// a view whose kind differs from the declaration is undefined (NVIDIA
+    /// reads zeros).
+    pub structured_srvs: Vec<StructuredSrv>,
+}
+
+/// A table entry a shader reads through a `StructuredBuffer` handle: root
+/// parameter `slot`, `offset_dwords` into its table, `stride` bytes per
+/// element.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct StructuredSrv {
+    pub slot: u8,
+    pub offset_dwords: u32,
+    pub stride: u32,
+}
+
+/// A table entry a translated shader reads through a descriptor heap
+/// handle: root parameter `slot`, `offset_dwords` into its table, from the
+/// view (or, `sampler`, the sampler) heap, as `props` (the DXIL resource
+/// properties the handle is annotated with: kind in the low byte, `0x1000`
+/// for a UAV). The host compares them with the descriptors it placed there
+/// ([`heap_reads`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct HeapRead {
+    pub slot: u8,
+    pub offset_dwords: u32,
+    pub sampler: bool,
+    pub props: (u32, u32),
+    /// The code adds an index of its own: `offset_dwords` is where the
+    /// entries it picks from start.
+    pub dynamic: bool,
+    /// The offset is from the heap's start (`ResourceDescriptorHeap`
+    /// parameters), not from a table's.
+    pub absolute: bool,
+    /// The index the code adds is root constant (slot, dword): the entry
+    /// read is known when the draw or dispatch is recorded.
+    pub index_from: Option<(u8, u32)>,
+    /// The index the code adds is read from a buffer ([`IndexLoad`]).
+    pub index_load: Option<IndexLoad>,
+}
+
+/// A heap index read from memory: the dword at byte `byte` of the buffer
+/// whose view is at the heap index in root constant (`slot`, `dword`),
+/// AND `mask`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct IndexLoad {
+    pub slot: u8,
+    pub dword: u32,
+    pub byte: u32,
+    pub mask: u32,
+}
+
+/// The heap reads of translated shaders, by container digest. Kept beside
+/// [`HostShader`] rather than in it: only the host's descriptor check reads
+/// them.
+static HEAP_READS: std::sync::Mutex<
+    std::collections::BTreeMap<[u8; 16], std::sync::Arc<[HeapRead]>>,
+> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+fn container_digest(dxil: &[u8]) -> Option<[u8; 16]> {
+    dxil.get(4..20)?.try_into().ok()
+}
+
+thread_local! {
+    /// How the dynamic heap indices of the shader being lowered are
+    /// computed (`VICTORY_SHADER_TRACE_DYNAMIC`, diagnostics).
+    pub(crate) static DYNAMIC_CHAINS: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Takes the dynamic index descriptions recorded on this thread.
+pub fn take_dynamic_chains() -> Vec<String> {
+    DYNAMIC_CHAINS.with(|c| std::mem::take(&mut *c.borrow_mut()))
+}
+
+/// Records the heap reads of the shader whose container is `dxil` (a
+/// translation, or one read back from a cache).
+pub fn note_heap_reads(dxil: &[u8], reads: Vec<HeapRead>) {
+    let Some(key) = container_digest(dxil) else {
+        return;
+    };
+    let mut map = HEAP_READS.lock().unwrap_or_else(|e| e.into_inner());
+    if reads.is_empty() {
+        map.remove(&key);
+    } else {
+        map.insert(key, reads.into());
+    }
+}
+
+/// The heap reads recorded for the shader whose container is `dxil`; empty
+/// when none were (or it reads none).
+pub fn heap_reads(dxil: &[u8]) -> std::sync::Arc<[HeapRead]> {
+    container_digest(dxil)
+        .and_then(|key| {
+            HEAP_READS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&key)
+                .cloned()
+        })
+        .unwrap_or_else(|| std::sync::Arc::from(Vec::new()))
 }
 
 /// `SFI0` feature bits of a shader that indexes the resource or the sampler
 /// descriptor heap directly.
 pub(crate) const SFI0_RESOURCE_HEAP: u64 = 0x200_0000;
 pub(crate) const SFI0_SAMPLER_HEAP: u64 = 0x400_0000;
+/// `SFI0` feature bit of a shader that reads barycentrics or the attributes
+/// at each vertex.
+pub(crate) const SFI0_BARYCENTRICS: u64 = 0x2_0000;
 
 impl HostShader {
     /// Whether the shader indexes a descriptor heap directly
@@ -446,6 +670,51 @@ impl HostShader {
             Some(u64::from_le_bytes(data.try_into().ok()?))
         });
         features.is_none_or(|f| f & (SFI0_RESOURCE_HEAP | SFI0_SAMPLER_HEAP) != 0)
+    }
+
+    /// Whether the shader needs the host's barycentrics (`SFI0`'s
+    /// barycentrics bit: `SV_Barycentrics` or `GetAttributeAtVertex`), which
+    /// a host without `BarycentricsSupported` refuses.
+    pub fn needs_barycentrics(&self) -> bool {
+        Container::parse(&self.dxil)
+            .ok()
+            .and_then(|c| {
+                let data = c.part(FourCC::SFI0)?.data.get(..8)?;
+                Some(u64::from_le_bytes(data.try_into().ok()?))
+            })
+            .is_some_and(|f| f & SFI0_BARYCENTRICS != 0)
+    }
+
+    /// The shader model and `SFI0` feature flags the DXIL declares, for the
+    /// log line of a pipeline the host refused (`sm 6.6 features 0x..`).
+    pub fn declared(&self) -> String {
+        let c = Container::parse(&self.dxil).ok();
+        let model = c
+            .as_ref()
+            .and_then(|c| c.part(FourCC::DXIL)?.data.get(..2).map(|b| b[0]))
+            .map_or("?".to_owned(), |v| format!("{}.{}", v >> 4, v & 15));
+        let features = c.as_ref().and_then(|c| {
+            let data = c.part(FourCC::SFI0)?.data.get(..8)?;
+            Some(u64::from_le_bytes(data.try_into().ok()?))
+        });
+        // PSV0: the info size, then the runtime info, whose bytes 16..24 are
+        // the wave size range (0 and u32::MAX: any).
+        let waves = c.as_ref().and_then(|c| {
+            let d = c.part(FourCC::PSV0)?.data;
+            Some((
+                crate::dxbc::u32_at(d, 20).ok()?,
+                crate::dxbc::u32_at(d, 24).ok()?,
+            ))
+        });
+        let waves = match waves {
+            Some((min, max)) if min == max => format!("WaveSize({min})"),
+            Some(_) => "any wave size".to_owned(),
+            None => "?".to_owned(),
+        };
+        format!(
+            "sm {model} features {} {waves}",
+            features.map_or("?".to_owned(), |f| format!("{f:#x}"))
+        )
     }
 
     /// Size of the user-data buffer the shader declares, in dwords (a
@@ -461,7 +730,101 @@ impl HostShader {
     }
 }
 
+/// A mesh program for a host without mesh shaders (see the notes in
+/// `meshbuf.rs`): the program as a compute shader that stores its outputs in
+/// a buffer, and the vertex shader that reads them back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MeshFallback {
+    /// The program: user data, descriptors and root views as a mesh shader's,
+    /// plus the buffer as the root UAV `u0` in [`MESH_BUFFER_SPACE`]. A
+    /// program that reads its thread group's number adds the dword of the
+    /// constant buffer `b0` in that space to the host's: the host may run a
+    /// dispatch in parts, whose groups each count from 0.
+    pub compute: HostShader,
+    /// Reads the buffer, the root SRV `t0` in [`MESH_BUFFER_SPACE`], and
+    /// nothing else.
+    pub vertex: HostShader,
+    pub buffer: MeshBuffer,
+}
+
+/// Bytes per record of the host's buffer view table (see [`UserData`]).
+pub const BUFFER_TABLE_RECORD: u32 = 16;
+
+/// `RootType::Other` code of a user-data dword the host computes: the byte
+/// at which the buffer view table (see [`UserData`]) holds its list of view
+/// addresses, one [`VIEW_ADDRESS_ENTRY`]-byte entry per slot of the bound
+/// view heap: the title address of the first byte of the view at that slot
+/// (low dword, then high), or zeros when the slot holds no view of title
+/// memory. It is past the records, so never 0: a host that does not know
+/// this value supplies 0, which a shader takes as no address at any slot.
+/// Programs that read a buffer descriptor's base address as a number (the
+/// address of a ray-tracing structure they walk through title memory) read
+/// it here.
+pub const USER_VIEW_ADDRESSES: u32 = 0x101;
+
+/// Bytes per entry of the view address list (see [`USER_VIEW_ADDRESSES`]).
+pub const VIEW_ADDRESS_ENTRY: u32 = 8;
+
+/// `RootType::Other` code of a user-data dword the host computes, one per
+/// root slot ([`UserData::slot`]) holding a descriptor table: how many heap
+/// slots the title's own table lies after the one the host bound for that
+/// root slot (wrapping; 0 when the host binds the title's own table, which
+/// is also what a host that does not know this value supplies). The host
+/// may bind a copy of a table in slots of its own, and the buffer view
+/// table (see [`UserData`]) has a record per slot of the title's heap only:
+/// a shader adds this to a slot index it found through the table before it
+/// looks the record up.
+pub const USER_TABLE_SLOTS: u32 = 0x102;
+
+/// `RootType::Other` code of a user-data dword the host computes, one per
+/// root slot ([`UserData::slot`]) holding a root SRV or UAV: how many bytes
+/// below the view's title address the raw view the host binds for it
+/// starts (0 to 15: a raw view begins on 16 bytes, a root descriptor
+/// anywhere). A shader adds it to every byte offset into that view. A host
+/// that does not know this value supplies 0 and binds views at their own
+/// address, as before.
+pub const USER_ROOT_VIEW_BIAS: u32 = 0x103;
+
+/// `RootType::Other` code of a user-data dword the host computes: the heap
+/// index of its view class list, a raw SRV with one [`VIEW_CLASS_ENTRY`]-
+/// byte entry per slot of the bound view heap: the numeric class of the
+/// format of the host view at that slot ([`VIEW_CLASS_FLOAT`],
+/// [`VIEW_CLASS_UINT`] or [`VIEW_CLASS_SINT`]). The list is in a slot past
+/// the title's, so never 0: a host that does not know this value supplies
+/// 0, which a shader takes as a float view at every slot.
+///
+/// The console's image stores and loads convert by the view's format, so
+/// the same data registers are an integer for a UINT view and a float for
+/// a float one. The host's typed accesses must name the view's type
+/// instead: an image access reads the class of its view here and takes the
+/// typed access of that class.
+pub const USER_VIEW_CLASSES: u32 = 0x104;
+
+/// Bytes per entry of the view class list (see [`USER_VIEW_CLASSES`]).
+pub const VIEW_CLASS_ENTRY: u32 = 4;
+
+/// A view of a float, UNORM or SNORM format, or no texture view (see
+/// [`USER_VIEW_CLASSES`]).
+pub const VIEW_CLASS_FLOAT: u32 = 0;
+/// A view of a UINT format (see [`USER_VIEW_CLASSES`]).
+pub const VIEW_CLASS_UINT: u32 = 1;
+/// A view of a SINT format (see [`USER_VIEW_CLASSES`]).
+pub const VIEW_CLASS_SINT: u32 = 2;
+
 /// One dword of user data and the root parameter that fills it.
+///
+/// With `root` [`RootType::ResourceHeap`] (and `indexed_buffer` false) the
+/// host supplies at `index` the heap index of its buffer view table: a raw
+/// SRV with one [`BUFFER_TABLE_RECORD`]-byte record per slot of the bound
+/// view heap, for buffer loads whose element stride only the view knows (a
+/// descriptor chosen at run time, such as each lane's own in a waterfall
+/// loop). A record is four dwords: the heap index of a raw SRV holding the
+/// view's bytes, the element stride in bytes (0 for a raw view, which an
+/// index does not move through), the byte at which the view starts in that
+/// SRV, and the view's element count (its bytes for a raw view; 0 when the
+/// slot holds no buffer view the host can read this way). The same buffer
+/// may also hold a list of view addresses after the records (see
+/// [`USER_VIEW_ADDRESSES`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UserData {
     /// The root constant selects a heap buffer. At `index` the host supplies
@@ -497,6 +860,208 @@ const UNKNOWN_STRUCTURED_STRIDE: &str = "a structured buffer of unknown stride";
 /// `WaveSize(32)`.
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
     translate_with_wave32(container, true)
+}
+
+/// Whether the host runs 64-lane compute waves (see [`set_host_wave64`]).
+static HOST_WAVE64: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+thread_local! {
+    /// A test's own answer to [`host_wave64`], over the process's.
+    static HOST_WAVE64_HERE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Tells translation whether the host's compute waves can hold 64 lanes
+/// (`D3D12_FEATURE_DATA_D3D12_OPTIONS1::WaveLaneCountMax >= 64`; assumed
+/// until told otherwise). Without them, a Wave64 compute program that needs
+/// the console's lane layout runs each console wave as two 32-lane host
+/// waves (`lower::split`) instead of declaring `WaveSize(64)`, which such a
+/// host refuses. Part of what a cached translation depends on.
+pub fn set_host_wave64(wave64: bool) {
+    HOST_WAVE64.store(wave64, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether translation targets a host with 64-lane waves. A shader that
+/// [`split_filter`] leaves out is translated as for one.
+pub fn host_wave64() -> bool {
+    HOST_WAVE64_HERE
+        .with(std::cell::Cell::get)
+        .unwrap_or_else(|| HOST_WAVE64.load(std::sync::atomic::Ordering::Relaxed))
+        || SPLIT_LEFT_OUT.with(std::cell::Cell::get)
+}
+
+thread_local! {
+    /// The shader being translated on this thread is not in [`split_filter`].
+    static SPLIT_LEFT_OUT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// `VICTORY_WAVE64_SPLIT_ONLY`, for bisecting the two-half lowering of
+/// Wave64 programs (`lower::split`): a comma-separated list of shader
+/// hashes (the 16 hex digits victory-gpu logs as `hash`) or prefixes of
+/// them, and ranges of equal-length prefixes, `lo-hi` inclusive. Only the
+/// shaders it matches are split; the others translate as for a 64-lane
+/// host (`WaveSize(64)`, which a 32-lane host refuses). Unset or empty:
+/// every shader. `none` matches none. E.g. `0-7` then `0-3` halves the
+/// set by first digit; `5c09eb42b7a3c362,e958` names one shader and a prefix.
+/// Part of what a cached translation depends on.
+pub fn split_filter() -> &'static str {
+    static FILTER: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    FILTER.get_or_init(|| {
+        std::env::var("VICTORY_WAVE64_SPLIT_ONLY")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+    })
+}
+
+/// Whether `filter` (see [`split_filter`]) takes the shader of hash `hash`.
+fn split_filter_matches(filter: &str, hash: &str) -> bool {
+    if filter.is_empty() {
+        return true;
+    }
+    filter
+        .split(',')
+        .map(str::trim)
+        .filter(|e| !e.is_empty())
+        .any(|e| match e.split_once('-') {
+            Some((lo, hi)) if lo.len() == hi.len() && lo.len() <= hash.len() => {
+                let h = &hash[..lo.len()];
+                lo <= h && h <= hi
+            }
+            Some(_) => false,
+            None => hash.starts_with(e),
+        })
+}
+
+/// Wave64 programs of the console's ray-tracing BVH builder
+/// (`XboxBvhBuilder.dll`), by the hash victory-gpu logs. Most of the
+/// builder's passes do not translate (and three that do hang the host GPU),
+/// so on a 32-lane host these four would run without the passes around
+/// them: they write half-built structures the title then reads back as -1
+/// and crashes on (runs 92-96). Left out, they stay refused like the rest
+/// of the builder, as on hosts without the split.
+// shortcut: the builder is kept off as a whole by naming its programs; a
+// rule that drops every dispatch of a module whose chain is incomplete
+// would cover other builds of the DLL too.
+const SPLIT_LEFT_OUT_BVH: [&str; 4] = [
+    "14394a322f6dd5c2",
+    "28918b7150a7aad5",
+    "e63d22c4def9ba6a",
+    "f6eb6498409ca974",
+];
+
+/// Two 1024-thread classification programs of the title's tiled shadows,
+/// by hash. Split, their output sends the tiled shadow passes that read it
+/// to descriptors of the wrong kind, and the host GPU faults (NVIDIA "TEX
+/// LAYOUT" exceptions, device hung) as loading starts (runs 99-124; with
+/// these two skipped, runs 111-112 load).
+// shortcut: refused as without the split, so the shadow passes they feed
+// read nothing new. Which part of their lowering goes wrong (16 console
+// waves, a wave leaving early, prefix sums in LDS) is not yet known.
+const SPLIT_LEFT_OUT_TILES: [&str; 2] = ["b8f3f7979d6bbc50", "eae3498e6553afa8"];
+
+/// More title programs whose split output is wrong, by hash, found by
+/// bisecting runs with `VICTORY_WAVE64_SPLIT_ONLY`:
+/// - `02384a60fda6f2d0`, the defragmenter of a VFX geometry heap (two
+///   console waves walking the heap from both ends): split alone, the host
+///   GPU faults as loading starts (run 138).
+// shortcut: refused as without the split; the fault in their lowering is
+// not yet found.
+const SPLIT_LEFT_OUT_WRONG: &[&str] = &["02384a60fda6f2d0"];
+
+/// Whether the two-half lowering takes the shader `container`: unless it
+/// is in [`SPLIT_LEFT_OUT_BVH`], [`SPLIT_LEFT_OUT_TILES`] or
+/// [`SPLIT_LEFT_OUT_WRONG`], when
+/// [`split_filter`] is unset or matches it. What a cached translation of it
+/// depends on, rather than the whole filter: bisecting then re-translates
+/// nothing already seen.
+pub fn split_takes(container: &[u8]) -> bool {
+    let hash = blake3::hash(container).to_hex();
+    split_takes_hash(&hash[..16])
+}
+
+/// [`split_takes`] for the shader whose container's BLAKE3 starts with the
+/// 16 hex digits `hash`.
+fn split_takes_hash(hash: &str) -> bool {
+    !SPLIT_LEFT_OUT_BVH.contains(&hash)
+        && !SPLIT_LEFT_OUT_TILES.contains(&hash)
+        && !SPLIT_LEFT_OUT_WRONG.contains(&hash)
+        && split_filter_matches(split_filter(), hash)
+}
+
+/// Runs `f` for the shader `container` with [`split_filter`] applied.
+fn with_split_filter<T>(container: &[u8], f: impl FnOnce() -> T) -> T {
+    let hash = blake3::hash(container).to_hex();
+    with_split_selection(&hash[..16], f)
+}
+
+/// Runs `f` with the two-half selection translation applies to the shader
+/// whose container's BLAKE3 starts with the 16 hex digits `hash`: one that
+/// [`split_takes`] leaves out is lowered as for a 64-lane host
+/// ([`host_wave64`] answers true inside `f`), as [`translate`] does. For
+/// tools that call the emitter directly (`victory translate`).
+pub fn with_split_selection<T>(hash: &str, f: impl FnOnce() -> T) -> T {
+    let left_out = !probe::force_split() && !split_takes_hash(hash);
+    let old = SPLIT_LEFT_OUT.with(|w| w.replace(left_out));
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            SPLIT_LEFT_OUT.with(|w| w.set(self.0));
+        }
+    }
+    let _restore = Restore(old);
+    f()
+}
+
+/// Runs `f` with [`host_wave64`] answering `wave64` on this thread.
+#[cfg(all(windows, any(test, feature = "host")))]
+pub(crate) fn with_host_wave64<T>(wave64: bool, f: impl FnOnce() -> T) -> T {
+    let old = HOST_WAVE64_HERE.with(|w| w.replace(Some(wave64)));
+    struct Restore(Option<bool>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            HOST_WAVE64_HERE.with(|w| w.set(self.0));
+        }
+    }
+    let _restore = Restore(old);
+    f()
+}
+
+thread_local! {
+    /// The program being translated on this thread is for a host without
+    /// barycentrics ([`translate_without_barycentrics`]).
+    static WITHOUT_BARYCENTRICS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether the program being translated on this thread reads barycentrics
+/// and the values at each vertex from the inputs of `bary.rs` rather than
+/// from the host's `SV_Barycentrics` and `GetAttributeAtVertex`.
+pub(crate) fn without_barycentrics() -> bool {
+    WITHOUT_BARYCENTRICS.with(std::cell::Cell::get)
+}
+
+/// Runs `f` with [`without_barycentrics`] answering true on this thread.
+fn with_barycentric_fallback<T>(f: impl FnOnce() -> T) -> T {
+    let old = WITHOUT_BARYCENTRICS.with(|w| w.replace(true));
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            WITHOUT_BARYCENTRICS.with(|w| w.set(self.0));
+        }
+    }
+    let _restore = Restore(old);
+    f()
+}
+
+/// As [`translate_with_wave32`], for a host without barycentrics: a pixel
+/// program that would read `SV_Barycentrics` or `GetAttributeAtVertex`
+/// reads the inputs [`barycentric_gs`] gives it instead (see `bary.rs`).
+/// Every other program translates exactly as [`translate_with_wave32`]
+/// translates it.
+pub fn translate_without_barycentrics(
+    container: &[u8],
+    allow_wave32: bool,
+) -> Result<HostShader, ShaderError> {
+    with_barycentric_fallback(|| translate_with_wave32(container, allow_wave32))
 }
 
 /// As [`translate`], controlling whether eligible <=32-thread Wave64 compute
@@ -555,29 +1120,38 @@ fn translate_program(
     hash: &str,
     view_stride: Option<ViewStride<'_>>,
 ) -> Result<(HostShader, Vec<crate::UsedResource>), ShaderError> {
+    with_split_filter(container, || {
+        translate_filtered(container, allow_wave32, hash, view_stride)
+    })
+}
+
+fn translate_filtered(
+    container: &[u8],
+    allow_wave32: bool,
+    hash: &str,
+    view_stride: Option<ViewStride<'_>>,
+) -> Result<(HostShader, Vec<crate::UsedResource>), ShaderError> {
     if container.starts_with(crate::dxbc::Fspx::MAGIC) {
         return Err(FSPX_UNSUPPORTED);
     }
     let c = Container::parse(container)?;
-    let Some(dxil) = c.part(FourCC::DXIL) else {
-        return Err(if c.fspx().is_some() {
-            FSPX_UNSUPPORTED
-        } else {
-            ShaderError::Malformed("no DXIL part")
-        });
-    };
-    let native = crate::native_programs(dxil.data)?
-        .into_iter()
-        .find(|p| {
-            matches!(
-                p.stage,
-                HwStage::Vs | HwStage::Ps | HwStage::Cs | HwStage::Ms
-            )
-        })
-        .ok_or(ShaderError::Unsupported {
-            offset: 0,
-            what: "a container without a vertex, pixel, compute or mesh program",
-        })?;
+    // A container with only a precompiled module: its programs when the
+    // ACCC lowering is on (`crate::accc`), else refused as such.
+    let native = match crate::container_programs(&c) {
+        Err(ShaderError::Malformed("no DXIL part")) if c.fspx().is_some() => Err(FSPX_UNSUPPORTED),
+        result => result,
+    }?
+    .into_iter()
+    .find(|p| {
+        matches!(
+            p.stage,
+            HwStage::Vs | HwStage::Ps | HwStage::Cs | HwStage::Ms
+        )
+    })
+    .ok_or(ShaderError::Unsupported {
+        offset: 0,
+        what: "a container without a vertex, pixel, compute or mesh program",
+    })?;
     let shader = translate_native(&c, &native, allow_wave32, hash, None, view_stride)?;
     Ok((shader, native.used))
 }
@@ -609,6 +1183,60 @@ pub fn translate_mesh_for_pixel(
     translate_native(c, native, true, "", Some(&pixel_inputs), None).map(Some)
 }
 
+/// Translates the mesh program of a console shader container for a host
+/// without mesh shaders.
+pub fn translate_mesh_fallback(container: &[u8]) -> Result<MeshFallback, ShaderError> {
+    mesh_fallback_of(container, None)
+}
+
+/// As [`translate_mesh_fallback`], with structured views for table entries
+/// whose stride only the bound view knows, as
+/// [`translate_with_view_strides`] resolves them. Returns the resource
+/// metadata used for host binding alongside.
+pub fn translate_mesh_fallback_with_view_strides(
+    container: &[u8],
+    view_stride: ViewStride<'_>,
+) -> Result<(MeshFallback, Vec<crate::UsedResource>), ShaderError> {
+    let c = Container::parse(container)?;
+    let used = mesh_program(&c)?.used;
+    Ok((mesh_fallback_of(container, Some(view_stride))?, used))
+}
+
+fn mesh_program(c: &Container<'_>) -> Result<NativeProgram, ShaderError> {
+    let dxil = c
+        .part(FourCC::DXIL)
+        .ok_or(ShaderError::Malformed("no DXIL part"))?;
+    crate::native_programs(dxil.data)?
+        .into_iter()
+        .find(|p| p.stage == HwStage::Ms)
+        .ok_or(ShaderError::Unsupported {
+            offset: 0,
+            what: "a mesh fallback of a container without a mesh program",
+        })
+}
+
+fn mesh_fallback_of(
+    container: &[u8],
+    view_stride: Option<ViewStride<'_>>,
+) -> Result<MeshFallback, ShaderError> {
+    let c = Container::parse(container)?;
+    let native = mesh_program(&c)?;
+    let (compute, buffer) = translate_stages(&c, &native, true, "", None, view_stride, true)?;
+    mesh_fallback(compute, buffer)
+}
+
+fn mesh_fallback(
+    compute: HostShader,
+    buffer: Option<MeshBuffer>,
+) -> Result<MeshFallback, ShaderError> {
+    let buffer = buffer.expect("a mesh program emitted into a buffer has its layout");
+    Ok(MeshFallback {
+        vertex: buffer.vertex_shader()?,
+        compute,
+        buffer,
+    })
+}
+
 fn translate_native(
     c: &Container<'_>,
     native: &NativeProgram,
@@ -617,6 +1245,29 @@ fn translate_native(
     pixel_inputs: Option<&[container::SigElement]>,
     view_stride: Option<ViewStride<'_>>,
 ) -> Result<HostShader, ShaderError> {
+    translate_stages(
+        c,
+        native,
+        allow_wave32,
+        hash,
+        pixel_inputs,
+        view_stride,
+        false,
+    )
+    .map(|e| e.0)
+}
+
+/// Runs the stages before emission and emits; `mesh_buffer` for a mesh
+/// program on a host without mesh shaders (then with the buffer's layout).
+fn translate_stages(
+    c: &Container<'_>,
+    native: &NativeProgram,
+    allow_wave32: bool,
+    hash: &str,
+    pixel_inputs: Option<&[container::SigElement]>,
+    view_stride: Option<ViewStride<'_>>,
+    mesh_buffer: bool,
+) -> Result<(HostShader, Option<MeshBuffer>), ShaderError> {
     // A compute program with root arguments past the 16 user SGPRs finds them
     // through the spill table `s[0:1]` points to.
     let p = ir::build_with(
@@ -628,7 +1279,13 @@ fn translate_native(
     // Structurisation first: tracing per-lane descriptors needs it (its
     // failure is reported after the earlier stages').
     let st = structure::structure(&p);
-    let res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok())?;
+    let res = resource::track_initialized(
+        &p,
+        &native.layout,
+        native.stage,
+        st.as_ref().ok(),
+        resource::Entry::of(native),
+    )?;
     let io = io::raise(&p, native)?;
     let st = st?;
     let parts = Emission {
@@ -638,6 +1295,7 @@ fn translate_native(
         st: &st,
         io: &io,
         res: &res,
+        mesh_buffer,
     };
     emit_with_options(parts, allow_wave32, hash, pixel_inputs, view_stride)
 }
@@ -688,10 +1346,55 @@ pub fn emit_with_wave32_for_hash(
         st,
         io,
         res,
+        mesh_buffer: false,
     };
-    emit_with_options(parts, allow_wave32, hash, None, None)
+    emit_with_options(parts, allow_wave32, hash, None, None).map(|e| e.0)
 }
 
+/// As [`emit`], for a host without barycentrics (see
+/// [`translate_without_barycentrics`]).
+pub fn emit_without_barycentrics(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+) -> Result<HostShader, ShaderError> {
+    with_barycentric_fallback(|| emit(c, native, p, st, io, res))
+}
+
+/// Emits a mesh program whose earlier stages already ran, for a host
+/// without mesh shaders. Nothing is pruned for a pixel shader: the buffer
+/// has no output budget.
+pub fn emit_mesh_fallback(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+) -> Result<MeshFallback, ShaderError> {
+    if native.stage != HwStage::Ms {
+        return Err(ShaderError::Unsupported {
+            offset: 0,
+            what: "a mesh fallback of a program that is no mesh program",
+        });
+    }
+    let parts = Emission {
+        c,
+        native,
+        p,
+        st,
+        io,
+        res,
+        mesh_buffer: true,
+    };
+    let (compute, buffer) = emit_with_options(parts, true, "", None, None)?;
+    mesh_fallback(compute, buffer)
+}
+
+#[derive(Clone, Copy)]
 struct Emission<'a> {
     c: &'a Container<'a>,
     native: &'a NativeProgram,
@@ -699,6 +1402,8 @@ struct Emission<'a> {
     st: &'a structure::Structured,
     io: &'a io::Io,
     res: &'a resource::Resources,
+    /// A mesh program emitted for a host without mesh shaders.
+    mesh_buffer: bool,
 }
 
 #[cfg(test)]
@@ -707,7 +1412,7 @@ fn emit_with_view_strides(
     allow_wave32: bool,
     view_stride: Option<ViewStride<'_>>,
 ) -> Result<HostShader, ShaderError> {
-    emit_with_options(parts, allow_wave32, "", None, view_stride)
+    emit_with_options(parts, allow_wave32, "", None, view_stride).map(|e| e.0)
 }
 
 fn emit_with_options(
@@ -716,11 +1421,36 @@ fn emit_with_options(
     hash: &str,
     pixel_inputs: Option<&[container::SigElement]>,
     view_stride: Option<ViewStride<'_>>,
-) -> Result<HostShader, ShaderError> {
+) -> Result<(HostShader, Option<MeshBuffer>), ShaderError> {
+    let result = emit_threaded(parts, allow_wave32, hash, pixel_inputs, view_stride);
+    // What lowering does only for programs everything else refused (so that
+    // every other program's code stays as it was) is a last chance. The
+    // refusal reported is the first one.
+    match result {
+        Err(refusal @ ShaderError::Unsupported { .. }) if !crate::switch::no_last_chance() => {
+            emit_program(parts, allow_wave32, hash, pixel_inputs, view_stride, true)
+                .map_err(|_| refusal)
+        }
+        result => result,
+    }
+}
+
+fn emit_threaded(
+    parts: Emission<'_>,
+    allow_wave32: bool,
+    hash: &str,
+    pixel_inputs: Option<&[container::SigElement]>,
+    view_stride: Option<ViewStride<'_>>,
+) -> Result<(HostShader, Option<MeshBuffer>), ShaderError> {
     let Emission {
-        c, native, p, st, ..
+        c,
+        native,
+        p,
+        st,
+        mesh_buffer,
+        ..
     } = parts;
-    let original = emit_program(parts, allow_wave32, hash, pixel_inputs, view_stride);
+    let original = emit_program(parts, allow_wave32, hash, pixel_inputs, view_stride, false);
     // Retry unsupported programs only. Threading can separate an unknown
     // register value from its apparent use on a mutually exclusive path.
     if !matches!(original, Err(ShaderError::Unsupported { .. })) {
@@ -733,7 +1463,13 @@ fn emit_with_options(
     let p = ir::thread_edges(p, &edges)?;
     let st = structure::structure(&p)?;
     let io = io::raise(&p, native)?;
-    let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
+    let res = resource::track_initialized(
+        &p,
+        &native.layout,
+        native.stage,
+        Some(&st),
+        resource::Entry::of(native),
+    )?;
     emit_program(
         Emission {
             c,
@@ -742,21 +1478,25 @@ fn emit_with_options(
             st: &st,
             io: &io,
             res: &res,
+            mesh_buffer,
         },
         allow_wave32,
         hash,
         pixel_inputs,
         view_stride,
+        false,
     )
 }
 
+/// `leftovers`: the last chance of [`emit_with_options`].
 fn emit_program(
     parts: Emission<'_>,
     allow_wave32: bool,
     hash: &str,
     pixel_inputs: Option<&[container::SigElement]>,
     view_stride: Option<ViewStride<'_>>,
-) -> Result<HostShader, ShaderError> {
+    leftovers: bool,
+) -> Result<(HostShader, Option<MeshBuffer>), ShaderError> {
     let Emission {
         c,
         native,
@@ -764,6 +1504,7 @@ fn emit_program(
         st,
         io,
         res,
+        mesh_buffer,
     } = parts;
     let pixel = native.stage == HwStage::Ps;
     let mut inputs = signature_part(c, FourCC::ISG1)?;
@@ -854,40 +1595,48 @@ fn emit_program(
         outputs,
         prims,
         mesh_stride,
+        mesh_buffer,
     };
     let lower_original =
-        || lower::lower_with_wave32(&parts, allow_wave32, pixel_inputs, view_stride);
+        || lower::lower_with_wave32(&parts, allow_wave32, pixel_inputs, view_stride, leftovers);
     let l = if allow_wave32
         && console_flow_for_hash(hash)
         && native.stage == HwStage::Cs
         && native.wave64
     {
         use lower::WaveMode::{ConsoleFlow, Wave32};
-        let lowered =
-            match lower::lower_with_wave_mode(&parts, true, pixel_inputs, view_stride, Wave32) {
-                Err(ShaderError::Unsupported { what, .. }) if what == lower::CONSOLE_FLOW => {
-                    structure::structure_console(p).and_then(|console| {
-                        let parts = lower::Parts {
-                            st: &console,
-                            ..parts.clone()
-                        };
-                        lower::lower_with_wave_mode(
-                            &parts,
-                            true,
-                            pixel_inputs,
-                            view_stride,
-                            ConsoleFlow,
-                        )
-                    })
-                }
-                result => result,
-            };
+        let lowered = match lower::lower_with_wave_mode(
+            &parts,
+            true,
+            pixel_inputs,
+            view_stride,
+            Wave32,
+            leftovers,
+        ) {
+            Err(ShaderError::Unsupported { what, .. }) if what == lower::CONSOLE_FLOW => {
+                structure::structure_console(p).and_then(|console| {
+                    let parts = lower::Parts {
+                        st: &console,
+                        ..parts.clone()
+                    };
+                    lower::lower_with_wave_mode(
+                        &parts,
+                        true,
+                        pixel_inputs,
+                        view_stride,
+                        ConsoleFlow,
+                        leftovers,
+                    )
+                })
+            }
+            result => result,
+        };
         // The ordinary shader can still be usable on a host with Wave64.
         lowered.or_else(|reason| lower_original().map_err(|_| reason))?
     } else {
         lower_original()?
     };
-    Ok(HostShader {
+    let shader = HostShader {
         stage: native.stage,
         dxil: l.dxil,
         user_data: l.user_data,
@@ -907,7 +1656,10 @@ fn emit_program(
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
         root_uavs: l.root_uavs,
-    })
+        structured_srvs: l.structured_srvs,
+    };
+    note_heap_reads(&shader.dxil, l.heap_reads);
+    Ok((shader, l.mesh_buffer))
 }
 
 fn signature_part(
@@ -991,6 +1743,7 @@ fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
             69 => 20,
             70 => 15,
             25 => 30, // cull primitive
+            23 => 28, // barycentrics (a translated pixel shader's)
             _ => {
                 return Err(ShaderError::Unsupported {
                     offset: 0,
@@ -1059,21 +1812,26 @@ mod tests {
     fn fspx_modules_are_unsupported_not_missing_dxil() {
         let fspx = crate::dxbc::Fspx::assemble(&[0; 28], &[], &[0x55; 8], &[]);
         let wrapped = crate::dxbc::build(&[(crate::FourCC::ACCC, &fspx)]);
-        for bytes in [&fspx, &wrapped] {
-            assert_eq!(
-                super::translate(bytes).unwrap_err(),
-                crate::ShaderError::Unsupported {
-                    offset: 0,
-                    what: "FSPX compute module"
-                }
-            );
+        let unsupported = crate::ShaderError::Unsupported {
+            offset: 0,
+            what: "FSPX compute module",
+        };
+        assert_eq!(super::translate(&fspx).unwrap_err(), unsupported);
+        // In a container the ACCC lowering (`crate::accc`) reads it, unless
+        // it is switched off; either way it is no missing DXIL part.
+        let wrapped = super::translate(&wrapped).unwrap_err();
+        assert_ne!(wrapped, crate::ShaderError::Malformed("no DXIL part"));
+        if crate::switch::no_accc() {
+            assert_eq!(wrapped, unsupported);
         }
-        // Without an FSPX module it is still the missing DXIL part.
+        // Without an FSPX module it is still the missing DXIL part (when the
+        // ACCC lowering is off; on, that lowering refuses it).
         let plain = crate::dxbc::build(&[(crate::FourCC::ACCC, b"other")]);
-        assert_eq!(
-            super::translate(&plain).unwrap_err(),
-            crate::ShaderError::Malformed("no DXIL part")
-        );
+        let plain = super::translate(&plain).unwrap_err();
+        assert_ne!(plain, unsupported);
+        if crate::switch::no_accc() {
+            assert_eq!(plain, crate::ShaderError::Malformed("no DXIL part"));
+        }
     }
 
     #[test]
@@ -1111,6 +1869,7 @@ mod tests {
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
+            structured_srvs: Vec::new(),
         };
         let with = |features: u64| shader(&[(FourCC::SFI0, &features.to_le_bytes())]);
         assert!(!with(0x4000).indexes_heaps());
@@ -1897,6 +2656,7 @@ mod tests {
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
+            structured_srvs: Vec::new(),
         };
         let file = |var: &str, stage| {
             std::env::var(var).ok().map(|p| super::HostShader {
@@ -1908,6 +2668,7 @@ mod tests {
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
                 root_uavs: Vec::new(),
+                structured_srvs: Vec::new(),
             })
         };
         let ps = file("VICTORY_REF_PS", crate::HwStage::Ps).unwrap_or(ps);
@@ -2095,6 +2856,14 @@ mod tests {
         // An extra first half into v3 that nothing reads still lowers.
         let unread = [&[0xC808_0000, 0xC80C_0000, 0xC809_0001][..], &export].concat();
         assert_eq!(lower(&unread), Ok(()));
+        // One a plain write overwrites before anything reads it lowers too, but
+        // only as the last chance (the write reads the old value as well).
+        let overwritten = [
+            &[0xC808_0000, 0xC80C_0000, 0xC809_0001, 0x7E06_0280][..], // v_mov_b32 v3, 0
+            &export,
+        ]
+        .concat();
+        assert_eq!(lower(&overwritten), Ok(()));
         // A first half exported without its second half is refused.
         let lone = [&[0xC808_0000][..], &export].concat();
         let refused = lower(&lone).unwrap_err();
@@ -2251,6 +3020,7 @@ mod tests {
             outputs: Vec::new(),
             prims: Vec::new(),
             mesh_stride: 0,
+            mesh_buffer: false,
         })
         .unwrap();
         #[cfg_attr(not(windows), allow(unused_mut, unused_variables))]
@@ -2272,6 +3042,7 @@ mod tests {
                 root_cbvs: l.root_cbvs,
                 root_srvs: l.root_srvs,
                 root_uavs: l.root_uavs,
+                structured_srvs: Vec::new(),
             };
             let (root, pso) = host.compute_pipeline(&cs).unwrap();
             let out = host

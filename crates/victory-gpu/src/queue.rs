@@ -41,6 +41,10 @@ struct Queue {
     desc: QueueDesc,
     /// The work, in order, held back behind waits.
     timeline: Arc<Timeline>,
+    /// Submission stamps this queue minted ([`crate::watch::TITLE_SUBMITS`]
+    /// counts every queue's, which tests submitting at the same time move).
+    #[cfg(test)]
+    stamps: std::sync::atomic::AtomicU64,
 }
 const _: () = assert!(std::mem::offset_of!(Queue, kind) == 0x10);
 
@@ -69,6 +73,8 @@ pub(crate) extern "system" fn create(
         kind: desc.kind,
         desc,
         timeline: Arc::default(),
+        #[cfg(test)]
+        stamps: Default::default(),
     });
     object::hand_out(QUEUE, queue, iid, &QUEUE_IIDS, out)
 }
@@ -246,6 +252,8 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
             return;
         }
         let stamp = crate::watch::TITLE_SUBMITS.fetch_add(1, Ordering::AcqRel) + 1;
+        #[cfg(test)]
+        queue(this).stamps.fetch_add(1, Ordering::AcqRel);
         let timeline = &queue(this).timeline;
         let async_mode = async_submit();
         let submit_op = |op: Op| {
@@ -434,6 +442,12 @@ fn system_timestamp() -> u64 {
 /// Frames presented so far.
 static FRAMES: AtomicU64 = AtomicU64::new(0);
 
+/// Frames the title has presented so far (for clocks that follow the
+/// frame rate, `victory-hle`'s `VICTORY_TIME_SCALE=auto`).
+pub fn frames_presented() -> u64 {
+    FRAMES.load(Ordering::Relaxed)
+}
+
 #[cfg(feature = "diagnostics")]
 pub(crate) fn presented() -> u64 {
     FRAMES.load(Ordering::Relaxed)
@@ -450,6 +464,8 @@ extern "system" fn present(
 ) -> HRESULT {
     // Read now: the parameters are the title's, maybe on its stack. The
     // frame is shown in the queue's order, after the work before it.
+    #[cfg(windows)]
+    crate::present_params::note(planes, plane_parameters.cast(), _parameters);
     let plane = if planes > 0 {
         // SAFETY: the title passes `planes` plane descriptions.
         unsafe { plane_parameters.as_ref() }
@@ -491,8 +507,7 @@ fn retain_present_overlay(
     plane_parameters: *const Plane,
     primary: This,
 ) -> Option<crate::resource::PresentTarget> {
-    const SERIES_S_PLANE_STRIDE: usize = 0x48;
-    let plane = (plane_parameters as usize).checked_add(SERIES_S_PLANE_STRIDE)?;
+    let plane = (plane_parameters as usize).checked_add(crate::present_params::PLANE_STRIDE)?;
     let count_at = plane.checked_add(std::mem::offset_of!(Plane, count))?;
     let mut count = [0; size_of::<u32>()];
     if !crate::host::read_into(count_at as *const u8, &mut count) || u32::from_ne_bytes(count) != 1
@@ -563,6 +578,14 @@ fn show(
         && let Some(copy) = crate::resource::host_copy_ref(resource)
         && let Some(host) = crate::host::host()
     {
+        // Diagnostics: `VICTORY_PLANES=base` shows the first plane alone.
+        #[cfg(feature = "diagnostics")]
+        let overlay = {
+            static BASE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            let base_only = *BASE
+                .get_or_init(|| std::env::var("VICTORY_PLANES").is_ok_and(|v| v.trim() == "base"));
+            if base_only { None } else { overlay }
+        };
         let (state, shown) = if let Some(overlay) = overlay
             .as_ref()
             .and_then(crate::resource::PresentTarget::existing_host_copy)
@@ -1998,15 +2021,18 @@ mod tests {
         }
         let _settle = SettleOnDrop;
 
+        // Stamps this queue minted: other tests' queues mint theirs from the
+        // same global count at the same time.
+        let minted = || queue(q).stamps.load(Ordering::Acquire);
         // Empty submission must not mint a stamp.
-        let before = crate::watch::TITLE_SUBMITS.load(Ordering::Acquire);
+        let before = minted();
         exec(q, 0, &list1);
-        assert_eq!(crate::watch::TITLE_SUBMITS.load(Ordering::Acquire), before);
+        assert_eq!(minted(), before);
         assert_eq!(crate::watch::current_stamp(), 0);
 
         let lists = [list1, list2];
         exec(q, 2, lists.as_ptr());
-        let after = crate::watch::TITLE_SUBMITS.load(Ordering::Acquire);
+        let after = minted();
         assert_eq!(
             after,
             before + 1,
@@ -2031,7 +2057,7 @@ mod tests {
         assert_eq!(out[1].load(Ordering::Acquire), 2);
         assert_eq!(out[2].load(Ordering::Acquire), 3);
         assert_eq!(
-            crate::watch::TITLE_SUBMITS.load(Ordering::Acquire),
+            minted(),
             after,
             "draining held segments must reuse the original stamp without minting new ones"
         );

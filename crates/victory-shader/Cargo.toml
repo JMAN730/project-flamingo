@@ -11,12 +11,16 @@ publish.workspace = true
 thiserror.workspace = true
 miniz_oxide.workspace = true
 memchr.workspace = true
+# Shader hashes for VICTORY_WAVE64_SPLIT_ONLY (as victory-gpu logs them).
+blake3.workspace = true
 
 [features]
 # Host D3D12 pipeline checks (`emit::host`).
 host = ["dep:windows"]
 # Debugging switches (emitted-module dumps and the like).
 diagnostics = []
+# Synthetic programs for other crates' tests (`emit::sample`).
+samples = []
 
 [[bench]]
 name = "guard_runs"

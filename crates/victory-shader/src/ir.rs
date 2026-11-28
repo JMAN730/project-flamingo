@@ -21,8 +21,10 @@ use crate::gfx10::{self, Fields, Flow, Instruction, Operand};
 
 /// One register dword. Scalar codes as in [`Operand::Scalar`]: 0-105 SGPRs,
 /// 106/107 VCC, 108-123 trap temporaries, 124 M0, 126/127 EXEC. Codes from
-/// [`PARKED`] up are scalars the compiler parked in VGPR lanes (`unspill`):
-/// no machine instruction names them.
+/// [`PARKED`] up are dwords of the root-argument spill table (`spill_loads`;
+/// inputs, named as their user SGPRs in [`Program::inputs`]), then scalars the
+/// compiler parked in VGPR lanes (`unspill`): no machine instruction names
+/// them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Reg {
     S(u8),
@@ -259,18 +261,31 @@ fn step_spill_tag(tag: &mut [SpillTag; 106], f: &Fields, name: &str) {
     }
 }
 
+/// What [`spill_loads`] made of the loads from the spill table.
+#[derive(Default)]
+struct Spilled {
+    /// Moves from a table dword: index in the list, destination, and the
+    /// scalar code (from [`PARKED`] up) that stands for the dword.
+    moves: Vec<(usize, u8, u8)>,
+    /// Per code from [`PARKED`] up: the user SGPR its dword is.
+    sgprs: Vec<u8>,
+}
+
 /// Rewrites loads from the spill table (`s[0:1]`, the high dword masked to a
 /// 40- or 48-bit address, through copies and constant offsets across control
 /// flow where the pointer holds on every predecessor) into `s_mov_b32` from
-/// the user SGPRs the table's dwords stand for.
+/// the user SGPRs the table's dwords stand for. The moves read codes past
+/// the machine's (see [`Spilled`]), as the program may have written the
+/// SGPRs of those numbers before it loads the table, which memory keeps.
 fn spill_loads(
     list: Vec<Instruction>,
     wave64: bool,
     code_len: usize,
-) -> Result<Vec<Instruction>, ShaderError> {
+) -> Result<(Vec<Instruction>, Spilled), ShaderError> {
     use gfx10::Fields::Smem;
+    let mut spilled = Spilled::default();
     if list.is_empty() {
-        return Ok(list);
+        return Ok((list, spilled));
     }
 
     let mut flows = Vec::with_capacity(list.len());
@@ -404,6 +419,20 @@ fn spill_loads(
                     let first = u32::from(SPILL_FIRST) + (total as u32) / 4;
                     if first + u32::from(n) <= 105 {
                         for k in 0..n {
+                            let sgpr = (first + u32::from(k)) as u8;
+                            let fix = crate::emit::fixes() & crate::emit::FIX_SPILL != 0;
+                            let code = match spilled.sgprs.iter().position(|&s| s == sgpr) {
+                                _ if !fix => None,
+                                Some(c) => Some(c),
+                                None if usize::from(PARKED) + spilled.sgprs.len() < 254 => {
+                                    spilled.sgprs.push(sgpr);
+                                    Some(spilled.sgprs.len() - 1)
+                                }
+                                None => None,
+                            };
+                            if let Some(c) = code {
+                                spilled.moves.push((out.len(), dst + k, PARKED + c as u8));
+                            }
                             let mov = 0xBE80_0000
                                 | u32::from(dst + k) << 16
                                 | 3 << 8
@@ -427,7 +456,7 @@ fn spill_loads(
             out.push(inst);
         }
     }
-    Ok(out)
+    Ok((out, spilled))
 }
 
 /// Scalar registers the compiler parked in lanes of a VGPR, as scalar moves.
@@ -460,6 +489,7 @@ fn unspill(
     wave64: bool,
     lanes: u8,
     vgprs: u16,
+    first: u8,
 ) -> Vec<(usize, u8, u8)> {
     /// `v_writelane_b32 vN, sX, K` / `v_readlane_b32 sX, vN, K`: (save, N, X, K).
     /// The hardware takes the lane modulo the wave size.
@@ -605,9 +635,9 @@ fn unspill(
             }
         }
     }
-    // Codes for the parked scalars, from `PARKED` up to 254 (255 stays unused
+    // Codes for the parked scalars, from `first` up to 254 (255 stays unused
     // so that the code after a parked one always exists).
-    let mut next = usize::from(PARKED);
+    let mut next = usize::from(first);
     let mut codes: Vec<((u8, u32), u8)> = Vec::new();
     for &(reg, lane) in &pairs {
         if next + 1 > 254 {
@@ -695,8 +725,9 @@ pub fn build_with(
     spilled: bool,
 ) -> Result<Program, ShaderError> {
     let mut list = gfx10::decode(code)?;
+    let mut table = Spilled::default();
     if spilled {
-        list = spill_loads(list, wave64, code.len())?;
+        (list, table) = spill_loads(list, wave64, code.len())?;
     }
     let lanes = 1 + u8::from(wave64);
     let isa = |offset, reason| ShaderError::Isa { offset, reason };
@@ -719,7 +750,10 @@ pub fn build_with(
     }
     leaders.sort_unstable();
     leaders.dedup();
-    let parked = unspill(&mut list, &leaders, wave64, lanes, vgprs);
+    let first = PARKED + table.sgprs.len() as u8;
+    let mut parked = unspill(&mut list, &leaders, wave64, lanes, vgprs, first);
+    parked.extend(&table.moves);
+    parked.sort_unstable();
     // When the first instruction is a loop header, give SSA a separate
     // entry edge to carry the initial register values into its phis.
     let preheader = usize::from(
@@ -766,8 +800,9 @@ pub fn build_with(
             what: "unknown opcode",
         })?;
         let mut fields = machine.fields(wave64);
-        // A move to or from a scalar parked in a VGPR lane (`unspill`): its
-        // codes are ones the machine word cannot hold.
+        // A move to or from a scalar parked in a VGPR lane (`unspill`), or
+        // from a spill-table dword (`spill_loads`): its codes are ones the
+        // machine word cannot hold.
         if let Ok(k) = parked.binary_search_by_key(&n, |m| m.0)
             && let Fields::Sop {
                 dst: Some(Operand::Scalar { code: to, .. }),
@@ -828,7 +863,18 @@ pub fn build_with(
     link(&mut blocks);
     split_irreducible(&mut blocks)?;
 
-    Ok(rename(blocks, wave64, vgprs))
+    let mut p = rename(blocks, wave64, vgprs);
+    // A spill-table dword is the user SGPR it stands for on entry.
+    for (reg, _) in &mut p.inputs {
+        if let Reg::S(c) = *reg
+            && let Some(&sgpr) = c
+                .checked_sub(PARKED)
+                .and_then(|k| table.sgprs.get(usize::from(k)))
+        {
+            *reg = Reg::S(sgpr);
+        }
+    }
+    Ok(p)
 }
 
 /// Drops blocks not reachable from entry block `0` and remaps remaining
@@ -1989,6 +2035,43 @@ mod tests {
             insts.iter().filter(|i| i.name() == "s_mov_b32").count(),
             1 + 4 + 1
         );
+    }
+
+    /// A load from the spill table into SGPRs that the table's dwords are
+    /// named after does not change what a later load from the table reads.
+    #[test]
+    fn spill_table_loads_read_the_table_after_its_names_are_written() {
+        let code: Vec<u8> = [
+            0xBE82_0300u32, // s_mov_b32 s2, s0
+            0x8703_FF01,    // s_and_b32 s3, s1, lit
+            0x0000_00FF,    //   0xff
+            0xF410_0201,    // s_load_dwordx16 s[8:23], s[2:3], 0x10 (s20..s35)
+            0xFA00_0010,
+            0xF404_0001, // s_load_dwordx2 s[0:1], s[2:3], 0x8 (s18, s19)
+            0xFA00_0008,
+            S_ENDPGM,
+        ]
+        .iter()
+        .flat_map(|w| w.to_le_bytes())
+        .collect();
+        let p = build_with(&code, false, 256, true).unwrap();
+        let insts: Vec<_> = p.blocks.iter().flat_map(|b| &b.insts).collect();
+        assert!(!insts.iter().any(|i| i.name().starts_with("s_load")));
+        let input = |reg| p.inputs.iter().find(|i| i.0 == reg).map(|i| i.1);
+        // s18 is first given table dword 10 (user SGPR 30); s0 still gets
+        // dword 2 (user SGPR 18) on entry.
+        let s18 = insts.iter().find_map(|i| i.write(Reg::S(18))).unwrap();
+        let mov18 = insts
+            .iter()
+            .find(|i| i.write(Reg::S(18)).is_some())
+            .unwrap();
+        assert_eq!(mov18.reads.first().map(|r| r.1), input(Reg::S(30)));
+        let mov0 = insts.iter().find(|i| i.write(Reg::S(0)).is_some()).unwrap();
+        let read = mov0.reads.first().unwrap().1;
+        assert_ne!(read, s18);
+        assert_eq!(Some(read), input(Reg::S(18)));
+        let mov1 = insts.iter().find(|i| i.write(Reg::S(1)).is_some()).unwrap();
+        assert_eq!(mov1.reads.first().map(|r| r.1), input(Reg::S(19)));
     }
 
     /// Loads from a pointer that is not the spill table stay loads.

@@ -454,6 +454,7 @@ pub(crate) fn expand(
     let Some(clamped_args) = crate::indirect::clamp_uav(
         list,
         (&args.buffer, args.offset(arguments)),
+        None,
         (0, stride, max),
     ) else {
         return Err("rectangle clamp unavailable");

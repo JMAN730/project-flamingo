@@ -12,6 +12,63 @@ fn present_result_distinguishes_occlusion_from_success_and_failure() {
     );
 }
 
+/// Half-float swap chains stay scRGB on SDR and HDR displays: gamma 2.2 is
+/// not a half-float presentation color space, and it is not DXGI's default.
+#[test]
+fn half_float_swap_chains_present_as_scrgb_on_any_display() {
+    let fp16 = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    let scrgb = DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709;
+    let g22 = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
+    assert_eq!(default_color_space(fp16), scrgb);
+    assert_eq!(desired_color_space(fp16, false), scrgb);
+    assert_eq!(desired_color_space(fp16, true), scrgb);
+    for format in [DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM] {
+        assert_eq!(default_color_space(format), g22);
+        assert_eq!(desired_color_space(format, true), g22);
+    }
+    let ten = DXGI_FORMAT_R10G10B10A2_UNORM;
+    assert_eq!(default_color_space(ten), g22);
+    assert_eq!(desired_color_space(ten, false), g22);
+    assert_eq!(
+        desired_color_space(ten, true),
+        DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020
+    );
+}
+
+/// Only the window's own monitor decides HDR, and the swap chain follows
+/// what the title was told.
+#[test]
+fn hdr_state_comes_from_the_windows_monitor_and_what_the_title_was_told() {
+    let info = HdrDisplayInfo {
+        min_luminance: 0.01,
+        max_luminance: 1000.0,
+        max_full_frame_luminance: 600.0,
+    };
+    let outputs = [
+        OutputHdr {
+            monitor: 1,
+            hdr: None,
+        },
+        OutputHdr {
+            monitor: 2,
+            hdr: Some(info),
+        },
+    ];
+    assert_eq!(
+        monitor_hdr(&outputs, 1),
+        None,
+        "SDR monitor next to an HDR one"
+    );
+    assert_eq!(monitor_hdr(&outputs, 2), Some(info));
+    assert_eq!(monitor_hdr(&outputs, 3), None, "unknown monitor");
+    assert_eq!(monitor_hdr(&[], 1), None);
+
+    assert!(swap_chain_hdr(Some(true), true));
+    assert!(!swap_chain_hdr(Some(true), false), "told HDR, SDR monitor");
+    assert!(!swap_chain_hdr(Some(false), true), "told SDR, HDR monitor");
+    assert!(!swap_chain_hdr(None, true), "never asked: SDR");
+}
+
 #[test]
 fn shadow_buffer_transitions_between_writes_and_reads() {
     let uav = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
@@ -3480,4 +3537,21 @@ mod relay_tests {
         h.log_messages();
         assert_eq!(h.d3d12_errors(), errors_before);
     }
+}
+
+/// A closed list can be submitted more than once: each submission's
+/// breadcrumb report gets the list's noted commands, and the list keeps
+/// them until it resets.
+#[cfg(feature = "diagnostics")]
+#[test]
+fn every_submission_of_a_list_gets_its_noted_commands() {
+    let notes: Mutex<Vec<Note>> = Mutex::new(vec![
+        ("a draw".to_owned(), None),
+        ("a copy".to_owned(), Some((0x1000, 16))),
+    ]);
+    let first = submitted_notes(&notes);
+    let second = submitted_notes(&notes);
+    assert_eq!(first.len(), 2);
+    assert_eq!(first, second);
+    assert_eq!(notes.lock().unwrap().len(), 2);
 }

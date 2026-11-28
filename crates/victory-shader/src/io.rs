@@ -150,6 +150,12 @@ pub enum Interp {
     /// One vertex's value (`v_interp_mov_f32`), as encoded: 0 for P10,
     /// 1 for P20, 2 for P0 (the provoking vertex).
     Vertex { attribute: Attribute, vertex: u8 },
+    /// One half of an interpolation whose weights the program computes (or
+    /// whose halves read different barycentrics). The first half
+    /// (`second` false) is `P0 + i * P10`, the second adds `j * P20` to its
+    /// old destination, each reading its weight from the register as data.
+    /// Lowered from the three vertices' values, in the last chance only.
+    Computed { attribute: Attribute, second: bool },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -364,6 +370,8 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
     };
     // Only a second interpolation half needs to trace SSA definitions.
     let mut halves = None;
+    // First halves of interpolations with computed weights.
+    let mut computed: Vec<Site> = Vec::new();
     for (b, block) in p.blocks.iter().enumerate() {
         for (i, inst) in block.insts.iter().enumerate() {
             let site = (b, i);
@@ -382,7 +390,7 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                                 return Err(unsupported(at, "an interpolation operand"));
                             };
                             // The first half's result is this one's old dst.
-                            let interp = halves
+                            let paired = halves
                                 .get_or_insert_with(|| Halves::new(p))
                                 .pair(
                                     attr,
@@ -391,7 +399,8 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                                     &barycentric,
                                 )
                                 .map_err(|what| unsupported(at, what))?;
-                            io.interps.push((site, interp.with(attribute)));
+                            io.interps
+                                .push((site, paired.with(attribute, &mut computed)));
                         }
                         _ => return Err(unsupported(at, "an interpolation form")),
                     }
@@ -406,11 +415,12 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                                 Some(&Operand::Vector { reg, .. }) => inst.read(Reg::V(reg)),
                                 _ => None,
                             };
-                            let interp = halves
+                            let paired = halves
                                 .get_or_insert_with(|| Halves::new(p))
                                 .pair(&v.src[0], read(2), read(1), &barycentric)
                                 .map_err(|what| unsupported(at, what))?;
-                            io.interps.push((site, interp.with(attribute)));
+                            io.interps
+                                .push((site, paired.with(attribute, &mut computed)));
                         }
                         _ => return Err(unsupported(at, "an interpolation form")),
                     }
@@ -460,6 +470,44 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
             }
         }
     }
+    // The first halves of computed interpolations compute their share (the
+    // halves of plain pairs, which the second half evaluates whole, do not).
+    let plain: Vec<Site> = io
+        .interps
+        .iter()
+        .filter_map(|(_, i)| match i {
+            Interp::Interpolated { first, .. } => Some(first),
+            _ => None,
+        })
+        .flatten()
+        .copied()
+        .collect();
+    for site in computed {
+        if io.interps.iter().any(|(s, _)| *s == site) {
+            continue;
+        }
+        let inst = &p.blocks[site.0].insts[site.1];
+        // A first half a plain pair also completes would compute for both.
+        if plain.contains(&site) {
+            return Err(unsupported(
+                inst.machine.offset,
+                "an interpolation with computed barycentrics",
+            ));
+        }
+        let attr = match &inst.fields {
+            Fields::Vintrp { attr, .. } => attr,
+            Fields::Valu(v) => &v.src[0],
+            _ => continue,
+        };
+        let attribute = attribute(inst, attr)?;
+        io.interps.push((
+            site,
+            Interp::Computed {
+                attribute,
+                second: false,
+            },
+        ));
+    }
     Ok(io)
 }
 
@@ -484,9 +532,32 @@ fn ps_vgprs(addr: u32) -> Vec<(u8, Input)> {
 }
 
 /// An interpolation before its attribute is known.
+enum Paired {
+    Plain(Pair),
+    /// The first halves of one whose weights are computed.
+    Computed(Vec<Site>),
+}
+
 struct Pair {
     barycentric: Barycentric,
     first: Vec<Site>,
+}
+
+impl Paired {
+    /// The interpolation at the second half; computed ones put their first
+    /// halves in `computed`.
+    fn with(self, attribute: Attribute, computed: &mut Vec<Site>) -> Interp {
+        match self {
+            Paired::Plain(pair) => pair.with(attribute),
+            Paired::Computed(first) => {
+                computed.extend(first);
+                Interp::Computed {
+                    attribute,
+                    second: true,
+                }
+            }
+        }
+    }
 }
 
 impl Pair {
@@ -537,23 +608,23 @@ impl<'a> Halves<'a> {
 
     /// The interpolation whose second half reads the first half's result
     /// `acc`, the barycentric `j`, and attribute `attr`: every first half
-    /// must read the same attribute channel and the same kind's i.
+    /// must read the same attribute channel and the same kind's i. Weights
+    /// that are no loaded barycentrics make a [`Paired::Computed`] pair.
     fn pair(
         &self,
         attr: &Operand,
         acc: Option<Value>,
         j: Option<Value>,
         barycentric: &impl Fn(Option<Value>) -> Option<(Barycentric, u8)>,
-    ) -> Result<Pair, &'static str> {
+    ) -> Result<Paired, &'static str> {
         let mut first = Vec::new();
         self.sites(
             acc.ok_or("an interpolation without its first half")?,
             &mut Vec::new(),
             &mut first,
         )?;
-        let Some((kind, 1)) = barycentric(j) else {
-            return Err("an interpolation with computed barycentrics");
-        };
+        let kind = barycentric(j).filter(|b| b.1 == 1).map(|b| b.0);
+        let mut plain = kind.is_some();
         for &(b, i) in &first {
             let inst = &self.p.blocks[b].insts[i];
             let (a, i) = match &inst.fields {
@@ -571,13 +642,11 @@ impl<'a> Halves<'a> {
             if a != *attr {
                 return Err("interpolation halves of different attributes");
             }
-            if barycentric(i) != Some((kind, 0)) {
-                return Err("an interpolation with computed barycentrics");
-            }
+            plain &= kind.is_some() && barycentric(i) == kind.map(|k| (k, 0));
         }
-        Ok(Pair {
-            barycentric: kind,
-            first,
+        Ok(match kind {
+            Some(barycentric) if plain => Paired::Plain(Pair { barycentric, first }),
+            _ => Paired::Computed(first),
         })
     }
 

@@ -13,6 +13,13 @@ pub const SAMPLER_SPACE: u32 = 0;
 /// Where root CBVs and SRVs are bound: `b<root parameter index>` and
 /// `t<root parameter index>` in this space.
 pub const ROOT_CBV_SPACE: u32 = 1;
+/// Where the buffer of a mesh program run without mesh shaders is bound
+/// (`super::meshbuf`): `u0` in this space for the compute shader that fills
+/// it, `t0` for the vertex shader that reads it back.
+pub const MESH_BUFFER_SPACE: u32 = 2;
+/// Bytes of the constant buffer `b0` in [`MESH_BUFFER_SPACE`]: one dword,
+/// the first thread group's number, in a buffer of the smallest size.
+const MESH_BASE_BYTES: u32 = 16;
 
 /// Title memory by address: console code reads and writes through raw 40-bit
 /// addresses it takes from root constants, descriptors and other memory (the
@@ -50,6 +57,7 @@ pub(crate) mod flags {
     pub const ROVS: u64 = 1 << 18;
     pub const WAVE_OPS: u64 = 1 << 19;
     pub const INT64: u64 = 1 << 20;
+    pub const BARYCENTRICS: u64 = 1 << 22;
     pub const ATOMIC_TYPED64: u64 = 1 << 27;
     pub const ATOMIC_HEAP64: u64 = 1 << 32;
     pub const RESOURCE_HEAP: u64 = 1 << 30;
@@ -98,6 +106,18 @@ pub(crate) struct Geometry {
     pub max_vertices: u32,
 }
 
+/// A sampling call of [`Shader::op`].
+#[derive(Clone)]
+pub(crate) struct SampleCall {
+    pub block: usize,
+    pub name: String,
+    pub attr: Attr,
+    pub ret: Ty,
+    pub opcode: u32,
+    pub args: Vec<V>,
+    pub result: V,
+}
+
 pub(crate) struct Shader {
     pub m: Module,
     /// Test builds: typed loads assembled from a dword-aligned pair.
@@ -106,6 +126,10 @@ pub(crate) struct Shader {
     /// Test builds: d16 loads that kept the destination VGPR's high half.
     #[cfg(test)]
     pub d16_kept_high_halves: u32,
+    /// Test builds: returning LDS atomics whose old value is 0 outside the
+    /// program's LDS (split halves).
+    #[cfg(all(test, windows))]
+    pub lds_atomics_zero_outside: u32,
     /// Test builds: constant byte offsets of `s_buffer_load_dword*`.
     #[cfg(test)]
     pub smem_buffer_bytes: Vec<u32>,
@@ -135,6 +159,9 @@ pub(crate) struct Shader {
     /// Root UAVs (raw buffers) read and written, likewise.
     pub root_uavs: Vec<(u8, V)>,
     pub flags: u64,
+    /// The latest sampling call (the one a sample lowering repeats with
+    /// other sampler handles), as [`Shader::op`] made it.
+    pub sample_call: Option<SampleCall>,
     /// Heap handles made with a non-uniform index.
     pub nonuniform_handles: u32,
     /// Heap handles annotated as constant buffers.
@@ -149,6 +176,16 @@ pub(crate) struct Shader {
     compute_derivatives: bool,
     /// Thread-group shared memory, in dwords.
     pub lds_dwords: u32,
+    /// A mesh program emitted as a compute shader that stores its outputs
+    /// in a buffer instead (`super::meshbuf`), for hosts without mesh
+    /// shaders. `mesh` stays set: the lowering is the mesh one.
+    pub mesh_buffer: bool,
+    /// That buffer's handle, once made, and whether this shader writes it
+    /// (the vertex shader reading it back does not).
+    sink: Option<(V, bool)>,
+    /// The constant buffer naming the first thread group of a part of a mesh
+    /// dispatch run without mesh shaders (`mesh_base_handle`).
+    mesh_base: Option<V>,
     lds: Option<V>,
     main: V,
     pub entry: usize,
@@ -178,6 +215,8 @@ impl Shader {
             unaligned_typed_loads: 0,
             #[cfg(test)]
             d16_kept_high_halves: 0,
+            #[cfg(all(test, windows))]
+            lds_atomics_zero_outside: 0,
             #[cfg(test)]
             smem_buffer_bytes: Vec::new(),
             #[cfg(test)]
@@ -206,6 +245,7 @@ impl Shader {
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
             flags: 0,
+            sample_call: None,
             nonuniform_handles: 0,
             cbuffer_handles: 0,
             rov: false,
@@ -213,6 +253,9 @@ impl Shader {
             wave_size: None,
             compute_derivatives: false,
             lds_dwords: 0,
+            mesh_buffer: false,
+            sink: None,
+            mesh_base: None,
             lds: None,
             main,
             entry,
@@ -256,7 +299,19 @@ impl Shader {
             .function(&format!("dx.op.{name}"), fty, Some(attr), false);
         let mut all = vec![self.m.i32(opcode)];
         all.extend(args);
-        self.m.call(block, f, all)
+        let result = self.m.call(block, f, all);
+        if matches!(opcode, 60..=65 | 73 | 81) {
+            self.sample_call = Some(SampleCall {
+                block,
+                name: name.to_owned(),
+                attr,
+                ret,
+                opcode,
+                args: args.to_vec(),
+                result,
+            });
+        }
+        result
     }
 
     /// The handle of the user-data constant buffer, made in the entry block.
@@ -353,6 +408,63 @@ impl Shader {
         let h = self.annotate(block, h, 11 | 0x1000, 0);
         self.flags |= flags::RAW_BUFFERS;
         self.root_uavs.push((slot, h));
+        h
+    }
+
+    /// The handle of the buffer that holds a mesh program's outputs on a
+    /// host without mesh shaders, a raw buffer in [`MESH_BUFFER_SPACE`], made
+    /// in the entry block: the root UAV `u0` for the shader that writes it
+    /// (`written`), the root SRV `t0` for the one that reads it back.
+    pub fn mesh_buffer_handle(&mut self, written: bool) -> V {
+        if let Some((h, _)) = self.sink {
+            return h;
+        }
+        let r = self.m.i32(0);
+        // Resource class: 1 UAV, 0 SRV.
+        let class = self.m.i8(u8::from(written));
+        let bind = [r, r, self.m.i32(MESH_BUFFER_SPACE), class];
+        let bind = self.m.aggregate(self.t.bind, &bind);
+        let f = self.m.bool(false);
+        let block = self.entry;
+        let h = self.op(
+            block,
+            "createHandleFromBinding",
+            Attr::ReadNone,
+            self.t.handle,
+            217,
+            &[bind, r, f],
+        );
+        // A raw buffer (11); 0x1000 marks a UAV.
+        let h = self.annotate(block, h, if written { 11 | 0x1000 } else { 11 }, 0);
+        self.flags |= flags::RAW_BUFFERS;
+        self.sink = Some((h, written));
+        h
+    }
+
+    /// The handle of the constant buffer `b0` in [`MESH_BUFFER_SPACE`], made
+    /// in the entry block: its first dword is the number of the first thread
+    /// group of this dispatch. A host without mesh shaders runs a mesh
+    /// dispatch in parts that fit its buffer, and each part numbers its
+    /// groups from 0.
+    pub fn mesh_base_handle(&mut self) -> V {
+        if let Some(h) = self.mesh_base {
+            return h;
+        }
+        let r = self.m.i32(0);
+        let bind = [r, r, self.m.i32(MESH_BUFFER_SPACE), self.m.i8(2)];
+        let bind = self.m.aggregate(self.t.bind, &bind);
+        let f = self.m.bool(false);
+        let block = self.entry;
+        let h = self.op(
+            block,
+            "createHandleFromBinding",
+            Attr::ReadNone,
+            self.t.handle,
+            217,
+            &[bind, r, f],
+        );
+        let h = self.annotate(block, h, 13, MESH_BASE_BYTES);
+        self.mesh_base = Some(h);
         h
     }
 
@@ -470,6 +582,14 @@ impl Shader {
     pub fn finish(mut self) -> Vec<u8> {
         let ud_size = (self.user_data * 4).next_multiple_of(16);
         self.fix_user_data_size(ud_size);
+        // A mesh program stored into a buffer is a compute shader on the
+        // host: no signatures, no mesh state.
+        if self.mesh_buffer {
+            self.inputs.clear();
+            self.outputs.clear();
+            self.prims.clear();
+            self.mesh = None;
+        }
         // The clean-up, before anything is declared about the code: a
         // feature whose last use it removed must not be declared (the
         // validator compares the flags with what the code uses).
@@ -479,6 +599,10 @@ impl Shader {
             let used = self.m.usage();
             for (flag, used) in [
                 (flags::WAVE_OPS, used.wave_ops),
+                (
+                    flags::BARYCENTRICS,
+                    used.vertex_attributes || self.inputs.iter().any(|e| e.kind == 28),
+                ),
                 (flags::INT64, used.int64),
                 (flags::TYPED_UAV_LOADS, used.typed_uav_loads),
                 (flags::RESOURCE_HEAP, used.heap_views),
@@ -503,6 +627,8 @@ impl Shader {
             || !self.root_cbvs.is_empty()
             || !self.root_srvs.is_empty()
             || !self.root_uavs.is_empty()
+            || self.sink.is_some()
+            || self.mesh_base.is_some()
         {
             let empty = self.m.md_str("");
             let mut cbvs = None;
@@ -553,24 +679,56 @@ impl Shader {
                     dxil_kind: 13,
                 });
             }
+            if self.mesh_base.is_some() {
+                let arr = self.m.array(MESH_BASE_BYTES / 4, self.t.i32);
+                let ty = self.m.named_struct("MeshBase", vec![arr]);
+                let p = self.m.ptr(ty);
+                let u = self.m.undef(p);
+                let ops = vec![
+                    Some(i32c(&mut self, cbv_list.len() as u32)),
+                    Some(self.m.md_value(u)),
+                    Some(empty),
+                    Some(i32c(&mut self, MESH_BUFFER_SPACE)),
+                    Some(i32c(&mut self, 0)),
+                    Some(i32c(&mut self, 1)),
+                    Some(i32c(&mut self, MESH_BASE_BYTES)),
+                    None,
+                ];
+                cbv_list.push(Some(self.m.md_node(ops)));
+                bindings.push(Binding {
+                    kind: 2,
+                    space: MESH_BUFFER_SPACE,
+                    register: 0,
+                    dxil_kind: 13,
+                });
+            }
             if !cbv_list.is_empty() {
                 cbvs = Some(self.m.md_node(cbv_list));
             }
             let mut srvs = None;
-            if !self.root_srvs.is_empty() {
+            // Root SRVs, then the mesh buffer where this shader only reads it.
+            let mut raw_srvs: Vec<(u32, u32)> = self
+                .root_srvs
+                .iter()
+                .map(|&(slot, _)| (ROOT_CBV_SPACE, u32::from(slot)))
+                .collect();
+            if matches!(self.sink, Some((_, false))) {
+                raw_srvs.push((MESH_BUFFER_SPACE, 0));
+            }
+            if !raw_srvs.is_empty() {
                 let ty = self
                     .m
                     .named_struct("struct.ByteAddressBuffer", vec![self.t.i32]);
                 let p = self.m.ptr(ty);
                 let u = self.m.undef(p);
                 let mut list = Vec::new();
-                for (n, (slot, _)) in self.root_srvs.clone().into_iter().enumerate() {
+                for (n, (space, register)) in raw_srvs.into_iter().enumerate() {
                     let ops = vec![
                         Some(i32c(&mut self, n as u32)),
                         Some(self.m.md_value(u)),
                         Some(empty),
-                        Some(i32c(&mut self, ROOT_CBV_SPACE)),
-                        Some(i32c(&mut self, u32::from(slot))),
+                        Some(i32c(&mut self, space)),
+                        Some(i32c(&mut self, register)),
                         Some(i32c(&mut self, 1)),
                         Some(i32c(&mut self, 11)),
                         Some(i32c(&mut self, 0)),
@@ -579,15 +737,24 @@ impl Shader {
                     list.push(Some(self.m.md_node(ops)));
                     bindings.push(Binding {
                         kind: 4,
-                        space: ROOT_CBV_SPACE,
-                        register: u32::from(slot),
+                        space,
+                        register,
                         dxil_kind: 11,
                     });
                 }
                 srvs = Some(self.m.md_node(list));
             }
             let mut uavs = None;
-            if !self.root_uavs.is_empty() {
+            // Root UAVs, then the mesh buffer where this shader writes it.
+            let mut raw_uavs: Vec<(u32, u32)> = self
+                .root_uavs
+                .iter()
+                .map(|&(slot, _)| (ROOT_CBV_SPACE, u32::from(slot)))
+                .collect();
+            if matches!(self.sink, Some((_, true))) {
+                raw_uavs.push((MESH_BUFFER_SPACE, 0));
+            }
+            if !raw_uavs.is_empty() {
                 let ty = self
                     .m
                     .named_struct("struct.RWByteAddressBuffer", vec![self.t.i32]);
@@ -596,7 +763,7 @@ impl Shader {
                 let no = self.m.bool(false);
                 let no = self.m.md_value(no);
                 let mut list = Vec::new();
-                for (n, (slot, _)) in self.root_uavs.clone().into_iter().enumerate() {
+                for (n, (space, register)) in raw_uavs.into_iter().enumerate() {
                     // Id, variable, name, space, lower bound, range size,
                     // shape (11: a raw buffer), globally coherent, counter,
                     // rasterizer ordered, extra.
@@ -604,8 +771,8 @@ impl Shader {
                         Some(i32c(&mut self, n as u32)),
                         Some(self.m.md_value(u)),
                         Some(empty),
-                        Some(i32c(&mut self, ROOT_CBV_SPACE)),
-                        Some(i32c(&mut self, u32::from(slot))),
+                        Some(i32c(&mut self, space)),
+                        Some(i32c(&mut self, register)),
                         Some(i32c(&mut self, 1)),
                         Some(i32c(&mut self, 11)),
                         Some(no),
@@ -617,8 +784,8 @@ impl Shader {
                     // PSV0 kind 7: a raw buffer with unordered access.
                     bindings.push(Binding {
                         kind: 7,
-                        space: ROOT_CBV_SPACE,
-                        register: u32::from(slot),
+                        space,
+                        register,
                         dxil_kind: 11,
                     });
                 }
@@ -829,6 +996,9 @@ impl Shader {
         }
         if self.flags & flags::WAVE_OPS != 0 {
             features |= 0x4000;
+        }
+        if self.flags & flags::BARYCENTRICS != 0 {
+            features |= 0x2_0000;
         }
         if self.flags & flags::INT64 != 0 {
             features |= 0x8000;

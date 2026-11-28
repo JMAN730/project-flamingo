@@ -7,9 +7,12 @@
 //! executable, and `D3D12SDKVersion` must match the `D3D12_SDK_VERSION` in the SDK's
 //! `d3d12.h` (620 for package 1.620.2).
 //!
-//! `build.rs` exports them with the linker's `/EXPORT:...,DATA` option. Once the exports are
-//! present the loader refuses to create a device when the DLL is missing (`0x887e0003`), so
-//! the DLL has to ship next to the executable under `D3D12\`.
+//! They are defined once, here, for every binary that links this crate. A binary exports
+//! them with the linker's `/EXPORT:...,DATA` option, which also takes them out of the
+//! library: this crate's `build.rs` does that for its own test binaries, `apps/victory`'s
+//! for the executable. Once the exports are present the loader refuses to create a device
+//! when the DLL is missing (`0x887e0003`), so both export only when the DLL is installed
+//! next to the build under `D3D12\`, and it has to stay next to the executable.
 
 #[allow(dead_code)]
 #[unsafe(no_mangle)]

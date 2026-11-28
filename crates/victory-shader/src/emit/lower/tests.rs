@@ -1,6 +1,8 @@
 //! Unit tests of `lower`, a child module so `lower.rs` stays under the asset policy's size limit.
 
-use super::{Lowered, Numeric, Parts, buffer_format, f16_nan_widen_bits, half_shift, lower};
+use super::{
+    Lowered, Numeric, Parts, buffer_format, f16_nan_widen_bits, half_shift, lower, structured_srv,
+};
 use crate::native::{
     ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
 };
@@ -118,6 +120,7 @@ fn loop_exit_mask_counted_after_the_loop_is_wave_wide() {
         outputs: vec![],
         prims: vec![],
         mesh_stride: 0,
+        mesh_buffer: false,
     })
     .expect("lower");
     // The count is a ballot of the reconverged wave, not a per-lane 0/1.
@@ -192,6 +195,7 @@ fn wave64_loop_exit_mask_counted_after_the_loop_is_wave_wide() {
         outputs: vec![],
         prims: vec![],
         mesh_stride: 0,
+        mesh_buffer: false,
     })
     .expect("lower");
     assert!(lowered.wave_ops, "exit-mask count must ballot the wave");
@@ -231,6 +235,7 @@ fn lower_words(words: &[u32], rsrc2: u32) -> Result<super::Lowered, crate::Shade
         outputs: vec![],
         prims: vec![],
         mesh_stride: 0,
+        mesh_buffer: false,
     })
 }
 
@@ -252,6 +257,20 @@ fn ds_swizzle_b32_zeros_inactive_source_lanes() {
         "ds_swizzle_b32 must ballot-mask inactive source lanes to 0"
     );
     assert!(lowered.wave_ops, "ds_swizzle_b32 uses wave operations");
+}
+
+/// `ds_bpermute_b32` gives each lane the data of the lane its address names,
+/// and 0 from a lane out of EXEC: a lane read behind a ballot.
+#[test]
+fn ds_bpermute_b32_reads_the_lane_its_address_names() {
+    // s_mov_b32 exec_lo, 0x5555; ds_bpermute_b32 v1, v0, v2 (address v0, data v2).
+    let words = [0xBEFE_03FF, 0x0000_5555, 0xDACC_0000, 0x0100_0200, S_ENDPGM];
+    let lowered = lower_words(&words, 0).expect("ds_bpermute_b32 lowers");
+    assert!(
+        lowered.has_wave_ballot,
+        "a source lane out of EXEC must read as 0"
+    );
+    assert!(lowered.wave_ops, "ds_bpermute_b32 uses wave operations");
 }
 
 /// A wave64 mesh shader's quad swizzle asks the ballot about the source's
@@ -292,6 +311,7 @@ fn mesh_quad_swizzle_checks_the_host_lane_of_its_source() {
         outputs: vec![],
         prims: vec![],
         mesh_stride: 0,
+        mesh_buffer: false,
     })
     .expect("mesh quad swizzle lowers");
     assert!(lowered.has_wave_ballot, "inactive sources still read 0");
@@ -367,6 +387,7 @@ fn pixel_discard_follows_a_vm_export_that_only_some_paths_run() {
         outputs: vec![target],
         prims: vec![],
         mesh_stride: 0,
+        mesh_buffer: false,
     })
     .expect("partial-path vm export lowers");
     assert!(
@@ -495,6 +516,7 @@ fn lower_ps(input_addr: u32) -> Result<Lowered, crate::ShaderError> {
         outputs: vec![target],
         prims: vec![],
         mesh_stride: 0,
+        mesh_buffer: false,
     })
 }
 
@@ -577,6 +599,7 @@ fn pixel_export_tracks_last_vm_and_masks_mrt_under_exec() {
         outputs: vec![target],
         prims: vec![],
         mesh_stride: 0,
+        mesh_buffer: false,
     })
     .expect("conditional MRT + last-vm done must lower");
     assert!(
@@ -693,6 +716,7 @@ fn lower_ps_words(words: &[u32]) -> Result<Lowered, crate::ShaderError> {
         outputs: vec![target],
         prims: vec![],
         mesh_stride: 0,
+        mesh_buffer: false,
     })
 }
 
@@ -778,6 +802,7 @@ fn lowers_lds(words: &[u32]) -> Result<(), crate::ShaderError> {
         outputs: vec![],
         prims: vec![],
         mesh_stride: 0,
+        mesh_buffer: false,
     })
     .map(|_| ())
 }
@@ -858,6 +883,7 @@ fn lower_wave32_dpp(words: &[u32]) -> Lowered {
         outputs: vec![],
         prims: vec![],
         mesh_stride: 0,
+        mesh_buffer: false,
     })
     .expect("lower")
 }
@@ -953,6 +979,7 @@ fn lower_wave(
         outputs: vec![],
         prims: vec![],
         mesh_stride: 0,
+        mesh_buffer: false,
     })
 }
 
@@ -1182,6 +1209,7 @@ fn perm_features(selector: u32) -> u64 {
         outputs: vec![],
         prims: vec![],
         mesh_stride: 0,
+        mesh_buffer: false,
     })
     .unwrap();
 
@@ -1253,13 +1281,13 @@ fn s_buffer_load_truncates_each_address_term_before_adding() {
 fn scalar_loads_through_a_heap_buffer_that_vector_loads_read_use_a_buffer_view() {
     // A descriptor from the resource heap (s0) at an index from a root
     // constant (s1), read by a scalar buffer load, then used by nothing
-    // else, by a vector buffer load, or by a vector buffer store. A slot
-    // that vector loads read is a buffer view (an SRV), so the scalar
-    // load must not read it through a constant buffer handle (a
-    // descriptor of the wrong type). A store makes it a UAV, which a
+    // else, by a vector buffer load, or by a vector buffer store. A
+    // heap-indexed slot nothing writes is a buffer view (an SRV), so
+    // the scalar load must not read it through a constant buffer handle
+    // (a descriptor of the wrong type). A store makes it a UAV, which a
     // read-only view would not match either: that case is unchanged.
-    // Heap-direct scalar loads alone still use a CBV handle; index 0 is
-    // skipped (shortcut: this title's dual-read null texture SRV; #485).
+    // The same code reading a table entry the resource list leaves out
+    // keeps the constant buffer handle, and a listed heap CBV stays one.
     #[derive(Clone, Copy)]
     enum Also {
         Nothing,
@@ -1299,24 +1327,31 @@ fn scalar_loads_through_a_heap_buffer_that_vector_loads_read_use_a_buffer_view()
         ]);
         words
     };
-    let layout = || {
-        vec![
-            root(RootType::ResourceHeap, 0, 0),
-            root(RootType::Constants, 1, 1),
-        ]
-    };
-    let cbuffers = |also| {
-        lower_with(&program(also), layout(), vec![])
+    let layout = |heap: RootType| vec![root(heap, 0, 0), root(RootType::Constants, 1, 1)];
+    let cbuffers = |also, heap| {
+        lower_with(&program(also), layout(heap), vec![])
             .unwrap()
             .cbuffer_handles
     };
-    assert_eq!(cbuffers(Also::Nothing), 1, "no other use: a CBV");
-    assert_eq!(cbuffers(Also::Load), 0, "buffer_load: an SRV");
-    assert_eq!(cbuffers(Also::Store), 1, "buffer_store: unchanged");
-    // Untyped heap-direct (#485 null-slot skip) must still lower.
+    let heap = RootType::ResourceHeap;
+    assert_eq!(
+        cbuffers(Also::Nothing, heap),
+        0,
+        "scalar loads only: an SRV"
+    );
+    assert_eq!(cbuffers(Also::Load, heap), 0, "buffer_load: an SRV");
+    assert_eq!(cbuffers(Also::Store, heap), 1, "buffer_store: unchanged");
+    let table = RootType::Table;
+    assert_eq!(
+        cbuffers(Also::Nothing, table),
+        1,
+        "unlisted table entry: a CBV"
+    );
+    // An unlisted heap view only scalar loads read skips heap index 0
+    // (the title's null texture) and still lowers.
     assert!(
-        lower_with(&program(Also::Nothing), layout(), vec![]).is_ok(),
-        "heap-direct scalar CBV with null-slot skip"
+        lower_with(&program(Also::Nothing), layout(heap), vec![]).is_ok(),
+        "heap-direct scalar view with null-slot skip"
     );
     // A listed ResourceHeap CBV keeps a live load at index 0 (no skip).
     let listed = vec![UsedResource {
@@ -1330,7 +1365,7 @@ fn scalar_loads_through_a_heap_buffer_that_vector_loads_read_use_a_buffer_view()
         slot: 0,
     }];
     assert_eq!(
-        lower_with(&program(Also::Nothing), layout(), listed)
+        lower_with(&program(Also::Nothing), layout(heap), listed)
             .unwrap()
             .cbuffer_handles,
         1,
@@ -1892,6 +1927,46 @@ fn descriptors_joined_by_nested_control_flow_lower_to_one_uniform_handle() {
     let l = lower_with(&words, layout, used).unwrap();
     // One image handle from the joins' heap index, the same in all lanes.
     assert_eq!(l.nonuniform_handles, 0);
+    #[cfg(windows)]
+    if let Ok(mut v) = super::super::validator::Validator::load(
+        super::super::validator::Validator::default_path().as_deref(),
+    ) {
+        v.validate(&mut l.dxil.clone())
+            .expect("DXIL validation failed");
+    }
+}
+
+/// `image_atomic_add` with 16-bit coordinates (a16) and a returned value
+/// lowers and validates; its data stays 32-bit.
+#[test]
+fn image_atomic_with_packed_coordinates_lowers() {
+    let words = [
+        0xBE84_0300, // s_mov_b32 s4, s0
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF408_0A02,
+        0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
+        0xF40C_0302,
+        0xFA00_0000, // s_load_dwordx8 s[12:19], s[4:5], 0x0
+        0x7E04_02FF,
+        0x0003_0002,              // v_mov_b32 v2, 0x30002: x 2, y 3
+        0x7E0A_0281,              // v_mov_b32 v5, 1
+        0x3420_0082,              // v_lshlrev_b32 v16, 2, v0
+        0xBF8C_C07F,              // s_waitcnt lgkmcnt(0)
+        0xF000_2108 | 0x11 << 18, // image_atomic_add glc dim:2D
+        0x4043_0502,              // v5, v2, s[12:19] a16
+        0xBF8C_0F70,              // s_waitcnt vmcnt(0)
+        0xE070_1000,
+        0x800A_0510, // buffer_store_dword v5, v16, s[40:43], 0 offen
+        S_ENDPGM,
+    ];
+    let (layout, mut used) = texture_and_uav_tables();
+    used.retain(|u| u.user_data == 0);
+    used[0].kind = ResourceType::Uav;
+    used[0].dwords = 8;
+    used[0].table_offset_dwords = 0;
+    let layout = vec![layout[0]];
+    #[cfg_attr(not(windows), allow(unused_variables))]
+    let l = lower_with(&words, layout, used).unwrap();
     #[cfg(windows)]
     if let Ok(mut v) = super::super::validator::Validator::load(
         super::super::validator::Validator::default_path().as_deref(),
@@ -2471,6 +2546,7 @@ fn lower_pixel_image(op: u32, dmask: u32, addr: &[u32]) -> Result<Lowered, crate
         outputs: vec![target],
         prims: vec![],
         mesh_stride: 0,
+        mesh_buffer: false,
     })?;
     #[cfg(windows)]
     if let Ok(mut v) = super::super::validator::Validator::load(
@@ -2588,6 +2664,7 @@ fn lds_subdword_reads_and_writes_lower() {
         outputs: vec![],
         prims: vec![],
         mesh_stride: 0,
+        mesh_buffer: false,
     })
     .unwrap();
 }
@@ -2799,6 +2876,7 @@ fn constant_64_bit_compares_lower_without_int64() {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
+            mesh_buffer: false,
         })
         .unwrap();
         let sfi0 = crate::dxbc::Container::parse(&emitted.dxil)
@@ -2864,6 +2942,7 @@ fn identical_branch_arms_lower_as_a_jump() {
         outputs: vec![],
         prims: vec![],
         mesh_stride: 0,
+        mesh_buffer: false,
     })
     .expect("degenerate Branch arms must lower without PHI/edge map errors");
     assert!(!lowered.dxil.is_empty());
@@ -3190,6 +3269,52 @@ fn image_stores_of_some_channels_zero_the_others() {
     assert!(lower_image(&image_words(0x08, 0, 1, false, &addr)).is_err());
 }
 
+/// The console converts an image access's data by its view's format, so an
+/// integer view's texels are integers in the data registers. A store or
+/// load reads its view's class from the host's view class list and takes
+/// the typed access of that class: float, and two integer ones (UINT,
+/// SINT), each in a block only that class runs. Validated with `dxil.dll`
+/// where present.
+#[test]
+fn image_accesses_take_the_typed_form_of_their_view_class() {
+    let mut addr = vec![F_HALF, F_HALF];
+    addr.extend((4..12).map(|_| 0));
+    addr.extend([F_ONE, 5, 0x4040_0000, 0x4080_0000]);
+    let classes = |l: &Lowered| {
+        l.user_data
+            .iter()
+            .any(|u| u.root == RootType::Other(crate::emit::USER_VIEW_CLASSES))
+    };
+    for (op, what, d16) in [
+        (0x08, "textureStore", false),
+        (0x00, "textureLoad", false),
+        (0x08, "textureStore", true),
+        (0x00, "textureLoad", true),
+    ] {
+        let mut words = image_words(op, 0xF, 1, false, &addr);
+        if d16 {
+            // d16 (bit 31 of the second word): two channels per register.
+            let at = words.iter().position(|&w| w == 0x0043_0C02).unwrap();
+            words[at] |= 1 << 31;
+        }
+        let l = lower_image(&words).unwrap_or_else(|e| panic!("{what} d16 {d16}: {e}"));
+        assert!(classes(&l), "{what} d16 {d16}: {:?}", l.user_data);
+        assert!(
+            !calls(&l, &format!("{what}.i32")).is_empty(),
+            "{what} d16 {d16}"
+        );
+        assert!(
+            !calls(&l, &format!("{what}.f32")).is_empty(),
+            "{what} d16 {d16}"
+        );
+        if !d16 {
+            // One integer access for each integer class, one float one.
+            assert_eq!(calls(&l, &format!("{what}.i32")).len(), 2, "{what}");
+            assert_eq!(calls(&l, &format!("{what}.f32")).len(), 1, "{what}");
+        }
+    }
+}
+
 /// The VOP3P integer dot products lower in the form assemblers write
 /// (op_sel_hi all set); op_sel, neg_hi, clamp and constant packed sources
 /// are refused rather than computed wrongly. An LDS store keeps the result
@@ -3213,10 +3338,123 @@ fn integer_dot_products_lower() {
     };
     for op in 0x14..=0x19u32 {
         dot(op, 0, 0x102).unwrap_or_else(|e| panic!("VOP3P {op:#x}: {e}"));
-        assert!(dot(op, 1 << 11, 0x102).is_err(), "op_sel, {op:#x}");
         assert!(dot(op, 1 << 8, 0x102).is_err(), "neg_hi, {op:#x}");
         assert!(dot(op, 1 << 15, 0x102).is_err(), "clamp, {op:#x}");
+        // The byte forms (0x16, 0x17) ignore OPSEL, which the console
+        // compiler sets to a pattern, and take constants (see `valu_tests`).
+        if matches!(op, 0x16 | 0x17) {
+            continue;
+        }
+        assert!(dot(op, 1 << 11, 0x102).is_err(), "op_sel, {op:#x}");
         // src1 the inline constant 1 instead of v2.
         assert!(dot(op, 0, 0x81).is_err(), "constant, {op:#x}");
     }
+}
+
+/// A structured SRV of a stride other than 4 carries alignment bits in its
+/// kind word and is still one; a structured UAV is not.
+#[test]
+fn structured_srvs_are_told_by_kind_whatever_their_alignment() {
+    assert!(structured_srv(super::Lower::buffer_props(Some(4), false)));
+    assert!(structured_srv(super::Lower::buffer_props(Some(12), false)));
+    assert_eq!(super::Lower::buffer_props(Some(12), false).0, 0x020C);
+    assert!(!structured_srv(super::Lower::buffer_props(Some(12), true)));
+    assert!(!structured_srv(super::Lower::buffer_props(None, false)));
+}
+
+/// A loop with two exits, a uniform break and the lanes running out, that
+/// join before the mask is counted: neither exit is on every path to the
+/// count, so the ballot is not placed at either (it would not dominate
+/// the read).
+#[test]
+fn a_mask_read_after_two_loop_exits_is_not_balloted_at_one() {
+    let words: &[u32] = &[
+        0x4A02_0081, // v_add_nc_u32 v1, 1, v0
+        0xBE8A_0380, // s_mov_b32 s10, 0
+        0xBE8B_0380, // s_mov_b32 s11, 0
+        0x4E02_0281, // loop: v_subrev_nc_u32 v1, 1, v1
+        0x7D84_0280, // v_cmp_eq_u32 vcc_lo, 0, v1
+        0x880A_0A6A, // s_or_b32 s10, vcc_lo, s10
+        0x800B_810B, // s_add_u32 s11, s11, 1
+        0xBF06_830B, // s_cmp_eq_u32 s11, 3
+        0xBF85_0003, // s_cbranch_scc1 break
+        0x8A7E_0A7E, // s_andn2_b32 exec_lo, exec_lo, s10
+        0xBF89_FFF8, // s_cbranch_execnz loop
+        0xBF82_0001, // s_branch join
+        0x7E06_0280, // break: v_mov_b32 v3, 0
+        0x887E_0A7E, // join: s_or_b32 exec_lo, exec_lo, s10
+        0xBE89_0F0A, // s_bcnt1_i32_b32 s9, s10
+        0x7E04_0209, // v_mov_b32 v2, s9
+        S_ENDPGM,
+    ];
+    let lowered = lower_words(words, 1 << 1).expect("lower");
+    assert_eq!(lowered.mask_ballots_after_loop, 0);
+    #[cfg(windows)]
+    {
+        if let Ok(mut v) = super::super::validator::Validator::load(
+            super::super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut lowered.dxil.clone())
+                .expect("DXIL validation failed");
+        }
+    }
+}
+
+#[test]
+fn a_descriptor_read_for_the_address_of_a_structure_in_title_memory_lowers() {
+    // A buffer descriptor from the table at s0 that no memory instruction
+    // takes: the program masks its base address out of words 0 and 1 (40
+    // bits, 256-byte aligned) and reads a header dword of the structure
+    // there, as programs that walk a ray-tracing structure do. Words 0 and
+    // 1 come from the host's list of view addresses; the header read goes
+    // through the title-memory directory.
+    let words = [
+        0xBE84_0300, // s_mov_b32 s4, s0
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF408_0202,
+        0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], null
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x870C_FF08,
+        0xFFFF_FF00, // s_and_b32 s12, s8, 0xffffff00
+        0x870D_FF09,
+        0x0000_00FF, // s_and_b32 s13, s9, 0xff
+        0x880C_B00C, // s_or_b32 s12, s12, 48
+        0xF400_0386,
+        0xFA00_0000, // s_load_dword s14, s[12:13], null
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x7E02_020E, // v_mov_b32 v1, s14
+        0xD834_0000,
+        0x0000_0100, // ds_write_b32 v0, v1
+        S_ENDPGM,
+    ];
+    let used = vec![UsedResource {
+        kind: ResourceType::Srv,
+        root: RootType::Table,
+        table_offset_dwords: 0,
+        lower_bound: 0,
+        stride: 4,
+        dwords: 4,
+        user_data: 0,
+        slot: 0,
+    }];
+    let l = lower_with(&words, vec![root(RootType::Table, 0, 0)], used).unwrap();
+    let reads = |root| l.user_data.iter().any(|u| u.root == root);
+    assert!(reads(RootType::ResourceHeap), "{:?}", l.user_data);
+    assert!(
+        reads(RootType::Other(crate::emit::USER_VIEW_ADDRESSES)),
+        "{:?}",
+        l.user_data
+    );
+    assert!(
+        reads(RootType::Other(crate::emit::USER_MEMORY_BASE)),
+        "{:?}",
+        l.user_data
+    );
+    // The record is looked up at the title's slot, wherever the host bound
+    // its copy of the root table.
+    assert!(
+        reads(RootType::Other(crate::emit::USER_TABLE_SLOTS)),
+        "{:?}",
+        l.user_data
+    );
 }

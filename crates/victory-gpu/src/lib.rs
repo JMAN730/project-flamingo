@@ -22,6 +22,8 @@
 mod adapter;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod cbv_trace;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
@@ -62,6 +64,8 @@ pub mod pipeline;
 #[cfg(windows)]
 mod present_compositor;
 #[cfg(windows)]
+mod present_params;
+#[cfg(windows)]
 mod primitive;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod profile;
@@ -92,7 +96,7 @@ mod upload_pool;
 mod watch;
 
 #[cfg(windows)]
-pub use host::{HdrDisplayInfo, display_hdr_info, on_failure, write_title_memory};
+pub use host::{HdrDisplayInfo, display_hdr_info, on_failure, title_told_hdr, write_title_memory};
 #[cfg(windows)]
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_view};
 #[cfg(windows)]

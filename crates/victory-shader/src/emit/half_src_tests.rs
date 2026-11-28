@@ -106,6 +106,7 @@ fn lower_body(body: &[u32]) -> lower::Lowered {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        mesh_buffer: false,
     })
     .expect("lower")
 }

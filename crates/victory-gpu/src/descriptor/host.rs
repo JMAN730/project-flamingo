@@ -828,6 +828,12 @@ pub(crate) struct HostHeap {
     next: Mutex<(u32, Vec<bool>)>,
     /// Leaf-only tracker of live SRV/UAV textures across title slots.
     tex_tracker: Mutex<TexTracker>,
+    /// The buffer view table translated shaders may read ([`super::table`]),
+    /// made on first use.
+    pub(super) buffer_table: Mutex<Option<super::table::BufferTable>>,
+    /// Counts slots made from another record than before (or made null),
+    /// for the buffer view table to tell when it must look again.
+    pub(super) writes: std::sync::atomic::AtomicU64,
     /// Lock-free occupancy bitset mirroring live texture slots in `tex_tracker`
     /// so non-texture / null mirrors skip locking `tex_tracker`.
     tex_slots: Slots,
@@ -839,6 +845,44 @@ pub(crate) struct HostHeap {
     /// Mirrors `tex_tracker.generation` so `tex_gen()` is lock-free on every
     /// bindless draw.
     tex_gen: AtomicU64,
+    /// The numeric class of each title slot's host view
+    /// (`victory_shader::emit::USER_VIEW_CLASSES`).
+    classes: Vec<AtomicU8>,
+    /// Those classes where translated image accesses read them, made on
+    /// first use, and whether it was filled once more after it was there
+    /// to take each change.
+    class_list: OnceLock<Option<ClassList>>,
+    class_list_filled: std::sync::atomic::AtomicBool,
+}
+
+/// A view heap's list of view classes (`victory_shader::emit::USER_VIEW_CLASSES`):
+/// one dword per title slot in CPU-visible memory the GPU reads, viewed raw
+/// at a dynamic slot of the heap.
+struct ClassList {
+    buffer: ID3D12Resource,
+    data: usize,
+    slot: u32,
+}
+
+// SAFETY: `data` is the persistent mapping of `buffer`; each dword is a
+// slot's class, written whole (a race between two writes of one slot leaves
+// one of them, as with the slot's descriptor).
+unsafe impl Send for ClassList {}
+// SAFETY: as for `Send`.
+unsafe impl Sync for ClassList {}
+
+impl ClassList {
+    fn write(&self, index: u32, class: u32) {
+        // SAFETY: the mapping covers a dword per title slot, and callers pass
+        // a title slot.
+        unsafe { ((self.data + index as usize * 4) as *mut u32).write_volatile(class) };
+    }
+
+    fn fill(&self, classes: &[AtomicU8]) {
+        for (index, class) in classes.iter().enumerate() {
+            self.write(index as u32, u32::from(class.load(Ordering::Acquire)));
+        }
+    }
 }
 
 /// Host heaps' GPU ranges (start, bytes, bytes per slot, sampler), for
@@ -1150,10 +1194,17 @@ impl HostHeap {
             srv_mips_slots: Slots::new(if sampler { 0 } else { count as usize }),
             next: Mutex::new((0, vec![false; extra as usize])),
             tex_tracker: Mutex::new(TexTracker::new(sampler, count)),
+            buffer_table: Mutex::new(None),
+            writes: std::sync::atomic::AtomicU64::new(0),
             tex_slots: Slots::new(if sampler { 0 } else { count as usize }),
             buf_tracker: Mutex::new(BufTracker::default()),
             buf_slots: Slots::new(if sampler { 0 } else { count as usize }),
             tex_gen: AtomicU64::new(0),
+            classes: (0..if sampler { 0 } else { count })
+                .map(|_| AtomicU8::new(0))
+                .collect(),
+            class_list: OnceLock::new(),
+            class_list_filled: std::sync::atomic::AtomicBool::new(false),
         };
         // A slot never written is undefined: shaders reading one (a slot
         // the title wrote in a way we do not know, or a table entry no
@@ -1174,6 +1225,7 @@ impl HostHeap {
             ms = started.elapsed().as_millis(),
             "host descriptor heap made null"
         );
+        super::check::forget(h.cpu, (count + extra) as usize * h.step as usize);
         Some(h)
     }
 
@@ -1244,6 +1296,7 @@ fn null_sampler(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     };
     // SAFETY: a slot of a sampler heap of ours.
     unsafe { host.device.CreateSampler(&desc, at) };
+    super::check::note(at, super::check::Kind::SAMPLER);
 }
 
 impl HostHeap {
@@ -1292,6 +1345,50 @@ impl HostHeap {
     /// when the host caps its size.
     pub(crate) fn count(&self) -> u32 {
         self.count
+    }
+
+    /// Notes the class of the view now at slot `index` (in the list too,
+    /// once there is one).
+    fn set_view_class(&self, index: u32, class: u32) {
+        if let Some(c) = self.classes.get(index as usize)
+            && u32::from(c.swap(class as u8, Ordering::AcqRel)) != class
+            && let Some(Some(list)) = self.class_list.get()
+        {
+            list.write(index, class);
+        }
+    }
+
+    /// The buffer of this view heap's list of view classes and the heap slot
+    /// of its raw view (`victory_shader::emit::USER_VIEW_CLASSES`), made on
+    /// first use. None for a sampler heap, or if the host cannot make it.
+    pub(crate) fn view_class_list(&self) -> Option<(&ID3D12Resource, u32)> {
+        let list = self
+            .class_list
+            .get_or_init(|| {
+                if self.sampler {
+                    return None;
+                }
+                let bytes = u64::from(self.count.max(1)) * 4;
+                let (buffer, data) = host()?.shared_buffer(bytes.next_multiple_of(1 << 16))?;
+                crate::host::name(&buffer, || "view class list".to_owned());
+                let slot = self.dynamic(1)?;
+                self.raw_resource_at(slot, &buffer, 0, bytes);
+                let list = ClassList {
+                    buffer,
+                    data: data as usize,
+                    slot,
+                };
+                list.fill(&self.classes);
+                tracing::info!(slots = self.count, "view class list made");
+                Some(list)
+            })
+            .as_ref()?;
+        // Classes that changed while the list was made, before it took
+        // changes itself.
+        if !self.class_list_filled.swap(true, Ordering::AcqRel) {
+            list.fill(&self.classes);
+        }
+        Some((&list.buffer, list.slot))
     }
 
     /// Gives back `n` dynamic slots from `first` (an index [`dynamic`]
@@ -1434,6 +1531,7 @@ impl HostHeap {
                 D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
             );
         }
+        self.note_copied(to, from);
     }
 
     /// Makes slot `index` (a dynamic one) a structured buffer alias with
@@ -1480,6 +1578,11 @@ impl HostHeap {
     }
 
     fn keep_opt(&self, index: u32, kept: Kept, retired: Option<&mut Vec<KeptObject>>) {
+        let class = match &kept {
+            Kept::Texture { class, .. } => *class,
+            _ => victory_shader::emit::VIEW_CLASS_FLOAT,
+        };
+        self.set_view_class(index, class);
         let (resource, refresh, host_mips) = match kept {
             Kept::Empty => (None, None, None),
             Kept::Resource(r) => (Some(KeptObject::Resource(r)), None, None),
@@ -1489,6 +1592,7 @@ impl HostHeap {
                 title,
                 is_uav: false,
                 host_mips: Some(mips),
+                ..
             } => (
                 Some(KeptObject::Resource(resource)),
                 None,
@@ -1587,6 +1691,7 @@ impl HostHeap {
                 host.device
                     .CreateConstantBufferView(Some(&desc), self.at(index))
             };
+            super::check::note(self.at(index), super::check::Kind::cbv(false));
             self.put(index);
         }
         self.keep(index, Kept::Empty);
@@ -1641,6 +1746,7 @@ impl HostHeap {
             host.device
                 .CreateShaderResourceView(buffer, Some(&desc), self.at(index))
         };
+        super::check::note(self.at(index), super::check::Kind::srv(Some(&desc), false));
         self.put(index);
         self.keep(index, kept);
     }
@@ -1699,6 +1805,7 @@ impl HostHeap {
                 self.at(index),
             )
         };
+        super::check::note(self.at(index), super::check::Kind::uav(Some(&desc), false));
         self.put(index);
         self.keep(index, kept);
     }
@@ -1717,9 +1824,26 @@ impl HostHeap {
                     self.at(index),
                 )
             };
+            super::check::note(self.at(index), super::check::Kind::uav(Some(&desc), true));
             self.put(index);
         }
         self.keep(index, Kept::Empty);
+    }
+
+    /// The kind of descriptor at slot `index`, marked read by a submission
+    /// of host fence value `read_by` or later (`VICTORY_CHECK_DESCRIPTORS`);
+    /// `None` past the heap's end.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn checked_kind(&self, index: u32, read_by: u64) -> Option<super::check::Kind> {
+        if index >= self.count.saturating_add(self.spare) {
+            return None;
+        }
+        let initial = if self.sampler {
+            super::check::Kind::SAMPLER
+        } else {
+            super::check::Kind::INITIAL_VIEW
+        };
+        Some(super::check::read(self.cpu(index), initial, read_by))
     }
 
     /// The shader-visible handle of slot `index`.
@@ -1752,6 +1876,20 @@ impl HostHeap {
             host.device
                 .CopyDescriptorsSimple(1, self.cpu(index), from, kind)
         };
+        self.note_copied(index, from);
+    }
+
+    /// `VICTORY_CHECK_DESCRIPTORS`: slot `index` now holds the kind noted
+    /// at `from`, the staging slot it was copied from.
+    fn note_copied(&self, index: u32, from: D3D12_CPU_DESCRIPTOR_HANDLE) {
+        if super::check::enabled() {
+            let initial = if self.sampler {
+                super::check::Kind::SAMPLER
+            } else {
+                super::check::Kind::INITIAL_VIEW
+            };
+            super::check::note(self.cpu(index), super::check::read(from, initial, 0));
+        }
     }
 
     fn cpu(&self, index: u32) -> D3D12_CPU_DESCRIPTOR_HANDLE {
@@ -1852,6 +1990,8 @@ impl HostHeap {
             // Not a view of ours (never written, or of a resource the
             // title released): nothing to read.
             if shown != 0 {
+                self.writes
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 self.fast[index as usize].store(0, Ordering::Release);
                 self.made.set(index, 0);
                 if !self.sampler {
@@ -1877,6 +2017,8 @@ impl HostHeap {
                 }
             };
         if shown != key || widen {
+            self.writes
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let later = !opts.for_draw && view.is_buffer();
             let target_null = if later && !self.sampler {
                 null_kind_of(&view)
@@ -2221,30 +2363,8 @@ impl HostHeap {
         if changed.is_empty() {
             return;
         }
-        let desc_fast = descriptor_fast();
-        if !desc_fast {
-            let mut retired = Vec::new();
-            for &slot in changed {
-                if slot.words[0] != VIEW_TAG {
-                    if self.shows_none(slot.index) {
-                        continue;
-                    }
-                    let _held = self.made.lock(slot.index);
-                    if self.made.get(slot.index).unwrap_or(0) != 0 {
-                        self.fast[slot.index as usize].store(0, Ordering::Release);
-                        self.made.set(slot.index, 0);
-                        if !self.sampler {
-                            self.made.set_null_kind(slot.index, NullKind::Tex2dSrv);
-                        }
-                        self.make_null_opt(slot.index, Some(&mut retired));
-                        self.track_slot(slot.index, None);
-                        self.track_buffer(slot.index, None);
-                    }
-                } else {
-                    self.mirror_words(slot.index, slot.words, for_draw, false, Some(&mut retired));
-                }
-            }
-            crate::host::retire_executing_batch(retired);
+        if !descriptor_fast() {
+            self.apply_changed_slots_plain(changed, for_draw);
             return;
         }
 
@@ -2270,6 +2390,37 @@ impl HostHeap {
                     &mut todo,
                     &mut retired,
                 );
+            }
+        }
+        crate::host::retire_executing_batch(retired);
+    }
+
+    /// [`Self::apply_changed_slots`] slot by slot, without the batching
+    /// (`VICTORY_DESCRIPTOR_FAST=0`).
+    fn apply_changed_slots_plain(&self, changed: &[ChangedSlot], for_draw: bool) {
+        let mut retired = Vec::new();
+        for &slot in changed {
+            if slot.words[0] != VIEW_TAG {
+                if self.shows_none(slot.index) {
+                    continue;
+                }
+                let _held = self.made.lock(slot.index);
+                if self.made.get(slot.index).unwrap_or(0) != 0 {
+                    // The buffer view table lists what the slot showed: it
+                    // looks again only when this count moved.
+                    self.writes
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    self.fast[slot.index as usize].store(0, Ordering::Release);
+                    self.made.set(slot.index, 0);
+                    if !self.sampler {
+                        self.made.set_null_kind(slot.index, NullKind::Tex2dSrv);
+                    }
+                    self.make_null_opt(slot.index, Some(&mut retired));
+                    self.track_slot(slot.index, None);
+                    self.track_buffer(slot.index, None);
+                }
+            } else {
+                self.mirror_words(slot.index, slot.words, for_draw, false, Some(&mut retired));
             }
         }
         crate::host::retire_executing_batch(retired);
@@ -3291,8 +3442,12 @@ fn narrow_to_resident(
     }
     // Prefer the window the last staging refresh noted; fall back to a live
     // mapped-prefix query so the first view before any upload is still clamped.
-    let resident =
-        crate::texture::resident(resource).or_else(|| crate::texture::live_resident(resource))?;
+    // The noted window names the host copy's levels (the refresh that
+    // notes it counts them so); the live query reads the title's layout
+    // and names the title's, which the copy may lack the top ones of.
+    let resident = crate::texture::resident(resource).or_else(|| {
+        crate::texture::live_resident(resource).map(|window| resident_on_host(resource, window))
+    })?;
     if resident.1 == 0 {
         return None;
     }
@@ -3347,6 +3502,15 @@ fn narrow_to_resident(
     Some((first, count))
 }
 
+/// The resident levels `window` (first, count) of title texture `resource`
+/// as read from the title's own layout (`texture::live_resident`), which
+/// name the title's levels, as its host copy numbers them: the copy may
+/// lack the title's top levels (`resource::dropped_mips`). A window noted
+/// by a refresh (`texture::resident`) is in the copy's numbers already.
+fn resident_on_host(resource: crate::object::This, window: (u32, u32)) -> (u32, u32) {
+    crate::resource::rebase_mip_range(window.0, window.1, crate::resource::dropped_mips(resource))
+}
+
 /// Whether a host SRV made with `host_mips` for title view `view` should be
 /// remade because more (or all) streamed levels have arrived.
 fn residency_widened(view: &View, title: usize, host_mips: (u32, u32)) -> bool {
@@ -3356,8 +3520,19 @@ fn residency_widened(view: &View, title: usize, host_mips: (u32, u32)) -> bool {
     // SAFETY: a live resource when this slot still holds it.
     let rd = unsafe { texture.GetDesc() };
     let mips = u32::from(rd.MipLevels);
+    // What the title asks for, as the host copy numbers its levels: the
+    // view was made that way, and a copy without its top levels would
+    // otherwise differ from the title's numbers at every look.
+    let on_host = |words: &[u32; 10]| {
+        let mut desc = srv_desc(words);
+        drop_mips_in_srv(
+            &mut desc,
+            crate::resource::dropped_mips(title as crate::object::This),
+        );
+        asked_srv_mips(&desc, mips)
+    };
     let asked = match view {
-        View::Shader(_, Some(w)) => match asked_srv_mips(&srv_desc(w), mips) {
+        View::Shader(_, Some(w)) => match on_host(w) {
             Some(a) => a,
             None => return false,
         },
@@ -3366,7 +3541,7 @@ fn residency_widened(view: &View, title: usize, host_mips: (u32, u32)) -> bool {
                 Ok(w) => w,
                 Err(_) => return false,
             };
-            match asked_srv_mips(&srv_desc(&words), mips) {
+            match on_host(&words) {
                 Some(a) => a,
                 None => return false,
             }
@@ -3400,6 +3575,7 @@ fn residency_widened(view: &View, title: usize, host_mips: (u32, u32)) -> bool {
         }
     } else {
         match crate::texture::resident(title as crate::object::This) {
+            // The noted window already names the host copy's levels.
             Some(window) if window.1 > 0 => crate::texture::narrowed(asked, window, mips),
             // Fully mapped (or no longer tracked as partial): the title's range.
             _ if host_mips != asked => asked,
@@ -3657,12 +3833,14 @@ enum Kept {
     /// access kind so [`HostHeap::mirror`] can track it without re-reading the
     /// title pointer after `make`. `host_mips` is the `(MostDetailedMip,
     /// MipLevels)` the host SRV was made with (`None` for UAVs), so a later
-    /// mirror can remake it when more streamed levels arrive.
+    /// mirror can remake it when more streamed levels arrive. `class` is
+    /// the numeric class of the host view's format ([`view_class`]).
     Texture {
         resource: ID3D12Resource,
         title: usize,
         is_uav: bool,
         host_mips: Option<(u32, u32)>,
+        class: u32,
     },
     AliasedShadow {
         shadow: Arc<Shadow>,
@@ -3691,6 +3869,8 @@ pub(crate) struct BufferRead {
     pub(crate) shadow: Arc<crate::shadow::Shadow>,
     pub(crate) address: u64,
     pub(crate) bytes: u64,
+    /// Bytes per element; 0 for a raw view, which an index does not move
+    /// through (the console's zero-stride buffer).
     pub(crate) stride: u32,
 }
 
@@ -3705,7 +3885,7 @@ pub(crate) fn selected_buffer(view: &View) -> Option<BufferRead> {
     let b = unsafe { desc.Anonymous.Buffer };
     let element = element_size(&desc);
     let stride = if b.Flags == D3D12_BUFFER_SRV_FLAG_RAW {
-        1
+        0
     } else {
         element.try_into().ok()?
     };
@@ -3733,6 +3913,12 @@ pub(crate) fn selected_buffer(view: &View) -> Option<BufferRead> {
 /// Re-expresses the exact byte start and length of a raw buffer SRV as
 /// structured elements of width `stride`, rejecting typed or already-structured
 /// views and fractional bounds.
+/// Whether `view` is a raw buffer view that [`HostHeap::make_structured_at`]
+/// can alias as `stride`-byte structured elements.
+pub(crate) fn raw_aliasable(view: &View, stride: u32) -> bool {
+    buffer_srv_parts(view).is_some_and(|(_, _, desc)| structured_alias(desc, stride).is_some())
+}
+
 fn structured_alias(
     mut desc: D3D12_SHADER_RESOURCE_VIEW_DESC,
     stride: u32,
@@ -3838,6 +4024,7 @@ fn buffer_srv_inner(
             host.device
                 .CreateShaderResourceView(&copy.buffer, Some(&desc), at)
         };
+        super::check::note(at, super::check::Kind::srv(Some(&desc), false));
         return Some(Kept::AliasedShadow {
             shadow: copy,
             address: start,
@@ -3862,6 +4049,7 @@ fn buffer_srv_inner(
         host.device
             .CreateShaderResourceView(&shadow.buffer, Some(&desc), at)
     };
+    super::check::note(at, super::check::Kind::srv(Some(&desc), false));
     if track_shadow {
         Some(Kept::AliasedShadow {
             shadow,
@@ -3959,6 +4147,7 @@ fn buffer_uav(
             at,
         )
     };
+    super::check::note(at, super::check::Kind::uav(Some(&desc), false));
     if WANT_COPY_HINT.with(std::cell::Cell::get) {
         record_buffer_copy_hint(&shadow, view_start, view_len);
     }
@@ -4266,6 +4455,38 @@ fn default_uav_desc(
     Some(desc)
 }
 
+/// The numeric class of the DXGI view format `format`, which translated
+/// image accesses take (`victory_shader::emit::USER_VIEW_CLASSES`): UINT,
+/// SINT, or float for every other format (UNORM and SNORM ones too).
+pub(crate) fn view_class(format: u32) -> u32 {
+    use victory_shader::emit::{VIEW_CLASS_FLOAT, VIEW_CLASS_SINT, VIEW_CLASS_UINT};
+    // The UINT and SINT view formats; the stencil views (22, 47) read the
+    // stencil as an unsigned integer.
+    const UINTS: [u32; 13] = [3, 7, 12, 17, 22, 25, 30, 36, 42, 47, 50, 57, 62];
+    const SINTS: [u32; 10] = [4, 8, 14, 18, 32, 38, 43, 52, 59, 64];
+    if UINTS.contains(&format) {
+        VIEW_CLASS_UINT
+    } else if SINTS.contains(&format) {
+        VIEW_CLASS_SINT
+    } else {
+        VIEW_CLASS_FLOAT
+    }
+}
+
+/// Whether a typed texture of format `own` may be viewed in the format
+/// `view` of its family, of another numeric class, where the host casts
+/// typed formats ([`casts_typed`]): `view` is UINT or SINT and `own` is
+/// neither FLOAT (2, 6, 10, 16, 34, 41, 54) nor sRGB, so the cast is never
+/// FLOAT to another type nor UNORM to SNORM.
+fn integer_cast(view: u32, own: u32) -> bool {
+    const FLOATS: [u32; 7] = [2, 6, 10, 16, 34, 41, 54];
+    use victory_shader::emit::VIEW_CLASS_FLOAT;
+    view_class(view) != VIEW_CLASS_FLOAT
+        && view_class(view) != view_class(own)
+        && !FLOATS.contains(&own)
+        && !crate::resource::SRGB.iter().any(|&(s, _)| s == own)
+}
+
 /// Whether the host can make a shader (or unordered access) view of
 /// `texture` in `format` (none: the texture's own). The console allows any
 /// view; the host refuses (and removes the device for) views without the
@@ -4273,9 +4494,12 @@ fn default_uav_desc(
 /// typed resource's, but for casts it allows (see [`casts_typed`]). A view
 /// of a typed texture in another format of its family takes the texture's
 /// format, unless it is the texture's sRGB or linear twin and the host
-/// casts: then the hardware converts (or not) as the console does.
-/// shortcut: other casts within a family (UINT of UNORM, say) read as the
-/// texture's own format.
+/// casts: then the hardware converts (or not) as the console does. So is
+/// an integer view of a UNORM or SNORM texture ([`integer_cast`]): its
+/// numeric class decides how translated image accesses take their data.
+/// shortcut: other casts within a family (UINT of FLOAT, UNORM of UINT)
+/// read as the texture's own format, and so do integer views where the
+/// host does not cast.
 fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordered: bool) -> bool {
     use crate::resource::{DEPTH_FORMATS, family};
     // SAFETY: a live resource.
@@ -4328,8 +4552,19 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
         .any(|&(s, l)| (s, l) == (view, own) || (l, s) == (view, own));
     if let Some(format) = format
         && !typeless
-        && !(twin && casts_typed())
+        && !((twin || integer_cast(view, own)) && casts_typed())
     {
+        if view_class(view) != view_class(own) {
+            // Translated image accesses take the class of the format the
+            // host views: an integer view read or written as floats (or
+            // the reverse) converts its data where the console would not.
+            once!(
+                view,
+                own,
+                unordered,
+                "a view of another numeric class than its typed texture takes the texture's format"
+            );
+        }
         *format = d.Format;
     }
     true
@@ -4364,8 +4599,6 @@ fn twin_uav(
         }
         all
     });
-    // A stencil plane's twin (R8 typeless, 60): the title's view is of the
-    // stencil plane if it names plane 1 or a stencil view format (22, 47).
     if d.Format.0 == 60 {
         let mut plane = 0;
         match desc.ViewDimension {
@@ -4383,22 +4616,38 @@ fn twin_uav(
             }
             _ => {}
         }
-        if plane != 1 && !matches!(desc.Format.0, 22 | 47) {
-            return None;
-        }
-        desc.Format.0 = 62;
+        desc.Format.0 = twin_view_format(desc.Format.0 as u32, plane, 60)? as i32;
         return Some(desc);
     }
-    // None, typeless and depth formats (R16: 0, 53, 55; R32: 0, 39, 40),
-    // and those of a depth-stencil format's depth plane (19 to 21, 44 to
-    // 46), for the twin of such a plane: the twin's UNORM / float view
-    // formats (R16_UNORM 56, R32_FLOAT 41).
-    desc.Format.0 = match (desc.Format.0, d.Format.0) {
+    desc.Format.0 = twin_view_format(desc.Format.0 as u32, 0, d.Format.0 as u32)? as i32;
+    Some(desc)
+}
+
+/// The format of the view of a depth texture's colour twin (of format
+/// `twin`) that stands for the title's unordered access view of format
+/// `view` (its plane slice `plane`), or `None` if the twin does not stand
+/// for that view.
+///
+/// A stencil plane's twin (R8 typeless, 60) stands for views of the
+/// stencil plane: those naming plane 1 or a stencil view format (22, 47).
+/// Their view is R8_UINT (62), as the console's stencil views are unsigned
+/// integer: its image stores take the data registers as the integer to
+/// write, and the translated store, finding the view UINT in the view
+/// class list, stores them as one.
+///
+/// For the twin of a one-plane depth texture or of a depth plane: none,
+/// typeless and depth formats (R16: 0, 53, 55; R32: 0, 39, 40) and those
+/// of a depth-stencil format's depth plane (19 to 21, 44 to 46) take the
+/// twin's UNORM / float view format (R16_UNORM 56, R32_FLOAT 41).
+fn twin_view_format(view: u32, plane: u32, twin: u32) -> Option<u32> {
+    if twin == 60 {
+        return (plane == 1 || matches!(view, 22 | 47)).then_some(DXGI_FORMAT_R8_UINT.0 as u32);
+    }
+    Some(match (view, twin) {
         (0 | 53 | 55 | 19..=21 | 44..=46, 53) => 56,
         (0 | 39 | 40 | 19..=21 | 44..=46, 39) => 41,
         (other, _) => other,
-    };
-    Some(desc)
+    })
 }
 
 /// Makes the host descriptor for `view` at `at`: the host resource it
@@ -4423,8 +4672,19 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 BufferLocation: gpu,
                 SizeInBytes: size.next_multiple_of(256),
             };
+            #[cfg(feature = "diagnostics")]
+            if let Some(hash) = crate::cbv_trace::on() {
+                tracing::info!(
+                    hash,
+                    address = format_args!("{address:#x}"),
+                    size,
+                    host_copy = format_args!("{gpu:#x}"),
+                    "cbv trace: constant view made at a title slot, on the buffer's host copy"
+                );
+            }
             // SAFETY: a slot of our heap; the range lies in the host copy.
             unsafe { device.CreateConstantBufferView(Some(&desc), at) };
+            super::check::note(at, super::check::Kind::cbv(false));
             if WANT_COPY_HINT.with(std::cell::Cell::get) {
                 record_buffer_copy_hint(&shadow, address, u64::from(size));
             }
@@ -4472,11 +4732,13 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                         at,
                     )
                 };
+                super::check::note(at, super::check::Kind::srv(desc.as_ref(), false));
                 Some(Kept::Texture {
                     resource: texture.clone(),
                     title: resource as usize,
                     is_uav: false,
                     host_mips,
+                    class: view_class(desc.as_ref().map_or(own, |d| d.Format.0 as u32)),
                 })
             } else if let (Some((data, len)), Some(desc)) =
                 (crate::resource::buffer_bytes(resource), desc)
@@ -4541,11 +4803,19 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                     at,
                 )
             };
+            super::check::note(at, super::check::Kind::uav(desc.as_ref(), false));
+            // The view's format: its own, or the texture's (a twin's own).
+            let format = desc.as_ref().map_or_else(
+                // SAFETY: a live resource.
+                || unsafe { texture.GetDesc() }.Format.0 as u32,
+                |d| d.Format.0 as u32,
+            );
             Some(Kept::Texture {
                 resource: texture.clone(),
                 title: resource as usize,
                 is_uav: true,
                 host_mips: None,
+                class: view_class(format),
             })
         }
         View::Sampler(words) => {
@@ -4557,12 +4827,14 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             };
             // SAFETY: a slot of our sampler heap.
             unsafe { device.CreateSampler(&desc, at) };
+            super::check::note(at, super::check::Kind::SAMPLER);
             Some(Kept::Empty)
         }
         View::ConsoleSampler(words) => {
             let desc = crate::sampler::console(words);
             // SAFETY: a slot of our sampler heap.
             unsafe { device.CreateSampler(&desc, at) };
+            super::check::note(at, super::check::Kind::SAMPLER);
             Some(Kept::Empty)
         }
         View::Placed(unordered, resource, desc) => {
@@ -4661,6 +4933,7 @@ fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
         }
         View::Constant(..) => {
             let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC::default();
+            super::check::note(at, super::check::Kind::cbv(true));
             // SAFETY: a slot of our heap; a zero location makes a null view.
             return unsafe { host.device.CreateConstantBufferView(Some(&desc), at) };
         }
@@ -4684,6 +4957,7 @@ fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
             at,
         )
     };
+    super::check::note(at, super::check::Kind::uav(Some(&desc), true));
 }
 
 /// A null texture UAV of the title's view dimension (1D, 1D or 2D arrays,
@@ -4753,6 +5027,7 @@ fn null_buffer_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
         host.device
             .CreateShaderResourceView(None::<&ID3D12Resource>, Some(&desc), at)
     };
+    super::check::note(at, super::check::Kind::srv(Some(&desc), true));
 }
 
 /// A texture view that reads zeros with the dimension (and mip and array
@@ -4780,6 +5055,7 @@ fn null_like(words: &[u32; 10], at: D3D12_CPU_DESCRIPTOR_HANDLE) {
         host.device
             .CreateShaderResourceView(None::<&ID3D12Resource>, Some(&desc), at)
     };
+    super::check::note(at, super::check::Kind::srv(Some(&desc), true));
 }
 
 /// A view that reads zeros, for slots whose view the host cannot make.
@@ -4804,6 +5080,7 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
         host.device
             .CreateShaderResourceView(None::<&ID3D12Resource>, Some(&desc), at)
     };
+    super::check::note(at, super::check::Kind::srv(Some(&desc), true));
 }
 
 /// Whether `view` names a texture resource (or placed texture).
@@ -4984,6 +5261,83 @@ mod tests {
         assert!(!in_buffer(256, 1 << 62, 1, 16));
     }
 
+    /// Translated image accesses take the class of the host view's format:
+    /// UINT and SINT formats by the DXGI numbers, everything else float. An
+    /// integer view of a UNORM or SNORM texture may be cast to; one of a
+    /// FLOAT or sRGB texture, or of its own class, is not.
+    #[test]
+    fn view_formats_have_the_numeric_class_of_their_type() {
+        use victory_shader::emit::{VIEW_CLASS_FLOAT, VIEW_CLASS_SINT, VIEW_CLASS_UINT};
+        use windows::Win32::Graphics::Dxgi::Common::*;
+        for f in [
+            DXGI_FORMAT_R32_UINT,
+            DXGI_FORMAT_R8_UINT,
+            DXGI_FORMAT_R8G8B8A8_UINT,
+            DXGI_FORMAT_R16G16B16A16_UINT,
+            DXGI_FORMAT_R10G10B10A2_UINT,
+            DXGI_FORMAT_X24_TYPELESS_G8_UINT,
+            DXGI_FORMAT_X32_TYPELESS_G8X24_UINT,
+        ] {
+            assert_eq!(super::view_class(f.0 as u32), VIEW_CLASS_UINT, "{f:?}");
+        }
+        for f in [
+            DXGI_FORMAT_R32_SINT,
+            DXGI_FORMAT_R8_SINT,
+            DXGI_FORMAT_R16G16_SINT,
+        ] {
+            assert_eq!(super::view_class(f.0 as u32), VIEW_CLASS_SINT, "{f:?}");
+        }
+        for f in [
+            DXGI_FORMAT_R32_FLOAT,
+            DXGI_FORMAT_R8_UNORM,
+            DXGI_FORMAT_R8_SNORM,
+            DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
+            DXGI_FORMAT_UNKNOWN,
+        ] {
+            assert_eq!(super::view_class(f.0 as u32), VIEW_CLASS_FLOAT, "{f:?}");
+        }
+        let cast =
+            |view: DXGI_FORMAT, own: DXGI_FORMAT| super::integer_cast(view.0 as u32, own.0 as u32);
+        assert!(cast(DXGI_FORMAT_R8_UINT, DXGI_FORMAT_R8_UNORM));
+        assert!(cast(DXGI_FORMAT_R16_SINT, DXGI_FORMAT_R16_SNORM));
+        assert!(!cast(DXGI_FORMAT_R32_UINT, DXGI_FORMAT_R32_FLOAT));
+        assert!(!cast(
+            DXGI_FORMAT_R8G8B8A8_UINT,
+            DXGI_FORMAT_R8G8B8A8_UNORM_SRGB
+        ));
+        assert!(!cast(DXGI_FORMAT_R8_UNORM, DXGI_FORMAT_R8_UINT));
+        assert!(!cast(DXGI_FORMAT_R8_UINT, DXGI_FORMAT_R8_UINT));
+    }
+
+    /// A stencil plane's twin is viewed as unsigned integer (R8_UINT, not
+    /// R8_SNORM, the format after it), as the console's stencil views are:
+    /// an image store's data registers hold the stencil value as an
+    /// integer. Depth planes keep their UNORM / float views, and a view
+    /// that is not of the stencil plane gets none.
+    #[test]
+    fn a_stencil_twin_is_viewed_as_unsigned_integer() {
+        use windows::Win32::Graphics::Dxgi::Common::{
+            DXGI_FORMAT_R8_TYPELESS, DXGI_FORMAT_R8_UINT,
+        };
+        const R8_TYPELESS: u32 = DXGI_FORMAT_R8_TYPELESS.0 as u32;
+        const R8_UINT: u32 = DXGI_FORMAT_R8_UINT.0 as u32;
+        assert_eq!(
+            super::view_class(R8_UINT),
+            victory_shader::emit::VIEW_CLASS_UINT
+        );
+        // Stencil view formats (X32_TYPELESS_G8X24_UINT, X24_TYPELESS_G8_UINT),
+        // and plane 1 with any format.
+        assert_eq!(super::twin_view_format(47, 0, R8_TYPELESS), Some(R8_UINT));
+        assert_eq!(super::twin_view_format(22, 0, R8_TYPELESS), Some(R8_UINT));
+        assert_eq!(super::twin_view_format(0, 1, R8_TYPELESS), Some(R8_UINT));
+        // A view of the depth plane is not the stencil twin's.
+        assert_eq!(super::twin_view_format(46, 0, R8_TYPELESS), None);
+        // Depth twins: R16_UNORM and R32_FLOAT, other formats kept.
+        assert_eq!(super::twin_view_format(55, 0, 53), Some(56));
+        assert_eq!(super::twin_view_format(46, 0, 39), Some(41));
+        assert_eq!(super::twin_view_format(42, 0, 39), Some(42));
+    }
+
     /// A texture filled with less than was mapped is looked at again, but
     /// not for ever: memory that is shown and cannot be read ends it, and a
     /// filling that got everything starts the count anew.
@@ -5107,6 +5461,38 @@ mod tests {
         null_for(&view, heap.cpu(0));
         // SAFETY: a plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    /// A slot the title cleared counts as a write on the slot-by-slot path
+    /// too: the buffer view table brings its records up to date only when
+    /// the heap's write count moved, and would go on listing the view.
+    #[test]
+    fn a_slot_cleared_slot_by_slot_counts_as_a_write() {
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return; // no host GPU
+        };
+        {
+            // Slot 1 as made from a view record.
+            let _held = heap.made.lock(1);
+            heap.made.set(1, 1 << 32 | 1);
+        }
+        let writes = || heap.writes.load(std::sync::atomic::Ordering::Acquire);
+        let before = writes();
+        let cleared = [
+            ChangedSlot {
+                index: 1,
+                words: [0; 3],
+            },
+            ChangedSlot {
+                index: 2,
+                words: [0; 3],
+            },
+        ];
+        heap.apply_changed_slots_plain(&cleared, false);
+        assert!(heap.shows_none(1));
+        assert_eq!(writes(), before + 1, "slot 2 showed nothing already");
+        heap.apply_changed_slots_plain(&cleared, false);
+        assert_eq!(writes(), before + 1);
     }
 
     /// Buffer views of no elements (the title makes them for buffers it has
@@ -6968,7 +7354,13 @@ void main() {
         };
         heap.null_raw_at(index);
         let (slot_null, stage_null) = (bytes(heap.cpu(index)), bytes(a));
-        assert!(slot_null.is_some() && stage_null.is_some());
+        if slot_null.is_none() || stage_null.is_none() {
+            // Some drivers (NVIDIA's) hand out CPU descriptor handles that
+            // are not addresses of readable memory, so the bytes a view was
+            // made as cannot be compared on this host.
+            eprintln!("skipped: this host's CPU descriptor handles are not readable memory");
+            return;
+        }
 
         heap.constant_at(index, 0x1000, 256);
         let (slot_cbv, stage_cbv) = (bytes(heap.cpu(index)), bytes(a));

@@ -95,6 +95,7 @@ fn translate(words: &[u32]) -> Result<lower::Lowered, ShaderError> {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        mesh_buffer: false,
     })
 }
 

@@ -2333,6 +2333,7 @@ mod tests {
 
     #[test]
     fn lazy_read_fault_materializes_gpu_bytes() {
+        let _views = crate::inplace::view_tests_lock();
         let Some(h) = crate::host::host() else {
             return;
         };
@@ -2377,6 +2378,7 @@ mod tests {
 
     #[test]
     fn lazy_write_fault_preserves_both_gpu_and_cpu_bytes() {
+        let _views = crate::inplace::view_tests_lock();
         let Some(h) = crate::host::host() else {
             return;
         };
@@ -2430,6 +2432,7 @@ mod tests {
 
     #[test]
     fn lazy_multi_flight_reuse_skips_rearming() {
+        let _views = crate::inplace::view_tests_lock();
         let Some(h) = crate::host::host() else {
             return;
         };
@@ -2473,6 +2476,7 @@ mod tests {
 
     #[test]
     fn lazy_hot_promotion_after_three_frames_and_decay() {
+        let _views = crate::inplace::view_tests_lock();
         let Some(h) = crate::host::host() else {
             return;
         };
@@ -2528,6 +2532,7 @@ mod tests {
 
     #[test]
     fn lazy_internal_materialization_on_read_into_kernel_writing_and_unregister() {
+        let _views = crate::inplace::view_tests_lock();
         let Some(h) = crate::host::host() else {
             return;
         };
@@ -2609,6 +2614,7 @@ mod tests {
 
     #[test]
     fn lazy_aliased_section_views_protect_and_fault_across_aliases() {
+        let _views = crate::inplace::view_tests_lock();
         let Some(h) = crate::host::host() else {
             return;
         };
@@ -2709,6 +2715,7 @@ mod tests {
 
     #[test]
     fn lazy_merge_under_writes_update_busy_and_copy_runs_never_deadlock() {
+        let _views = crate::inplace::view_tests_lock();
         let Some(h) = crate::host::host() else {
             return;
         };
@@ -2853,6 +2860,7 @@ mod tests {
 
     #[test]
     fn lazy_first_page_sets_ever_active_before_virtual_protect() {
+        let _views = crate::inplace::view_tests_lock();
         let Some(h) = crate::host::host() else {
             return;
         };
@@ -2929,6 +2937,7 @@ mod tests {
 
     #[test]
     fn lazy_try_arm_under_guards_skips_pinned_and_clears_cold_state() {
+        let _views = crate::inplace::view_tests_lock();
         let Some(h) = crate::host::host() else {
             return;
         };
@@ -3034,6 +3043,7 @@ mod tests {
 
     #[test]
     fn lazy_fast_copy_rip_routes_to_fast_fill_without_materializing() {
+        let _views = crate::inplace::view_tests_lock();
         let Some(h) = crate::host::host() else {
             return;
         };
@@ -3080,6 +3090,7 @@ mod tests {
 
     #[test]
     fn lazy_fetcher_cross_queue_sync_reads_latest_direct_queue_writes() {
+        let _views = crate::inplace::view_tests_lock();
         let Some(h) = crate::host::host() else {
             return;
         };
@@ -3111,6 +3122,7 @@ mod tests {
 
     #[test]
     fn lazy_section_view_merges_via_own_view_before_restoring_prot() {
+        let _views = crate::inplace::view_tests_lock();
         let Some(h) = crate::host::host() else {
             return;
         };
@@ -3221,6 +3233,7 @@ mod tests {
 
     #[test]
     fn lazy_view_owner_skips_self_refresh_while_other_shadow_materializes_and_promotes_hot() {
+        let _views = crate::inplace::view_tests_lock();
         let Some(h) = crate::host::host() else {
             return;
         };
@@ -3380,6 +3393,7 @@ mod tests {
 
     #[test]
     fn lazy_materialize_ranges_batches_multi_block_and_multi_shadow_into_single_dma() {
+        let _views = crate::inplace::view_tests_lock();
         let Some(h) = crate::host::host() else {
             return;
         };
@@ -3518,6 +3532,7 @@ mod tests {
 
     #[test]
     fn lazy_deferred_card_page_does_not_pin_card_sent_and_materializes_live() {
+        let _views = crate::inplace::view_tests_lock();
         let Some(h) = crate::host::host() else {
             return;
         };
@@ -3605,6 +3620,7 @@ mod tests {
 
     #[test]
     fn lazy_active_hot_block_does_not_decay_after_120_frames_and_reprobes_cleanly() {
+        let _views = crate::inplace::view_tests_lock();
         let Some(h) = crate::host::host() else {
             return;
         };
@@ -3685,6 +3701,7 @@ mod tests {
 
     #[test]
     fn fast_copy_read_into_raw_and_unmapped_hole_respect_lazy_back_and_holes() {
+        let _views = crate::inplace::view_tests_lock();
         let Some(h) = crate::host::host() else {
             return;
         };
@@ -3767,6 +3784,7 @@ mod tests {
 
     #[test]
     fn fill_ahead_wrote_under_rebar_mirror_lock_does_not_deadlock_on_lazy_sibling_page() {
+        let _views = crate::inplace::view_tests_lock();
         let Some(h) = crate::host::host() else {
             return;
         };
@@ -3827,6 +3845,7 @@ mod tests {
 
     #[test]
     fn lazy_discard_range_saturated_len_completes_instantly_and_prunes_hot() {
+        let _views = crate::inplace::view_tests_lock();
         let Some(h) = crate::host::host() else {
             return;
         };
@@ -3896,6 +3915,7 @@ mod tests {
 
     #[test]
     fn lazy_rejects_private_allocation_without_own_view() {
+        let _views = crate::inplace::view_tests_lock();
         let Some(h) = crate::host::host() else {
             return;
         };
@@ -3933,6 +3953,7 @@ mod tests {
 
     #[test]
     fn lazy_rejects_deferral_and_rolls_back_primary_when_alias_protect_fails() {
+        let _views = crate::inplace::view_tests_lock();
         let Some(h) = crate::host::host() else {
             return;
         };
@@ -4005,6 +4026,7 @@ mod tests {
 
     #[test]
     fn lazy_failed_dma_keeps_entry_armed_and_recovers_on_retry() {
+        let _views = crate::inplace::view_tests_lock();
         let Some(h) = crate::host::host() else {
             return;
         };
@@ -4058,6 +4080,7 @@ mod tests {
 
     #[test]
     fn lazy_remapping_blocks_deferral_and_discard_range_materializes_surviving_alias() {
+        let _views = crate::inplace::view_tests_lock();
         let Some(h) = crate::host::host() else {
             return;
         };
@@ -4150,6 +4173,7 @@ mod tests {
 
     #[test]
     fn lazy_copy_mapped_title_dst_materializes_deferred_source() {
+        let _views = crate::inplace::view_tests_lock();
         let Some(h) = crate::host::host() else {
             return;
         };
@@ -4191,6 +4215,7 @@ mod tests {
 
     #[test]
     fn lazy_unwind_failed_virtual_protect_makes_failure_visible_to_waiters() {
+        let _views = crate::inplace::view_tests_lock();
         let Some(h) = crate::host::host() else {
             return;
         };
@@ -4321,6 +4346,7 @@ mod tests {
 
     #[test]
     fn lazy_fetch_gpu_bytes_and_batch_detach_inflight_fetcher_on_error() {
+        let _views = crate::inplace::view_tests_lock();
         let Some(h) = crate::host::host() else {
             return;
         };
@@ -4428,6 +4454,7 @@ mod tests {
 
     #[test]
     fn lazy_direct_submit_guard_serializes_across_first_activation_transition() {
+        let _views = crate::inplace::view_tests_lock();
         let Some(h) = crate::host::host() else {
             return;
         };
@@ -4561,6 +4588,7 @@ mod tests {
 
     #[test]
     fn lazy_active_or_arming_reads_arming_before_lazy_across_completion_interleaving() {
+        let _views = crate::inplace::view_tests_lock();
         assert_eq!(LAZY_COUNT.load(Ordering::SeqCst), 0);
         assert_eq!(ARMING_COUNT.load(Ordering::SeqCst), 0);
         assert!(!active_or_arming());
@@ -4601,6 +4629,7 @@ mod tests {
 
     #[test]
     fn lazy_mapping_65th_section_view_materializes_armed_block() {
+        let _views = crate::inplace::view_tests_lock();
         let Some(h) = crate::host::host() else {
             return;
         };
@@ -4712,6 +4741,7 @@ mod tests {
 
     #[test]
     fn lazy_write_mapped_reports_materialization_failure_without_writing_or_counting() {
+        let _views = crate::inplace::view_tests_lock();
         let Some(h) = crate::host::host() else {
             return;
         };
@@ -4764,6 +4794,7 @@ mod tests {
 
     #[test]
     fn lazy_note_signalled_uses_submitted_queue_order_without_locking_queue_order() {
+        let _views = crate::inplace::view_tests_lock();
         // Exercise the exact production `QueueOrderTimeline` lock-order,
         // candidate, submission, and fence-watermark bookkeeping against a 100%
         // isolated test-owned timeline (zero race and zero lock-order inversion
@@ -4812,6 +4843,7 @@ mod tests {
 
     #[test]
     fn lazy_card_before_signals_fence_while_not_ever_active_for_first_copy_fetch() {
+        let _views = crate::inplace::view_tests_lock();
         let Some(h) = crate::host::host() else {
             return;
         };
@@ -4902,6 +4934,7 @@ mod tests {
 
     #[test]
     fn lazy_try_defer_rejects_remap_between_own_view_check_and_pages_of() {
+        let _views = crate::inplace::view_tests_lock();
         let Some(h) = crate::host::host() else {
             return;
         };
@@ -4940,6 +4973,7 @@ mod tests {
 
     #[test]
     fn lazy_begin_remap_is_lock_free_noop_when_disabled() {
+        let _views = crate::inplace::view_tests_lock();
         // Hold `LAZY_STATE` on this thread: `begin_remap_if(..., false)` must
         // return `0` without attempting to acquire `LAZY_STATE` (which would
         // self-deadlock on the non-reentrant `Mutex`).
@@ -4950,6 +4984,7 @@ mod tests {
 
     #[test]
     fn lazy_discard_range_promotes_surviving_alias_on_failed_drain_and_preserves_restore_failed() {
+        let _views = crate::inplace::view_tests_lock();
         let Some(h) = crate::host::host() else {
             return;
         };
@@ -5091,6 +5126,7 @@ mod tests {
 
     #[test]
     fn lazy_kernel_writing_survives_pin_expiry_during_drain_and_propagates_failure() {
+        let _views = crate::inplace::view_tests_lock();
         let Some(h) = crate::host::host() else {
             return;
         };
@@ -5175,6 +5211,7 @@ mod tests {
 
     #[test]
     fn lazy_kernel_will_write_and_write_title_memory_propagate_failure_and_unannounce() {
+        let _views = crate::inplace::view_tests_lock();
         let Some(h) = crate::host::host() else {
             return;
         };
@@ -5225,6 +5262,7 @@ mod tests {
 
     #[test]
     fn lazy_views_mapped_protects_new_alias_when_materialization_fails() {
+        let _views = crate::inplace::view_tests_lock();
         let Some(h) = crate::host::host() else {
             return;
         };
@@ -5319,6 +5357,7 @@ mod tests {
 
     #[test]
     fn lazy_views_mapped_fails_closed_when_drain_and_alias_protect_both_fail() {
+        let _views = crate::inplace::view_tests_lock();
         let Some(h) = crate::host::host() else {
             return;
         };
@@ -5421,6 +5460,7 @@ mod tests {
 
     #[test]
     fn lazy_write_mapped_retries_concurrent_arm_and_fails_closed_when_exhausted() {
+        let _views = crate::inplace::view_tests_lock();
         let Some(h) = crate::host::host() else {
             return;
         };
@@ -5489,6 +5529,7 @@ mod tests {
 
     #[test]
     fn lazy_direct_submit_guard_fails_closed_for_unconfirmed_copy_and_retires_completed_fence() {
+        let _views = crate::inplace::view_tests_lock();
         let Some(h) = crate::host::host() else {
             return;
         };
@@ -5561,6 +5602,7 @@ mod tests {
 
     #[test]
     fn lazy_restore_failed_excluded_from_clean_owner_proof_and_shadow_refresh() {
+        let _views = crate::inplace::view_tests_lock();
         let Some(h) = crate::host::host() else {
             return;
         };
@@ -5627,6 +5669,7 @@ mod tests {
 
     #[test]
     fn lazy_sub_64k_attached_alias_restores_exact_extent_on_materialize_and_unwind() {
+        let _views = crate::inplace::view_tests_lock();
         let Some(h) = crate::host::host() else {
             return;
         };
@@ -5800,6 +5843,7 @@ mod tests {
 
     #[test]
     fn lazy_try_arm_under_guards_transitions_readonly_directly_to_noaccess_without_rw_window() {
+        let _views = crate::inplace::view_tests_lock();
         let Some(h) = crate::host::host() else {
             return;
         };
@@ -5876,6 +5920,7 @@ mod tests {
 
     #[test]
     fn lazy_arm_invalidates_clean_proof_when_alias_is_unguarded_or_view_guard_disabled() {
+        let _views = crate::inplace::view_tests_lock();
         use windows_sys::Win32::System::Memory::{
             MEMORY_BASIC_INFORMATION, PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE, VirtualQuery,
         };
@@ -6063,6 +6108,7 @@ mod tests {
 
     #[test]
     fn lazy_attach_new_alias_is_mutually_exclusive_with_guarded_refresh_protect_here() {
+        let _views = crate::inplace::view_tests_lock();
         let Some(h) = crate::host::host() else {
             return;
         };
@@ -6189,6 +6235,7 @@ mod tests {
 
     #[test]
     fn lazy_discard_primary_with_shorter_surviving_alias_clamps_and_merges() {
+        let _views = crate::inplace::view_tests_lock();
         const SUB_LEN: usize = 4096;
         let Some(h) = crate::host::host() else {
             return;

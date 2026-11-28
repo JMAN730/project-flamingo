@@ -25,10 +25,13 @@
 //! **A page that is not there when a shader touches it is a lost access**:
 //! the read gives 0, the store is dropped, and the fault note only helps
 //! the next frame. Before a dispatch the host makes ready everything it can
-//! see the dispatch name: the whole copy around each root view, around each
-//! pair of root constants that is a title address and around each root
-//! constant that is one in 256-byte units, and the 4 MiB after each (a
-//! structure may cross a window's end).
+//! see the dispatch name: each root view, each pair of root constants that
+//! is a title address and each root constant that is one in 256-byte units
+//! readies the whole committed range of the title allocation around it
+//! ([`ready_span`]: a structure the title builds in its heap is longer than
+//! the window a pointer to it lands in), and the 4 MiB after it. A page a
+//! shader still found empty readies its own allocation the same way, so a
+//! fault costs one frame's accesses once per allocation, not per page.
 //!
 //! shortcut: a copy that is numbered is kept for the rest of the run, and
 //! there are at most [`COPIES`] of them (4 MiB windows mostly: 4 GiB at
@@ -60,6 +63,12 @@ const FAULTS_SLOT_OFFSET: u32 = COPIES + 2;
 const CELL: u64 = 4 << 20;
 /// A directory page.
 const PAGE: u64 = 1 << 16;
+/// The most of one allocation that one address readies whole.
+const REGION_CAP: u64 = 256 << 20;
+/// A region of an allocation: start, length, committed.
+type Region = (u64, u64, bool);
+/// Past the cap: the aligned block around the address and the next one.
+const BLOCK: u64 = 64 << 20;
 
 struct Memory {
     /// Buffer, its mapping, its GPU address.
@@ -74,6 +83,9 @@ struct Memory {
     frame: u64,
     /// Pages asked for this frame that are not the title's memory.
     refused: std::collections::HashSet<u64>,
+    /// Ranges [`Memory::name`] has readied whole (kept for the run, as the
+    /// copies are).
+    readied: Vec<(u64, u64)>,
 }
 
 // SAFETY: the mappings are of buffers the struct owns; all access is under
@@ -103,6 +115,19 @@ fn page_index(address: u64) -> Option<u64> {
     (page < u64::from(MEMORY_PAGES) - 1).then_some(page)
 }
 
+/// The directory pages a copy of the `len` bytes at title address `first`
+/// holds whole, each with its byte offset in the copy; none at or past the
+/// sentinel entry.
+fn fill_pages(first: u64, len: u64) -> impl Iterator<Item = (u64, u32)> {
+    let end = first.saturating_add(len);
+    let start = first.checked_next_multiple_of(PAGE).unwrap_or(end);
+    (start..end)
+        .step_by(PAGE as usize)
+        .take_while(move |&at| at.checked_add(PAGE).is_some_and(|e| e <= end))
+        .take_while(|&at| page_index(at).is_some())
+        .map(move |at| (at / PAGE, (at - first) as u32))
+}
+
 /// The next 4 MiB cell boundary after `address`.
 fn next_cell(address: u64) -> u64 {
     (address & !(CELL - 1)).wrapping_add(CELL)
@@ -127,6 +152,94 @@ fn constant_addresses(constants: &[u32]) -> Vec<u64> {
     out
 }
 
+/// What naming `address` readies, from the regions of the allocation that
+/// holds it (`(start, len, committed)`, in address order): the committed
+/// run of contiguous regions around it, or past [`REGION_CAP`] the
+/// [`BLOCK`]-aligned block around it and the next one, inside that run.
+/// None when `address` lies in no committed region listed.
+fn ready_span(regions: &[Region], address: u64) -> Option<(u64, u64)> {
+    let at = regions
+        .iter()
+        .position(|&(s, l, _)| s <= address && address - s < l)?;
+    if !regions[at].2 {
+        return None;
+    }
+    let joined = |a: Region, b: Region| a.2 && b.2 && a.0 + a.1 == b.0;
+    let mut first = at;
+    while first > 0 && joined(regions[first - 1], regions[first]) {
+        first -= 1;
+    }
+    let mut last = at;
+    while last + 1 < regions.len() && joined(regions[last], regions[last + 1]) {
+        last += 1;
+    }
+    let (start, end) = (
+        regions[first].0,
+        regions[last].0.saturating_add(regions[last].1),
+    );
+    if end - start <= REGION_CAP {
+        return Some((start, end));
+    }
+    let block = address & !(BLOCK - 1);
+    Some((block.max(start), block.saturating_add(2 * BLOCK).min(end)))
+}
+
+/// Page numbers as sorted runs of title addresses `(first byte, end)`.
+fn page_runs(pages: &[u32]) -> Vec<(u64, u64)> {
+    let mut sorted = pages.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    let mut runs: Vec<(u64, u64)> = Vec::new();
+    for page in sorted {
+        let at = u64::from(page) * PAGE;
+        match runs.last_mut() {
+            Some(run) if run.1 == at => run.1 = at + PAGE,
+            _ => runs.push((at, at + PAGE)),
+        }
+    }
+    runs
+}
+
+/// The regions of the allocation around `address` (see [`ready_span`])
+/// within [`REGION_CAP`] of it, and the allocation's base and type.
+fn allocation_regions(address: u64) -> (Vec<Region>, Option<(u64, u32)>) {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    let query = |at: u64| {
+        // SAFETY: plain data, all zeros is a valid value.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a query of an address of this process into a local of
+        // the size given.
+        let n = unsafe {
+            VirtualQuery(
+                at as usize as *const core::ffi::c_void,
+                &mut info,
+                size_of::<MEMORY_BASIC_INFORMATION>(),
+            )
+        };
+        (n != 0).then_some(info)
+    };
+    let Some(here) = query(address) else {
+        return (Vec::new(), None);
+    };
+    let base = here.AllocationBase as u64;
+    if base == 0 {
+        return (Vec::new(), None);
+    }
+    let mut regions = Vec::new();
+    let mut at = base.max(address.saturating_sub(REGION_CAP));
+    let stop = address.saturating_add(REGION_CAP);
+    while at < stop && regions.len() < 4096 {
+        let Some(info) = query(at) else { break };
+        if info.AllocationBase as u64 != base || info.RegionSize == 0 {
+            break;
+        }
+        let start = info.BaseAddress as u64;
+        regions.push((start, info.RegionSize as u64, info.State == MEM_COMMIT));
+        at = start + info.RegionSize as u64;
+    }
+    (regions, Some((base, here.Type)))
+}
+
 impl Memory {
     fn new() -> Option<Memory> {
         let host = host()?;
@@ -147,6 +260,7 @@ impl Memory {
             heaps: HashMap::new(),
             frame: u64::MAX,
             refused: Default::default(),
+            readied: Vec::new(),
         })
     }
 
@@ -196,18 +310,17 @@ impl Memory {
                 // shortcut: a page of a title buffer inside this one that
                 // has a copy of its own is given this copy too.
                 let (first, len) = shadow.span();
-                let mut at = first.next_multiple_of(PAGE);
-                while at + PAGE <= first + len && at / PAGE < u64::from(MEMORY_PAGES) - 1 {
-                    // SAFETY: inside the directory's mapping.
-                    let other = unsafe { self.directory.1.add((at / PAGE) as usize * 2) };
+                for (page, offset) in fill_pages(first, len) {
+                    // SAFETY: inside the directory's mapping
+                    // ([`fill_pages`] stops before the sentinel).
+                    let other = unsafe { self.directory.1.add(page as usize * 2) };
                     // SAFETY: as above; the offset first, as below.
                     unsafe {
                         if other.read() == 0 {
-                            other.add(1).write_volatile((at - first) as u32);
+                            other.add(1).write_volatile(offset);
                             other.write_volatile(n as u32 + 1);
                         }
                     }
-                    at += PAGE;
                 }
                 n
             }
@@ -247,21 +360,54 @@ impl Memory {
             // Each is an access that read 0 or was dropped.
             static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 50 {
+                // The runs, each with the allocation it lies in: a run in a
+                // range a dispatch named should not be here.
+                let runs = page_runs(&pages);
+                let mut text = String::new();
+                for &(start, end) in runs.iter().take(8) {
+                    let (regions, alloc) = allocation_regions(start);
+                    let near: u64 = regions.iter().map(|r| r.1).sum();
+                    let named = self.readied.iter().any(|&(s, e)| s <= start && start < e);
+                    text.push_str(&match alloc {
+                        Some((base, kind)) => format!(
+                            " {start:#x}..{end:#x} (allocation {base:#x}, {near:#x} bytes near, type {kind:#x}{})",
+                            if named { ", named before" } else { "" }
+                        ),
+                        None => format!(" {start:#x}..{end:#x} (no allocation)"),
+                    });
+                }
                 tracing::warn!(
                     pages = pages.len(),
                     first = format_args!("{:#x}", u64::from(pages[0]) * PAGE),
-                    "title memory by address: shaders touched pages that had no copy (those accesses read 0 or were dropped); the copies are made now"
+                    runs = runs.len(),
+                    "title memory by address: shaders touched pages that had no copy (those accesses read 0 or were dropped); the copies are made now:{text}"
                 );
             }
         }
         for page in pages {
-            self.map(u64::from(page) * PAGE);
+            self.name(u64::from(page) * PAGE);
         }
     }
 
-    /// What a dispatch names: the copy around `address` and the 4 MiB
+    /// What a dispatch names: the committed range of the allocation around
+    /// `address` ([`ready_span`]), at least the copy around it, and the 4 MiB
     /// after it.
     fn name(&mut self, address: u64) {
+        if !self
+            .readied
+            .iter()
+            .any(|&(s, e)| s <= address && address < e)
+        {
+            let (regions, _) = allocation_regions(address);
+            if let Some((start, end)) = ready_span(&regions, address) {
+                let mut at = start & !(PAGE - 1);
+                while at < end {
+                    self.map(at.max(start));
+                    at += PAGE;
+                }
+                self.readied.push((start, end));
+            }
+        }
         self.map(address);
         self.map(next_cell(address));
     }
@@ -383,6 +529,23 @@ mod tests {
     }
 
     #[test]
+    fn fill_pages_lists_the_whole_pages_a_copy_holds() {
+        // Aligned: every page, offsets from the copy's start.
+        let got: Vec<_> = fill_pages(0x20_0000, 3 * PAGE).collect();
+        assert_eq!(got, [(0x20, 0), (0x21, 0x1_0000), (0x22, 0x2_0000)]);
+        // Unaligned: the partial pages at both ends are left out.
+        let got: Vec<_> = fill_pages(0x20_0100, 3 * PAGE).collect();
+        assert_eq!(got, [(0x21, 0xFF00), (0x22, 0x1_FF00)]);
+        // Smaller than a page: none.
+        assert_eq!(fill_pages(0x20_0100, PAGE).count(), 0);
+        // Never the sentinel entry, nor past the directory.
+        let last = (u64::from(MEMORY_PAGES) - 2) * PAGE;
+        let got: Vec<_> = fill_pages(last, 4 * PAGE).collect();
+        assert_eq!(got, [(u64::from(MEMORY_PAGES) - 2, 0)]);
+        assert_eq!(fill_pages(u64::MAX - PAGE, PAGE).count(), 0);
+    }
+
+    #[test]
     fn next_cell_advances_to_following_4mib_window() {
         assert_eq!(next_cell(0), CELL);
         assert_eq!(next_cell(0x1234), CELL);
@@ -398,6 +561,88 @@ mod tests {
         assert_eq!(got, vec![0x12_3456_7800, 0x34_5678_0000, 0x02_0000_0000]);
         // Small constants are ignored.
         assert!(constant_addresses(&[0, 1, 0xFFFF, 0x100]).is_empty());
+    }
+
+    const M: u64 = 1 << 20;
+
+    #[test]
+    fn ready_span_is_the_committed_run_around_the_address() {
+        let regions = [
+            (0x1000_0000, 4 * M, true),
+            (0x1000_0000 + 4 * M, 12 * M, true),
+            (0x1000_0000 + 16 * M, M, false),
+            (0x1000_0000 + 17 * M, 2 * M, true),
+        ];
+        // A 13 MiB structure from 0x10300000 is readied whole with its run,
+        // not only the 8 MiB the address's window and the next one hold.
+        assert_eq!(
+            ready_span(&regions, 0x1030_0000),
+            Some((0x1000_0000, 0x1000_0000 + 16 * M))
+        );
+        // Past the reserved gap: its own run only.
+        assert_eq!(
+            ready_span(&regions, 0x1000_0000 + 18 * M),
+            Some((0x1000_0000 + 17 * M, 0x1000_0000 + 19 * M))
+        );
+        // Reserved, or outside every region: nothing.
+        assert_eq!(ready_span(&regions, 0x1000_0000 + 16 * M), None);
+        assert_eq!(ready_span(&regions, 0x2000_0000), None);
+        assert_eq!(ready_span(&[], 0x1000), None);
+    }
+
+    #[test]
+    fn ready_span_past_the_cap_is_two_blocks_from_the_address() {
+        let regions = [(0, 1 << 30, true)];
+        assert_eq!(
+            ready_span(&regions, 0x1234_5678),
+            Some((0x1000_0000, 0x1000_0000 + 2 * BLOCK))
+        );
+        // At the run's end the second block is cut there.
+        assert_eq!(
+            ready_span(&regions, (1 << 30) - 1),
+            Some(((1 << 30) - BLOCK, 1 << 30))
+        );
+    }
+
+    /// An allocation of 24 MiB with its first 16 committed: an address
+    /// 13 MiB in readies those 16, and none of the reserved rest.
+    #[test]
+    fn an_address_readies_the_committed_part_of_its_allocation() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        // SAFETY: a fresh reservation, committed in part, released below.
+        let base = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                (24 * M) as usize,
+                MEM_RESERVE,
+                PAGE_READWRITE,
+            )
+        };
+        assert!(!base.is_null());
+        // SAFETY: inside the reservation.
+        let done = unsafe { VirtualAlloc(base, (16 * M) as usize, MEM_COMMIT, PAGE_READWRITE) };
+        assert!(!done.is_null());
+        let start = base as u64;
+        let (regions, alloc) = allocation_regions(start + 13 * M);
+        assert_eq!(alloc.map(|a| a.0), Some(start));
+        assert_eq!(
+            ready_span(&regions, start + 13 * M),
+            Some((start, start + 16 * M))
+        );
+        assert_eq!(ready_span(&regions, start + 20 * M), None);
+        // SAFETY: the reservation made above.
+        unsafe { VirtualFree(base, 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn page_runs_join_neighbouring_pages() {
+        assert_eq!(
+            page_runs(&[0x52fc5, 0x52fc4, 0x52fc6, 0x2, 0x52fc4]),
+            [(0x2 * PAGE, 0x3 * PAGE), (0x52fc4 * PAGE, 0x52fc7 * PAGE)]
+        );
+        assert!(page_runs(&[]).is_empty());
     }
 
     #[test]

@@ -778,6 +778,7 @@ dependencies = [
 name = "victory-shader"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "memchr",
  "miniz_oxide",
  "tempfile",
@@ -936,7 +937,11 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "serde",
  "serde_json",
+ "tempfile",
+ "toml",
+ "victory-core",
  "walkdir",
 ]
 

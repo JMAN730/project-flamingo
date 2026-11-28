@@ -161,7 +161,7 @@ pub(crate) struct Host {
     /// Optional dedicated `D3D12_COMMAND_LIST_TYPE_COPY` queue for relay DMA
     /// readbacks (`VICTORY_RELAY_COPY_QUEUE=0` disables).
     copy_queue: Option<ID3D12CommandQueue>,
-    fence: ID3D12Fence,
+    pub(crate) fence: ID3D12Fence,
     /// The last value signalled on `fence`, behind the submission lock.
     submitted: Mutex<u64>,
     event: HANDLE,
@@ -183,6 +183,8 @@ pub(crate) struct Host {
     present_compositor_retry: Mutex<Retry>,
     /// Detached host lists whose submissions finished, ready to reuse.
     free_lists: Mutex<Vec<HostList>>,
+    /// GPU-writable memory for mesh programs run without mesh shaders.
+    mesh_scratch: Mutex<MeshScratch>,
     #[cfg(test)]
     reused_lists: std::sync::atomic::AtomicU64,
     #[cfg(test)]
@@ -407,6 +409,10 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
             None => {}
         }
     }
+    #[cfg(feature = "diagnostics")]
+    if crumbs_on() {
+        text.push_str(&crumb_report());
+    }
     tracing::error!("{text}");
     #[cfg(test)]
     if FAIL_PANICS.with(std::cell::Cell::get) {
@@ -416,6 +422,30 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
         Some(report) => report(&text),
         None => std::process::abort(),
     }
+}
+
+/// Unless `VICTORY_FAST_WAKE=1`: a submission's completion
+/// does not scan the GPU memory waits its copy-back may meet; the fence
+/// watcher's poll finds them, as before that scan was added.
+fn old_completion_scan() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        // Default: completions leave memory waits to the watcher (waking
+        // them on the completing thread made world entry hang the GPU in 4
+        // of 5 runs). `VICTORY_FAST_WAKE=1` wakes them at once.
+        let fast = crate::switch::on("VICTORY_FAST_WAKE");
+        if fast {
+            tracing::info!("VICTORY_FAST_WAKE: completions wake satisfied memory waits at once");
+        }
+        !fast
+    })
+}
+
+/// The host fence value of the last submission sent to the queue, read
+/// without the submission lock (held while one is prepared): every signal
+/// of the host fence notes it ([`Host::note_signalled`]) behind a leaf lock.
+pub(crate) fn submitted_value() -> u64 {
+    relay::QUEUE_TIMELINE.last_signalled().0
 }
 
 /// The host GPU, created on first use; `None` without one (a run then
@@ -642,6 +672,7 @@ fn create() -> windows::core::Result<Host> {
             present_retry: Mutex::new(Retry::new()),
             present_compositor_retry: Mutex::new(Retry::new()),
             free_lists: Mutex::default(),
+            mesh_scratch: Mutex::default(),
             #[cfg(test)]
             reused_lists: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
@@ -757,6 +788,11 @@ fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
 
 /// A host command list and its allocator, always used together.
 pub(crate) struct HostList {
+    /// The id occlusion query tracking knows this list's recordings by
+    /// (`crate::query::next_recording`): it stays with the list when the
+    /// list is moved out of its `Arc` to be recycled, which its address
+    /// does not.
+    recording: usize,
     allocator: ID3D12CommandAllocator,
     pub(crate) list: ID3D12GraphicsCommandList,
     /// Work for submission time, in recorded order.
@@ -849,10 +885,15 @@ pub(crate) struct HostList {
     /// and at the end, and where they are read back.
     #[cfg(feature = "diagnostics")]
     stamps: OnceLock<Option<(ID3D12QueryHeap, ID3D12Resource)>>,
+    /// With `VICTORY_BREADCRUMBS`: this recording's pair of words in the
+    /// breadcrumb buffer ([`Crumbs`]), `u32::MAX` before its first note.
+    #[cfg(feature = "diagnostics")]
+    crumb: std::sync::atomic::AtomicU32,
 }
 
 impl Drop for HostList {
     fn drop(&mut self) {
+        crate::query::forget_list(self.recording);
         self.release_kept();
         self.release_epoch();
     }
@@ -1290,6 +1331,161 @@ pub(crate) fn dred_on() -> bool {
     *ON.get_or_init(|| cfg!(feature = "diagnostics") && crate::switch::on("VICTORY_D3D12_DRED"))
 }
 
+/// Whether our own breadcrumbs are on (`VICTORY_BREADCRUMBS`, diagnostics
+/// builds, without device-removed data): each noted command of a list is
+/// preceded by two immediate writes into system memory, read when the
+/// device is removed to name the commands that had begun but not finished.
+/// Lighter than device-removed data, which slows the GPU enough to hide
+/// some faults.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn crumbs_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| !dred_on() && crate::switch::on("VICTORY_BREADCRUMBS"))
+}
+
+/// Recordings with breadcrumb words at once (reused round-robin).
+#[cfg(feature = "diagnostics")]
+const CRUMB_LISTS: u32 = 4096;
+
+/// The breadcrumb buffer: per recording, the noted command done before
+/// and the one begun up to.
+#[cfg(feature = "diagnostics")]
+struct Crumbs {
+    _buffer: ID3D12Resource,
+    gpu: u64,
+    cpu: usize,
+    next: std::sync::atomic::AtomicU32,
+}
+
+#[cfg(feature = "diagnostics")]
+fn crumbs() -> Option<&'static Crumbs> {
+    static CRUMBS: OnceLock<Option<Crumbs>> = OnceLock::new();
+    CRUMBS
+        .get_or_init(|| {
+            let device = &host()?.device;
+            let props = D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_CUSTOM,
+                CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
+                MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
+                ..Default::default()
+            };
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: u64::from(CRUMB_LISTS) * 8,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                ..Default::default()
+            };
+            let mut buffer: Option<ID3D12Resource> = None;
+            // SAFETY: plain object creation; the mapping stays valid while
+            // the buffer lives (for the process).
+            unsafe {
+                device
+                    .CreateCommittedResource(
+                        &props,
+                        D3D12_HEAP_FLAG_NONE,
+                        &desc,
+                        D3D12_RESOURCE_STATE_COMMON,
+                        None,
+                        &mut buffer,
+                    )
+                    .ok()?;
+                let buffer = buffer?;
+                let mut cpu = std::ptr::null_mut();
+                buffer.Map(0, None, Some(&mut cpu)).ok()?;
+                std::ptr::write_bytes(cpu.cast::<u8>(), 0, CRUMB_LISTS as usize * 8);
+                tracing::warn!("VICTORY_BREADCRUMBS: noted commands leave breadcrumbs");
+                Some(Crumbs {
+                    gpu: buffer.GetGPUVirtualAddress(),
+                    cpu: cpu as usize,
+                    _buffer: buffer,
+                    next: std::sync::atomic::AtomicU32::new(0),
+                })
+            }
+        })
+        .as_ref()
+}
+
+/// The recordings of the last submissions, with breadcrumbs: host fence
+/// value, then per list its breadcrumb words and noted commands (copied
+/// from the list at each submission, since a closed list can be submitted
+/// more than once and its notes are cleared only when it resets).
+#[cfg(feature = "diagnostics")]
+type CrumbRun = (u64, Vec<(u32, Vec<Note>)>);
+
+#[cfg(feature = "diagnostics")]
+static CRUMB_RUNS: Mutex<std::collections::VecDeque<CrumbRun>> =
+    Mutex::new(std::collections::VecDeque::new());
+
+/// A recording's noted commands for one submission's breadcrumb report.
+/// The recording keeps its own: its breadcrumb commands run again when it
+/// is submitted again, and that submission's report names them too.
+#[cfg(feature = "diagnostics")]
+fn submitted_notes(notes: &Mutex<Vec<Note>>) -> Vec<Note> {
+    notes.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// Keeps the noted commands of the lists of submission `sub` for the
+/// breadcrumb report.
+#[cfg(feature = "diagnostics")]
+fn keep_crumbs(sub: u64, runs: &[&HostList]) {
+    let lists = runs
+        .iter()
+        .map(|r| (r.crumb.load(Ordering::Relaxed), submitted_notes(&r.notes)))
+        .collect();
+    let mut kept = CRUMB_RUNS.lock().unwrap_or_else(|e| e.into_inner());
+    kept.push_back((sub, lists));
+    while kept.len() > 12 {
+        kept.pop_front();
+    }
+}
+
+/// For each list of the last submissions that did not finish: the noted
+/// commands that had begun but not finished when the device was removed.
+#[cfg(feature = "diagnostics")]
+fn crumb_report() -> String {
+    let Some(crumbs) = crumbs() else {
+        return "; no breadcrumbs".into();
+    };
+    let mut text = String::new();
+    let kept = CRUMB_RUNS.lock().unwrap_or_else(|e| e.into_inner());
+    for (sub, lists) in kept.iter() {
+        text.push_str(&format!("; submission {sub}"));
+        for (i, (slot, notes)) in lists.iter().enumerate() {
+            let slot = *slot;
+            if slot == u32::MAX {
+                text.push_str(&format!("; list {i}: no noted commands"));
+                continue;
+            }
+            // SAFETY: the mapped breadcrumb words of this recording, written by the GPU.
+            let (done, begun) = unsafe {
+                let at = (crumbs.cpu as *const u32).add(slot as usize * 2);
+                (at.read_volatile(), at.add(1).read_volatile())
+            };
+            let n = notes.len() as u32;
+            if done >= n {
+                text.push_str(&format!("; list {i}: {n} noted commands done"));
+                continue;
+            }
+            text.push_str(&format!(
+                "; list {i}: done before {done}, begun up to {begun} of {n} noted commands:"
+            ));
+            let last = begun.max(done + 1).min(n).min(done + 6);
+            for k in done..last {
+                let note: String = notes[k as usize].0.chars().take(600).collect();
+                text.push_str(&format!(" [{k}] {note}"));
+            }
+        }
+    }
+    text
+}
+
 /// Whether each list of a submission runs and is timed on its own, slow
 /// ones logged with their commands (`VICTORY_GPU_TIMING`, diagnostics
 /// builds; the commands are noted with `VICTORY_D3D12_DRED` on).
@@ -1323,6 +1519,25 @@ struct Scratch {
 unsafe impl Send for Scratch {}
 
 const SCRATCH_CHUNK: u64 = 4 << 20;
+
+/// The buffer for mesh programs run without mesh shaders
+/// (`State::dispatch_mesh`), and its size: what their compute half stores
+/// and their draw reads back. Every such dispatch of every list uses it
+/// from the start: the host has one queue, which runs lists one after the
+/// other and a list's commands in order, so one dispatch's draw has read it
+/// before the next one's compute pass writes it.
+#[derive(Default)]
+struct MeshScratch {
+    buffer: Option<(ID3D12Resource, u64)>,
+}
+
+/// The least the mesh buffer holds.
+pub(crate) const MESH_BUFFER_MIN: u64 = 16 << 20;
+/// The most the mesh buffer is grown to. A dispatch of more thread groups
+/// than it holds runs in parts (`State::dispatch_mesh`), so this trades
+/// memory against passes; an indirect dispatch, whose group count only the
+/// GPU has, records the parts of the most groups it can have.
+pub(crate) const MESH_BUFFER_MOST: u64 = 64 << 20;
 
 /// Per-list GPU-writable buffers for indirect rectangle expansion
 /// (`crate::rectangles`): one vertex scratch buffer (reused per draw after
@@ -1384,6 +1599,10 @@ struct Readback {
     lines: usize,
     row_bytes: usize,
     total: usize,
+    /// For occlusion query results: the resolve, whose spare query results
+    /// follow the `total` bytes at `src` and are combined into them before
+    /// the copy ([`crate::query::Resolve`]).
+    query: Option<std::sync::Arc<crate::query::Resolve>>,
 }
 
 /// What a list does on the CPU when it is submitted: copies between host
@@ -1423,6 +1642,21 @@ struct Deferred {
     /// Bottom-of-pipe writes, done once the list has run: address, what,
     /// bytes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
+    /// Fills traced by `VICTORY_TRACE_CBV` (diagnostics): stage hash,
+    /// scratch CPU address, title address, bytes, scratch GPU address.
+    #[cfg(feature = "diagnostics")]
+    #[allow(clippy::type_complexity)]
+    traced_fills: Vec<(
+        &'static str,
+        usize,
+        usize,
+        usize,
+        u64,
+        std::sync::Arc<Mutex<Option<[u8; crate::cbv_trace::COMPARED]>>>,
+    )>,
+    /// Things the list's commands use that are given back when the last
+    /// holder lets go ([`HostList::hold`]), by address.
+    held: std::collections::HashMap<usize, std::sync::Arc<dyn std::any::Any + Send + Sync>>,
     /// Monotonic count of deferred title-memory copies (`defer_copy`) recorded
     /// since reset, used to partition fresh-table CBV snapshot reuse across
     /// intervening buffer writes.
@@ -1462,8 +1696,41 @@ impl Host {
             let mesh = ok
                 && options.MeshShaderTier != D3D12_MESH_SHADER_TIER_NOT_SUPPORTED
                 && model.HighestShaderModel.0 >= D3D_SHADER_MODEL_6_6.0;
-            tracing::info!(mesh, "host mesh shader support");
-            mesh
+            // Diagnostics builds: run mesh programs the way hosts without
+            // mesh shaders do, on a host that has them (to compare the two).
+            let unused =
+                cfg!(feature = "diagnostics") && crate::switch::on("VICTORY_NO_MESH_SHADERS");
+            tracing::info!(mesh, unused, "host mesh shader support");
+            mesh && !unused
+        })
+    }
+
+    /// Whether the host gives pixel shaders barycentrics (`SV_Barycentrics`
+    /// and `GetAttributeAtVertex`, `D3D12_FEATURE_DATA_D3D12_OPTIONS3
+    /// .BarycentricsSupported`); logged once. Without them, pixel shaders
+    /// that need them run behind the geometry shader of
+    /// `victory_shader::emit::barycentric_gs`.
+    pub(crate) fn barycentrics(&self) -> bool {
+        static BARYCENTRICS: OnceLock<bool> = OnceLock::new();
+        *BARYCENTRICS.get_or_init(|| {
+            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS3::default();
+            // SAFETY: the query writes its own structure of the given size.
+            let ok = unsafe {
+                self.device
+                    .CheckFeatureSupport(
+                        D3D12_FEATURE_D3D12_OPTIONS3,
+                        (&raw mut options).cast(),
+                        size_of_val(&options) as u32,
+                    )
+                    .is_ok()
+            };
+            let barycentrics = ok && options.BarycentricsSupported.as_bool();
+            // Diagnostics builds: run them the way hosts without
+            // barycentrics do, on a host that has them (to compare the two).
+            let unused =
+                cfg!(feature = "diagnostics") && crate::switch::on("VICTORY_NO_BARYCENTRICS");
+            tracing::info!(barycentrics, unused, "host barycentric support");
+            barycentrics && !unused
         })
     }
 
@@ -1484,6 +1751,12 @@ impl Host {
                     )
                     .is_ok()
             };
+            // `VICTORY_WAVE64_SPLIT=1`: on 32-lane hosts, wave64 programs run
+            // as two 32-lane halves. shortcut: experimental; off, they are
+            // refused as before (the title read -1 from GPU-written data
+            // with it on).
+            let split = std::env::var_os("VICTORY_WAVE64_SPLIT").is_some_and(|v| v != "0");
+            victory_shader::emit::set_host_wave64(!split || ok && options.WaveLaneCountMax >= 64);
             let wave32 = ok
                 && wave32_supported(
                     options.WaveOps.as_bool(),
@@ -1602,6 +1875,7 @@ impl Host {
             )?;
             prelude.Close()?;
             Ok(HostList {
+                recording: crate::query::next_recording(),
                 allocator,
                 list,
                 deferred: Mutex::default(),
@@ -1634,6 +1908,8 @@ impl Host {
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
                 stamps: OnceLock::new(),
+                #[cfg(feature = "diagnostics")]
+                crumb: std::sync::atomic::AtomicU32::new(u32::MAX),
             })
         }
     }
@@ -1709,6 +1985,11 @@ impl Host {
         if !behind {
             crate::inplace::tick();
         }
+        // The order these lists reach the host queue in: occlusion query
+        // resolves choose the parts of the runs submitted before them.
+        for list in runs {
+            crate::query::submitting(list.recording());
+        }
         let this_submission = relay::STARTED.fetch_add(1, Ordering::AcqRel) + 1;
         crate::shadow::preparing(this_submission);
 
@@ -1729,6 +2010,10 @@ impl Host {
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::Submissions, 1);
+        #[cfg(feature = "diagnostics")]
+        if crumbs_on() {
+            keep_crumbs(*submitted + 1, runs);
+        }
         let mut batch = Batch::default();
         let mut settled = std::time::Duration::ZERO;
 
@@ -1833,7 +2118,10 @@ impl Host {
                 let _lazy_order = crate::lazy_back::direct_submit_guard();
                 // SAFETY: closed lists; the fence is ours under `submitted`.
                 let signalled = unsafe {
+                    let calling = std::time::Instant::now();
                     self.queue.ExecuteCommandLists(&lists);
+                    crate::timeline::HELD_US[3]
+                        .fetch_add(calling.elapsed().as_micros() as u64, Ordering::Relaxed);
                     self.queue.Signal(&self.fence, *submitted)
                 };
                 if signalled.is_ok() {
@@ -1953,7 +2241,10 @@ impl Host {
                         {
                             hook();
                         }
+                        let calling = std::time::Instant::now();
                         self.queue.ExecuteCommandLists(group);
+                        crate::timeline::HELD_US[3]
+                            .fetch_add(calling.elapsed().as_micros() as u64, Ordering::Relaxed);
                         let res = self.queue.Signal(&self.fence, *submitted);
                         if res.is_ok() {
                             self.note_signalled(*submitted);
@@ -2060,6 +2351,11 @@ impl Host {
                 shadow.copy_back_done(ranges);
             }
         }
+        #[cfg(feature = "diagnostics")]
+        crate::timeline::wait_stats::copied_back(
+            *submitted,
+            non_rebar_writes.iter().map(|w| (w.1, w.2)).collect(),
+        );
         for (shadow, address, len) in non_rebar_writes {
             let written = shadow.copy_back(address, len);
             COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
@@ -2097,8 +2393,28 @@ impl Host {
         let mut woken = deferred_woken;
         for list in runs {
             for &(at, what, bytes) in &list.deferred().writes {
+                #[cfg(feature = "diagnostics")]
+                let _scan = crate::timeline::wait_stats::scanning(
+                    crate::timeline::wait_stats::Scan::DoneWrite {
+                        sub: *submitted,
+                        at,
+                        bytes,
+                    },
+                );
                 woken.add(what.write(at as *mut u8, bytes));
             }
+        }
+        // GPU memory waits that what shaders wrote (copied back above)
+        // satisfies: woken now with `VICTORY_FAST_WAKE`, else at the fence
+        // watcher's next poll.
+        if !old_completion_scan() {
+            #[cfg(feature = "diagnostics")]
+            let scan = crate::timeline::wait_stats::scanning(
+                crate::timeline::wait_stats::Scan::Completion { sub: *submitted },
+            );
+            woken.add(crate::fence::written(0, 0));
+            #[cfg(feature = "diagnostics")]
+            drop(scan);
         }
         self.log_messages();
         if relay::relay() {
@@ -2112,16 +2428,101 @@ impl Host {
     }
 }
 
+/// Where `len` bytes (a multiple of 256) go in a scratch chunk of which
+/// `used` bytes are taken, at a multiple of `align`: their offset and the
+/// bytes taken after them; `None` if they do not fit in the chunk.
+fn scratch_place(used: u64, len: u64, align: u64) -> Option<(u64, u64)> {
+    let at = used.next_multiple_of(align);
+    let end = at.checked_add(len)?;
+    (end <= SCRATCH_CHUNK).then_some((at, end))
+}
+
+#[cfg(test)]
+mod scratch_place_tests {
+    use super::{SCRATCH_CHUNK, scratch_place};
+
+    /// A constant view of 544 bytes at an address off 256 takes 768 bytes
+    /// of scratch at a multiple of 256, and what is placed after it starts
+    /// past all 768: its fill (544 bytes) and its view (768) overlap nothing.
+    #[test]
+    fn unaligned_constants_take_whole_blocks_that_nothing_overlaps() {
+        let len = 544u64.next_multiple_of(256);
+        assert_eq!(len, 768);
+        let (at, used) = scratch_place(100, len, 256).unwrap();
+        assert_eq!((at, used), (256, 1024));
+        let (next, _) = scratch_place(used, 256, 256).unwrap();
+        assert!(next >= at + len);
+        let (placed, _) = scratch_place(used, 512, 512).unwrap();
+        assert_eq!(placed, 1024);
+        // Past the chunk's end: the next chunk.
+        assert_eq!(scratch_place(SCRATCH_CHUNK - 256, len, 256), None);
+        assert_eq!(
+            scratch_place(SCRATCH_CHUNK - len, len, 256),
+            Some((SCRATCH_CHUNK - len, SCRATCH_CHUNK))
+        );
+    }
+}
+
+/// Submissions of lists whose indirect work budget ran out
+/// ([`HostList::budget`]): their indirect records after that ran empty.
+pub(crate) static BUDGET_SPENT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Copies a finished list's texture-to-buffer and texture readbacks into title memory.
 /// Returns `false` if lazy materialization failed for any readback destination;
 /// rows that could not be materialized or written are never counted in `COPY_BACK[1]`.
 pub(super) fn read_backs(list: &HostList) -> bool {
+    list.note_budget_spent();
     let deferred = list.deferred();
+    #[cfg(feature = "diagnostics")]
+    for (hash, scratch, title, len, gpu, at_submit) in &deferred.traced_fills {
+        let (hash, scratch, title, len, gpu) = (*hash, *scratch, *title, *len, *gpu);
+        let n = len.min(crate::cbv_trace::COMPARED);
+        let title_at_submit = at_submit
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .map_or_else(
+                || "unread".to_owned(),
+                |bytes| crate::cbv_trace::hex(&bytes[..n]),
+            );
+        let mut filled = [0u8; crate::cbv_trace::COMPARED];
+        let mut now = [0u8; crate::cbv_trace::COMPARED];
+        // SAFETY: the list's own scratch upload memory, mapped until reset.
+        unsafe { std::ptr::copy_nonoverlapping(scratch as *const u8, filled.as_mut_ptr(), n) };
+        let readable =
+            crate::shadow::copy_mapped_wide_checked(now.as_mut_ptr(), title as *const u8, n);
+        let title_now = if readable {
+            crate::cbv_trace::hex(&now[..n])
+        } else {
+            "unreadable".to_owned()
+        };
+        tracing::info!(
+            hash,
+            address = format_args!("{title:#x}"),
+            len,
+            scratch = format_args!("{gpu:#x}"),
+            title_at_submit = %title_at_submit,
+            filled = %crate::cbv_trace::hex(&filled[..n]),
+            title_now = %title_now,
+            "cbv trace: after the list ran, the fill's first bytes and title memory's"
+        );
+    }
     let mut ok = true;
     for rb in &deferred.readbacks {
+        let combined = rb.query.as_ref().map(|resolve| {
+            let spares = resolve.spares().1 as usize;
+            // SAFETY: the list has run; its readback memory holds the
+            // `total` bytes of results and 8 more for each spare query
+            // (`defer_query_results`), mapped until the list is reset.
+            let resolved =
+                unsafe { std::slice::from_raw_parts(rb.src as *const u8, rb.total + 8 * spares) };
+            resolve.combined(resolved)
+        });
+        let src = combined
+            .as_ref()
+            .map_or(rb.src as *const u8, |results| results.as_ptr());
         let written = if rb.dst_pitch == rb.src_pitch {
             crate::watch::writing(rb.dst, rb.total);
-            match write_mapped(rb.dst as *mut u8, rb.src as *const u8, rb.total) {
+            match write_mapped(rb.dst as *mut u8, src, rb.total) {
                 Some(n) => n,
                 None => {
                     ok = false;
@@ -2274,6 +2675,11 @@ impl Host {
         // Without it the queries fail as unsupported, which reads like a
         // missing GPU feature.
         if !dred_on() {
+            #[cfg(feature = "diagnostics")]
+            if crumbs_on() {
+                let _ = runs;
+                return crumb_report();
+            }
             return "; a diagnostics build with VICTORY_D3D12_DRED=1 records where the GPU stopped"
                 .to_owned();
         }
@@ -2452,6 +2858,11 @@ impl Host {
 }
 
 impl HostList {
+    /// The id occlusion query tracking knows this list's recordings by.
+    pub(crate) fn recording(&self) -> usize {
+        self.recording
+    }
+
     /// Keeps `blocks` (memory handed out for the recording) until the list
     /// finishes executing and is recycled or dropped.
     pub(crate) fn keep_uploads(&self, blocks: Vec<Vec<u8>>) {
@@ -2461,6 +2872,16 @@ impl HostList {
                 .unwrap_or_else(|e| e.into_inner())
                 .extend(blocks);
         }
+    }
+
+    /// Holds `what` until the list is reset or dropped, which is after its
+    /// last submission has run: what gives back a resource when its last
+    /// holder lets go (a buffer view table's raw view slot) is not given
+    /// back while this list may still use it. Holding the same thing again
+    /// changes nothing.
+    pub(crate) fn hold(&self, what: std::sync::Arc<dyn std::any::Any + Send + Sync>) {
+        let at = std::sync::Arc::as_ptr(&what).cast::<()>() as usize;
+        self.deferred().held.entry(at).or_insert(what);
     }
 
     /// Keeps dynamic descriptor slots alive until this host list finishes
@@ -2616,6 +3037,14 @@ impl HostList {
     }
 
     pub(crate) fn close(&self) {
+        // The last noted command's breadcrumb: done once it finishes.
+        #[cfg(feature = "diagnostics")]
+        if crumbs_on() {
+            let notes = self.notes.lock().unwrap_or_else(|e| e.into_inner());
+            if !notes.is_empty() {
+                self.crumb(notes.len() as u32);
+            }
+        }
         // Lists can execute together, in a different order, or more than once.
         // Buffers do not decay between lists in the same ExecuteCommandLists.
         // Restore a known entry state for the next recording.
@@ -2776,6 +3205,9 @@ impl HostList {
     /// Clears per-recording tracking state shared between [`Self::reset`] and
     /// [`Self::release_for_pool`].
     fn clear_tracking(&self) {
+        // The recording is over: its occlusion query runs that no later
+        // list resolves are let go.
+        crate::query::forget_list(self.recording);
         self.release_kept();
         self.shadow_states
             .lock()
@@ -2826,6 +3258,8 @@ impl HostList {
         }
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        #[cfg(feature = "diagnostics")]
+        self.crumb.store(u32::MAX, Ordering::Relaxed);
     }
 
     /// Releases all retained memory and retirement pins before parking an idle,
@@ -3363,7 +3797,44 @@ impl HostList {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .push((what, range));
+        } else if crumbs_on() {
+            let mut notes = self.notes.lock().unwrap_or_else(|e| e.into_inner());
+            self.crumb(notes.len() as u32);
+            notes.push((what(), range));
         }
+    }
+
+    /// Writes the breadcrumbs before noted command `at`: begun up to it
+    /// (when the front end of the GPU reaches it), done before it (once all
+    /// earlier work has finished).
+    #[cfg(feature = "diagnostics")]
+    fn crumb(&self, at: u32) {
+        let Some(crumbs) = crumbs() else { return };
+        let Ok(list) = self.list.cast::<ID3D12GraphicsCommandList2>() else {
+            return;
+        };
+        let mut slot = self.crumb.load(Ordering::Relaxed);
+        if slot == u32::MAX {
+            slot = crumbs.next.fetch_add(1, Ordering::Relaxed) % CRUMB_LISTS;
+            self.crumb.store(slot, Ordering::Relaxed);
+        }
+        let done = crumbs.gpu + u64::from(slot) * 8;
+        let params = [
+            D3D12_WRITEBUFFERIMMEDIATE_PARAMETER {
+                Dest: done + 4,
+                Value: at + 1,
+            },
+            D3D12_WRITEBUFFERIMMEDIATE_PARAMETER {
+                Dest: done,
+                Value: at,
+            },
+        ];
+        let modes = [
+            D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_IN,
+            D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT,
+        ];
+        // SAFETY: an open list; the destinations lie in our breadcrumb buffer.
+        unsafe { list.WriteBufferImmediate(2, params.as_ptr(), Some(modes.as_ptr())) };
     }
 
     /// Notes a pipeline the list binds.
@@ -3380,6 +3851,8 @@ impl HostList {
     /// until the list is reset, the first time only: the list keeps the
     /// first, so its address names the same pipeline from then on.
     pub(crate) fn bind_pipeline(&self, p: &crate::pipeline::host::HostPipeline) {
+        #[cfg(feature = "diagnostics")]
+        crate::shadow::note_bound_pipeline(&p.name);
         self.mark_work();
         let first = {
             let mut deferred = self.deferred();
@@ -3448,11 +3921,50 @@ impl HostList {
     pub(crate) fn fill_scratch(&self, src: *const u8, len: u64) -> Option<u64> {
         let key = (src as usize, len as usize);
         if let Some(&gpu) = self.deferred().filled.get(&key) {
+            #[cfg(feature = "diagnostics")]
+            if let Some(hash) = crate::cbv_trace::on() {
+                tracing::info!(
+                    hash,
+                    address = format_args!("{:#x}", src as usize),
+                    len,
+                    scratch = format_args!("{gpu:#x}"),
+                    "cbv trace: reuses a fill of the same title range from earlier in the list"
+                );
+            }
             return Some(gpu);
         }
         let (gpu, to) = self.scratch(len)?;
         self.defer_fill(to, src, len as usize);
         self.deferred().filled.insert(key, gpu);
+        #[cfg(feature = "diagnostics")]
+        if let Some(hash) = crate::cbv_trace::on() {
+            // Title memory's first bytes as the submission prepares the
+            // fill: told apart from the fill's after the run, it shows
+            // whether the fill copied what title memory held then.
+            let at_submit = std::sync::Arc::new(Mutex::new(None));
+            let (snapshot, from, n) = (
+                at_submit.clone(),
+                src as usize,
+                (len as usize).min(crate::cbv_trace::COMPARED),
+            );
+            self.defer_host_read(from as *const u8, n, move || {
+                let mut bytes = [0u8; crate::cbv_trace::COMPARED];
+                let read = crate::shadow::copy_mapped_wide_checked(
+                    bytes.as_mut_ptr(),
+                    from as *const u8,
+                    n,
+                );
+                *snapshot.lock().unwrap_or_else(|e| e.into_inner()) = read.then_some(bytes);
+            });
+            self.deferred().traced_fills.push((
+                hash,
+                to as usize,
+                src as usize,
+                len as usize,
+                gpu,
+                at_submit,
+            ));
+        }
         Some(gpu)
     }
 
@@ -3653,6 +4165,33 @@ impl HostList {
             lines,
             row_bytes,
             total,
+            query: None,
+        });
+    }
+
+    /// Copies `count` occlusion query results from the readback memory at
+    /// `src` into title memory at `dst` once the list has run, each
+    /// combined with the results of its later parts as `resolve` chose them
+    /// when the list was submitted: one further result follows the `count`
+    /// for each spare query.
+    pub(crate) fn defer_query_results(
+        &self,
+        dst: *mut u8,
+        src: *const u8,
+        count: usize,
+        resolve: std::sync::Arc<crate::query::Resolve>,
+    ) {
+        let total = count * 8;
+        self.mark_work();
+        self.deferred().readbacks.push(Readback {
+            dst: dst as usize,
+            src: src as usize,
+            dst_pitch: total,
+            src_pitch: total,
+            lines: 1,
+            row_bytes: total,
+            total,
+            query: Some(resolve),
         });
     }
 
@@ -3712,7 +4251,7 @@ impl HostList {
             return Some(made);
         }
         let mut s = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
-        while s.current < s.chunks.len() && s.used.next_multiple_of(align) + len > SCRATCH_CHUNK {
+        while s.current < s.chunks.len() && scratch_place(s.used, len, align).is_none() {
             (s.current, s.used) = (s.current + 1, 0);
         }
         if s.current == s.chunks.len() {
@@ -3724,9 +4263,9 @@ impl HostList {
             s.used = 0;
         }
         let (ref buffer, data, gpu) = s.chunks[s.current];
-        let at = s.used.next_multiple_of(align);
+        let (at, used) = scratch_place(s.used, len, align).unwrap_or((0, len));
         let made = f(buffer, at, gpu + at, (data + at as usize) as *mut u8);
-        s.used = at + len;
+        s.used = used;
         drop(s);
         self.mark_work();
         Some(made)
@@ -3754,6 +4293,27 @@ impl HostList {
         }
         // SAFETY: a live buffer.
         Some(unsafe { buffer.GetGPUVirtualAddress() })
+    }
+
+    /// After the list ran: counts it in [`BUDGET_SPENT`] if its indirect
+    /// work budget ([`Self::budget`]) ran out, so indirect records after that
+    /// point ran empty, logging at powers of two.
+    fn note_budget_spent(&self) {
+        let Some(Some((_, data))) = self.budget.get() else {
+            return;
+        };
+        // SAFETY: the list's own mapped word; the list has run.
+        let used = unsafe { (*data as *const u32).read_volatile() };
+        // `BUDGET` in `shaders/argument_clamp.hlsl` (`indirect_budget` models it).
+        if used >= 1 << 31 {
+            let n = BUDGET_SPENT.fetch_add(1, Ordering::Relaxed) + 1;
+            if n.is_power_of_two() {
+                tracing::warn!(
+                    lists = n,
+                    "a list spent its indirect work budget: its later indirect draws and dispatches ran empty"
+                );
+            }
+        }
     }
 
     /// A shader that can store to buffers is bound.
@@ -4034,6 +4594,33 @@ impl HostList {
         drop(gather);
         self.mark_work();
         Some(out)
+    }
+
+    /// The GPU-writable buffer for mesh programs run without mesh shaders,
+    /// of at least `len` bytes where [`MESH_BUFFER_MOST`] allows (and of
+    /// [`MESH_BUFFER_MIN`]): the buffer, its host GPU address and its size.
+    /// The host shares one between its lists, and this list keeps it alive.
+    /// Its state is tracked as a shadow buffer's is ([`HostList::use_shadow`]):
+    /// common when a list starts and when it closes.
+    pub(crate) fn mesh_buffer(&self, len: u64) -> Option<(ID3D12Resource, u64, u64)> {
+        let want = len
+            .clamp(MESH_BUFFER_MIN, MESH_BUFFER_MOST)
+            .next_multiple_of(1 << 16);
+        let host = host()?;
+        let (buffer, have) = {
+            let mut s = host.mesh_scratch.lock().unwrap_or_else(|e| e.into_inner());
+            if s.buffer.as_ref().is_none_or(|(_, have)| *have < want) {
+                let buffer = host.default_buffer(want)?;
+                name(&buffer, || format!("mesh buffer {want:#x}"));
+                // Lists that recorded the smaller one keep it alive.
+                s.buffer = Some((buffer, want));
+            }
+            s.buffer.clone()?
+        };
+        self.keep(&buffer);
+        // SAFETY: a live buffer.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        Some((buffer, gpu, have))
     }
 
     /// The list's GPU-writable scratch buffer for expanded indirect
@@ -5326,6 +5913,11 @@ pub(crate) fn write_mapped_raw_with(
     if len == 0 {
         return 0;
     }
+    #[cfg(feature = "diagnostics")]
+    // SAFETY: the caller's source holds `len` bytes.
+    crate::shadow::high_ones(dst as usize, unsafe {
+        std::slice::from_raw_parts(src, len)
+    });
     let Some(method) = copy_back_method() else {
         return 0;
     };
@@ -6846,50 +7438,269 @@ pub struct HdrDisplayInfo {
     pub max_full_frame_luminance: f32,
 }
 
-/// Queries the host display outputs for an active HDR10 (`G2084_NONE_P2020`)
-/// desktop mode. Returns `None` when HDR is disabled or unsupported.
-pub fn display_hdr_info() -> Option<HdrDisplayInfo> {
-    // SAFETY: plain DXGI factory, adapter and output enumeration.
+/// Whether this process uses more than 85% of the video memory budget the
+/// OS gives it on the host adapter. Asked at most every 250 ms; false if
+/// the adapter cannot say.
+pub(crate) fn video_memory_tight() -> bool {
+    use std::sync::atomic::{AtomicBool, AtomicU64};
+    static ASKED_MS: AtomicU64 = AtomicU64::new(0);
+    static TIGHT: AtomicBool = AtomicBool::new(false);
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let now = START
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_millis() as u64
+        + 1;
+    let asked = ASKED_MS.load(Ordering::Relaxed);
+    if asked != 0 && now - asked < 250
+        || ASKED_MS
+            .compare_exchange(asked, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+    {
+        return TIGHT.load(Ordering::Relaxed);
+    }
+    let Some(host) = host() else { return false };
+    // SAFETY: plain DXGI factory and adapter queries.
+    let tight = unsafe {
+        CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+            .and_then(|f| f.EnumAdapterByLuid::<IDXGIAdapter3>(host.device.GetAdapterLuid()))
+            .and_then(|a| {
+                let mut info = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
+                a.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut info)
+                    .map(|()| info.Budget > 0 && info.CurrentUsage > info.Budget / 100 * 85)
+            })
+            .unwrap_or(false)
+    };
+    if tight && !TIGHT.load(Ordering::Relaxed) {
+        tracing::info!("video memory near its budget: new read-only textures go to system memory");
+    }
+    TIGHT.store(tight, Ordering::Relaxed);
+    tight
+}
+
+/// Bytes of video memory made since start (frees not counted): render
+/// targets and depth, other textures, GPU-only buffers.
+#[cfg(feature = "diagnostics")]
+pub(crate) static VRAM_MADE: [std::sync::atomic::AtomicU64; 3] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// Counts `resource` in [`VRAM_MADE`] slot `kind`.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn note_vram(kind: usize, resource: &ID3D12Resource) {
+    let Some(host) = host() else { return };
+    // SAFETY: plain queries on a live resource and device.
+    let bytes = unsafe {
+        let desc = resource.GetDesc();
+        host.device
+            .GetResourceAllocationInfo(0, &[desc])
+            .SizeInBytes
+    };
+    VRAM_MADE[kind].fetch_add(bytes, Ordering::Relaxed);
+}
+
+/// Logs the host adapter's video memory (local) and the system memory it
+/// maps (non-local): what this process uses of each against the budget the
+/// OS gives it.
+#[cfg(feature = "diagnostics")]
+fn log_video_memory() {
+    let Some(host) = host() else { return };
+    // SAFETY: plain DXGI factory and adapter queries.
     unsafe {
-        let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
-        let adapter: IDXGIAdapter1 = if let Some(host) = host() {
-            let luid = host.device.GetAdapterLuid();
-            factory
-                .EnumAdapterByLuid::<IDXGIAdapter1>(luid)
-                .or_else(|_| factory.EnumAdapters1(0))
-                .ok()?
-        } else {
-            factory.EnumAdapters1(0).ok()?
+        let Ok(factory) = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0)) else {
+            return;
         };
-        let mut i = 0u32;
-        while let Ok(output) = adapter.EnumOutputs(i) {
-            i += 1;
-            let Ok(output6) = output.cast::<IDXGIOutput6>() else {
-                continue;
-            };
-            let Ok(desc) = output6.GetDesc1() else {
-                continue;
-            };
-            if desc.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020 {
-                return Some(HdrDisplayInfo {
-                    min_luminance: desc.MinLuminance,
-                    max_luminance: desc.MaxLuminance,
-                    max_full_frame_luminance: desc.MaxFullFrameLuminance,
-                });
-            }
-        }
-        None
+        let Ok(adapter) = factory.EnumAdapterByLuid::<IDXGIAdapter3>(host.device.GetAdapterLuid())
+        else {
+            return;
+        };
+        let mb = |group| {
+            let mut info = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
+            adapter
+                .QueryVideoMemoryInfo(0, group, &mut info)
+                .map(|()| (info.CurrentUsage >> 20, info.Budget >> 20))
+                .unwrap_or_default()
+        };
+        let (local, local_budget) = mb(DXGI_MEMORY_SEGMENT_GROUP_LOCAL);
+        let (shared, shared_budget) = mb(DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL);
+        let [targets, textures, buffers] = VRAM_MADE
+            .each_ref()
+            .map(|n| n.load(Ordering::Relaxed) >> 20);
+        tracing::info!(
+            "video memory {local}/{local_budget} MB, shared {shared}/{shared_budget} MB; made \
+             since start: targets {targets} MB, textures {textures} MB, GPU buffers {buffers} MB"
+        );
     }
 }
 
-fn desired_color_space(format: DXGI_FORMAT, hdr_active: bool) -> DXGI_COLOR_SPACE_TYPE {
-    if !hdr_active {
-        return DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
+/// One host output as DXGI describes it: its monitor and, when it is in
+/// HDR10 mode (`G2084_NONE_P2020`), its luminance bounds.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct OutputHdr {
+    monitor: isize,
+    hdr: Option<HdrDisplayInfo>,
+}
+
+/// The HDR state of `monitor`'s output. Only that output counts, not any
+/// output of the adapter: a window on an SDR monitor is SDR even when
+/// another monitor is in HDR mode.
+fn monitor_hdr(outputs: &[OutputHdr], monitor: isize) -> Option<HdrDisplayInfo> {
+    outputs.iter().find(|o| o.monitor == monitor)?.hdr
+}
+
+/// The swap chain presents in HDR only when the title was told HDR and the
+/// window's monitor is in HDR mode. A title told SDR (or that never asked)
+/// writes SDR values whatever the desktop does.
+fn swap_chain_hdr(told: Option<bool>, window_hdr: bool) -> bool {
+    told == Some(true) && window_hdr
+}
+
+/// The outputs of every adapter `factory` lists.
+fn host_outputs(factory: &IDXGIFactory1) -> Vec<OutputHdr> {
+    let mut outputs = Vec::new();
+    // SAFETY: plain DXGI adapter and output enumeration.
+    unsafe {
+        let mut a = 0;
+        while let Ok(adapter) = factory.EnumAdapters1(a) {
+            a += 1;
+            let mut i = 0;
+            while let Ok(output) = adapter.EnumOutputs(i) {
+                i += 1;
+                let Ok(desc) = output.cast::<IDXGIOutput6>().and_then(|o| o.GetDesc1()) else {
+                    continue;
+                };
+                let hdr = desc.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
+                outputs.push(OutputHdr {
+                    monitor: desc.Monitor.0 as isize,
+                    hdr: hdr.then_some(HdrDisplayInfo {
+                        min_luminance: desc.MinLuminance,
+                        max_luminance: desc.MaxLuminance,
+                        max_full_frame_luminance: desc.MaxFullFrameLuminance,
+                    }),
+                });
+            }
+        }
     }
+    outputs
+}
+
+/// The outputs as last enumerated, with the factory that enumerated them.
+/// They are enumerated again only when the factory is no longer current
+/// (a display was added, removed or changed mode, HDR included).
+struct OutputCache {
+    factory: IDXGIFactory1,
+    outputs: Vec<OutputHdr>,
+}
+// SAFETY: DXGI factories are free-threaded; the cache is used under a lock.
+unsafe impl Send for OutputCache {}
+
+fn cached_outputs() -> Vec<OutputHdr> {
+    static CACHE: Mutex<Option<OutputCache>> = Mutex::new(None);
+    let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    // SAFETY: a live factory.
+    let current = |c: &&OutputCache| unsafe { c.factory.IsCurrent() }.as_bool();
+    if let Some(c) = cache.as_ref().filter(current) {
+        return c.outputs.clone();
+    }
+    // SAFETY: plain factory creation.
+    let Ok(factory) =
+        (unsafe { CreateDXGIFactory2::<IDXGIFactory1>(DXGI_CREATE_FACTORY_FLAGS(0)) })
+    else {
+        return cache
+            .as_ref()
+            .map(|c| c.outputs.clone())
+            .unwrap_or_default();
+    };
+    let outputs = host_outputs(&factory);
+    if cache.is_some() {
+        tracing::info!(
+            outputs = outputs.len(),
+            "host displays changed; HDR state read again"
+        );
+    }
+    *cache = Some(OutputCache {
+        factory,
+        outputs: outputs.clone(),
+    });
+    outputs
+}
+
+/// The monitor `hwnd` is on, or the primary monitor without a window.
+fn monitor_of(hwnd: Option<HWND>) -> isize {
+    use windows::Win32::Graphics::Gdi::{
+        MONITOR_DEFAULTTOPRIMARY, MonitorFromPoint, MonitorFromWindow,
+    };
+    // SAFETY: plain monitor queries; a stale window handle gives the primary.
+    let monitor = unsafe {
+        match hwnd {
+            Some(hwnd) => MonitorFromWindow(hwnd, MONITOR_DEFAULTTOPRIMARY),
+            None => MonitorFromPoint(Default::default(), MONITOR_DEFAULTTOPRIMARY),
+        }
+    };
+    monitor.0 as isize
+}
+
+/// The HDR state of the monitor `hwnd` is on (cached; see [`OutputCache`]).
+fn window_hdr_info(hwnd: Option<HWND>) -> Option<HdrDisplayInfo> {
+    monitor_hdr(&cached_outputs(), monitor_of(hwnd))
+}
+
+/// Whether HDR10 desktop mode is active on the monitor the title's window
+/// is on (the primary monitor before there is a window), with its luminance
+/// bounds. `None` when that monitor is SDR.
+pub fn display_hdr_info() -> Option<HdrDisplayInfo> {
+    window_hdr_info(title_window())
+}
+
+/// What the title was last told about HDR: 0 never, 1 SDR, 2 HDR.
+static TOLD_HDR: AtomicU32 = AtomicU32::new(0);
+
+/// Records what the title was told about HDR (`XDisplayTryEnableHdrMode`),
+/// so the swap chain presents in the color space the title writes.
+pub fn title_told_hdr(enabled: bool) {
+    TOLD_HDR.store(if enabled { 2 } else { 1 }, Ordering::Relaxed);
+}
+
+fn told_hdr() -> Option<bool> {
+    match TOLD_HDR.load(Ordering::Relaxed) {
+        0 => None,
+        v => Some(v == 2),
+    }
+}
+
+/// The swap chain's HDR state for `hwnd`. Warns when the title was told
+/// HDR but the window's monitor is SDR (once each time that starts).
+fn presenter_hdr(hwnd: HWND) -> bool {
+    static MISMATCH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let told = told_hdr();
+    let window = window_hdr_info(Some(hwnd)).is_some();
+    let mismatch = told == Some(true) && !window;
+    if mismatch && !MISMATCH.swap(true, Ordering::Relaxed) {
+        tracing::warn!(
+            "the title was told HDR but the window's monitor is SDR: its PQ values show as SDR"
+        );
+    } else if !mismatch {
+        MISMATCH.store(false, Ordering::Relaxed);
+    }
+    swap_chain_hdr(told, window)
+}
+
+/// The color space DXGI gives a new swap chain of `format`: scRGB (linear)
+/// for half floats, sRGB-like gamma 2.2 otherwise.
+fn default_color_space(format: DXGI_FORMAT) -> DXGI_COLOR_SPACE_TYPE {
+    if format == DXGI_FORMAT_R16G16B16A16_FLOAT {
+        DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709
+    } else {
+        DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709
+    }
+}
+
+/// The color space a swap chain of `format` presents in. Half floats are
+/// always scRGB, which DWM shows on SDR and HDR displays alike; gamma 2.2 is
+/// not a color space DXGI presents half floats in.
+fn desired_color_space(format: DXGI_FORMAT, hdr_active: bool) -> DXGI_COLOR_SPACE_TYPE {
     match format {
-        DXGI_FORMAT_R10G10B10A2_UNORM => DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020,
-        DXGI_FORMAT_R16G16B16A16_FLOAT => DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709,
-        _ => DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709,
+        DXGI_FORMAT_R10G10B10A2_UNORM if hdr_active => DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020,
+        _ => default_color_space(format),
     }
 }
 
@@ -6976,6 +7787,8 @@ impl Meter {
     fn frame(&mut self, hwnd: HWND) {
         #[cfg(feature = "diagnostics")]
         tracing::debug!(target: "victory_gpu::frame", token = crate::frame::current(), "present");
+        #[cfg(feature = "diagnostics")]
+        crate::timeline::wait_stats::frame();
         self.frames += 1;
         self.logged_frames += 1;
         let elapsed = self.since.elapsed();
@@ -6999,6 +7812,11 @@ impl Meter {
             [0, 1].map(|i| COPY_BACK[i].swap(0, Ordering::Relaxed) as f64 / [1e3, 1e6][i] / frames);
         let dropped = crate::draw::take_dropped() as f64 / frames;
         let indirect = crate::list::take_indirect() as f64 / frames;
+        let [fence, memory, running, called] = crate::timeline::HELD_US
+            .each_ref()
+            .map(|n| n.swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames);
+        let [mesh_direct, mesh_indirect] =
+            crate::draw::take_mesh_without_mesh_shaders().map(|n| n as f64 / frames);
         // Over the same frames as the counts above.
         #[cfg(feature = "diagnostics")]
         let drops = crate::pipeline::take_drops();
@@ -7006,6 +7824,11 @@ impl Meter {
             self.logged = std::time::Instant::now();
             let logged_frames = (std::mem::take(&mut self.logged_frames) as f64).max(1.0);
             crate::upload_pool::trim_idle(ram_idle_ms(available_physical_ram()));
+            #[cfg(feature = "diagnostics")]
+            log_video_memory();
+            tracing::info!(
+                "queues per frame (ms, summed over queues): held behind fences {fence:.1},                  behind memory waits {memory:.1}; running work {running:.1}; in the driver's                  ExecuteCommandLists {called:.1}"
+            );
             tracing::info!(
                 "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
@@ -7014,6 +7837,11 @@ impl Meter {
                  {indirect:.0} indirect",
                 making = crate::pipeline::making()
             );
+            if mesh_direct + mesh_indirect > 0.0 {
+                tracing::info!(
+                    "mesh dispatches run as a compute pass and a draw (no mesh shaders on this                      host): {mesh_direct:.1}/frame direct, {mesh_indirect:.1}/frame indirect"
+                );
+            }
             let twins = crate::resource::TWINS[0].load(Ordering::Relaxed);
             if twins > 0 {
                 let [to_depth, to_twin] = [2, 3]
@@ -7067,6 +7895,10 @@ impl Meter {
             #[cfg(feature = "diagnostics")]
             {
                 crate::copystat::log(logged_frames);
+                tracing::info!(
+                    conflicts = crate::shadow::CONFLICTS.swap(0, Ordering::Relaxed),
+                    "copy-back conflicts (dwords left to a newer CPU write) since the last line"
+                );
                 for (why, n) in drops.iter().take(40) {
                     tracing::info!(
                         "dropped {:.1}/frame without a host pipeline: {why}",
@@ -7276,7 +8108,7 @@ impl Host {
             format,
             DXGI_FORMAT_R10G10B10A2_UNORM | DXGI_FORMAT_R16G16B16A16_FLOAT
         ) {
-            p.sync_color_space(display_hdr_info().is_some());
+            p.sync_color_space(presenter_hdr(p.hwnd));
         } else {
             p.sync_color_space(false);
         }
@@ -7464,14 +8296,14 @@ impl Host {
                 width,
                 height,
                 format,
-                color_space: DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709,
+                color_space: default_color_space(format),
                 copy,
                 hwnd,
                 meter: Meter::new(),
                 last_present_issue: None,
                 compositor: None,
             };
-            p.sync_color_space(display_hdr_info().is_some());
+            p.sync_color_space(presenter_hdr(hwnd));
             Ok(p)
         }
     }
@@ -7646,6 +8478,10 @@ impl Host {
                 &mut buffer,
             )
         };
+        #[cfg(feature = "diagnostics")]
+        if let Some(b) = &buffer {
+            note_vram(2, b);
+        }
         match made {
             Ok(()) => buffer,
             Err(e) => {

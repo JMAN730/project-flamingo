@@ -94,6 +94,9 @@ fn bundled_shader(source: &str, entry: &str, target: &str) -> Option<&'static [u
         (include_str!("../shaders/rebar_hash.hlsl"), "main", "cs_5_1") => {
             Some(bytecode!("rebar_hash"))
         }
+        (include_str!("../shaders/mesh_draws.hlsl"), "main", "cs_5_1") => {
+            Some(bytecode!("mesh_draws"))
+        }
         _ => None,
     }
 }
@@ -292,6 +295,7 @@ mod tests {
             include_str!("../shaders/rect_rewrite.hlsl"),
             include_str!("../shaders/rect_expand.hlsl"),
             include_str!("../shaders/rebar_hash.hlsl"),
+            include_str!("../shaders/mesh_draws.hlsl"),
         ] {
             let expected = bundled_shader(source, "main", "cs_5_1").unwrap();
             let bytes = compile_compute("bundled helper", source).unwrap();

@@ -75,7 +75,17 @@ const RECHECK: Duration = Duration::from_millis(100);
 const STALL: Duration = Duration::from_secs(5);
 /// How often the background watcher re-checks live fences while at least one
 /// event or queue wait is pending (for direct CPU/shader memory writes).
-const WATCH_POLL: Duration = Duration::from_millis(10);
+/// Each poll a queue waits through adds up: a world frame chains dozens of
+/// submissions through GPU memory waits. 10 ms by default; `VICTORY_FAST_WAKE=1`
+/// makes it 1 ms (with it, world entry hung the GPU more often).
+fn watch_poll() -> Duration {
+    static POLL: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    // `VICTORY_FAST_WAKE=1`: poll every 1 ms instead of 10 ms.
+    *POLL.get_or_init(|| match crate::switch::on("VICTORY_FAST_WAKE") {
+        true => Duration::from_millis(1),
+        false => Duration::from_millis(10),
+    })
+}
 
 struct Watcher {
     /// Incremented whenever an event or queue wait is added. Pure leaf lock:
@@ -104,6 +114,8 @@ fn watch_notify() {
 }
 
 fn watch_loop() {
+    #[cfg(feature = "diagnostics")]
+    let _scan = crate::timeline::wait_stats::scanning(crate::timeline::wait_stats::Scan::Watcher);
     loop {
         let seen = *WATCHER.generation.lock().unwrap_or_else(|e| e.into_inner());
         let (woken, any_waiting) = scan_live_fences();
@@ -119,7 +131,7 @@ fn watch_loop() {
             drop(
                 WATCHER
                     .added
-                    .wait_timeout(g, WATCH_POLL)
+                    .wait_timeout(g, watch_poll())
                     .unwrap_or_else(|e| e.into_inner()),
             );
         } else {
@@ -231,7 +243,12 @@ fn scan_memory_waiters() -> (Vec<Arc<Timeline>>, bool) {
         let Some(live) = timeline.upgrade() else {
             return false;
         };
-        if wait.satisfied() || Instant::now() >= *deadline {
+        let satisfied = wait.satisfied();
+        if satisfied || Instant::now() >= *deadline {
+            #[cfg(feature = "diagnostics")]
+            if satisfied {
+                crate::timeline::wait_stats::woke(&live, wait);
+            }
             woken.push(live);
             false
         } else {
@@ -379,7 +396,11 @@ pub(crate) extern "system" fn signal(this: This, value: u64) -> HRESULT {
     let waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
     fence.value.store(value, Ordering::Release);
     let mut queues = wake(fence, waiters);
+    #[cfg(feature = "diagnostics")]
+    let scan = crate::timeline::wait_stats::scanning(crate::timeline::wait_stats::Scan::Signal);
     queues.extend(scan_memory_waiters().0);
+    #[cfg(feature = "diagnostics")]
+    drop(scan);
     run_held(queues);
     S_OK
 }
@@ -506,6 +527,10 @@ impl Held {
 /// fence whose value the write touched, plus any satisfied memory waits, and
 /// returns the held queues.
 pub(crate) fn written(at: usize, bytes: usize) -> Woken {
+    #[cfg(feature = "diagnostics")]
+    let _scan = crate::timeline::wait_stats::scanning_unless_set(
+        crate::timeline::wait_stats::Scan::DoneWrite { sub: 0, at, bytes },
+    );
     let end = at.saturating_add(bytes);
     let mut queues = {
         let live = live();

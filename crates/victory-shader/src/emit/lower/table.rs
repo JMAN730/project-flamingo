@@ -1,0 +1,392 @@
+//! Buffer loads whose element stride only the view knows (a descriptor the
+//! program picks at run time, such as each lane's own in a waterfall loop
+//! over heap indices): read through the host's buffer view table (see
+//! [`UserData`]), which gives each heap slot's raw view, stride, first byte
+//! and element count.
+
+use super::{Lower, Val, Why};
+use crate::emit::bitcode::{Attr, Bin, Cast, Term, V, pred};
+use crate::emit::{self, UNKNOWN_STRUCTURED_STRIDE, UserData};
+use crate::ir::{Inst, Reg};
+use crate::native::RootType;
+use crate::resource::Source;
+
+/// A buffer view's record in the host's buffer view table
+/// ([`Lower::table_buffer`]).
+pub(super) struct TableBuffer {
+    handle: V,
+    stride: V,
+    bias: V,
+    elements: V,
+}
+
+impl Lower<'_> {
+    /// Whether every view `src` may name sits at a fixed table entry, whose
+    /// stride the host specializes the pipeline with instead (see
+    /// [`emit::StructuredBinding`]): such loads keep that path.
+    fn view_specializable(&self, src: &Source) -> bool {
+        src.leaves().into_iter().all(|leaf| {
+            let Source::Loaded { load, first } = *leaf else {
+                return false;
+            };
+            let Some(address) = self.scalar.get(&load) else {
+                return false;
+            };
+            let Some(param) = self.x.native.layout.get(address.param) else {
+                return false;
+            };
+            param.root == RootType::Table
+                && address.dynamic.is_none()
+                && address
+                    .offset
+                    .checked_add(4 * u32::from(first))
+                    .is_some_and(|o| o % 32 == 0)
+        })
+    }
+
+    /// The slot of the buffer descriptor `src` in the title's heap, where
+    /// the host's buffer view table holds its record, and whether it may
+    /// differ between lanes. Not the index [`Lower::handle`] takes: through
+    /// a root table the host bound a copy of, that one is the copy's slot.
+    pub(super) fn buffer_heap_index(&mut self, src: &Source) -> Result<(V, bool), Why> {
+        let outer = std::mem::replace(&mut self.title_slots, true);
+        let index = self.buffer_heap_index_in(src);
+        self.title_slots = outer;
+        index
+    }
+
+    fn buffer_heap_index_in(&mut self, src: &Source) -> Result<(V, bool), Why> {
+        match src {
+            Source::Loaded { load, first } => {
+                let index = self.heap_index(*load, *first, false)?;
+                Ok((index, self.x.res.waterfall.loads.contains(load)))
+            }
+            Source::Phi { .. } => Ok((self.uniform_heap_index(src, false)?, false)),
+            Source::Select { .. } => Ok((self.lane_heap_index(src, false)?, false)),
+            Source::Fetched { .. } | Source::Lanes { .. } | Source::LanePhi { .. } => {
+                Ok((self.lane_heap_index(src, false)?, true))
+            }
+            Source::Constant(_) | Source::Built { .. } => Err(UNKNOWN_STRUCTURED_STRIDE),
+        }
+    }
+
+    /// The user-data dword holding the heap index of the host's buffer
+    /// view table (see [`UserData`]).
+    pub(super) fn buffer_table_slot(&mut self) -> Result<V, Why> {
+        let existing = self
+            .user_reads
+            .values()
+            .find(|u| !u.indexed_buffer && u.root == RootType::ResourceHeap)
+            .map(|u| u.index);
+        let index = match existing {
+            Some(index) => index,
+            None => {
+                // After every input, which keeps its own position.
+                let inputs = self
+                    .params
+                    .values()
+                    .filter_map(|&(p, word)| {
+                        let rp = self.x.native.layout[p];
+                        matches!(rp.root, RootType::Constants | RootType::Table)
+                            .then_some(u32::from(rp.user_data) + word + 1)
+                    })
+                    .max()
+                    .unwrap_or(0);
+                let index = inputs.max(self.s.user_data);
+                if index + 1 > 64 {
+                    return Err("a buffer view table beyond the root constant budget");
+                }
+                self.user_reads.insert(
+                    index,
+                    UserData {
+                        indexed_buffer: false,
+                        index,
+                        slot: 0,
+                        root: RootType::ResourceHeap,
+                        dword: 0,
+                    },
+                );
+                index
+            }
+        };
+        Ok(self.user_word(index))
+    }
+
+    /// The host's record of the buffer view `src` names (see
+    /// [`UserData`]): a raw handle of the memory holding it, its
+    /// stride, its first byte there and its element count. A slot the host
+    /// has no record for gives the table's own view and no elements.
+    pub(super) fn table_buffer(&mut self, src: &Source) -> Result<TableBuffer, Why> {
+        if crate::switch::no_buffer_table() || self.view_specializable(src) {
+            return Err(UNKNOWN_STRUCTURED_STRIDE);
+        }
+        let (index, per_lane) = self.buffer_heap_index(src)?;
+        let c = self.cur;
+        let slot = self.buffer_table_slot()?;
+        let table = self.s.heap_handle(c, slot, false, false, (11, 0));
+        let invalid = self.s.m.i32(u32::MAX - 15);
+        let limit = self.s.m.i32(emit::VIEW_HEAP_LIMIT);
+        let in_heap = self.s.m.cmp(c, pred::IULT, index, limit);
+        let size = self.s.m.i32(emit::BUFFER_TABLE_RECORD);
+        let at = self.s.m.bin(c, Bin::Mul, index, size);
+        let at = self.s.m.select(c, in_heap, at, invalid);
+        let iu = self.s.m.undef(self.s.t.i32);
+        let mask = self.s.m.i8(0xF);
+        let align = self.s.m.i32(4);
+        let r = self.s.op(
+            c,
+            "rawBufferLoad.f32",
+            Attr::ReadOnly,
+            self.s.t.res_ret,
+            139,
+            &[table, at, iu, mask, align],
+        );
+        let mut words = [iu; 4];
+        for (k, w) in words.iter_mut().enumerate() {
+            let x = self.s.m.extract(c, r, k as u32);
+            *w = self.as_int(x);
+        }
+        let [alias, stride, bias, elements] = words;
+        let zero = self.s.m.i32(0);
+        let known = self.s.m.cmp(c, pred::NE, elements, zero);
+        let alias = self.s.m.select(c, known, alias, slot);
+        let handle = self.s.heap_handle(c, alias, false, per_lane, (11, 0));
+        Ok(TableBuffer {
+            handle,
+            stride,
+            bias,
+            elements,
+        })
+    }
+
+    /// The numeric class of the view `src` names, from the host's list of
+    /// view classes ([`emit::USER_VIEW_CLASSES`]), by the view's slot in the
+    /// title's heap: whether it is UINT, and whether SINT. The console's
+    /// image instructions convert by the view's format, which only the
+    /// descriptor knows; the host's descriptor is not readable, so its class
+    /// comes from the list. None where the program cannot find the view's
+    /// title slot: such accesses stay float.
+    pub(super) fn view_class(&mut self, src: &Source) -> Option<(V, V)> {
+        let (index, _) = self.buffer_heap_index(src).ok()?;
+        let list = self.host_word(RootType::Other(emit::USER_VIEW_CLASSES), 0, 0);
+        let head = self.cur;
+        let zero = self.s.m.i32(0);
+        // A host without the list supplies 0: no list is read.
+        let listed = self.s.m.cmp(head, pred::NE, list, zero);
+        let (read, join) = (self.s.m.new_block(), self.s.m.new_block());
+        self.s.m.terminate(head, Term::CondBr(listed, read, join));
+        let c = read;
+        let table = self.s.heap_handle(c, list, false, false, (11, 0));
+        let invalid = self.s.m.i32(u32::MAX - 15);
+        let limit = self.s.m.i32(emit::VIEW_HEAP_LIMIT);
+        let in_heap = self.s.m.cmp(c, pred::IULT, index, limit);
+        let entry = self.s.m.i32(emit::VIEW_CLASS_ENTRY);
+        let at = self.s.m.bin(c, Bin::Mul, index, entry);
+        // A slot past the list reads 0: float.
+        let at = self.s.m.select(c, in_heap, at, invalid);
+        let (iu, mask, align) = (
+            self.s.m.undef(self.s.t.i32),
+            self.s.m.i8(1),
+            self.s.m.i32(4),
+        );
+        let r = self.s.op(
+            c,
+            "rawBufferLoad.f32",
+            Attr::ReadOnly,
+            self.s.t.res_ret,
+            139,
+            &[table, at, iu, mask, align],
+        );
+        let x = self.s.m.extract(c, r, 0);
+        let read_class = self.s.m.cast(c, Cast::Bitcast, x, self.s.t.i32);
+        self.s.m.terminate(read, Term::Br(join));
+        self.cur = join;
+        let c = join;
+        let class = self.s.m.phi(join, self.s.t.i32);
+        self.s
+            .m
+            .set_phi(class, vec![(read_class, read), (zero, head)]);
+        let (uint, sint) = (
+            self.s.m.i32(emit::VIEW_CLASS_UINT),
+            self.s.m.i32(emit::VIEW_CLASS_SINT),
+        );
+        Some((
+            self.s.m.cmp(c, pred::EQ, class, uint),
+            self.s.m.cmp(c, pred::EQ, class, sint),
+        ))
+    }
+
+    /// An indexed load of `mask`'s dwords at byte `off` of element `index`
+    /// of a buffer whose stride only its view knows, through the host's
+    /// table. An element past the view's, or an address that wraps, reads
+    /// zeros (the console's structured bounds check).
+    // shortcut: an offset past the element's stride reads into the next
+    // element, or past the view into the memory after it, as far as the
+    // raw view holding it reaches.
+    pub(super) fn table_load(
+        &mut self,
+        src: &Source,
+        index: V,
+        off: V,
+        mask: V,
+        count: u32,
+    ) -> Result<V, Why> {
+        let t = self.table_buffer(src)?;
+        let c = self.cur;
+        let start = self.s.m.bin(c, Bin::Mul, index, t.stride);
+        let within = self.s.m.bin(c, Bin::Add, start, off);
+        let high = self.mul_hi(index, t.stride, false);
+        let zero = self.s.m.i32(0);
+        let product_wrapped = self.s.m.cmp(c, pred::NE, high, zero);
+        let offset_wrapped = self.s.m.cmp(c, pred::IULT, within, start);
+        // A raw view (stride 0) is not indexed: the index moves nothing,
+        // and the count is of bytes, not of elements, so the byte offset is
+        // what it bounds. A slot with no record (a null view, an index past
+        // the table) reads as stride 0 and count 0: every byte is past it,
+        // so the load reads zeros, never the table's own record.
+        // A raw view bounds the last byte the load reads, not its first: a
+        // vector load that runs past the view's end must not read the
+        // neighbouring memory the alias window around it holds.
+        // shortcut: such a load reads zeros in every component, where the
+        // console keeps the components still inside the view.
+        let past_element = self.s.m.cmp(c, pred::IUGE, index, t.elements);
+        let bytes = self.s.m.i32(4 * count.max(1));
+        let end = self.s.m.bin(c, Bin::Add, within, bytes);
+        let end_wrapped = self.s.m.cmp(c, pred::IULT, end, within);
+        let past_end = self.s.m.cmp(c, pred::IUGT, end, t.elements);
+        let past_byte = self.s.m.bin(c, Bin::Or, past_end, end_wrapped);
+        let structured = self.s.m.cmp(c, pred::NE, t.stride, zero);
+        let past = self.s.m.select(c, structured, past_element, past_byte);
+        let wrapped = self.s.m.bin(c, Bin::Or, product_wrapped, offset_wrapped);
+        let outside = self.s.m.bin(c, Bin::Or, wrapped, past);
+        let byte = self.s.m.bin(c, Bin::Add, within, t.bias);
+        let bias_wrapped = self.s.m.cmp(c, pred::IULT, byte, within);
+        let outside = self.s.m.bin(c, Bin::Or, outside, bias_wrapped);
+        // The host leaves this final block outside every view it lists.
+        let invalid = self.s.m.i32(u32::MAX - 15);
+        let byte = self.s.m.select(c, outside, invalid, byte);
+        let iu = self.s.m.undef(self.s.t.i32);
+        let align = self.s.m.i32(4);
+        Ok(self.s.op(
+            c,
+            "rawBufferLoad.f32",
+            Attr::ReadOnly,
+            self.s.t.res_ret,
+            139,
+            &[t.handle, byte, iu, mask, align],
+        ))
+    }
+
+    /// A buffer descriptor (`count` of its words from the first) that no
+    /// memory instruction takes, read only as data, as programs that walk a
+    /// ray-tracing structure through title memory read its base address:
+    /// words 0 and 1 from the slot's entry in the host's view address list
+    /// ([`emit::USER_VIEW_ADDRESSES`]) in the GFX10 layout (word 0 the low
+    /// address dword, word 1 bits 0-15 the high one and bits 16-29 the
+    /// stride), the stride and word 2 (the record count) from the slot's
+    /// record in the buffer view table. A slot the host has no address for
+    /// reads address 0, which no title memory holds.
+    // shortcut: word 3 (format and bounds checking) has no host value:
+    // reading it stops the program.
+    pub(super) fn view_address_data(
+        &mut self,
+        inst: &Inst,
+        code: u8,
+        count: u32,
+        src: &Source,
+    ) -> Result<(), Why> {
+        if crate::switch::no_buffer_table() {
+            return Err("a descriptor read only as data");
+        }
+        let (index, _) = self.buffer_heap_index(src)?;
+        let c = self.cur;
+        let slot = self.buffer_table_slot()?;
+        let table = self.s.heap_handle(c, slot, false, false, (11, 0));
+        let list = self.host_word(RootType::Other(emit::USER_VIEW_ADDRESSES), 0, 0);
+        let invalid = self.s.m.i32(u32::MAX - 15);
+        let limit = self.s.m.i32(emit::VIEW_HEAP_LIMIT);
+        let in_heap = self.s.m.cmp(c, pred::IULT, index, limit);
+        let iu = self.s.m.undef(self.s.t.i32);
+        let align = self.s.m.i32(4);
+        let load = |l: &mut Self, at: V, mask: u8| {
+            let mask = l.s.m.i8(mask);
+            l.s.op(
+                c,
+                "rawBufferLoad.f32",
+                Attr::ReadOnly,
+                l.s.t.res_ret,
+                139,
+                &[table, at, iu, mask, align],
+            )
+        };
+        let size = self.s.m.i32(emit::BUFFER_TABLE_RECORD);
+        let at = self.s.m.bin(c, Bin::Mul, index, size);
+        let at = self.s.m.select(c, in_heap, at, invalid);
+        let record = load(self, at, 0xF);
+        let entry = self.s.m.i32(emit::VIEW_ADDRESS_ENTRY);
+        let at = self.s.m.bin(c, Bin::Mul, index, entry);
+        let at = self.s.m.bin(c, Bin::Add, list, at);
+        let zero = self.s.m.i32(0);
+        let listed = self.s.m.cmp(c, pred::NE, list, zero);
+        let known = self.s.m.bin(c, Bin::And, listed, in_heap);
+        let at = self.s.m.select(c, known, at, invalid);
+        let address = load(self, at, 0x3);
+        let word = |l: &mut Self, r: V, k: u32| {
+            let x = l.s.m.extract(c, r, k);
+            l.as_int(x)
+        };
+        let (stride, elements) = (word(self, record, 1), word(self, record, 3));
+        let (low, high) = (word(self, address, 0), word(self, address, 1));
+        let k = |l: &mut Self, v: u32| l.s.m.i32(v);
+        let (k16, k3fff, kffff) = (k(self, 16), k(self, 0x3FFF), k(self, 0xFFFF));
+        let high = self.s.m.bin(c, Bin::And, high, kffff);
+        let stride = self.s.m.bin(c, Bin::And, stride, k3fff);
+        let stride = self.s.m.bin(c, Bin::Shl, stride, k16);
+        let word1 = self.s.m.bin(c, Bin::Or, high, stride);
+        for k in 0..count {
+            let reg = Reg::S(code + k as u8);
+            match k {
+                0 => self.write(inst, reg, low, None),
+                1 => self.write(inst, reg, word1, None),
+                2 => self.write(inst, reg, elements, None),
+                _ => {
+                    if let Some(v) = inst.write(reg) {
+                        self.vals.insert(
+                            v,
+                            Val::Missing("a descriptor's address or format read as data"),
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// A buffer descriptor the program reads as data whose stride only its
+    /// view knows: word 2 (the record count) from the host's table, as the
+    /// loads through it take the stride ([`Lower::table_load`]).
+    pub(super) fn table_descriptor_data(
+        &mut self,
+        inst: &Inst,
+        code: u8,
+        count: u32,
+        first: u8,
+        src: &Source,
+    ) -> Result<(), Why> {
+        let t = self.table_buffer(src)?;
+        for k in 0..count {
+            let Some(v) = inst.write(Reg::S(code + k as u8)) else {
+                continue;
+            };
+            if k.wrapping_sub(u32::from(first)) == 2 {
+                self.write(inst, Reg::S(code + k as u8), t.elements, None);
+            } else {
+                self.vals.insert(
+                    v,
+                    Val::Missing("a descriptor's address or format read as data"),
+                );
+            }
+        }
+        Ok(())
+    }
+}

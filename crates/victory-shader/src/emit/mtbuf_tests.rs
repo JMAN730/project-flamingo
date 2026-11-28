@@ -102,6 +102,7 @@ fn emit_test_program(
             st: &st,
             io: &io,
             res: &res,
+            mesh_buffer: false,
         },
         true,
         view_stride,

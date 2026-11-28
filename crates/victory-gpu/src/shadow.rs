@@ -467,6 +467,11 @@ pub(crate) struct Shadow {
     /// Per page of title memory from `start`'s on: the write-watch asking
     /// after which it was last copied (0: never).
     copied: Mutex<Vec<u64>>,
+    /// Per page of title memory from `start`'s on: whether any of it was
+    /// ever copied from title memory to the copy (a refresh of any part,
+    /// watched or not). Until then the copy's bytes there say nothing of
+    /// what the title holds.
+    refreshed: Box<[std::sync::atomic::AtomicBool]>,
     /// Whether the memory is write-watched: unknown, yes, no.
     watched: AtomicU8,
     /// Ranges shaders of a submission not yet copied back may be writing:
@@ -994,19 +999,15 @@ pub(crate) fn relay_fetched_value() -> u64 {
     RELAY_FETCHED.load(Ordering::Acquire)
 }
 
-/// Bytewise three-way merge of GPU writes (`now`) vs pre-submission reference
-/// (`held`) into current title memory (`title`), updating `held` in place.
-/// Returns `true` if any byte of `title` changed.
-fn merge_piece(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
-    let mut differs = 0u8;
-    for ((n, h), t) in now.iter().zip(held.iter_mut()).zip(title.iter_mut()) {
-        let wrote = if *n != *h { 0xffu8 } else { 0 };
-        let merged = (*t & !wrote) | (*n & wrote);
-        differs |= merged ^ *t;
-        *t = merged;
-        *h = (*h & !wrote) | (*n & wrote);
-    }
-    differs != 0
+/// Three-way merge of GPU writes (`now`) at title address `address` vs the
+/// pre-submission reference (`held`) into current title memory (`title`),
+/// by [`take_gpu_writes`]'s rule; `held` takes `now` (what the GPU copy now
+/// holds). Returns `true` if any byte of `title` changed.
+#[cfg(test)]
+fn merge_piece(address: usize, now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
+    let changed = take_gpu_writes(address, now, held, title);
+    held.copy_from_slice(now);
+    changed
 }
 
 /// `[from, to)` minus the intervals in `skip`, in ascending order.
@@ -1363,6 +1364,32 @@ unsafe impl Send for Shadow {}
 unsafe impl Sync for Shadow {}
 
 impl Shadow {
+    /// The copy's bytes for `len` bytes of title memory at `address`, as
+    /// they are now (tests look at what a submission's shaders left there).
+    #[cfg(all(test, feature = "diagnostics"))]
+    pub(crate) fn host_bytes(&self, address: u64, len: usize) -> Vec<u8> {
+        assert!(address >= self.start && address + len as u64 <= self.start + self.len);
+        // SAFETY: within the copy's persistent mapping.
+        unsafe {
+            std::slice::from_raw_parts(self.data.add((address - self.start) as usize), len).to_vec()
+        }
+    }
+
+    /// Writes `bytes` into the copy at a title address, as the GPU would
+    /// (tests of copy-back).
+    #[cfg(test)]
+    fn gpu_wrote(&self, address: u64, bytes: &[u8]) {
+        assert!(address >= self.start && address + bytes.len() as u64 <= self.start + self.len);
+        // SAFETY: within the copy's persistent mapping.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                self.data.add((address - self.start) as usize),
+                bytes.len(),
+            );
+        }
+    }
+
     /// Unique identifier for this host copy, stable for its lifetime.
     pub(crate) fn id(&self) -> u64 {
         self.id
@@ -1618,6 +1645,7 @@ impl Shadow {
             len,
             born_seq: crate::host::birth_seq(),
             copied: Mutex::new(Vec::new()),
+            refreshed: Box::default(),
             watched: AtomicU8::new(NOT_WATCHED),
             pending: Mutex::default(),
             flights: Mutex::default(),
@@ -1649,6 +1677,9 @@ impl Shadow {
             len,
             born_seq: crate::host::birth_seq(),
             copied: Mutex::new(vec![0; pages as usize]),
+            refreshed: (0..pages)
+                .map(|_| std::sync::atomic::AtomicBool::new(false))
+                .collect(),
             watched: AtomicU8::new(0),
             pending: Mutex::default(),
             flights: Mutex::default(),
@@ -1861,6 +1892,8 @@ impl Shadow {
         if len == 0 {
             return;
         }
+        #[cfg(feature = "diagnostics")]
+        note_writer(from, len);
         list.defer_gpu_write(self, from as usize, len as usize);
     }
 
@@ -2273,12 +2306,18 @@ impl Shadow {
         let sub_n = gpu.len();
         title.clear();
         title.resize(sub_n, 0);
+        // `start` can be another view of the title's memory (a surviving
+        // alias), which is where the bytes are read and written; the merge
+        // goes by the address this copy knows the piece under, which is
+        // what its refresh history is kept by (views share page offsets, so
+        // dwords line up the same).
+        let known_at = self.start as usize + sub_at;
         if via_own {
             if !crate::inplace::read_own_blocking(start + sub_at, title) {
                 return None;
             }
             let old_backup = old.to_vec();
-            if merge_piece(gpu, old, title) {
+            if self.merge_piece(known_at, gpu, old, title) {
                 crate::host::shaders_write(start + sub_at, &title[..]);
                 let Some(shown) = crate::inplace::write_own_blocking(start + sub_at, &title[..])
                 else {
@@ -2292,7 +2331,7 @@ impl Shadow {
         }
         if crate::host::read_into_raw((start + sub_at) as *const u8, title) {
             let mut merged_old = old.to_vec();
-            if merge_piece(gpu, &mut merged_old, title) {
+            if self.merge_piece(known_at, gpu, &mut merged_old, title) {
                 crate::host::shaders_write(start + sub_at, &title[..]);
                 if self.put_back_own(start + sub_at, &title[..]) {
                     old.copy_from_slice(&merged_old);
@@ -2363,6 +2402,90 @@ impl Shadow {
         Some(written)
     }
 
+    /// The merge of a piece of this copy on the paths that run after a
+    /// submission's lists rather than with them (card copies, the relay,
+    /// lazy readback): the GPU's changed bytes are taken as they are.
+    ///
+    /// [`take_gpu_writes`]'s three-way rule is not the default here. On
+    /// these paths the title runs on while the work is in flight and
+    /// `held` is the copy as last brought up to date, not what one
+    /// submission started from, so the rule finds a "newer CPU write" many
+    /// times a second in the title's world, where the path that copies back
+    /// with the submission finds a handful in a whole run; with it the
+    /// title soon reads a pointer made of two halves and stops.
+    /// `VICTORY_COPY_BACK_LATE_RULE=1` applies it here anyway, to study
+    /// (never where title memory never went to the copy: `held` is then no
+    /// record of what the title had, the copy having begun as zeros).
+    /// `address` is the piece's address in this copy's own range, also
+    /// when the bytes are reached through another view of the memory.
+    ///
+    /// The rule as applied here has limits it is left with, being a mode to
+    /// study with and not one the title runs under:
+    /// - What went to the copy is known by page ([`Self::never_copied`]).
+    ///   On a page only part of which did, the rest is under the rule too,
+    ///   with `held` still the copy's first zeros: a GPU write there is
+    ///   left out as a conflict wherever the title's bytes are not zero.
+    /// - The callers cut a piece down to the first and last byte the GPU
+    ///   changed, so the dwords at its two ends can be compared in part
+    ///   only: a title write to the bytes cut off is not seen, and the
+    ///   GPU's bytes of that dword are taken.
+    /// - A page counts as copied once a copy of title bytes to it
+    ///   succeeded, whole segment by whole segment: a segment that failed
+    ///   in part leaves its pages as never copied, though some bytes went.
+    /// - As everywhere on these paths, `held` is the copy as last brought
+    ///   up to date, so a title write between that and the submission is
+    ///   taken for one made while the GPU ran.
+    fn take_gpu_writes(&self, address: usize, gpu: &[u8], held: &[u8], title: &mut [u8]) -> bool {
+        if late_rule() && !self.never_copied(address, title.len()) {
+            return take_gpu_writes(address, gpu, held, title);
+        }
+        let mut changed = false;
+        for ((t, g), h) in title.iter_mut().zip(gpu).zip(held) {
+            if g != h && *t != *g {
+                *t = *g;
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    /// [`merge_piece`] by this copy's [`Self::take_gpu_writes`].
+    fn merge_piece(&self, address: usize, now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
+        let changed = self.take_gpu_writes(address, now, held, title);
+        held.copy_from_slice(now);
+        changed
+    }
+
+    /// Notes that the copy took title bytes on the pages of title memory
+    /// `[from, to)`: called once they are in the copy, so a copy that
+    /// failed leaves a page as never copied.
+    fn mark_refreshed(&self, from: usize, to: usize) {
+        if from >= to {
+            return;
+        }
+        let base = self.start as usize / PAGE;
+        for page in from / PAGE..=(to - 1) / PAGE {
+            if let Some(seen) = page.checked_sub(base).and_then(|i| self.refreshed.get(i)) {
+                seen.store(true, Ordering::Release);
+            }
+        }
+    }
+
+    /// Whether no part of the pages of title memory `[address, address +
+    /// len)` was ever copied to this copy (`false` for a copy that keeps no
+    /// such record).
+    fn never_copied(&self, address: usize, len: usize) -> bool {
+        if len == 0 {
+            return false;
+        }
+        let base = self.start as usize / PAGE;
+        (address / PAGE..=(address + len - 1) / PAGE).all(|page| {
+            page.checked_sub(base)
+                .and_then(|i| self.refreshed.get(i))
+                .is_some_and(|seen| !seen.load(Ordering::Acquire))
+        })
+    }
+
     /// Synchronous card-copy merge (`Host::card_back`).
     pub(crate) fn card_merge(&self, at: usize, gpu: &[u8], title: &mut Vec<u8>) -> usize {
         let start = self.start as usize;
@@ -2384,15 +2507,9 @@ impl Shadow {
         title.resize(n, 0);
         let mut written = 0;
         if crate::host::read_into_raw((start + at) as *const u8, title) {
-            let mut differs = 0u8;
-            for ((t, g), o) in title.iter_mut().zip(gpu).zip(old.iter_mut()) {
-                let wrote = if *g != *o { 0xffu8 } else { 0 };
-                let merged = (*t & !wrote) | (*g & wrote);
-                differs |= merged ^ *t;
-                *t = merged;
-                *o = merged;
-            }
-            if differs != 0 {
+            let changed = self.take_gpu_writes(start + at, gpu, old, title);
+            old.copy_from_slice(title);
+            if changed {
                 crate::host::shaders_write(start + at, &title[..]);
                 if !self.put_back_own(start + at, &title[..]) {
                     crate::watch::writing(start + at, n);
@@ -2510,7 +2627,12 @@ impl Shadow {
             let mut changed = false;
             for (a, b) in outside(at, at + n, skip) {
                 let (a, b) = (a - at, b - at);
-                changed |= merge_piece(&gpu[a..b], &mut held[a..b], &mut title[a..b]);
+                changed |= self.merge_piece(
+                    start + at + a,
+                    &gpu[a..b],
+                    &mut held[a..b],
+                    &mut title[a..b],
+                );
             }
             if !changed {
                 return Some(0);
@@ -2527,7 +2649,12 @@ impl Shadow {
         let mut changed = false;
         for (a, b) in outside(at, at + n, skip) {
             let (a, b) = (a - at, b - at);
-            changed |= merge_piece(&gpu[a..b], &mut held[a..b], &mut title[a..b]);
+            changed |= self.merge_piece(
+                start + at + a,
+                &gpu[a..b],
+                &mut held[a..b],
+                &mut title[a..b],
+            );
         }
         if !mapped || !changed {
             return Some(0);
@@ -2583,7 +2710,7 @@ impl Shadow {
         if !crate::host::read_into_raw((start + at) as *const u8, title) {
             return 0;
         }
-        if !merge_piece(now, held, title) {
+        if !self.merge_piece(start + at, now, held, title) {
             return 0;
         }
         crate::host::shaders_write(start + at, &title[..]);
@@ -2950,18 +3077,9 @@ impl Shadow {
                 if gpu != old {
                     let title_buf = &mut title.get_or_insert_with(|| vec![0u8; PAGE])[..n];
                     if crate::host::read_into_raw((start + at) as *const u8, title_buf) {
-                        let mut changed = false;
-                        let mut host_differs = false;
-                        for ((t, &g), o) in title_buf.iter_mut().zip(gpu).zip(old.iter_mut()) {
-                            if g != *o && *t != g {
-                                *t = g;
-                                changed = true;
-                            }
-                            if *t != g {
-                                host_differs = true;
-                            }
-                            *o = *t;
-                        }
+                        let changed = take_gpu_writes(start + at, gpu, old, title_buf);
+                        let host_differs = title_buf != gpu;
+                        old.copy_from_slice(title_buf);
                         if changed {
                             crate::host::shaders_write(start + at, title_buf);
                             if !self.put_back_own(start + at, title_buf) {
@@ -3068,16 +3186,11 @@ impl Shadow {
                     && let title = &mut title.get_or_insert_with(|| vec![0u8; PAGE])[..n]
                     && crate::host::read_into_raw((start + at) as *const u8, title)
                 {
-                    // Title memory with the GPU's bytes put in; the copy
+                    // Title memory with the GPU's bytes put in (where the
+                    // title kept its own, [`take_gpu_writes`]); the copy
                     // takes the title's bytes in turn.
-                    let mut changed = false;
-                    for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old) {
-                        if *h != *o && *t != *h {
-                            *t = *h;
-                            changed = true;
-                        }
-                        *h = *t;
-                    }
+                    let changed = take_gpu_writes(start + at, host, old, title);
+                    host.copy_from_slice(title);
                     if changed {
                         crate::host::shaders_write(start + at, title);
                         if !self.put_back_own(start + at, title) {
@@ -3429,6 +3542,11 @@ impl Shadow {
                     }
                     page_ok = true;
                 }
+            }
+            if page_ok {
+                // The reference now holds the title's bytes of this page's
+                // part of the range (a page not stale had them already).
+                self.mark_refreshed(lo, hi);
             }
             if page_ok && (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
                 let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
@@ -3840,7 +3958,8 @@ impl Shadow {
                             }
                         }
                     }
-                    let (_succeeded, failed, bytes) = partition_copy_segs(&segs, &ok);
+                    let (succeeded, failed, bytes) = partition_copy_segs(&segs, &ok);
+                    self.mark_refreshed_segs(&succeeded);
                     let all_ok = failed.is_empty();
                     // Invalidate ReBAR hashes for every chunk that wrote VRAM,
                     // including successful chunks of a partially failed segment.
@@ -3910,10 +4029,20 @@ impl Shadow {
         }
     }
 
+    /// Notes the title bytes of the copied `segs` as taken into the copy
+    /// ([`Self::mark_refreshed`]): for card copies with their bytes being
+    /// published, under the same lock.
+    fn mark_refreshed_segs(&self, segs: &[CopySeg]) {
+        for seg in segs {
+            self.mark_refreshed(seg.src, seg.src + seg.len);
+        }
+    }
+
     /// Post-copy metadata invalidation for non-mirrored `segs`, acquiring each
     /// per-shadow lock at most once. `touched_rebar` includes any chunk that may
     /// have written VRAM even when another chunk of the same segment failed.
     fn finish_copy_segs(&self, start: usize, succeeded: &[CopySeg], touched_rebar: &[CopySeg]) {
+        self.mark_refreshed_segs(succeeded);
         if let Some(rebar) = &self.rebar {
             rebar.mark_dirty_segs(start, touched_rebar);
         }
@@ -4916,6 +5045,192 @@ fn stale_pages_in(
     out
 }
 
+/// The copy-back rule, a three-way merge of one piece at title address
+/// `address`: `title` (title memory now) takes `gpu`'s bytes (the GPU's
+/// copy) where the GPU changed them against `held` (the bytes before the
+/// submission ran, or what an earlier merge left there), by aligned dword,
+/// and only where the title has not changed that dword since either: a CPU
+/// write made while the GPU ran is newer than the bytes the GPU worked
+/// from, and wins (the title's memory may have been reused for its own
+/// data in the meantime). Returns whether `title` changed. The copy-back
+/// that runs with a submission merges through this; the paths that run
+/// after it (relay, card copies, lazy readback) only when asked to
+/// ([`Shadow::take_gpu_writes`]). [`CONFLICTS`] counts the dwords left to
+/// the CPU (`copy-back conflicts` in the diagnostics copy line);
+/// `VICTORY_COPY_BACK_GPU_WINS` (diagnostics builds) restores the old rule,
+/// the GPU's bytes always win, for comparison.
+fn take_gpu_writes(address: usize, gpu: &[u8], held: &[u8], title: &mut [u8]) -> bool {
+    #[cfg(feature = "diagnostics")]
+    let gpu_wins = {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| crate::switch::on("VICTORY_COPY_BACK_GPU_WINS"))
+    };
+    #[cfg(not(feature = "diagnostics"))]
+    let gpu_wins = false;
+    let n = title.len().min(gpu.len()).min(held.len());
+    let (gpu, held, title) = (&gpu[..n], &held[..n], &mut title[..n]);
+    // Most pieces: the title left them alone, so they take the GPU's bytes.
+    if gpu_wins || title == held {
+        let changed = title != gpu;
+        if gpu_wins {
+            for ((t, g), h) in title.iter_mut().zip(gpu).zip(held) {
+                if g != h {
+                    *t = *g;
+                }
+            }
+        } else {
+            title.copy_from_slice(gpu);
+        }
+        return changed;
+    }
+    let mut changed = false;
+    let mut i = 0;
+    while i < n {
+        let end = (i + 4 - (address + i) % 4).min(n);
+        let g = &gpu[i..end];
+        if g != &held[i..end] && title[i..end] != *g {
+            if title[i..end] == held[i..end] {
+                title[i..end].copy_from_slice(g);
+                changed = true;
+            } else {
+                CONFLICTS.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        i = end;
+    }
+    changed
+}
+
+/// Whether the merges that run after a submission's lists use the three-way
+/// rule ([`Shadow::take_gpu_writes`]): `VICTORY_COPY_BACK_LATE_RULE=1`
+/// (diagnostics builds), and always in tests, which keep the rule's
+/// behaviour there pinned down.
+fn late_rule() -> bool {
+    #[cfg(feature = "diagnostics")]
+    let asked = {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| crate::switch::on("VICTORY_COPY_BACK_LATE_RULE"))
+    };
+    #[cfg(not(feature = "diagnostics"))]
+    let asked = false;
+    cfg!(test) || asked
+}
+
+/// Dwords copy-back left to a newer CPU write (see [`take_gpu_writes`]).
+pub(crate) static CONFLICTS: AtomicU64 = AtomicU64::new(0);
+
+/// Diagnostics (`VICTORY_WATCH_HIGH_ONES`): the host pipeline the
+/// recording thread bound last, and the GPU write ranges recent draws and
+/// dispatches declared with it, so a suspicious copy-back can name them.
+#[cfg(feature = "diagnostics")]
+mod writers {
+    use std::cell::RefCell;
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    thread_local! {
+        static PIPELINE: RefCell<String> = const { RefCell::new(String::new()) };
+    }
+    static RANGES: Mutex<VecDeque<(u64, u64, String)>> = Mutex::new(VecDeque::new());
+
+    pub(crate) fn on() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| crate::switch::on("VICTORY_WATCH_HIGH_ONES"))
+    }
+
+    pub(crate) fn bound(name: &str) {
+        if on() {
+            PIPELINE.with(|p| name.clone_into(&mut p.borrow_mut()));
+        }
+    }
+
+    pub(super) fn declared(address: u64, len: u64) {
+        if !on() {
+            return;
+        }
+        let name = PIPELINE.with(|p| p.borrow().clone());
+        let mut ranges = RANGES.lock().unwrap_or_else(|e| e.into_inner());
+        if ranges.len() >= 8192 {
+            ranges.pop_front();
+        }
+        ranges.push_back((address, len, name));
+    }
+
+    /// Pipelines that declared writes covering `at`, most recent first.
+    pub(super) fn covering(at: u64) -> Vec<String> {
+        let ranges = RANGES.lock().unwrap_or_else(|e| e.into_inner());
+        let mut out: Vec<String> = Vec::new();
+        for (a, n, name) in ranges.iter().rev() {
+            if *a <= at && at < a + n && !out.contains(name) {
+                out.push(name.clone());
+                if out.len() >= 6 {
+                    break;
+                }
+            }
+        }
+        out
+    }
+}
+
+#[cfg(feature = "diagnostics")]
+pub(crate) use writers::bound as note_bound_pipeline;
+
+#[cfg(feature = "diagnostics")]
+fn note_writer(address: u64, len: u64) {
+    writers::declared(address, len);
+}
+
+/// Diagnostics (`VICTORY_WATCH_HIGH_ONES`): logs a write of ours into
+/// title memory (copy-back, readback) that turns the high dword of an
+/// 8-byte-aligned qword that held a title pointer into 0xFFFFFFFF, with
+/// the qword before and after and the title buffer it belongs to, so a
+/// write that clobbers the upper half of 64-bit values can be traced. At
+/// most 200 lines.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn high_ones(address: usize, bytes: &[u8]) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static LOGGED: AtomicU32 = AtomicU32::new(0);
+    if !writers::on() || LOGGED.load(Ordering::Relaxed) >= 200 {
+        return;
+    }
+    let end = address + bytes.len();
+    let dword = |at: usize| -> u32 {
+        u32::from_le_bytes(bytes[at - address..at - address + 4].try_into().unwrap())
+    };
+    // Qwords whose high dword lies wholly inside the write.
+    let mut q = address.saturating_sub(4) & !7;
+    while q + 8 <= end {
+        let hi = q + 4;
+        if hi >= address && dword(hi) == u32::MAX {
+            let mut old = [0u8; 8];
+            // Raw: callers may hold host copy locks (no lazy readback here).
+            if crate::host::read_into_raw(q as *const u8, &mut old) {
+                let old = u64::from_le_bytes(old);
+                // Only where a title pointer was (high dword 1-15, as
+                // title addresses here are below 64 GiB): plain -1 data
+                // over other data is common and not what is looked for.
+                if (1..16).contains(&(old >> 32)) {
+                    let lo = if q >= address { dword(q) } else { old as u32 };
+                    let buffer = find(q as u64, 8).map(|s| format!("{:#x}+{:#x}", s.start, s.len));
+                    tracing::warn!(
+                        qword = format_args!("{q:#x}"),
+                        before = format_args!("{old:#018x}"),
+                        after = format_args!("{:#018x}", (u64::from(u32::MAX) << 32) | u64::from(lo)),
+                        write = format_args!("{address:#x}+{:#x}", bytes.len()),
+                        buffer = ?buffer,
+                        writers = ?writers::covering(q as u64),
+                        "a write of ours sets a qword's high dword to 0xFFFFFFFF"
+                    );
+                    if LOGGED.fetch_add(1, Ordering::Relaxed) >= 200 {
+                        return;
+                    }
+                }
+            }
+        }
+        q += 8;
+    }
+}
+
 /// A refresh that copies none of its range is skipped: the writes it was
 /// asked about were already in the copy, the range is outside the buffer,
 /// or shaders were still writing all of it (that part is left to a later
@@ -5469,6 +5784,7 @@ pub(crate) fn aligned(address: u64, len: u64) -> Option<Arc<Shadow>> {
         }
         copies.insert(key, Arc::downgrade(&copy));
     }
+    keep_aligned(&copy);
     tracing::debug!(
         address = format_args!("{address:#x}"),
         len,
@@ -5479,11 +5795,51 @@ pub(crate) fn aligned(address: u64, len: u64) -> Option<Arc<Shadow>> {
 
 /// The copy `aligned` made for this range, if one is still alive.
 pub(crate) fn aligned_existing(address: u64, len: u64) -> Option<Arc<Shadow>> {
-    ALIGNED
+    let copy = ALIGNED
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .get(&(address, len))
-        .and_then(std::sync::Weak::upgrade)
+        .and_then(std::sync::Weak::upgrade)?;
+    keep_aligned(&copy);
+    Some(copy)
+}
+
+/// The most [`aligned`] copies kept alive past the slots that made them,
+/// and the most bytes they may hold together.
+const ALIGNED_KEPT: usize = 256;
+const ALIGNED_KEPT_BYTES: u64 = 256 << 20;
+
+/// The [`aligned`] copies used last, oldest first. A view made for one draw
+/// lives in a slot that is given back after the draw; without these the
+/// next draw of the same view would allocate its copy, and copy the view's
+/// bytes, all over again.
+static ALIGNED_RECENT: Mutex<std::collections::VecDeque<Arc<Shadow>>> =
+    Mutex::new(std::collections::VecDeque::new());
+
+/// Notes `copy` as the [`aligned`] copy used last, and lets go of the ones
+/// used longest ago beyond [`ALIGNED_KEPT`] copies or
+/// [`ALIGNED_KEPT_BYTES`] (a single larger copy is still kept while it is
+/// the last one used).
+fn keep_aligned(copy: &Arc<Shadow>) {
+    let mut gone = Vec::new();
+    {
+        let mut recent = ALIGNED_RECENT.lock().unwrap_or_else(|e| e.into_inner());
+        if recent.back().is_some_and(|last| Arc::ptr_eq(last, copy)) {
+            return;
+        }
+        if let Some(at) = recent.iter().position(|kept| Arc::ptr_eq(kept, copy)) {
+            recent.remove(at);
+        }
+        recent.push_back(copy.clone());
+        let mut bytes: u64 = recent.iter().map(|kept| kept.len).sum();
+        while recent.len() > 1 && (recent.len() > ALIGNED_KEPT || bytes > ALIGNED_KEPT_BYTES) {
+            let Some(old) = recent.pop_front() else { break };
+            bytes -= old.len;
+            gone.push(old);
+        }
+    }
+    // Dropped outside the lock: the last reference frees a host buffer.
+    drop(gone);
 }
 
 /// How many bytes of `[address, address + len)` lie inside the copy that
@@ -5836,6 +6192,7 @@ mod tests {
 
     #[test]
     fn a_buffer_sized_past_the_address_space_ends_at_its_top() {
+        let _views = crate::inplace::view_tests_lock();
         let start = u64::MAX - 0x0fff;
         register(usize::MAX, start, u64::MAX);
         let end = BUFFERS
@@ -5849,6 +6206,7 @@ mod tests {
 
     #[test]
     fn a_buffer_too_big_to_round_to_a_shadow_size_gets_no_copy() {
+        let _views = crate::inplace::view_tests_lock();
         // The end saturates at the top, so rounding its length up to 64 KiB
         // would overflow: no copy, before any host allocation.
         register(usize::MAX - 1, 0x1000, u64::MAX);
@@ -5859,6 +6217,7 @@ mod tests {
 
     #[test]
     fn concurrent_aligned_views_share_the_copy_refreshed_at_submission() {
+        let _views = crate::inplace::view_tests_lock();
         if crate::host::host().is_none() {
             return;
         }
@@ -5902,6 +6261,7 @@ mod tests {
     /// outside it.
     #[test]
     fn a_refresh_covers_the_views_bytes_inside_its_copy() {
+        let _views = crate::inplace::view_tests_lock();
         // The hit-detection view: 3136 bytes of 56-byte elements, 48 bytes
         // into its buffer, in a copy that starts at the view.
         assert_eq!(range_inside(0x3000_0030, 3136, 0x3000_0030, 3136), 3136);
@@ -5921,6 +6281,7 @@ mod tests {
     /// an empty range is neither.
     #[test]
     fn a_refresh_that_copies_nothing_is_counted_as_skipped() {
+        let _views = crate::inplace::view_tests_lock();
         assert_eq!(skipped(0, 0), None);
         assert_eq!(skipped(4 << 20, 0), Some(4 << 20));
         assert_eq!(skipped(4 << 20, 1), None);
@@ -5931,6 +6292,7 @@ mod tests {
 
     #[test]
     fn partial_match_leaves_unchecked_bytes_visible() {
+        let _views = crate::inplace::view_tests_lock();
         let mut unchanged = UnchangedPages::default();
         let before = vec![0; PAGE];
         let mut host = before.clone();
@@ -5945,6 +6307,7 @@ mod tests {
 
     #[test]
     fn snapshot_edges_are_cacheable_and_survive_later_ranges() {
+        let _views = crate::inplace::view_tests_lock();
         let mut unchanged = UnchangedPages::default();
         unchanged.begin(PAGE - 3, PAGE + 4);
         assert!(!unchanged.differs(PAGE - 3, &[1; 3], &[1; 3]));
@@ -5959,6 +6322,7 @@ mod tests {
 
     #[test]
     fn next_submission_checks_the_same_page_again() {
+        let _views = crate::inplace::view_tests_lock();
         let mut unchanged = UnchangedPages::default();
         unchanged.begin(0, 4);
         assert!(!unchanged.differs(0, &[0; 4], &[0; 4]));
@@ -5989,6 +6353,7 @@ mod tests {
 
     #[test]
     fn overlapping_ranges_match_uncached_comparisons() {
+        let _views = crate::inplace::view_tests_lock();
         let before = vec![0; 4 * PAGE];
         let mut host = before.clone();
         for at in [2, PAGE - 1, PAGE + 5, 3 * PAGE + 7] {
@@ -6015,6 +6380,7 @@ mod tests {
     #[test]
     #[ignore = "synthetic CPU release benchmark"]
     fn benchmark_overlapping_copy_back() {
+        let _views = crate::inplace::view_tests_lock();
         use std::hint::black_box;
         use std::time::{Duration, Instant};
 
@@ -6063,6 +6429,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn unregister_drops_shadow_immediately_when_idle() {
+        let _views = crate::inplace::view_tests_lock();
         let _rebar = lock_rebar_gpu_test();
         let _retire = crate::host::isolated_retire_scope();
         if host().is_none() {
@@ -6084,6 +6451,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn bytes_reads_the_copy_inside_the_buffer_only() {
+        let _views = crate::inplace::view_tests_lock();
         let _rebar = lock_rebar_gpu_test();
         let _retire = crate::host::isolated_retire_scope();
         if host().is_none() {
@@ -6111,9 +6479,321 @@ mod tests {
         unregister(resource, start);
     }
 
+    /// Copy-back takes the GPU's dword only where the title still holds
+    /// what the GPU started from; a dword the title rewrote meanwhile keeps
+    /// the title's bytes and counts a conflict.
+    #[test]
+    fn copy_back_leaves_dwords_the_title_rewrote_to_the_title() {
+        let _views = crate::inplace::view_tests_lock();
+        let held = [0u8; 12];
+        let mut gpu = held;
+        gpu[1] = 0xaa; // dword 0: only the GPU wrote it
+        gpu[5] = 0xbb; // dword 1: both wrote it
+        let mut title = held;
+        title[6] = 0x11;
+        title[9] = 0x22; // dword 2: only the title wrote it
+        let conflicts = CONFLICTS.load(Ordering::Relaxed);
+        assert!(take_gpu_writes(0x1000, &gpu, &held, &mut title));
+        assert_eq!(title, [0, 0xaa, 0, 0, 0, 0, 0x11, 0, 0, 0x22, 0, 0]);
+        assert!(CONFLICTS.load(Ordering::Relaxed) > conflicts);
+        // A title that kept every byte takes the GPU's whole piece.
+        let mut title = held;
+        assert!(take_gpu_writes(0x1000, &gpu, &held, &mut title));
+        assert_eq!(title, gpu);
+        // Nothing the GPU changed: nothing to write.
+        let mut title = held;
+        title[3] = 7;
+        assert!(!take_gpu_writes(0x1000, &held, &held, &mut title));
+        assert_eq!(title[3], 7);
+    }
+
+    /// Dwords follow title addresses: a piece starting off a 4-byte
+    /// boundary splits its first and last dwords there.
+    #[test]
+    fn copy_back_dwords_follow_title_addresses() {
+        let _views = crate::inplace::view_tests_lock();
+        let held = [0u8; 6];
+        let mut gpu = held;
+        gpu[0] = 1; // title 0x1002: the dword 0x1000..0x1004
+        gpu[2] = 2; // title 0x1004: the next dword
+        let mut title = held;
+        title[1] = 9; // title 0x1003: same dword as gpu[0]
+        let mut merged = title;
+        assert!(take_gpu_writes(0x1002, &gpu, &held, &mut merged));
+        assert_eq!(merged, [0, 9, 2, 0, 0, 0]);
+        let mut held_ref = held;
+        let mut title = held;
+        assert!(merge_piece(0x1002, &gpu, &mut held_ref, &mut title));
+        assert_eq!(held_ref, gpu, "the reference takes the GPU's bytes");
+    }
+
+    /// One submission: its copy-back puts the GPU's bytes back, leaves the
+    /// title's own write alone and takes it into the copy.
+    #[cfg(windows)]
+    #[test]
+    fn one_submission_copies_back_and_syncs_the_copy() {
+        let _views = crate::inplace::view_tests_lock();
+        let _rebar = lock_rebar_gpu_test();
+        let _retire = crate::host::isolated_retire_scope();
+        if host().is_none() {
+            return;
+        }
+        let mut title = vec![0u8; 4096];
+        let start = title.as_ptr() as u64;
+        let resource = 0xdead_beef_0004_usize;
+        register(resource, start, title.len() as u64);
+        let shadow = find(start, 64).expect("shadow");
+        if shadow.rebar.is_some() || shadow.card.is_some() || shadow.place.is_some() {
+            unregister(resource, start);
+            return;
+        }
+        let (a, n) = (start as usize, title.len());
+        shadow.update(a, n);
+        assert!(shadow.writing(a + 8, 64, |_, _| None));
+        shadow.gpu_wrote(start + 9, &[0xcc]);
+        shadow.gpu_wrote(start + 16, &[0xdd]);
+        title[12] = 0x22;
+        title[17] = 0x33;
+        shadow.copy_back(a + 8, 64);
+        assert_eq!(
+            (title[9], title[12], title[16], title[17]),
+            (0xcc, 0x22, 0, 0x33),
+            "the title's dword at 16 is newer than the GPU's"
+        );
+        assert_eq!(shadow.bytes(start + 12, 1), Some(&[0x22][..]));
+        assert!(shadow.before.read().unwrap().snapshot.is_none());
+        assert!(shadow.pending.lock().unwrap().is_empty());
+        unregister(resource, start);
+    }
+
+    /// The copy-back rule of one copy: on a page that never took title
+    /// bytes the GPU's changed bytes are taken as they are; once any
+    /// refresh touched the page (through the copy runs, or the path for
+    /// ranges earlier lists write), a dword the title rewrote stays the
+    /// title's.
+    #[cfg(windows)]
+    #[test]
+    fn a_refreshed_page_keeps_the_titles_newer_write() {
+        let _views = crate::inplace::view_tests_lock();
+        if host().is_none() {
+            return;
+        }
+        let mut side = vec![0x11u8; 2 * PAGE];
+        let start = 0x7000_0000_u64;
+        let Some(shadow) =
+            Shadow::new_card_sized_for_test(side.as_mut_ptr(), start, side.len() as u64)
+        else {
+            return;
+        };
+        let address = start as usize;
+        let held = [0x11u8; 8];
+        let gpu = [0xc3, 0xc3, 0xc3, 0xc3, 0x11, 0x11, 0x11, 0x11];
+        // The title rewrote the dword the GPU also wrote.
+        let rewritten = [0x22, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11];
+
+        let mut title = rewritten;
+        assert!(shadow.never_copied(address, 8));
+        assert!(shadow.take_gpu_writes(address, &gpu, &held, &mut title));
+        assert_eq!(title, gpu, "nothing says the title wrote: the GPU's bytes");
+
+        // The second page, refreshed as a range an earlier list writes is.
+        let second = address + PAGE;
+        shadow.mark_refreshed(second, second + 16);
+        assert!(!shadow.never_copied(second, 8));
+        let mut title = rewritten;
+        assert!(!shadow.take_gpu_writes(second, &gpu, &held, &mut title));
+        assert_eq!(title, rewritten, "the title's newer dword stays");
+        // A range reaching into a refreshed page is under the rule too.
+        assert!(!shadow.never_copied(second - 4, 8));
+    }
+
+    /// The copy runs note a page as holding title bytes once the bytes are
+    /// in the copy, not when the copy is planned.
+    #[cfg(windows)]
+    #[test]
+    fn a_copy_run_marks_its_pages_once_the_bytes_are_copied() {
+        let _views = crate::inplace::view_tests_lock();
+        if host().is_none() {
+            return;
+        }
+        let title = vec![0x11u8; 2 * PAGE];
+        let mut side = vec![0u8; 2 * PAGE];
+        let address = title.as_ptr() as usize;
+        let Some(shadow) =
+            Shadow::new_card_sized_for_test(side.as_mut_ptr(), address as u64, side.len() as u64)
+        else {
+            return;
+        };
+        let mut segs = Vec::new();
+        assert_eq!(
+            shadow.push_copy_segs(&[(address, address + 4)], &mut segs),
+            4
+        );
+        assert!(shadow.never_copied(address, 8), "planned, not yet copied");
+        assert_eq!(shadow.copy_runs(&[(address, address + 4)]), 4);
+        assert!(!shadow.never_copied(address, 8));
+        assert!(
+            shadow.never_copied(address + PAGE, 8),
+            "only the page copied"
+        );
+    }
+
+    /// A relay merge that reaches the title's bytes through another view of
+    /// its memory still goes by this copy's own record of what it took: on
+    /// a page that never took title bytes the GPU's changed bytes land as
+    /// they are, as they would through the copy's own address.
+    #[cfg(windows)]
+    #[test]
+    fn a_merge_through_another_view_goes_by_the_copys_own_refresh_history() {
+        let _views = crate::inplace::view_tests_lock();
+        // A range no memory of the test is at; the view is elsewhere.
+        let Some(shadow) = Shadow::new_rebar_for_test(0x7100_0000, PAGE as u64, 0) else {
+            return;
+        };
+        let mut view = [9u32, 0];
+        let gpu = 7u32.to_le_bytes();
+        let mut old = [0u8; 4];
+        let (mut title, mut wrote_fallback) = (Vec::new(), false);
+        let written = shadow.apply_rebar_relay_subrange(
+            view.as_mut_ptr() as usize,
+            0,
+            &gpu,
+            &mut old,
+            &mut title,
+            false,
+            &mut wrote_fallback,
+        );
+        assert_eq!(written, Some(4));
+        assert_eq!(view, [7, 0], "nothing says the title wrote the 9");
+        assert_eq!(old, gpu);
+    }
+
+    /// The refresh of a range earlier lists write (`update_busy`) puts the
+    /// pages it copies under the copy-back rule: a dword the title rewrites
+    /// after it stays the title's when the card copy is merged back, where
+    /// on a page no refresh reached the GPU's changed bytes are still taken
+    /// as they are. Needs a host that makes card copies.
+    #[cfg(windows)]
+    #[test]
+    fn a_page_update_busy_refreshed_keeps_the_titles_newer_write() {
+        let _views = crate::inplace::view_tests_lock();
+        use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
+            PAGE_READWRITE, UnmapViewOfFile,
+        };
+
+        /// The test's section and its view: unmapped and closed when the
+        /// test ends, on a failed assertion too, after what the view was
+        /// registered as is forgotten.
+        struct Mapped {
+            section: HANDLE,
+            view: MEMORY_MAPPED_VIEW_ADDRESS,
+            len: usize,
+        }
+        impl Drop for Mapped {
+            fn drop(&mut self) {
+                let va0 = self.view.Value as usize;
+                if va0 != 0 {
+                    crate::lazy_back::clear_hot_for_test_pub(va0 / PAGE);
+                    crate::watch::title_memory_remapped(va0, self.len);
+                    // SAFETY: the view mapped by the test, which nothing
+                    // uses any more (the copy over it was dropped first).
+                    unsafe { UnmapViewOfFile(self.view) };
+                }
+                // SAFETY: the section made by the test, with no view left.
+                unsafe { CloseHandle(self.section) };
+            }
+        }
+
+        if host().is_none() {
+            return;
+        }
+        let len = 2 * PAGE;
+        // SAFETY: a fresh anonymous section of two pages.
+        let section: HANDLE = unsafe {
+            CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                len as u32,
+                std::ptr::null(),
+            )
+        };
+        assert!(!section.is_null());
+        let mut mapped = Mapped {
+            section,
+            view: MEMORY_MAPPED_VIEW_ADDRESS {
+                Value: std::ptr::null_mut(),
+            },
+            len,
+        };
+        // SAFETY: maps the whole section made above.
+        let view = unsafe { MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, len) };
+        assert!(!view.Value.is_null());
+        mapped.view = view;
+        let ptr = view.Value.cast::<u8>();
+        let va0 = ptr as usize;
+        crate::lazy_back::clear_hot_for_test_pub(va0 / PAGE);
+        crate::inplace::title_memory_section(section as usize, len as u64, true);
+        assert!(crate::inplace::title_memory_view(
+            va0,
+            len,
+            section as usize,
+            0
+        ));
+        // SAFETY: both pages of the view are mapped read-write.
+        unsafe { std::ptr::write_bytes(ptr, 0x11, len) };
+
+        // The copy begins as zeros: it holds no title bytes yet. Declared
+        // after the mapping, so it is dropped before the view goes.
+        let mut side = vec![0u8; len];
+        let shadow = Shadow::new_card_sized_for_test(side.as_mut_ptr(), va0 as u64, len as u64)
+            .expect("the host made buffers a moment ago");
+        assert!(shadow.never_copied(va0, 8));
+
+        // An earlier list writes the first page, so it is refreshed this way.
+        assert_eq!(shadow.update_busy(va0, va0 + PAGE), (PAGE, true));
+        assert!(side[..PAGE].iter().all(|&b| b == 0x11));
+        assert!(side[PAGE..].iter().all(|&b| b == 0));
+
+        // The title then rewrites the first dword of each page, and the GPU
+        // writes the first two dwords of each.
+        let rewritten = [0x22, 0x11, 0x11, 0x11];
+        let gpu_wrote = [0xc3, 0xc3, 0xc3, 0xc3, 0xc4, 0xc4, 0xc4, 0xc4];
+        let mut gpu = side.clone();
+        for page in [0, PAGE] {
+            // SAFETY: inside the two mapped pages.
+            unsafe { std::ptr::copy_nonoverlapping(rewritten.as_ptr(), ptr.add(page), 4) };
+            gpu[page..page + 8].copy_from_slice(&gpu_wrote);
+        }
+        let mut scratch = Vec::new();
+        let first = shadow.card_merge(0, &gpu[..PAGE], &mut scratch);
+        let second = shadow.card_merge(PAGE, &gpu[PAGE..], &mut scratch);
+        // SAFETY: both pages are still mapped; nothing else writes them.
+        let title = unsafe { std::slice::from_raw_parts(ptr, len) };
+        let (first_page, second_page) = (title[..8].to_vec(), title[PAGE..PAGE + 8].to_vec());
+
+        drop(shadow);
+        drop(mapped);
+
+        assert_eq!(
+            first_page,
+            [0x22, 0x11, 0x11, 0x11, 0xc4, 0xc4, 0xc4, 0xc4],
+            "the refreshed page keeps the title's dword and takes the GPU's other one"
+        );
+        assert_eq!(
+            second_page, gpu_wrote,
+            "nothing says what the title had on the page never refreshed"
+        );
+        assert_eq!((first, second), (8, 8));
+    }
+
     #[cfg(windows)]
     #[test]
     fn unregister_retires_shadow_until_active_epoch_finishes() {
+        let _views = crate::inplace::view_tests_lock();
         let _rebar = lock_rebar_gpu_test();
         let _retire = crate::host::isolated_retire_scope();
         let Some(host) = host() else {
@@ -6147,6 +6827,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn unregister_drops_new_shadow_despite_older_pinned_list() {
+        let _views = crate::inplace::view_tests_lock();
         let _rebar = lock_rebar_gpu_test();
         let _retire = crate::host::isolated_retire_scope();
         let Some(host) = host() else {
@@ -6177,6 +6858,7 @@ mod tests {
 
     #[test]
     fn rebar_budget_reservation_enforces_cap_and_releases() {
+        let _views = crate::inplace::view_tests_lock();
         let used = AtomicU64::new(0);
         assert!(!try_reserve_rebar(&used, 64, 0));
         assert!(!try_reserve_rebar(&used, 0, 1024));
@@ -6191,6 +6873,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn rebar_loose_budget_is_isolated_and_releases_on_drop() {
+        let _views = crate::inplace::view_tests_lock();
         let _rebar = REBAR_GPU_TEST.lock().unwrap_or_else(|e| e.into_inner());
         let _retire = crate::host::isolated_retire_scope();
         let Some(h) = host() else {
@@ -6308,6 +6991,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn rebar_mark_dirty_spans_restores_failed_readback_pieces() {
+        let _views = crate::inplace::view_tests_lock();
         let _rebar = lock_rebar_gpu_test();
         let _retire = crate::host::isolated_retire_scope();
         let Some(h) = host() else {
@@ -6342,6 +7026,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn rebar_failed_copy_back_keeps_pending_and_preserves_gpu_bytes_on_refresh() {
+        let _views = crate::inplace::view_tests_lock();
         let _rebar = lock_rebar_gpu_test();
         let _retire = crate::host::isolated_retire_scope();
         let Some(h) = host() else {
@@ -6387,6 +7072,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn rebar_shadow_gpu_write_round_trips_and_preserves_concurrent_cpu_writes() {
+        let _views = crate::inplace::view_tests_lock();
         use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATE_COPY_DEST;
 
         let _rebar = lock_rebar_gpu_test();
@@ -6471,6 +7157,7 @@ mod tests {
 
     #[test]
     fn rebar_dirty_bits_marks_and_coalesces_across_word_boundaries() {
+        let _views = crate::inplace::view_tests_lock();
         let mut bits = RebarDirtyBits::new(140);
         assert!(bits.take_runs().is_empty());
 
@@ -6491,6 +7178,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn rebar_gpu_hash_compare_skips_unchanged_pieces_and_merges_concurrent_writes() {
+        let _views = crate::inplace::view_tests_lock();
         use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATE_COPY_DEST;
 
         let _rebar = REBAR_GPU_TEST.lock().unwrap_or_else(|e| e.into_inner());
@@ -6670,6 +7358,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn concurrent_find_reads_share_the_same_shadow_under_rwlock() {
+        let _views = crate::inplace::view_tests_lock();
         let _rebar = lock_rebar_gpu_test();
         let _retire = crate::host::isolated_retire_scope();
         if host().is_none() {
@@ -6699,6 +7388,7 @@ mod tests {
     /// and leading entries before the range must not stall the scan.
     #[test]
     fn stale_pages_include_uncopied_pages_absent_from_write_watch() {
+        let _views = crate::inplace::view_tests_lock();
         let base = 0x100usize;
         // Pages 0..4: page 0 copied at t=5, page 1 never copied (0), page 2
         // copied at t=5, page 3 copied at t=10.
@@ -6719,6 +7409,7 @@ mod tests {
 
     #[test]
     fn loose_budget_scales_across_ram_tiers() {
+        let _views = crate::inplace::view_tests_lock();
         assert_eq!(loose_budget_for_ram(None), 256 * MIB);
         assert_eq!(loose_budget_for_ram(Some(8 * GIB)), 128 * MIB);
         assert_eq!(loose_budget_for_ram(Some(16 * GIB)), 128 * MIB);
@@ -6731,6 +7422,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn loose_evicts_lru_idle_windows_over_budget_and_skips_in_use_or_pending() {
+        let _views = crate::inplace::view_tests_lock();
         let _rebar = lock_rebar_gpu_test();
         let _retire = crate::host::isolated_retire_scope();
         let Some(host) = host() else {
@@ -6853,6 +7545,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn reregistering_a_title_buffer_retires_its_old_shadow_by_epoch() {
+        let _views = crate::inplace::view_tests_lock();
         let _rebar = lock_rebar_gpu_test();
         let _retire = crate::host::isolated_retire_scope();
         let Some(h) = host() else {
@@ -6894,6 +7587,7 @@ mod tests {
 
     #[test]
     fn wide_copy_is_default_on_multicore_and_can_be_overridden() {
+        let _views = crate::inplace::view_tests_lock();
         assert!(wide_copy_enabled(None, Some(4)));
         assert!(wide_copy_enabled(None, Some(16)));
         assert!(!wide_copy_enabled(None, Some(2)));
@@ -6905,6 +7599,7 @@ mod tests {
 
     #[test]
     fn chunk_copy_segs_preserves_boundaries_and_mirror_offsets() {
+        let _views = crate::inplace::view_tests_lock();
         let segs = [
             CopySeg {
                 src: 0x1000,
@@ -6955,6 +7650,7 @@ mod tests {
 
     #[test]
     fn parallel_shadow_update_preserves_boundaries_unmapped_pages_and_pending_gaps() {
+        let _views = crate::inplace::view_tests_lock();
         use windows_sys::Win32::System::Memory::{
             MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc,
             VirtualFree,
@@ -7046,6 +7742,7 @@ mod tests {
 
     #[test]
     fn parallel_shadow_update_rebar_mirror_syncs_mirror_and_vram() {
+        let _views = crate::inplace::view_tests_lock();
         let Some(h) = host() else {
             return;
         };
@@ -7103,6 +7800,7 @@ mod tests {
 
     #[test]
     fn wide_refresh_reentrancy_and_batch_do_not_deadlock() {
+        let _views = crate::inplace::view_tests_lock();
         let Some(h) = host() else {
             return;
         };
@@ -7175,6 +7873,7 @@ mod tests {
 
     #[test]
     fn card_limits_scales_default_budget_for_high_vram_and_honors_override() {
+        let _views = crate::inplace::view_tests_lock();
         const MIB: u64 = 1 << 20;
         const GIB: u64 = 1 << 30;
         assert_eq!(
@@ -7203,6 +7902,7 @@ mod tests {
 
     #[test]
     fn card_piece_runs_and_inflight_slot_math_agree() {
+        let _views = crate::inplace::view_tests_lock();
         let joined_runs = joined_piece_runs(vec![
             CardSpan {
                 first: 5,
@@ -7257,6 +7957,7 @@ mod tests {
 
     #[test]
     fn first_and_last_difference_find_exact_edges() {
+        let _views = crate::inplace::view_tests_lock();
         let mut a = vec![0x5au8; 257];
         let mut b = a.clone();
         assert_eq!(first_difference(&a, &b), None);
@@ -7271,6 +7972,7 @@ mod tests {
 
     #[test]
     fn parts_written_cuts_64k_pages_into_4k_runs() {
+        let _views = crate::inplace::view_tests_lock();
         const PART: usize = 4 << 10;
         let base = 0x2000_0000usize;
         let bits = (1u16 << 1) | (1u16 << 2) | (1u16 << 15);
@@ -7296,6 +7998,7 @@ mod tests {
 
     #[test]
     fn relay_merge_rebar_merges_gpu_writes_without_touching_concurrent_cpu_writes() {
+        let _views = crate::inplace::view_tests_lock();
         let mut title = vec![0x10u8; 4096];
         let Some(shadow) = Shadow::new_rebar_for_test(title.as_mut_ptr() as u64, 4096, 0x10) else {
             return;
@@ -7315,6 +8018,7 @@ mod tests {
 
     #[test]
     fn relay_merge_rebar_parallel_scan_merges_large_buffer_across_chunks() {
+        let _views = crate::inplace::view_tests_lock();
         const N: usize = 8 << 20;
         let mut title = vec![0x22u8; N];
         let Some(shadow) = Shadow::new_rebar_for_test(title.as_mut_ptr() as u64, N as u64, 0x22)
@@ -7345,6 +8049,7 @@ mod tests {
 
     #[test]
     fn title_writes_under_a_busy_range_are_copied_for_rebar_mirror() {
+        let _views = crate::inplace::view_tests_lock();
         use windows_sys::Win32::System::Memory::{
             MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
         };
@@ -7391,6 +8096,7 @@ mod tests {
 
     #[test]
     fn card_shadow_test_helper_creates_and_tracks_dirty_ranges() {
+        let _views = crate::inplace::view_tests_lock();
         let _retire = crate::host::isolated_retire_scope();
         let mut backing = vec![0x55u8; 64 << 10];
         let mut side = vec![0x55u8; 64 << 10];
@@ -7423,6 +8129,7 @@ mod tests {
 
     #[test]
     fn refresh_batch_materializes_deferred_lazy_block_instead_of_zeroing() {
+        let _views = crate::inplace::view_tests_lock();
         use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
@@ -7549,6 +8256,7 @@ mod tests {
 
     #[test]
     fn materialize_rebar_spans_ignores_inverted_span_without_underflow() {
+        let _views = crate::inplace::view_tests_lock();
         use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
@@ -7620,6 +8328,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn wide_rebar_copy_partial_failure_with_failed_retry_invalidates_written_hashes() {
+        let _views = crate::inplace::view_tests_lock();
         use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
@@ -7705,6 +8414,10 @@ mod tests {
                 copied, 0,
                 "failed segment must not be counted as fully copied"
             );
+            assert!(
+                shadow.never_copied(va0, len),
+                "a failed copy leaves no page noted as holding title bytes"
+            );
             // VRAM bytes for chunks 0..2 were already modified to `0x22`.
             let vram_p0 = shadow.read_test_bytes(va0 as u64, 64);
             assert_eq!(vram_p0, vec![0x22u8; 64]);
@@ -7748,6 +8461,7 @@ mod tests {
 
     #[test]
     fn collect_stale_does_not_acknowledge_excluded_lazy_owned_cpu_write() {
+        let _views = crate::inplace::view_tests_lock();
         use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
@@ -7871,6 +8585,7 @@ mod tests {
 
     #[test]
     fn evict_over_budget_drains_and_evicts_idle_deferred_windows() {
+        let _views = crate::inplace::view_tests_lock();
         use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
@@ -7970,6 +8685,7 @@ mod tests {
 
     #[test]
     fn stale_and_merge_ranges_under_writes_scope_to_conflicting_subranges_only() {
+        let _views = crate::inplace::view_tests_lock();
         use windows_sys::Win32::System::Memory::{
             MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
         };
@@ -8051,6 +8767,7 @@ mod tests {
 
     #[test]
     fn rebar_merge_ranges_under_writes_handles_many_strided_runs_without_consuming_runs_left() {
+        let _views = crate::inplace::view_tests_lock();
         use windows_sys::Win32::System::Memory::{
             MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
         };
@@ -8146,6 +8863,7 @@ mod tests {
 
     #[test]
     fn merge_ranges_under_writes_records_fallback_reasons() {
+        let _views = crate::inplace::view_tests_lock();
         use windows_sys::Win32::System::Memory::{
             MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
         };
@@ -8237,6 +8955,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn card_busy_refresh_coalesces_current_submission_constants() {
+        let _views = crate::inplace::view_tests_lock();
         use windows_sys::Win32::System::Memory::{
             MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
         };
@@ -8300,6 +9019,7 @@ mod tests {
 
     #[test]
     fn card_busy_refresh_preserves_bytes_from_older_flights() {
+        let _views = crate::inplace::view_tests_lock();
         let mut flights = Flights::default();
         let shared = (108, 120);
         let older_only = (128, 133);
@@ -8338,6 +9058,7 @@ mod tests {
     /// byte diffs strictly inside its subrange and preserves GPU writes there.
     #[test]
     fn card_busy_page_runs_coalesces_unprotected_and_preserves_older_gpu_writes() {
+        let _views = crate::inplace::view_tests_lock();
         let base = 0x10_0000usize;
         let held = vec![0u8; PAGE];
         let mut title = held.clone();
@@ -8387,6 +9108,7 @@ mod tests {
     /// prunes landed sends cleanly.
     #[test]
     fn card_sent_index_skips_only_newer_sends_and_prunes_in_order() {
+        let _views = crate::inplace::view_tests_lock();
         let mut sent = CardSent::default();
         sent.push_sorted(5, vec![(10, 20), (100, 120)]);
         // 4,096 strided ranges in send 7 across 1 MiB.
@@ -8429,6 +9151,7 @@ mod tests {
     /// while merging shader writes cleanly.
     #[test]
     fn card_merge_relay_indexed_sent_skips_only_ranges_after_fetched() {
+        let _views = crate::inplace::view_tests_lock();
         const LEN: usize = 2 * PIECE;
         let base: Vec<u8> = (0..LEN)
             .map(|i| (i.wrapping_mul(17) ^ (i >> 8)) as u8)
@@ -8499,6 +9222,7 @@ mod tests {
     ///   calling `copy_back_done` STRICTLY BEFORE clearing `settling` and notifying.
     #[test]
     fn card_sent_busy_and_before_lock_order_stress() {
+        let _views = crate::inplace::view_tests_lock();
         use std::sync::atomic::{AtomicBool, AtomicU64};
         use std::sync::{Barrier, Condvar};
 
@@ -8726,6 +9450,7 @@ mod tests {
 
     #[test]
     fn relay_merge_rebar_preserves_mirror_and_returns_none_on_materialization_or_read_failure() {
+        let _views = crate::inplace::view_tests_lock();
         use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
@@ -8814,6 +9539,7 @@ mod tests {
 
     #[test]
     fn mirrored_copy_seg_never_writes_partial_prefix_when_lazy_can_arm() {
+        let _views = crate::inplace::view_tests_lock();
         use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
@@ -8921,6 +9647,7 @@ mod tests {
 
     #[test]
     fn failed_wide_card_refresh_preserves_staging_baseline_and_keeps_good_segments() {
+        let _views = crate::inplace::view_tests_lock();
         use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
@@ -9015,6 +9742,7 @@ mod tests {
 
     #[test]
     fn apply_rebar_relay_subrange_short_write_fails_and_preserves_unwritten_mirror() {
+        let _views = crate::inplace::view_tests_lock();
         use windows_sys::Win32::System::Memory::{
             MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READONLY, PAGE_READWRITE, VirtualAlloc,
             VirtualFree, VirtualProtect,
@@ -9137,6 +9865,7 @@ mod tests {
 
     #[test]
     fn update_busy_reports_failure_when_page_backed_by_other_shadows_lazy_block() {
+        let _views = crate::inplace::view_tests_lock();
         use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, FILE_MAP_WRITE, MEM_RELEASE, MEM_RESERVE,
@@ -9259,6 +9988,7 @@ mod tests {
 
     #[test]
     fn update_busy_reports_failure_when_page_armed_after_ownership_check() {
+        let _views = crate::inplace::view_tests_lock();
         use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
@@ -9400,6 +10130,7 @@ mod tests {
 
     #[test]
     fn card_staging_publication_and_dirty_marking_are_atomic_with_relay_merge() {
+        let _views = crate::inplace::view_tests_lock();
         use std::sync::{Barrier, Condvar};
         use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
         use windows_sys::Win32::System::Memory::{
@@ -9571,6 +10302,7 @@ mod tests {
 
     #[test]
     fn lock_and_read_retries_when_page_materialized_between_failed_read_and_block_lookup() {
+        let _views = crate::inplace::view_tests_lock();
         use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
@@ -9658,6 +10390,7 @@ mod tests {
 
     #[test]
     fn merge_ranges_under_writes_reports_lazy_failed_page_without_skipping_other_pages() {
+        let _views = crate::inplace::view_tests_lock();
         use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, FILE_MAP_WRITE, MEM_RELEASE, MEM_RESERVE,

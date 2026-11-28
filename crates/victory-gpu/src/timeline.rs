@@ -15,13 +15,15 @@
 use std::collections::VecDeque;
 #[cfg(any(not(windows), test))]
 use std::sync::atomic::AtomicU32;
-#[cfg(any(not(windows), feature = "diagnostics", test))]
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::Instant;
 
 use crate::fence::Held;
+
+#[cfg(feature = "diagnostics")]
+pub(crate) mod wait_stats;
 
 /// A GPU wait for a memory location to satisfy a D3D12 comparison.
 #[derive(Clone, Copy, Debug)]
@@ -63,15 +65,7 @@ impl MemoryWait {
         } else {
             (val, self.reference)
         };
-        match self.comparison {
-            2 => lhs < rhs,
-            3 => lhs == rhs,
-            4 => lhs <= rhs,
-            5 => lhs > rhs,
-            6 => lhs != rhs,
-            7 => lhs >= rhs,
-            _ => true,
-        }
+        self.holds(lhs, rhs)
     }
 
     /// Whether the memory location currently satisfies the wait condition.
@@ -136,6 +130,12 @@ impl MemoryWait {
             };
             (val, self.reference)
         };
+        self.holds(lhs, rhs)
+    }
+
+    /// Whether the (masked) memory value `lhs` against the (cut) reference
+    /// `rhs` meets the comparison.
+    fn holds(&self, lhs: u64, rhs: u64) -> bool {
         match self.comparison {
             2 => lhs < rhs,
             3 => lhs == rhs,
@@ -175,7 +175,15 @@ struct State {
     busy: bool,
     /// The first op is a wait not reached yet, registered with its fence.
     held: bool,
+    /// Since when, and why ([`HELD_US`] index), the queue has been held.
+    held_since: Option<(Instant, usize)>,
 }
+
+/// Microseconds queues spent held, summed over queues: behind a fence wait,
+/// a GPU memory wait; then running work, and time inside the driver's
+/// ExecuteCommandLists. The frame-rate line reads
+/// and resets them.
+pub(crate) static HELD_US: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
 impl Timeline {
     fn lock(&self) -> MutexGuard<'_, State> {
@@ -186,6 +194,8 @@ impl Timeline {
     /// Work another thread is running for the queue is waited for, as a
     /// submission's own work is.
     pub(crate) fn submit(self: &Arc<Self>, op: Op) {
+        #[cfg(feature = "diagnostics")]
+        wait_stats::queue_called();
         let mut s = self.lock();
         s.ops.push_back(op);
         s.pushed += 1;
@@ -209,6 +219,8 @@ impl Timeline {
                 _ => {}
             }
         }
+        #[cfg(feature = "diagnostics")]
+        let _recheck = wait_stats::rechecking(self);
         self.run(s);
     }
 
@@ -258,6 +270,9 @@ impl Timeline {
     ) {
         s.busy = true;
         s.held = false;
+        if let Some((since, why)) = s.held_since.take() {
+            HELD_US[why].fetch_add(since.elapsed().as_micros() as u64, Ordering::Relaxed);
+        }
         while let Some(op) = s.ops.pop_front() {
             match op {
                 Op::Wait(fence, value) => {
@@ -266,6 +281,7 @@ impl Timeline {
                     if !fence.wait_on_gpu(value, self) {
                         s.ops.push_front(Op::Wait(fence, value));
                         s.held = true;
+                        s.held_since = Some((Instant::now(), 0));
                         break;
                     }
                 }
@@ -289,9 +305,22 @@ impl Timeline {
                         {
                             s.ops.push_front(Op::WaitMemory(wait, Some(deadline)));
                             s.held = true;
+                            s.held_since = Some((Instant::now(), 1));
+                            #[cfg(feature = "diagnostics")]
+                            wait_stats::held(self);
                             break;
                         }
-                        if !wait.satisfied() {
+                        let timed_out = !wait.satisfied();
+                        #[cfg(feature = "diagnostics")]
+                        if was_registered {
+                            let how = if timed_out {
+                                wait_stats::How::Timeout
+                            } else {
+                                wait_stats::How::Met
+                            };
+                            wait_stats::released(self, &wait, how);
+                        }
+                        if timed_out {
                             // Fail-open is intentional: if a console memory wait is
                             // never satisfied (for example, an unimplemented signal
                             // path), continuing after the 2 s stall avoids permanently
@@ -318,13 +347,19 @@ impl Timeline {
                             );
                         }
                     }
+                    #[cfg(feature = "diagnostics")]
+                    if was_registered && met {
+                        wait_stats::released(self, &wait, wait_stats::How::Met);
+                    }
                     if was_registered {
                         crate::fence::cancel_memory_wait(self);
                     }
                 }
                 Op::Run(work) => {
                     drop(s);
+                    let started = Instant::now();
                     work();
+                    HELD_US[2].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
                     s = self.lock();
                 }
             }
@@ -540,6 +575,51 @@ mod tests {
         assert!(wait.satisfied());
         // SAFETY: freeing the page we allocated above.
         unsafe { VirtualFree(page, 0, MEM_RELEASE) };
+    }
+
+    /// A wait checked on a committed page whose page is then freed (or
+    /// decommitted) is checked again without faulting: nothing remembers the
+    /// page as committed between checks.
+    #[cfg(windows)]
+    #[test]
+    fn memory_wait_on_a_page_freed_after_a_check_resolves_without_faulting() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_DECOMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
+            VirtualFree,
+        };
+        for release in [false, true] {
+            // SAFETY: one committed page, decommitted or freed below.
+            let page = unsafe {
+                VirtualAlloc(
+                    std::ptr::null(),
+                    4096,
+                    MEM_RESERVE | MEM_COMMIT,
+                    PAGE_READWRITE,
+                )
+            };
+            assert!(!page.is_null());
+            let wait = MemoryWait {
+                address: page as u64 + 8,
+                reference: 1,
+                mask: u32::MAX,
+                width: 8,
+                comparison: 3,
+            };
+            assert!(!wait.satisfied(), "the page holds zeros");
+            // SAFETY: our page, decommitted or freed; read by `satisfied` only
+            // through fault-safe reads.
+            unsafe {
+                match release {
+                    false => VirtualFree(page, 4096, MEM_DECOMMIT),
+                    true => VirtualFree(page, 0, MEM_RELEASE),
+                };
+            }
+            assert!(wait.satisfied(), "an unreadable address resolves the wait");
+            if !release {
+                // SAFETY: releasing the reservation left by the decommit.
+                unsafe { VirtualFree(page, 0, MEM_RELEASE) };
+            }
+        }
     }
 
     #[cfg(windows)]

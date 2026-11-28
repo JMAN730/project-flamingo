@@ -59,6 +59,7 @@ fn lower_compute(native: &NativeProgram) -> lower::Lowered {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        mesh_buffer: false,
     })
     .expect("lower")
 }
@@ -95,4 +96,199 @@ fn a_global_atomic_whose_address_is_loaded_from_memory_reads_the_directory() {
     let lowered = lower_compute(&native_compute(&words));
     assert!(lowered.root_srvs.contains(&SLOT_MEMORY));
     assert_eq!(lowered.root_uavs, [SLOT_FAULTS]);
+}
+
+/// Lowers `words` as [`lower_compute`] does and validates the DXIL with
+/// `dxil.dll` when there is one; checks it reads the page directory.
+fn lowered_by_address(words: &[u32]) -> lower::Lowered {
+    let mut native = native_compute(words);
+    // Four root constants at s0: s[2:3] holds a title address (s[0:1]
+    // would be the spill table of root arguments).
+    native.layout[0] = RootParam {
+        root: RootType::Constants,
+        table_offset_dwords: 0,
+        sgprs: 4,
+        base_register: 0,
+        user_data: 0,
+        slot: 0,
+    };
+    native.used.clear();
+    let lowered = lower_compute(&native);
+    assert!(lowered.root_srvs.contains(&SLOT_MEMORY));
+    assert_eq!(lowered.root_uavs, [SLOT_FAULTS]);
+    #[cfg(windows)]
+    {
+        match super::validator::Validator::load(
+            super::validator::Validator::default_path().as_deref(),
+        ) {
+            Ok(mut v) => v
+                .validate(&mut lowered.dxil.clone())
+                .expect("DXIL validation failed"),
+            Err(e) => eprintln!("{e}; validation skipped"),
+        }
+    }
+    lowered
+}
+
+/// `s_load_dwordx2 s[4:5], s[2:3], 0`: a pointer read from title memory
+/// (at the address root constants 2 and 3 hold), then dwords 2 and 3 of a raw buffer
+/// descriptor around it (`OOB_SELECT` 3: raw).
+const POINTER_DESCRIPTOR: [u32; 6] = [
+    0xF404_0101, // s_load_dwordx2 s[4:5], s[2:3], 0
+    0xFA00_0000,
+    0xBE86_03C1, // s_mov_b32 s6, -1
+    0xBE87_03FF, // s_mov_b32 s7, 0x31014fac
+    0x3101_4FAC,
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+];
+
+fn with_descriptor(body: &[u32]) -> Vec<u32> {
+    let mut w = POINTER_DESCRIPTOR.to_vec();
+    w.extend_from_slice(body);
+    w.push(0xBF81_0000); // s_endpgm
+    w
+}
+
+#[test]
+fn buffer_accesses_through_a_descriptor_around_a_loaded_pointer_read_the_directory() {
+    lowered_by_address(&with_descriptor(&[
+        0xE030_1000, // buffer_load_dword v1, v0, s[4:7], 0 offen
+        0x8001_0100,
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0xE070_1010, // buffer_store_dword v1, v0, s[4:7], 0 offen offset:16
+        0x8001_0100,
+    ]));
+}
+
+#[test]
+fn a_buffer_atomic_through_a_descriptor_around_a_loaded_pointer_reads_the_directory() {
+    lowered_by_address(&with_descriptor(&[
+        0xE0C8_5000, // buffer_atomic_add v1, v0, s[4:7], 0 offen glc
+        0x8001_0100,
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0xE070_1010, // buffer_store_dword v1, v0, s[4:7], 0 offen offset:16
+        0x8001_0100,
+    ]));
+}
+
+#[test]
+fn a_scalar_buffer_load_through_a_descriptor_around_a_loaded_pointer_reads_the_directory() {
+    lowered_by_address(&with_descriptor(&[
+        0xF420_0202, // s_buffer_load_dword s8, s[4:7], 0x10
+        0xFA00_0010,
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x7E02_0208, // v_mov_b32 v1, s8
+        0xE070_1010, // buffer_store_dword v1, v0, s[4:7], 0 offen offset:16
+        0x8001_0100,
+    ]));
+}
+
+#[test]
+fn a_descriptor_whose_size_the_code_loads_is_bounded_at_run_time() {
+    let words = [
+        0xF404_0101, // s_load_dwordx2 s[4:5], s[2:3], 0
+        0xFA00_0000,
+        0xF400_0181, // s_load_dword s6, s[2:3], 8: the size
+        0xFA00_0008,
+        0xBE87_03FF, // s_mov_b32 s7, 0x31014fac
+        0x3101_4FAC,
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xE030_1000, // buffer_load_dword v1, v0, s[4:7], 0 offen
+        0x8001_0100,
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0xE070_1010, // buffer_store_dword v1, v0, s[4:7], 0 offen offset:16
+        0x8001_0100,
+        0xBF81_0000, // s_endpgm
+    ];
+    lowered_by_address(&words);
+}
+
+#[test]
+fn a_global_access_at_a_loaded_scalar_base_plus_a_lane_offset_reads_the_directory() {
+    let words = [
+        0xF404_0101, // s_load_dwordx2 s[4:5], s[2:3], 0
+        0xFA00_0000,
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xDC30_8000, // global_load_dword v1, v0, s[4:5]
+        0x0104_0000,
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0xDC70_8010, // global_store_dword v0, v1, s[4:5] offset:16
+        0x0004_0100,
+        0xBF81_0000, // s_endpgm
+    ];
+    lowered_by_address(&words);
+}
+
+#[test]
+fn a_scalar_load_at_a_first_lane_read_of_a_lane_pointer_reads_the_directory() {
+    let words = [
+        0xDC34_8000, // global_load_dwordx2 v[2:3], v0, s[4:5]
+        0x027D_0000, //   (off: v[0:1] is the address)
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0x7E08_0502, // v_readfirstlane_b32 s4, v2
+        0x7E0A_0503, // v_readfirstlane_b32 s5, v3
+        0xF400_0202, // s_load_dword s8, s[4:5], 0
+        0xFA00_0000,
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x7E02_0208, // v_mov_b32 v1, s8
+        0xDC70_8000, // global_store_dword v[2:3], v1, off
+        0x007D_0102,
+        0xBF81_0000, // s_endpgm
+    ];
+    lowered_by_address(&words);
+}
+
+/// The `dx.op.<function>` calls of `lowered` whose argument `at` is the
+/// constant `mask`.
+fn with_mask(lowered: &lower::Lowered, function: &str, at: usize, mask: i32) -> usize {
+    let name = format!("dx.op.{function}");
+    lowered
+        .dx_ops
+        .iter()
+        .filter(|(n, args)| *n == name && args.get(at) == Some(&Some(mask)))
+        .count()
+}
+
+/// Every dword of a multi-dword access to title memory has its own
+/// directory entry (the next dword may be in another copy) and its own
+/// range check: each is loaded or stored alone, after its own lookup.
+#[test]
+fn each_dword_of_a_title_memory_access_is_looked_up_and_checked_alone() {
+    let lowered = lowered_by_address(&with_descriptor(&[
+        0xF428_0202, // s_buffer_load_dwordx4 s[8:11], s[4:7], 0x10
+        0xFA00_0010,
+        0xE034_1000, // buffer_load_dwordx2 v[1:2], v0, s[4:7], 0 offen
+        0x8001_0100,
+        0xBF8C_0070, // s_waitcnt vmcnt(0) lgkmcnt(0)
+        0x7E02_0208, // v_mov_b32 v1, s8
+        0x7E04_020B, // v_mov_b32 v2, s11
+        0xE074_1010, // buffer_store_dwordx2 v[1:2], v0, s[4:7], 0 offen offset:16
+        0x8001_0100,
+    ]));
+    // Loads: a directory entry (two dwords) then the dword it locates, for
+    // the pointer's two dwords, the scalar load's four and the vector
+    // load's two.
+    let load = "rawBufferLoad.f32";
+    let (lookups, dwords) = (
+        with_mask(&lowered, load, 4, 3),
+        with_mask(&lowered, load, 4, 1),
+    );
+    assert_eq!(
+        (lookups, dwords),
+        (2 + 4 + 2 + 2, 2 + 4 + 2),
+        "{:?}",
+        lowered.dx_ops
+    );
+    for mask in [7, 15] {
+        assert_eq!(
+            with_mask(&lowered, load, 4, mask),
+            0,
+            "{:?}",
+            lowered.dx_ops
+        );
+    }
+    // Stores: one dword at a time (each lookup's fault note is one too).
+    let store = "rawBufferStore.i32";
+    assert_eq!(with_mask(&lowered, store, 8, 3), 0, "{:?}", lowered.dx_ops);
+    assert_eq!(with_mask(&lowered, store, 8, 1), lookups + 2);
 }

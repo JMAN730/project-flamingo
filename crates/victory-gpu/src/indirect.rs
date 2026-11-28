@@ -31,6 +31,7 @@ use windows::core::Interface;
 use crate::host::{HostList, host, transition};
 
 const SOURCE: &str = include_str!("../shaders/argument_clamp.hlsl");
+const MESH_SOURCE: &str = include_str!("../shaders/mesh_draws.hlsl");
 
 /// A mesh dispatch's `kind` bit for [`bound`]: its records are clamped as rows,
 /// each [`ROW_STRIDE`] bytes in the scratch buffer (two root constants, then
@@ -75,8 +76,13 @@ fn make() -> windows::core::Result<Clamp> {
 }
 
 fn make_for(device: &ID3D12Device) -> windows::core::Result<Clamp> {
+    pass_for(device, "argument clamp", SOURCE)
+}
+
+/// A compute pass of ours from HLSL `source`, named `name` in messages.
+fn pass_for(device: &ID3D12Device, name: &str, source: &str) -> windows::core::Result<Clamp> {
     // Wine's d3dcompiler_47 refuses it; `compile_compute` then uses DXC.
-    let bytes = crate::hlsl::compile_compute("argument clamp", SOURCE)?;
+    let bytes = crate::hlsl::compile_compute(name, source)?;
     let bytes = &bytes[..];
     // SAFETY: plain object creation; the root signature is inside the shader.
     unsafe {
@@ -124,16 +130,19 @@ pub(crate) fn validate_layout(
 /// (PC argument numbering) `stride` bytes apart from `src` into a list-owned
 /// scratch buffer, leaving the scratch buffer in `UNORDERED_ACCESS` with a UAV
 /// barrier after the write (for passes such as [`crate::rectangles`] that read
-/// the clamped records in another compute shader). Callers return the scratch
-/// buffer to `COMMON` via [`done_uav`] once done reading it. Replaces the
-/// list's compute root signature and pipeline. `None` if the clamp or layout
-/// is not available.
+/// the clamped records in another compute shader), bounded by the 32-bit
+/// count in `count` when given (records past it are neither clamped nor
+/// charged to the list's budget). Callers return the scratch buffer to
+/// `COMMON` via [`done_uav`] once done reading it. Replaces the list's
+/// compute root signature and pipeline. `None` if the clamp or layout is not
+/// available.
 pub(crate) fn clamp_uav(
     list: &HostList,
     src: (&ID3D12Resource, u64),
+    count: Option<(&ID3D12Resource, u64)>,
     spec: (u32, u32, u32),
 ) -> Option<ID3D12Resource> {
-    validate_layout(spec, src.1, None)?;
+    validate_layout(spec, src.1, count.map(|(_, off)| off))?;
     let bytes = scratch_bytes(spec.0, spec.1, spec.2);
     let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
     let wait = list.take_buffer_writes() || every_wait();
@@ -143,7 +152,7 @@ pub(crate) fn clamp_uav(
         &dst,
         budget,
         src,
-        None,
+        count,
         spec,
         false,
         wait,
@@ -837,6 +846,65 @@ fn done_on(list: &ID3D12GraphicsCommandList, scratch: &ID3D12Resource) {
             D3D12_RESOURCE_STATE_COMMON,
         )]);
     }
+}
+
+fn mesh_pass() -> Option<&'static Clamp> {
+    static PASS: std::sync::OnceLock<Option<Clamp>> = std::sync::OnceLock::new();
+    PASS.get_or_init(|| {
+        match host()
+            .ok_or_else(windows::core::Error::empty)
+            .and_then(|h| pass_for(&h.device, "mesh draw arguments", MESH_SOURCE))
+        {
+            Ok(c) => Some(c),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "no mesh draw arguments: indirect mesh dispatches dropped on this host"
+                );
+                None
+            }
+        }
+    })
+    .as_ref()
+}
+
+/// Bytes of a draw's and of a dispatch's arguments.
+pub(crate) const DRAW_BYTES: u32 = 16;
+pub(crate) const DISPATCH_BYTES: u32 = 12;
+
+/// Records, in `list`, the pass that makes the arguments of an indirect
+/// mesh dispatch on a host without mesh shaders: from the first clamped
+/// record at host address `args` (in unordered-access state, as
+/// [`clamp_uav`] leaves it) it writes, at host address `made`, `parts`
+/// draws [`DRAW_BYTES`] apart and after them `parts` dispatches
+/// [`DISPATCH_BYTES`] apart. Part k covers the record's thread groups from
+/// `k * capacity`, at most `capacity` of them: its dispatch runs that many
+/// groups and its draw has `vertices` per instance and one instance per
+/// group. Replaces the list's compute root signature and pipeline. False if
+/// the pass is not available.
+pub(crate) fn mesh_draws(
+    list: &HostList,
+    args: u64,
+    made: u64,
+    (parts, capacity, vertices): (u32, u32, u32),
+) -> bool {
+    let Some(c) = mesh_pass() else {
+        return false;
+    };
+    let l = &list.list;
+    let constants = [parts, capacity, vertices, 0];
+    // SAFETY: an open list; our root signature, pipeline and live buffers
+    // the caller's list holds, both in unordered-access state.
+    unsafe {
+        l.SetComputeRootSignature(&c.root);
+        l.SetPipelineState(&c.pso);
+        l.SetComputeRoot32BitConstants(0, 4, constants.as_ptr().cast(), 0);
+        l.SetComputeRootUnorderedAccessView(1, args);
+        l.SetComputeRootUnorderedAccessView(2, made);
+        l.Dispatch(1, 1, 1);
+        l.ResourceBarrier(&[uav_barrier()]);
+    }
+    true
 }
 
 pub(crate) fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
@@ -1636,5 +1704,54 @@ void main() {
         // SAFETY: `src_ptr` is mapped for `total` bytes and the GPU is idle.
         let src_after = unsafe { std::slice::from_raw_parts(src_ptr.cast_const(), total) };
         assert_eq!(src_after, &src[..]);
+    }
+
+    /// The arguments of an indirect mesh dispatch without mesh shaders: the
+    /// first record's thread groups are split over the parts, each with its
+    /// draw and its dispatch, and the title's records stay as they are.
+    #[test]
+    fn mesh_draw_arguments_split_the_first_record() {
+        let Some(host) = super::host() else {
+            return; // no host GPU here
+        };
+        // (first record, what each of 3 parts of 1000 groups runs).
+        let cases: [([u32; 3], [u32; 3]); 4] = [
+            ([2500, 1, 1], [1000, 1000, 500]),
+            ([1000, 1, 1], [1000, 0, 0]),
+            ([5000, 1, 1], [1000, 1000, 1000]),
+            ([700, 0, 1], [0, 0, 0]),
+        ];
+        for (first, want) in cases {
+            let list = host.new_list().expect("host command list");
+            let (args, args_at) = host.shared_buffer(256).expect("records");
+            let (made, made_at) = host.shared_buffer(256).expect("made arguments");
+            let records: [[u32; 3]; 3] = [first, [7, 1, 1], [9, 1, 1]];
+            // SAFETY: freshly mapped host buffers of 256 bytes; live buffers.
+            let (args_gpu, made_gpu) = unsafe {
+                std::ptr::copy_nonoverlapping(
+                    records.as_ptr().cast::<u8>(),
+                    args_at,
+                    size_of_val(&records),
+                );
+                std::ptr::write_bytes(made_at, 0xaa, 256);
+                (args.GetGPUVirtualAddress(), made.GetGPUVirtualAddress())
+            };
+            // Three parts of 1000 groups, 768 vertices each.
+            assert!(super::mesh_draws(&list, args_gpu, made_gpu, (3, 1000, 768)));
+            list.close();
+            host.execute(&[&list]);
+            // SAFETY: execution finished; the buffers are mapped and readable.
+            let (after, draws, dispatches) = unsafe {
+                (
+                    args_at.cast::<[[u32; 3]; 3]>().read_unaligned(),
+                    made_at.cast::<[[u32; 4]; 3]>().read_unaligned(),
+                    made_at.add(48).cast::<[[u32; 3]; 3]>().read_unaligned(),
+                )
+            };
+            assert_eq!(after, records, "{first:?}: the title's records");
+            assert_eq!(draws, want.map(|n| [768, n, 0, 0]), "{first:?}: draws");
+            let empty_or = |n: u32| if n == 0 { [0; 3] } else { [n, 1, 1] };
+            assert_eq!(dispatches, want.map(empty_or), "{first:?}: dispatches");
+        }
     }
 }
